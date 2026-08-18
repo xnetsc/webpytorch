@@ -7,7 +7,8 @@ import io, json, time
 import numpy as np
 from js import pythonIO
 from pyodide.http import pyfetch
-from webtorch import tts
+from webtorch import tts, use_default_io
+use_default_io()                   # REQUIRED: install IO (built-in browser fetch / host open)
 
 NPZ = "/models/vits_web.npz"
 REF = "/models/vits_ref_wav.npy"

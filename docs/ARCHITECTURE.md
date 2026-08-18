@@ -28,7 +28,7 @@ Pyodide (Python-in-WASM) worker in the browser.
 | `_sdk.py` | transformers-style facade (`AutoModelForCausalLM`, `AutoTokenizer`) + the task **pipeline registry** (`pipeline`, `register_pipeline`) |
 | `lm_engine.py` | generic decoder `TransformerLM` (RMSNorm + GQA + rope + SwiGLU **or** MoE), samplers (`greedy/nucleus/ras`), KV-cache + capture-replay, `build_lm` |
 | `quantize.py` | streaming quantizer — IO-free `Quantizer.stream(read,has,names,write)`; convenience `Quantizer.quantize` |
-| `webio.py` | the **only** IO layer: two global async callbacks (`set_io`/`io_read`, `set_io_write`/`io_write`) + path/bytes/callback/dict resolvers and pure-numpy safetensors read/write on top |
+| `webio.py` | the **only** IO layer: two REQUIRED global async callbacks (`set_io_read`/`io_read`, `set_io_write`/`io_write`; `use_default_io()` for built-ins) + path/bytes/callback/dict resolvers and pure-numpy safetensors read/write on top |
 | `onnxrt.py` | generic ONNX runtime (pure-Python protobuf parser + ~50-op interpreter) |
 | `llm.py` | `CausalLM` (int4/GGUF loading + capture decode); `BPETokenizer` |
 | `cosyvoice.py` `tts.py` `detection.py` `vl.py` `audiofe.py` | concrete model impls (**internal** — reached via `pipeline` / `webtorch.models.*`) |
@@ -41,13 +41,17 @@ Pyodide (Python-in-WASM) worker in the browser.
   or the advanced `webtorch.models.*` namespace. Pipelines are protocol + registry: a model
   is a set of methods (`.synth/.clone`, `.detect`, `.generate`), and third parties add models
   with `register_pipeline` without changing the SDK.
-- **No hardcoded IO — two global async callbacks.** The core never opens files/URLs. Every
-  byte read goes through one global `io_read(name, offset, length)` callback and every byte
-  written through its mirror `io_write(name, data, offset)` (`webio`, installed via
-  `set_io`/`set_io_write`). `offset`/`length` enable ranged/streaming access (int4 weight
-  shards, streamed quantizer output), so a too-big-to-fit model streams in and out without
-  ever fully residing in memory. Path/bytes/dict adapters (and pure-numpy safetensors
-  read/write) sit on top for convenience — a str `dst` is just a name handed to `io_write`.
+- **No hardcoded IO — two REQUIRED global async callbacks.** The core never opens files/URLs
+  and ships with **no default IO**: every byte read goes through one global
+  `io_read(name, offset, length)` callback and every byte written through its mirror
+  `io_write(name, data, offset)` (`webio`, installed via `set_io_read`/`set_io_write`).
+  Until both are installed the first read/write raises — a misconfigured SDK fails fast
+  instead of silently hitting the network/disk. `webtorch.use_default_io()` opts into the
+  built-in browser-fetch / host-open pair in one explicit call. `offset`/`length` enable
+  ranged/streaming access (int4 weight shards, streamed quantizer output), so a too-big-to-fit
+  model streams in and out without ever fully residing in memory. Path/bytes/dict adapters
+  (and pure-numpy safetensors read/write) sit on top — a str `dst` is just a name handed to
+  `io_write`; the SDK never assumes it is local.
 - **Backend kernels** (the WgPy fork, `src/` + `webgl/` + `webgpu/`) add: batched matmul,
   graph capture/replay, fused Adam/softmax/layernorm, in-place KV-scatter, int4/int8 dequant-
   matmul. See [NOTICE](../NOTICE) and [WGPY_BACKEND.md](WGPY_BACKEND.md).

@@ -9,7 +9,17 @@ on **WebGPU** (with a **WebGL** fallback), backed by a modified
 runtime, and a streaming quantizer — so a third party can drop it in for PyTorch and
 train/infer real models client-side, with **no server and no native install**.
 
+> **Where this runs:** webtorch is **Python-in-the-browser**. Every snippet below executes
+> **inside Pyodide** (CPython compiled to WASM), normally in a Web Worker, run via
+> `pyodide.runPythonAsync(code)` on top of the WgPy WebGPU/WebGL backend — that async
+> runtime is why top-level `await` works in the examples. You do **not** `pip install`
+> webtorch into system Python; the package files are loaded into Pyodide's in-memory
+> filesystem alongside the backend wheels (the demo's [`webapp/worker.js`](webapp/worker.js)
+> shows the full bootstrap; steps in **[docs/BUILD.md](docs/BUILD.md)**). Plain host CPython
+> can only `import webtorch` as a numpy-fallback smoke test — the GPU paths need the browser.
+
 ```python
+# ── inside Pyodide (browser) ──
 import webtorch
 webtorch.install_torch()                 # `import torch` now resolves to webtorch
 
@@ -20,23 +30,53 @@ opt = torch.optim.Adam(net.parameters(), lr=1e-3)
 loss = nn.CrossEntropyLoss()(net(x), y); loss.backward(); opt.step()
 ```
 
+Loading models needs IO, and **IO is required** — install it once (or use the built-in):
+
+```python
+import webtorch
+webtorch.use_default_io()                    # REQUIRED — built-in browser fetch / host open
+# ...or bring your own storage (OPFS / IndexedDB / S3 / …):
+#   async def read(name, offset=0, length=None) -> bytes: ...
+#   async def write(name, data, offset=0) -> None: ...
+#   webtorch.set_io_read(read); webtorch.set_io_write(write)
+
+# Any CausalLM/MoE model, identified by its config — AutoGPTQ int4 OR int8, or GGUF:
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
+print(lm.generate("Hello", max_new=64))
+
+# Task pipelines: built-in names are pre-registered loaders — add your own, no SDK edit:
+async def load_my_llm(**kw):
+    return await webtorch.AutoModelForCausalLM.from_pretrained(kw["path"])
+webtorch.register_pipeline("text-generation", "my-llm", load_my_llm)
+gen = await webtorch.pipeline("text-generation", "my-llm", path="/models/qwen-gptq")
+print(gen("Hi", max_new=32))
+```
+
 ## Features
 
 - **Drop-in PyTorch** — `Tensor` + autograd, `nn.{Linear,Conv1d/2d/3d,LayerNorm,RMSNorm,
   MultiheadAttention,…}`, `optim.{SGD,Adam,AdamW}`. Trains real GPT/CNN/Transformer on
   WebGPU **and** WebGL.
-- **LLMs, quantized or fp16** — `AutoModelForCausalLM.from_pretrained(...)` for the
-  CausalLM series (Qwen2/Qwen3/Llama-shaped) and the **MoE series** (Qwen2-MoE/Qwen3-MoE),
-  from AutoGPTQ int4 or GGUF. WebGPU capture-replay decode (~20×).
+- **LLMs (any CausalLM/MoE, by config — not a fixed model list)** —
+  `AutoModelForCausalLM.from_pretrained(path)` loads the CausalLM series (Qwen2/Qwen3/Llama-
+  shaped) and the **MoE series** (Qwen2-MoE/Qwen3-MoE) by reading the model's `config`, from
+  an **AutoGPTQ int4 *or* int8** dir or a **GGUF** file. Decode runs on the int (4/8) capture-
+  replay kernel (~20×); a fp16 model is quantized on load (there is no fp16 *decode* path yet).
+  General training/CNN/`nn` in the core runs in native fp32.
 - **Streaming quantization** — turn any fp16 model into int4/int8 without holding it in
-  RAM; streams weights **in** and quantized shards **out** through two global async IO
-  callbacks (`set_io`/`set_io_write`), so nothing needs to fit in memory; output is
+  RAM; streams weights **in** and quantized shards **out** through the global async IO
+  callbacks (`set_io_read`/`set_io_write`), so nothing needs to fit in memory; output is
   standard AutoGPTQ, loadable by auto_gptq / vLLM / transformers.
 - **Generic ONNX runtime** — run any `.onnx` (pure-Python parser + ~50 ops, no deps).
-- **Task pipelines** — uniform, model-agnostic `pipeline("text-to-speech" | "object-detection"
-  | "image-to-text" | "text-generation")`; register your own models with `register_pipeline`.
-  Ships text-to-speech (CosyVoice2 incl. zero-shot voice cloning, VITS), detection (YOLO/DETR),
-  and vision-language (Qwen2.5-VL).
+- **Task pipelines (open registry, not a whitelist)** — uniform, model-agnostic
+  `pipeline("text-to-speech" | "object-detection" | "image-to-text" | "text-generation")`.
+  The built-in model names are just *pre-registered* loaders; add your own (any task, incl.
+  LLMs) with `register_pipeline` **without changing the SDK**. Ships text-to-speech
+  (CosyVoice2 incl. zero-shot voice cloning, VITS), detection (YOLO/DETR), and
+  vision-language (Qwen2.5-VL).
+- **Bring-your-own IO (required)** — the core does no IO itself. Install one global async
+  read + one write callback (`set_io_read`/`set_io_write`), or call `use_default_io()` for
+  the built-in browser-fetch / host-open pair; until then, any load fails fast.
 
 ## Quickstart
 

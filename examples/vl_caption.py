@@ -8,7 +8,8 @@ import io, json, time
 from js import pythonIO
 import pyodide_js
 from pyodide.http import pyfetch
-from webtorch import vl
+from webtorch import vl, use_default_io
+use_default_io()                   # REQUIRED: install IO (built-in browser fetch / host open)
 
 MODEL = "/models/qwen2.5-vl-3b"
 IMAGE = "/models/vl_test.png"

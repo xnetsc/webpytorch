@@ -5,8 +5,15 @@ Transformers, and LLMs on **WebGPU/WebGL** (via Pyodide + WgPy), with a
 transformers-style model API and a streaming quantizer. Third parties use the
 public API only — no need to touch internals.
 
+> **Runtime:** this is **Python-in-the-browser**. All code below runs **inside Pyodide**
+> (CPython→WASM), typically in a Web Worker, via `pyodide.runPythonAsync(code)` on the WgPy
+> WebGPU/WebGL backend — hence top-level `await` works. webtorch is **not** `pip install`ed
+> into system Python; its files are loaded into Pyodide's virtual FS next to the backend
+> wheels (see [`webapp/worker.js`](../webapp/worker.js) and [BUILD.md](BUILD.md)). Host
+> CPython import is a numpy-fallback smoke test only; GPU paths need the browser.
+
 ```python
-import webtorch
+import webtorch          # inside Pyodide (browser / Web Worker)
 ```
 
 ---
@@ -30,20 +37,31 @@ RMSNorm,MultiheadAttention,…}`, activations/losses, `optim.{SGD,Adam,AdamW}`,
 autograd, `.to()/.view()/.transpose()/.reshape()`. Real GPT + CNN + Transformer
 train end-to-end on both backends.
 
-## 2. LLMs — quantized **or** fp16, transformers-style
+## 2. LLMs — any CausalLM/MoE by config (int4 / int8 / GGUF)
+
+> **Set IO first.** Loading reads files, and the core has no default IO — call
+> `webtorch.use_default_io()` (or your own `set_io_read`/`set_io_write`) once before any
+> `from_pretrained`, or it raises. See [IO injection](#io-injection-required-not-optional).
 
 ```python
-# already-quantized (AutoGPTQ int4 safetensors / llama.cpp GGUF)
+webtorch.use_default_io()                        # REQUIRED before loading (built-in fetch/open)
+
+# Any CausalLM/MoE model, identified by its config — AutoGPTQ int4 OR int8, or GGUF:
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
 text = lm.generate("Hello", max_new=64)          # WebGPU capture-replay decode
 
-# streaming token output
-for tok in lm.stream("...", max_new=128): render(tok)
+for tok in lm.stream("...", max_new=128): render(tok)   # streaming token output
 ```
 
-Covers the **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the **MoE series**
-(Qwen2-MoE / Qwen3-MoE) through one generic layer — router top-k + optional shared
-expert. Verified end-to-end on the real Qwen1.5-MoE-A2.7B (int4) → coherent text.
+The model is picked by its `config`, **not** a hard-coded name — one config-driven engine
+covers the **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the **MoE series** (Qwen2-MoE
+/ Qwen3-MoE: router top-k + optional shared expert). Verified end-to-end on the real
+Qwen1.5-MoE-A2.7B (int4) → coherent text.
+
+**Precision:** AutoGPTQ is loaded at whatever bits its `quantization_config` declares
+(**int4 or int8** — not fixed to int4); GGUF is dequantized then requantized to int`bits`
+(4 or 8). LLM *decode* runs on the int (4/8) capture kernel — a fp16 model is quantized on
+load; there is no fp16 decode path yet. (The general torch core in §1 runs native fp32.)
 
 ## 3. Quantization — dedicated, streaming, IO-free, framework-agnostic
 
@@ -63,19 +81,18 @@ await webtorch.Quantizer.quantize(src, dst, config, bits=4)
 Peak RAM = one input tensor + one output shard, independent of model size. Output =
 AutoGPTQ safetensors + index + `config.json`.
 
-## 4. Task pipelines — uniform, model-agnostic
+## 4. Task pipelines — uniform interface, open registry (not a fixed model list)
 
 Interact by **task**, not by model. Each pipeline exposes the same methods regardless of
-the model underneath; the concrete model (CosyVoice2/VITS/DETR/YOLO/Qwen-VL) is an
-internal detail, never a public interface.
+the model underneath; the concrete model is an internal detail, never a public interface.
 
 ```python
-tts = await webtorch.pipeline("text-to-speech")                  # model="vits" | "cosyvoice2"
+tts = await webtorch.pipeline("text-to-speech")                  # model="auto" → default loader
 wav = tts("Hello.")                                              # same call for any TTS model
 wav = tts("Hello.", reference_audio=(w16, w24))                  # generic zero-shot voice clone
                                                                  # (pipeline(..., clone=True) to enable)
 
-det = await webtorch.pipeline("object-detection")               # model="yolo" | "detr"
+det = await webtorch.pipeline("object-detection")
 boxes = det(image, threshold=0.3)
 
 vl  = await webtorch.pipeline("image-to-text", path="/models/qwen2.5-vl-3b")
@@ -87,17 +104,55 @@ text = gen("Hello", max_new=64)                                  # or: for t in 
 onnx = await webtorch.OnnxModel.from_source("/models/any.onnx")  # run ANY onnx graph
 ```
 
+**The `model="…"` names are registry keys, not a whitelist.** The SDK *pre-registers* a
+few built-in loaders (`"cosyvoice2"`/`"vits"`, `"yolo"`/`"detr"`, `"qwen-vl"`, `"auto"`);
+`model="auto"` uses the task default. You register your own **without editing the SDK** —
+the wrapper only calls the task protocol (`.synth/.clone`, `.detect`, `.generate`,
+`.stream`) on your impl, never branching on model identity:
+
+```python
+# a custom TTS model — impl must expose .sr / .synth / .clone / .can_clone
+async def load_my_tts(**kw):
+    return await MyTTS.load(kw.get("path", "/models/my-tts"))    # uses io_read internally
+webtorch.register_pipeline("text-to-speech", "my-tts", load_my_tts, default=True)
+tts = await webtorch.pipeline("text-to-speech", "my-tts");  wav = tts("hello")
+
+# a custom LLM behind the text-generation task
+async def load_my_llm(**kw):
+    return await webtorch.AutoModelForCausalLM.from_pretrained(kw["path"])   # any int4/int8/GGUF
+webtorch.register_pipeline("text-generation", "my-llm", load_my_llm)
+gen = await webtorch.pipeline("text-generation", "my-llm", path="/models/my-qwen-gptq")
+print(gen("Hello", max_new=64))
+```
+
 > Concrete implementations are reachable for advanced use as `webtorch.models.cosyvoice`
 > etc. (like `transformers.models.*`) but are **not** part of the public API.
 
-## IO injection (no hardcoded IO anywhere)
+## IO injection (required, not optional)
 
-The library core never touches the filesystem. Every byte read flows through one
-global async callback `io_read(name, offset, length)` (`webtorch.set_io`) and every
-byte written through its mirror `io_write(name, data, offset)` (`webtorch.set_io_write`).
-Public APIs also accept a `path` / `bytes` / `dict`, auto-distinguished (framework-
-compatible); small configs are passed as plain objects. Because it is one injection
-point, oversized models stream in and out of external storage. See [API.md](API.md).
+The library core never touches the filesystem — and it ships with **no default IO**, so you
+**must** install a global read + write callback before loading anything, or the first
+read/write raises `RuntimeError` (fail-fast, never a silent fallback). The two are mirror
+images:
+
+```python
+# Option A — built-ins (browser fetch+Range / host+Pyodide open). One explicit call:
+webtorch.use_default_io()
+
+# Option B — bring your own storage (OPFS / IndexedDB / S3 / socket / …):
+async def my_read(name, offset=0, length=None) -> bytes:   # length None = whole file
+    ...                                                    # `name` is just a key/URL/path you gave a loader
+async def my_write(name, data, offset=0) -> None:          # offset 0 = whole file
+    ...
+webtorch.set_io_read(my_read)
+webtorch.set_io_write(my_write)
+```
+
+`offset`/`length` mark ranged/streaming access (int4 weight shards, streamed quantizer
+output) so a callback can issue an HTTP Range request or seek into storage. Public APIs also
+accept a `path` / `bytes` / `dict`, auto-distinguished; small configs are passed as plain
+objects. Because it is one injection point, oversized models stream in and out of external
+storage without ever fully residing in memory. See [API.md](API.md).
 
 ## Layout
 

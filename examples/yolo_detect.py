@@ -7,7 +7,8 @@ import io, json, time
 from js import pythonIO
 import pyodide_js
 from pyodide.http import pyfetch
-from webtorch import detection
+from webtorch import detection, use_default_io
+use_default_io()                   # REQUIRED: install IO (built-in browser fetch / host open)
 
 NPZ = "/models/yolov8n_web.npz"
 NAMES = "/models/coco_names.json"

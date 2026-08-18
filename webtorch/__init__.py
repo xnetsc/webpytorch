@@ -47,14 +47,20 @@ from .lm_engine import TransformerLM, build_lm, SAMPLERS
 # way `transformers.models.*` are, but are intentionally absent from the public surface.
 from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (advanced)
 
-# ---- global async IO callback -------------------------------------------------
-# EVERY file read in the SDK (weights, configs, tokenizers, ONNX, npz) flows through
-# ONE injection point. Install your own async reader once and all loaders use it:
-#     async def my_io(name, offset=0, length=None) -> bytes: ...
-#     webtorch.set_io(my_io)
-# `offset`/`length` are set for ranged/streaming reads (e.g. int4 weight shards) so
-# the callback can issue an HTTP Range request or seek into local storage.
-from .webio import set_io, get_io, io_read, set_io_write, get_io_write, io_write
+# ---- symmetric global async IO callbacks (REQUIRED) ---------------------------
+# EVERY file the SDK reads/writes (weights, configs, tokenizers, ONNX, npz, quantized
+# shards) flows through ONE pair of injection points. The core ships with NO default IO —
+# you MUST install both, or the first read/write raises. All loaders, the quantizer, and
+# the cache then use them:
+#     async def my_read(name, offset=0, length=None) -> bytes: ...
+#     async def my_write(name, data, offset=0) -> None: ...
+#     webtorch.set_io_read(my_read); webtorch.set_io_write(my_write)
+# For demos / the common browser case, `webtorch.use_default_io()` installs the built-in
+# browser-fetch+Range / host-open pair in one explicit call. `offset`/`length` mark
+# ranged/streaming access (e.g. int4 weight shards) so a callback can issue an HTTP Range
+# request or seek into local/remote storage.
+from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
+                    use_default_io, default_io_read, default_io_write)
 
 __all__ = [
     # torch-compatible core
@@ -63,8 +69,9 @@ __all__ = [
     "AutoTokenizer", "AutoModelForCausalLM", "pipeline", "register_pipeline", "Quantizer", "OnnxModel",
     # generic decoder engine (CausalLM + MoE series)
     "TransformerLM", "build_lm", "SAMPLERS",
-    # global async IO callbacks — reads: (name, offset, length) -> bytes ; writes: (name, data, offset) -> None
-    "set_io", "get_io", "io_read", "set_io_write", "get_io_write", "io_write",
+    # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None
+    "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
+    "use_default_io", "default_io_read", "default_io_write",
     "__version__",
 ]
 

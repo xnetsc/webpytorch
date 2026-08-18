@@ -192,14 +192,77 @@ async def write_json(dst, name, obj, io=None):
     raise TypeError("unsupported json sink: %r" % type(dst))
 
 
-# ============================ the SINGLE global IO callback ============================
-# EVERY file/weight the SDK reads goes through one async callback:
-#     async def io(name: str, offset: int = 0, length: int | None = None) -> bytes
-# `length is None` => read the whole file; otherwise read `length` bytes from `offset`
-# (used for streaming / HTTP-Range). The user installs their own via `set_io(...)`; the
-# default reads via the browser (pyfetch, with a Range header) or the host (open+seek).
+# ============================ the SINGLE global IO callbacks ============================
+# A symmetric pair the integrator MUST install — the core ships with NO default IO, so an
+# unconfigured SDK fails fast instead of silently reaching the network/disk:
+#     async def read(name, offset=0, length=None) -> bytes   # length None = whole file
+#     async def write(name, data, offset=0) -> None           # offset 0   = whole file
+#     webtorch.set_io_read(read); webtorch.set_io_write(write)
+# `offset`/`length` mark ranged/streaming access (int4 weight shards, streamed shard writes)
+# so a callback can issue an HTTP Range request or seek into local/remote storage. The
+# built-in browser-fetch / host-open implementations are provided as an OPT-IN one-liner
+# (`use_default_io()`); nothing is installed until you ask for it.
 
-async def _default_io(name, offset=0, length=None):
+_IO = None        # read  callback — None until the integrator installs one
+_IOW = None       # write callback — None until the integrator installs one
+
+_UNSET_READ = ("webtorch IO is not configured: install a global read callback with "
+               "webtorch.set_io_read(async def read(name, offset=0, length=None) -> bytes), "
+               "or call webtorch.use_default_io() for the built-in browser-fetch / host-open reader.")
+_UNSET_WRITE = ("webtorch IO is not configured: install a global write callback with "
+                "webtorch.set_io_write(async def write(name, data, offset=0) -> None), "
+                "or call webtorch.use_default_io() for the built-in host/Pyodide writer.")
+
+
+def set_io_read(callback):
+    """Install the GLOBAL async READ callback used for EVERY file/weight the SDK reads:
+        async def callback(name, offset=0, length=None) -> bytes
+    Your callback fetches the bytes from wherever the data actually lives (disk / OPFS /
+    S3 / socket / …); `length is None` means whole-file, otherwise a byte range. REQUIRED
+    — until it (or `use_default_io()`) is called, any read raises. `None` clears it back to
+    the unconfigured state. Mirror of `set_io_write`."""
+    global _IO
+    _IO = callback
+
+def get_io_read():
+    return _IO
+
+async def io_read(name, offset=0, length=None, io=None):
+    """The one entry point the whole SDK uses to read bytes — routes to the global read
+    callback (or a per-call `io` override). Raises RuntimeError if none is configured."""
+    fn = io or _IO
+    if fn is None:
+        raise RuntimeError(_UNSET_READ)
+    return bytes(await fn(name, offset, length))
+
+
+def set_io_write(callback):
+    """Install the GLOBAL async WRITE callback used for EVERY file the SDK writes:
+        async def callback(name, data, offset=0) -> None
+    Your callback persists the bytes wherever they should live (disk / OPFS / IndexedDB /
+    a download / S3 / …). `offset == 0` means whole-file; a positive offset patches in
+    place. REQUIRED — until it (or `use_default_io()`) is called, any write raises. `None`
+    clears it back to the unconfigured state. Mirror of `set_io_read`."""
+    global _IOW
+    _IOW = callback
+
+def get_io_write():
+    return _IOW
+
+async def io_write(name, data, offset=0, io=None):
+    """The one entry point the whole SDK uses to write bytes — routes to the global write
+    callback (or a per-call `io` override). Raises RuntimeError if none is configured."""
+    fn = io or _IOW
+    if fn is None:
+        raise RuntimeError(_UNSET_WRITE)
+    await fn(name, bytes(data), offset)
+
+
+# ---- OPT-IN built-in IO (browser fetch+Range / host+Pyodide open+seek) ----
+# Not installed automatically. Call `use_default_io()` (or install these individually) to
+# use them; a bare SDK has no IO until you do.
+
+async def default_io_read(name, offset=0, length=None):
     try:                                                    # browser
         from pyodide.http import pyfetch
         if length is not None:
@@ -212,35 +275,7 @@ async def _default_io(name, offset=0, length=None):
             if offset: f.seek(offset)
             return f.read() if length is None else f.read(length)
 
-_IO = _default_io
-
-def set_io(callback):
-    """Install the GLOBAL async IO callback used for EVERY file/weight the SDK reads:
-        async def callback(name, offset=0, length=None) -> bytes
-    Your callback fetches the bytes from wherever the data actually lives (disk / OPFS /
-    S3 / socket / …); `length is None` means whole-file, otherwise a byte range. Pass
-    `None` to restore the built-in default (browser pyfetch / host open)."""
-    global _IO
-    _IO = callback or _default_io
-
-def get_io():
-    return _IO
-
-async def io_read(name, offset=0, length=None, io=None):
-    """The one entry point the whole SDK uses to read bytes — routes to the global
-    callback (or a per-call `io` override with the same signature)."""
-    return bytes(await (io or _IO)(name, offset, length))
-
-
-# ---- the SINGLE global WRITE callback (mirror of io_read) ----
-# EVERY file the SDK writes (quantized shards, index.json, config.json, cached downloads)
-# goes through one async callback:
-#     async def io_write(name: str, data: bytes, offset: int = 0) -> None
-# `offset == 0` writes/creates the whole file; a positive offset patches in place (for
-# streamed/chunked writes). Install your own via `set_io_write(...)`; the default writes
-# through the local/Pyodide filesystem (open+seek), the exact counterpart of the reader.
-
-async def _default_io_write(name, data, offset=0):
+async def default_io_write(name, data, offset=0):
     import os
     d = os.path.dirname(name)
     if d:
@@ -257,24 +292,12 @@ async def _default_io_write(name, data, offset=0):
         with open(name, "wb") as f:
             f.write(bytes(data))
 
-_IOW = _default_io_write
-
-def set_io_write(callback):
-    """Install the GLOBAL async write callback used for EVERY file the SDK writes:
-        async def callback(name, data, offset=0) -> None
-    Your callback persists the bytes wherever they should live (disk / OPFS / IndexedDB /
-    a download / S3 / …). `offset == 0` means whole-file; a positive offset patches in
-    place. Pass `None` to restore the built-in default (local/Pyodide open+seek)."""
-    global _IOW
-    _IOW = callback or _default_io_write
-
-def get_io_write():
-    return _IOW
-
-async def io_write(name, data, offset=0, io=None):
-    """The one entry point the whole SDK uses to write bytes — routes to the global write
-    callback (or a per-call `io` override with the same signature)."""
-    await (io or _IOW)(name, bytes(data), offset)
+def use_default_io():
+    """Opt in to the built-in IO: browser `fetch`+Range for reads / host+Pyodide `open`
+    for reads & writes. One explicit call installs BOTH global callbacks. Convenience for
+    demos/examples and the common browser case; production integrators install their own."""
+    set_io_read(default_io_read)
+    set_io_write(default_io_write)
 
 
 # ----------------------------- byte-source helpers (built on io_read) -----------------------------

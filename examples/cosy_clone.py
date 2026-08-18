@@ -12,6 +12,7 @@ import numpy as np
 from js import pythonIO, Object
 from pyodide.ffi import to_js
 import webtorch
+webtorch.use_default_io()          # REQUIRED: install IO (built-in browser fetch / host open)
 
 TEXT = "Hello, this is a cloned voice speaking in the browser."
 
