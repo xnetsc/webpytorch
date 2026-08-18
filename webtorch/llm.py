@@ -154,13 +154,22 @@ class CausalLM:
             await self._np(prefix + ".scales"), b, self.gs, self.bits)
 
     async def _f16_chunked(self, name, chunk_bytes=64 << 20):
+        """Stream a big 2-D weight (embed / lm_head) in row blocks -> host fp16, so the full
+        fp32 tensor never materializes. dtype-aware: handles F16 / BF16 / F32 sources."""
         shard = self._idx[name]; h, base = await self._hdr(shard)
-        info = h[name]; a, z = info["data_offsets"]; V, Hh = info["shape"]; row = Hh * 2
+        info = h[name]; a, z = info["data_offsets"]; V, Hh = info["shape"]; dt = info["dtype"]
+        esz = 2 if dt in ("F16", "BF16") else 4; row = Hh * esz
         out = np.empty((V, Hh), np.float16); rpc = max(1, chunk_bytes // row)
         for v0 in range(0, V, rpc):
             v1 = min(V, v0 + rpc)
             raw = await self._rng(shard, base + a + v0 * row, base + a + v1 * row - 1)
-            out[v0:v1] = np.frombuffer(raw, np.float16).reshape(v1 - v0, Hh)
+            if dt == "BF16":
+                arr = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
+            elif dt == "F16":
+                arr = np.frombuffer(raw, np.float16)
+            else:
+                arr = np.frombuffer(raw, np.float32)
+            out[v0:v1] = arr.reshape(v1 - v0, Hh).astype(np.float16)
         return out
 
     def _quantize_head(self, WVH, blk=4096):
@@ -327,6 +336,68 @@ class CausalLM:
                 "o": await qb("attn_output"),
                 "gate": await qb("ffn_gate"), "up": await qb("ffn_up"), "down": await qb("ffn_down")})
         self.final_norm = wt.Tensor(await self._gload("output_norm.weight"))
+        self.load_s = round(time.perf_counter() - t0, 1)
+        self._gpu = wt._adam_backend_ready()
+        self._init_state()
+        return self
+
+    # ---- fp16 (plain HF safetensors) loading: run UNquantized, or quantize on load ----
+    def _mklin(self, W_out_in, bias=None):
+        """One linear at the chosen precision: fp16 (UnquantizedLinear) or int4/int8."""
+        if self._qbits:
+            return self._gquant(W_out_in, bias)            # quantize-on-load -> QuantizedLinear
+        return wt.UnquantizedLinear(W_out_in, bias)        # fp16 weights, fp32 compute
+
+    async def _lin(self, prefix):
+        b = await self._np(prefix + ".bias") if (prefix + ".bias") in self._idx else None
+        return self._mklin(await self._np(prefix + ".weight"), b)
+
+    @classmethod
+    async def from_fp16(cls, base, lmax=320, quantize=None):
+        """Load a plain fp16/bf16 HF safetensors dir (no `quantization_config`). Runs the
+        model UNquantized by default (fp16 weights, fp32 compute); pass `quantize=4` or `8`
+        to instead quantize every linear to int on load (same served fp16 model → int
+        inference). Same engine (KV cache, capture/replay, generate) as the int loaders."""
+        from . import webio
+        self = cls(base); self.lmax = lmax; self._shard_hdr = {}
+        self._qbits = int(quantize) if quantize else 0
+        if self._qbits:
+            self.bits = self._qbits                        # gs keeps the default 128
+        cfg = await webio.read_json(self.base + "config.json")
+        self.H = cfg["hidden_size"]; self.L = cfg["num_hidden_layers"]
+        self.NH = cfg["num_attention_heads"]; self.NKV = cfg["num_key_value_heads"]
+        self.HD = self.H // self.NH; self.VOCAB = cfg["vocab_size"]
+        self.eps = cfg["rms_norm_eps"]; self.theta = cfg["rope_theta"]
+        tie = cfg.get("tie_word_embeddings", False)
+
+        vocab = await webio.read_json(self.base + "vocab.json")
+        merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
+        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")])
+
+        try:                                                   # sharded models have an index
+            imeta = await webio.read_json(self.base + "model.safetensors.index.json")
+            self._idx = imeta.get("weight_map")
+        except Exception:                                      # single-file model: no index.json
+            self._idx = None
+        if not self._idx:
+            h, _ = await self._hdr("model.safetensors")
+            self._idx = {k: "model.safetensors" for k in h}
+
+        t0 = time.perf_counter()
+        self.embed = await self._f16_chunked("model.embed_tokens.weight")     # (V,H) fp16
+        headW = self.embed if tie else await self._f16_chunked("lm_head.weight")
+        self.head = self._quantize_head(headW) if self._qbits else [wt.UnquantizedLinear(headW)]
+        self.layers = []
+        for i in range(self.L):
+            p = "model.layers.%d." % i
+            self.layers.append({
+                "in_ln": wt.Tensor(await self._np(p + "input_layernorm.weight")),
+                "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight")),
+                "q": await self._lin(p + "self_attn.q_proj"), "k": await self._lin(p + "self_attn.k_proj"),
+                "v": await self._lin(p + "self_attn.v_proj"), "o": await self._lin(p + "self_attn.o_proj"),
+                "gate": await self._lin(p + "mlp.gate_proj"), "up": await self._lin(p + "mlp.up_proj"),
+                "down": await self._lin(p + "mlp.down_proj")})
+        self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
         self._init_state()

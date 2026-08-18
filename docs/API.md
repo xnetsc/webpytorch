@@ -17,13 +17,19 @@ you **must** install two global async callbacks first — `set_io_read` and `set
 - `webtorch.Tensor`, `webtorch.core` → the tensor engine (also under `torch.*` after install).
 
 ## Causal LM (dense + MoE series)
-- `await webtorch.AutoModelForCausalLM.from_pretrained(path, bits=4, lmax=320)`
-  - `path`: AutoGPTQ dir (**int4 or int8** — bits read from its `quantization_config`) |
-    `*.gguf` (llama.cpp; dequantized and requantized to int`bits`, 4 or 8) | fp16 HF
-    (quantize first via `Quantizer`). LLM inference runs on the int (4/8) capture-
-    accelerated kernel — there is no fp16 linear path for decoding yet.
+- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=4, lmax=320)`
+  - Runs inference at **int4, int8, or fp16** — `dtype` selects it:
+    - `"auto"` (default): AutoGPTQ dir → int at its declared bits; `*.gguf` → int`bits`;
+      plain fp16/bf16 HF dir → **fp16** (unquantized, weights in fp16/bf16, compute fp32).
+    - `"fp16"`: force unquantized fp16 execution (plain HF dir).
+    - `"int4"` / `"int8"`: quantize a plain fp16 HF dir on load, or requantize a GGUF to
+      that width. (An AutoGPTQ dir always loads at its own stored bits.)
+  - `path`: AutoGPTQ dir | `*.gguf` | plain fp16/bf16 HF dir (`config.json` +
+    `model.safetensors[.index.json]` + `vocab.json`/`merges.txt`).
   - Config-driven across the whole **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the
     **MoE series** — no per-model code; the model is identified by its `config`, not a name.
+  - int4/int8 use the capture-accelerated int kernel (~20× decode); fp16 uses a plain
+    `x @ W.T + b` matmul (the `UnquantizedLinear` layer), same engine and KV-cache.
   - returns a model with `.generate(prompt, max_new=…) -> str` and
     `.stream(prompt, max_new=…) -> iterator[token]`.
 - `await webtorch.AutoTokenizer.from_pretrained(path)` → byte-BPE tokenizer
@@ -131,6 +137,44 @@ too-big-to-fit fp16 model can be streamed **in** and its quantized weights strea
 to external storage without either fitting in memory. `name` is just a string handed to
 your callback (a path, URL, or object key) — the SDK never assumes it is local; the browser
 default resolves it as a URL relative to the page origin.
+
+### Installable read callbacks — built-in and model hubs
+These are `io_read`-shaped async callbacks you **install yourself** via `set_io_read`; none
+is a hidden default. Pick the one matching where your files live:
+
+- `webtorch.default_io_read` / `webtorch.default_io_write` — the built-ins. `default_io_read`
+  reads via browser `fetch`+Range (in Pyodide) or host `urllib`/`open`; `default_io_write`
+  writes via host/Pyodide `open`+seek. Install them yourself, or call `use_default_io()`
+  (which just does `set_io_read(default_io_read); set_io_write(default_io_write)`):
+  ```python
+  webtorch.set_io_read(webtorch.default_io_read)     # explicit form
+  webtorch.set_io_write(webtorch.default_io_write)
+  # or simply: webtorch.use_default_io()
+  ```
+- `webtorch.hf_read(revision="main", endpoint=…, token=None)` — returns a callback that
+  fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:
+  ```python
+  webtorch.set_io_read(webtorch.hf_read())           # + set_io_write only if you quantize
+  lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
+  print(lm.generate("The capital of France is", max_new=8))
+  ```
+- `webtorch.modelscope_read(revision="master", endpoint=…, token=None)` — same, for
+  **ModelScope (魔搭)**:
+  ```python
+  webtorch.set_io_read(webtorch.modelscope_read())
+  lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+  ```
+
+**How the hub callbacks work (internal logic).** A loader turns the repo id you passed into
+file names like `"<org>/<repo>/config.json"`, `"<org>/<repo>/model.safetensors"`. The
+callback splits the first two path segments as the repo and maps the rest to that hub's file
+URL — HF: `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`; ModelScope:
+`{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — then
+streams the bytes with an HTTP `Range` request (shared transport `_fetch_range`, with
+exponential-backoff retry so a hundreds-of-reads streamed load survives a transient drop). A
+full `http(s)://` URL in `name` is fetched as-is, so mixed sources work. `token` is sent as a
+Bearer header for gated/private repos. These are **reads only** — set a writer separately if
+you also quantize.
 
 Lower-level adapters (built on the two callbacks; normally you won't call them directly):
 `resolve_tensor_reader(src, io=None)`, `resolve_shard_writer(dst, io=None)`,

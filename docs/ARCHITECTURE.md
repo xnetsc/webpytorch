@@ -28,9 +28,9 @@ Pyodide (Python-in-WASM) worker in the browser.
 | `_sdk.py` | transformers-style facade (`AutoModelForCausalLM`, `AutoTokenizer`) + the task **pipeline registry** (`pipeline`, `register_pipeline`) |
 | `lm_engine.py` | generic decoder `TransformerLM` (RMSNorm + GQA + rope + SwiGLU **or** MoE), samplers (`greedy/nucleus/ras`), KV-cache + capture-replay, `build_lm` |
 | `quantize.py` | streaming quantizer — IO-free `Quantizer.stream(read,has,names,write)`; convenience `Quantizer.quantize` |
-| `webio.py` | the **only** IO layer: two REQUIRED global async callbacks (`set_io_read`/`io_read`, `set_io_write`/`io_write`; `use_default_io()` for built-ins) + path/bytes/callback/dict resolvers and pure-numpy safetensors read/write on top |
+| `webio.py` | the **only** IO layer: two REQUIRED global async callbacks (`set_io_read`/`io_read`, `set_io_write`/`io_write`; `use_default_io()` for built-ins; `hf_read`/`modelscope_read` to load by hub repo id) + path/bytes/callback/dict resolvers and pure-numpy safetensors read/write on top |
 | `onnxrt.py` | generic ONNX runtime (pure-Python protobuf parser + ~50-op interpreter) |
-| `llm.py` | `CausalLM` (int4/GGUF loading + capture decode); `BPETokenizer` |
+| `llm.py` | `CausalLM` — loads AutoGPTQ (int4/int8), GGUF, or plain fp16/bf16 HF; runs int4/int8 (capture kernel) or fp16 (`UnquantizedLinear`, plain matmul); `BPETokenizer` |
 | `cosyvoice.py` `tts.py` `detection.py` `vl.py` `audiofe.py` | concrete model impls (**internal** — reached via `pipeline` / `webtorch.models.*`) |
 
 ## Design rules

@@ -2829,6 +2829,28 @@ class QuantizedLinear(Module):
         return int(self.qweight.size * 4 + self.qzeros.size * 4 + self.scales.size * 4 + self.bias.size * 4)
 
 
+class UnquantizedLinear(Module):
+    """Inference-only UNquantized Linear: `y = x @ W.T + b`. Weights come from an fp16/bf16
+    model and are computed in fp32 (the WebGPU/WebGL backend is fp32). Exposes the same
+    `__call__(x) -> Tensor` interface as `QuantizedLinear`, so the LLM engine treats int4 /
+    int8 / fp16 layers identically (capture-replay decode works the same)."""
+    def __init__(self, weight, bias=None):
+        W = np.asarray(weight)                                   # (Nt=out, Kt=in)
+        self.Nt, self.Kt = int(W.shape[0]), int(W.shape[1])
+        self.Wt = xp.asarray(np.ascontiguousarray(W.T.astype(np.float32)))   # (Kt, Nt) for x@Wt
+        self.bias = xp.asarray(np.zeros((self.Nt,), np.float32) if bias is None
+                               else np.asarray(bias, np.float32))
+
+    def forward(self, x):
+        xd = x.data; lead = xd.shape[:-1]
+        xf = _contig(xd.reshape(-1, self.Kt))
+        of = xf @ self.Wt
+        return Tensor((of + self.bias).reshape(*lead, self.Nt))
+
+    def nbytes(self):
+        return int(self.Wt.size * 4 + self.bias.size * 4)
+
+
 def quantize_model(module, group_size=32, bits=4):
     """Replace each Linear -> QuantizedLinear and each Embedding ->
     QuantizedEmbedding, one tensor at a time (streaming-friendly)."""

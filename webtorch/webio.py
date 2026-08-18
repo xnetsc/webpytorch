@@ -262,18 +262,54 @@ async def io_write(name, data, offset=0, io=None):
 # Not installed automatically. Call `use_default_io()` (or install these individually) to
 # use them; a bare SDK has no IO until you do.
 
-async def default_io_read(name, offset=0, length=None):
-    try:                                                    # browser
-        from pyodide.http import pyfetch
-        if length is not None:
-            r = await pyfetch(name, headers={"Range": "bytes=%d-%d" % (offset, offset + length - 1)})
-        else:
-            r = await pyfetch(name)
+async def _fetch_once(url, rng, headers):
+    try:
+        from pyodide.http import pyfetch                     # browser (Pyodide)
+    except ImportError:
+        pyfetch = None
+    if pyfetch is not None:
+        h = dict(headers or {})
+        if rng: h["Range"] = rng
+        r = await pyfetch(url, headers=h)
         return bytes(await r.bytes())
-    except Exception:                                       # host
-        with open(name, "rb") as f:
-            if offset: f.seek(offset)
-            return f.read() if length is None else f.read(length)
+    if url.startswith(("http://", "https://")):             # host: urllib
+        import urllib.request
+        req = urllib.request.Request(url, headers=dict(headers or {}))
+        if rng: req.add_header("Range", rng)
+        with urllib.request.urlopen(req, timeout=60) as f:
+            return f.read()
+    raise FileNotFoundError(url)                             # not a URL -> caller reads locally
+
+async def _fetch_range(url, offset=0, length=None, headers=None, retries=4):
+    """Read bytes from an http(s) URL or a local path, with an optional byte range. Uses the
+    browser's `fetch` inside Pyodide (with a `Range` header) and `urllib`/`open` on the host
+    — the shared transport under `default_io_read`, `hf_read`, and `modelscope_read`. Network
+    reads are retried with exponential backoff so a streamed load (hundreds of ranged reads)
+    survives a transient drop / reset."""
+    rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
+    if not url.startswith(("http://", "https://")):         # local file (host)
+        try:
+            from pyodide.http import pyfetch                 # in browser, a bare path is a URL
+            return await _fetch_once(url, rng, headers)
+        except ImportError:
+            with open(url, "rb") as f:
+                if offset: f.seek(offset)
+                return f.read() if length is None else f.read(length)
+    import asyncio
+    last = None
+    for attempt in range(retries):
+        try:
+            return await _fetch_once(url, rng, headers)
+        except Exception as e:                              # transient network / TLS / 5xx
+            last = e
+            if attempt < retries - 1:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+    raise last
+
+async def default_io_read(name, offset=0, length=None):
+    """Built-in reader: browser `fetch`+Range / host `urllib` (for URLs) or `open`+seek (for
+    local paths). `name` is resolved as a URL relative to the page origin in the browser."""
+    return await _fetch_range(name, offset, length)
 
 async def default_io_write(name, data, offset=0):
     import os
@@ -298,6 +334,63 @@ def use_default_io():
     demos/examples and the common browser case; production integrators install their own."""
     set_io_read(default_io_read)
     set_io_write(default_io_write)
+
+
+# ---- model-hub read callbacks (io_read-shaped; you INSTALL them, they are NOT a default) ----
+# These are convenience READ callbacks so you can load a model straight from Hugging Face or
+# ModelScope by its repo id — no separate download step. They are NOT installed automatically;
+# you pick one and pass it to `set_io_read` (writes, if you quantize, need a separate writer).
+#
+# How they work: a loader turns the repo id you gave it into file names like
+# "<org>/<repo>/config.json", "<org>/<repo>/model.safetensors". The callback splits off the
+# first two segments as the repo, maps the rest to that hub's file URL, and streams the bytes
+# with an HTTP Range request (via `_fetch_range`, same transport as `default_io_read`). A full
+# http(s) URL in `name` is fetched as-is, so mixed sources still work.
+
+def _split_repo(name):
+    parts = name.lstrip("/").split("/")
+    return "/".join(parts[:2]), "/".join(parts[2:])         # (org/repo, filepath)
+
+def hf_read(revision="main", endpoint="https://huggingface.co", token=None):
+    """Return an `io_read`-shaped async callback that fetches files directly from the
+    **Hugging Face Hub**. Install it, then load by repo id — nothing to pre-download:
+
+        webtorch.set_io_read(webtorch.hf_read())        # + set_io_write(...) only if quantizing
+        lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+
+    `name` ("<org>/<repo>/<path>") maps to `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`,
+    read with an HTTP Range request (streaming). `token` (optional) is sent as a Bearer header
+    for gated/private repos; `endpoint` can point at a mirror. Reads only."""
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    async def read(name, offset=0, length=None):
+        if name.startswith(("http://", "https://")):
+            url = name
+        else:
+            repo, path = _split_repo(name)
+            url = "%s/%s/resolve/%s/%s" % (endpoint.rstrip("/"), repo, revision, path)
+        return await _fetch_range(url, offset, length, hdr)
+    return read
+
+def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None):
+    """Return an `io_read`-shaped async callback that fetches files directly from
+    **ModelScope (魔搭)**. Same shape as `hf_read`:
+
+        webtorch.set_io_read(webtorch.modelscope_read())
+        lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+
+    `name` ("<org>/<repo>/<path>") maps to
+    `{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}`, read
+    with an HTTP Range request. `revision` defaults to ModelScope's `master`. Reads only."""
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    async def read(name, offset=0, length=None):
+        if name.startswith(("http://", "https://")):
+            url = name
+        else:
+            repo, path = _split_repo(name)
+            url = "%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s" % (
+                endpoint.rstrip("/"), repo, revision, path)
+        return await _fetch_range(url, offset, length, hdr)
+    return read
 
 
 # ----------------------------- byte-source helpers (built on io_read) -----------------------------

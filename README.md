@@ -40,9 +40,14 @@ webtorch.use_default_io()                    # REQUIRED — built-in browser fet
 #   async def write(name, data, offset=0) -> None: ...
 #   webtorch.set_io_read(read); webtorch.set_io_write(write)
 
-# Any CausalLM/MoE model, identified by its config — AutoGPTQ int4 OR int8, or GGUF:
+# Any CausalLM/MoE model, identified by its config — int4 / int8 / fp16:
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
 print(lm.generate("Hello", max_new=64))
+
+# ...or load straight from a model hub by repo id (install the hub read callback):
+webtorch.set_io_read(webtorch.hf_read())            # or webtorch.modelscope_read() for 魔搭
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
+print(lm.generate("The capital of France is", max_new=8))
 
 # Task pipelines: built-in names are pre-registered loaders — add your own, no SDK edit:
 async def load_my_llm(**kw):
@@ -58,11 +63,12 @@ print(gen("Hi", max_new=32))
   MultiheadAttention,…}`, `optim.{SGD,Adam,AdamW}`. Trains real GPT/CNN/Transformer on
   WebGPU **and** WebGL.
 - **LLMs (any CausalLM/MoE, by config — not a fixed model list)** —
-  `AutoModelForCausalLM.from_pretrained(path)` loads the CausalLM series (Qwen2/Qwen3/Llama-
-  shaped) and the **MoE series** (Qwen2-MoE/Qwen3-MoE) by reading the model's `config`, from
-  an **AutoGPTQ int4 *or* int8** dir or a **GGUF** file. Decode runs on the int (4/8) capture-
-  replay kernel (~20×); a fp16 model is quantized on load (there is no fp16 *decode* path yet).
-  General training/CNN/`nn` in the core runs in native fp32.
+  `AutoModelForCausalLM.from_pretrained(path, dtype=…)` loads the CausalLM series
+  (Qwen2/Qwen3/Llama-shaped) and the **MoE series** (Qwen2-MoE/Qwen3-MoE) by reading the
+  model's `config`, and runs inference at **int4, int8, *or* fp16**: an AutoGPTQ dir (int4/
+  int8), a **GGUF** file, or a plain **fp16/bf16 HF** dir (run unquantized, or quantized on
+  load with `dtype="int8"`/`"int4"`). int4/int8 use the capture-replay kernel (~20×); fp16
+  uses a plain matmul. General training/CNN/`nn` in the core runs in native fp32.
 - **Streaming quantization** — turn any fp16 model into int4/int8 without holding it in
   RAM; streams weights **in** and quantized shards **out** through the global async IO
   callbacks (`set_io_read`/`set_io_write`), so nothing needs to fit in memory; output is

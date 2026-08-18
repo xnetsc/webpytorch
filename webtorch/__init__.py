@@ -60,7 +60,7 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 # ranged/streaming access (e.g. int4 weight shards) so a callback can issue an HTTP Range
 # request or seek into local/remote storage.
 from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
-                    use_default_io, default_io_read, default_io_write)
+                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read)
 
 __all__ = [
     # torch-compatible core
@@ -71,7 +71,8 @@ __all__ = [
     "TransformerLM", "build_lm", "SAMPLERS",
     # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None
     "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
-    "use_default_io", "default_io_read", "default_io_write",
+    # built-in / hub read callbacks you install via set_io_read (NOT auto-installed)
+    "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
     "__version__",
 ]
 

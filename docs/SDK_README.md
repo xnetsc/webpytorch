@@ -46,11 +46,15 @@ train end-to-end on both backends.
 ```python
 webtorch.use_default_io()                        # REQUIRED before loading (built-in fetch/open)
 
-# Any CausalLM/MoE model, identified by its config — AutoGPTQ int4 OR int8, or GGUF:
+# Any CausalLM/MoE model, identified by its config — int4 / int8 / fp16:
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
 text = lm.generate("Hello", max_new=64)          # WebGPU capture-replay decode
 
 for tok in lm.stream("...", max_new=128): render(tok)   # streaming token output
+
+# load straight from a hub by repo id (install a hub reader instead of the default):
+webtorch.set_io_read(webtorch.hf_read())         # Hugging Face; or webtorch.modelscope_read()
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
 ```
 
 The model is picked by its `config`, **not** a hard-coded name — one config-driven engine
@@ -58,10 +62,13 @@ covers the **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the **MoE series**
 / Qwen3-MoE: router top-k + optional shared expert). Verified end-to-end on the real
 Qwen1.5-MoE-A2.7B (int4) → coherent text.
 
-**Precision:** AutoGPTQ is loaded at whatever bits its `quantization_config` declares
-(**int4 or int8** — not fixed to int4); GGUF is dequantized then requantized to int`bits`
-(4 or 8). LLM *decode* runs on the int (4/8) capture kernel — a fp16 model is quantized on
-load; there is no fp16 decode path yet. (The general torch core in §1 runs native fp32.)
+**Precision — int4 / int8 / fp16 (`dtype=`).** `dtype="auto"` (default): an AutoGPTQ dir
+loads at whatever bits its `quantization_config` declares (**int4 or int8**); a GGUF is
+requantized to int`bits`; a plain **fp16/bf16 HF dir runs unquantized** (fp16 weights, fp32
+compute, via the `UnquantizedLinear` layer). Force it with `dtype="fp16"`, or quantize a
+fp16 model on load with `dtype="int8"`/`"int4"`. int4/int8 use the capture-accelerated int
+kernel (~20× decode); fp16 uses a plain `x @ W.T + b`. (The general torch core in §1 runs
+native fp32.)
 
 ## 3. Quantization — dedicated, streaming, IO-free, framework-agnostic
 
@@ -153,6 +160,29 @@ output) so a callback can issue an HTTP Range request or seek into storage. Publ
 accept a `path` / `bytes` / `dict`, auto-distinguished; small configs are passed as plain
 objects. Because it is one injection point, oversized models stream in and out of external
 storage without ever fully residing in memory. See [API.md](API.md).
+
+### Built-in and model-hub read callbacks (you install them; none is a default)
+The SDK ships ready-made `io_read`-shaped callbacks — you pass one to `set_io_read`; they are
+never auto-installed:
+
+```python
+# Built-ins (browser fetch+Range / host urllib+open). use_default_io() just installs both:
+webtorch.set_io_read(webtorch.default_io_read); webtorch.set_io_write(webtorch.default_io_write)
+
+# Load straight from a hub by repo id — no separate download step:
+webtorch.set_io_read(webtorch.hf_read())          # Hugging Face   (token=… for gated repos)
+webtorch.set_io_read(webtorch.modelscope_read())  # ModelScope 魔搭 (revision defaults to master)
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
+```
+
+**Internal logic.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`.
+`hf_read`/`modelscope_read` split the first two segments as the repo and map the rest to the
+hub's file URL — HF `…/resolve/{revision}/{path}`, ModelScope
+`…/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — then stream it with
+an HTTP `Range` request (shared transport, retried with backoff so a many-reads load survives
+a transient drop). A full `http(s)://` `name` is fetched as-is. Reads only — install a writer
+separately if you quantize. `default_io_read`/`default_io_write` use the same transport for
+plain paths/URLs and the local (or Pyodide) filesystem.
 
 ## Layout
 

@@ -52,16 +52,29 @@ class AutoTokenizer:
 
 # ---- transformers-style causal LM (dense + MoE series) ----------------------
 class AutoModelForCausalLM:
-    """Config-driven loader for the CausalLM series. Detects the served format
-    (AutoGPTQ int4 safetensors / llama.cpp GGUF) and MoE (config num_experts),
-    returning a ready-to-`.generate()` model. No model-specific code."""
+    """Config-driven loader for the CausalLM series (+ MoE). Detects the served format and
+    runs at the requested precision — **int4, int8, or fp16** — returning a ready-to-
+    `.generate()` model. No model-specific code.
+
+    `dtype`:
+      - "auto"  (default): AutoGPTQ dir → int at its declared bits; GGUF → int`bits`;
+        plain fp16/bf16 HF dir → run **fp16** (unquantized).
+      - "fp16": force unquantized fp16 execution (plain HF dir).
+      - "int4"/"int8": for a plain fp16 HF dir, quantize every linear on load; for GGUF,
+        requantize to that width. (An AutoGPTQ dir always loads at its own stored bits.)
+    """
     @staticmethod
-    async def from_pretrained(path, bits=4, lmax=320):
-        from . import llm as _llm
+    async def from_pretrained(path, dtype="auto", bits=4, lmax=320):
+        from . import llm as _llm, webio
         p = path.rstrip("/")
         if p.endswith(".gguf"):
-            return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=bits)
-        return await _llm.CausalLM.from_gptq(p, lmax=lmax)   # handles dense; MoE via build_moe_lm
+            gb = 8 if dtype == "int8" else (4 if dtype == "int4" else bits)
+            return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=gb)
+        cfg = await webio.read_json(p + "/config.json")
+        if "quantization_config" in cfg:                     # already-quantized AutoGPTQ (int4/int8)
+            return await _llm.CausalLM.from_gptq(p, lmax=lmax)
+        q = {"int4": 4, "int8": 8}.get(dtype)                # plain fp16/bf16 HF dir
+        return await _llm.CausalLM.from_fp16(p, lmax=lmax, quantize=q)   # q=None → run fp16
 
 
 # Dedicated quantization interface (IO-free core `Quantizer.stream(...)` + framework-
@@ -187,10 +200,10 @@ class OnnxModel:
 
 # ---- symmetric global async IO callbacks (REQUIRED; single injection point for ALL reads AND writes) ----
 from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
-                    use_default_io, default_io_read, default_io_write)
+                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read)
 
 
 # ---- explicit exports --------------------------------------------------------
 __all__ = ["install_torch", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
            "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
-           "use_default_io", "default_io_read", "default_io_write"]
+           "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read"]
