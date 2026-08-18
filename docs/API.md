@@ -152,8 +152,8 @@ is a hidden default. Pick the one matching where your files live:
   # or simply: webtorch.use_default_io()
   ```
 - `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
-  max_parallel=8, prefetch=True, chunk_mb=16)` — returns a callback that fetches straight
-  from the **Hugging Face Hub**, so you load by repo id, no pre-download:
+  max_parallel=8, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
+  fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:
   ```python
   webtorch.set_io_read(webtorch.hf_read())           # + set_io_write only if you quantize
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
@@ -174,8 +174,11 @@ is a hidden default. Pick the one matching where your files live:
   **just that range now** (a separate request — it never waits for the prefetch to reach that
   offset) and stores it. The prefetch keeps going and skips ranges already cached.
 - Once the whole file is cached it is marked complete, so a **later run reads it straight
-  from disk — zero network**. (In the browser the cache lives in Pyodide's FS; mount
-  IDBFS/OPFS at the cache dir to persist across reloads.)
+  from disk — zero network**.
+- **Persistent by default (`persist=True`).** On the host the cache dir is a real directory.
+  In the browser the cache dir is automatically backed by **IndexedDB (IDBFS)** and synced,
+  so the cache **survives page reloads** — no setup needed. `persist=False` keeps an
+  in-session-only cache (browser MEMFS, wiped on reload).
 - All range reads (prefetch chunks included) go through a **bounded queue** — at most
   `max_parallel` concurrent network reads. `cache=False` disables caching (pure streaming);
   `prefetch=False` keeps the cache but no read-ahead.

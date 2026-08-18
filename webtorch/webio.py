@@ -411,6 +411,58 @@ async def _remote_size(url, headers):
     return None
 
 
+# ---- browser persistence: back the cache dir with IndexedDB so it survives page reloads ----
+# On the host the cache dir is already a real disk (persistent). In the browser Pyodide's
+# default FS (MEMFS) is wiped on reload, so we mount IDBFS at the cache dir and syncfs it:
+# load prior contents on first use, flush each newly-completed file back to IndexedDB.
+_persist = {"mounted": set(), "loaded": set()}
+
+def _browser_fs():
+    try:
+        from js import pyodide as _p          # exposed by the Pyodide worker bootstrap
+        return _p.FS
+    except Exception:
+        return None                           # host / non-Pyodide -> real disk, already persistent
+
+async def _fs_syncfs(FS, populate):
+    from js import Promise
+    from pyodide.ffi import create_proxy
+    def executor(resolve, reject):
+        def cb(err):
+            (reject if err else resolve)(err if err else None)
+        FS.syncfs(populate, create_proxy(cb))
+    return await Promise.new(create_proxy(executor))
+
+async def _persist_load(cache_dir):
+    """Mount IDBFS at cache_dir and load prior contents (IndexedDB -> FS), once. No-op on host."""
+    if not cache_dir or cache_dir in _persist["loaded"]:
+        return
+    FS = _browser_fs()
+    if FS is None:
+        _persist["loaded"].add(cache_dir); return
+    cur = ""
+    for part in cache_dir.strip("/").split("/"):
+        cur += "/" + part
+        try: FS.mkdir(cur)
+        except Exception: pass                # already exists
+    if cache_dir not in _persist["mounted"] and hasattr(FS.filesystems, "IDBFS"):
+        try:
+            FS.mount(FS.filesystems.IDBFS, {}, cache_dir); _persist["mounted"].add(cache_dir)
+        except Exception: pass
+    if cache_dir in _persist["mounted"]:
+        try: await _fs_syncfs(FS, True)       # populate FS <- IndexedDB
+        except Exception: pass
+    _persist["loaded"].add(cache_dir)
+
+async def _persist_flush(cache_dir):
+    """Flush newly-written cache files FS -> IndexedDB. No-op on host / when not IDBFS-mounted."""
+    FS = _browser_fs()
+    if FS is None or cache_dir not in _persist["mounted"]:
+        return
+    try: await _fs_syncfs(FS, False)          # push FS -> IndexedDB
+    except Exception: pass
+
+
 class _CachedFile:
     """Sparse local cache of one remote file + a background whole-file prefetch. A range read
     is served from the cache when those bytes are present, else fetched on the spot (never
@@ -461,6 +513,8 @@ class _CachedFile:
             try: open(self.marker, "w").close()
             except Exception: pass
             self.complete = True
+            return True                                       # just completed -> caller persists
+        return False
 
     def _ensure_prefetch(self):
         if self._prefetching or self.complete or not self.c.prefetch or self.size is None:
@@ -475,7 +529,8 @@ class _CachedFile:
             while self.size is not None and o < self.size and not self.complete:
                 b = min(self.size, o + self.c.chunk)
                 if not self._has(o, b):
-                    self._store(o, await self.c._net(self.url, o, b - o))
+                    if self._store(o, await self.c._net(self.url, o, b - o)):
+                        await self.c._flush()                 # persist a completed file
                 o = b
         except Exception:
             pass
@@ -494,16 +549,18 @@ class _CachedFile:
         if partial:
             self._ensure_prefetch()                           # read-ahead the rest, in background
         data = await self.c._net(self.url, offset, length)    # miss -> fetch just this range now
-        self._store(offset, data)
+        if self._store(offset, data):
+            await self.c._flush()                             # persist a completed file
         return data
 
 
 class _HubCache:
     """Owns the cache dir, the bounded read queue, and one `_CachedFile` per URL."""
-    def __init__(self, cache_dir, headers, max_parallel=8, prefetch=True, chunk=16 << 20):
+    def __init__(self, cache_dir, headers, max_parallel=8, prefetch=True, chunk=16 << 20, persist=True):
         self.cache_dir = cache_dir; self.headers = headers
         self.max_parallel = max(1, int(max_parallel)); self.prefetch = prefetch
-        self.chunk = int(chunk); self.files = {}; self.tasks = []; self._sem = None
+        self.chunk = int(chunk); self.persist = persist
+        self.files = {}; self.tasks = []; self._sem = None; self._loaded = False
 
     def _semaphore(self):
         import asyncio
@@ -519,26 +576,34 @@ class _HubCache:
         try: return await _remote_size(url, self.headers)
         except Exception: return None
 
+    async def _flush(self):
+        if self.persist:
+            await _persist_flush(self.cache_dir)
+
     async def read(self, url, offset, length):
         if not self.cache_dir:
             return await self._net(url, offset, length)       # cache disabled -> pure streaming
+        if not self._loaded:                                  # first use: load prior cache (browser: IDBFS)
+            self._loaded = True
+            if self.persist:
+                await _persist_load(self.cache_dir)
         st = self.files.get(url)
         if st is None:
             st = self.files[url] = _CachedFile(self, url)
         return await st.read(offset, length)
 
 
-def _hub_reader(map_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb):
+def _hub_reader(map_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
     hdr = {"Authorization": "Bearer " + token} if token else None
     hub = _HubCache((cache_dir or _default_hub_cache()) if cache else None, hdr,
-                    max_parallel=max_parallel, prefetch=prefetch, chunk=chunk_mb << 20)
+                    max_parallel=max_parallel, prefetch=prefetch, chunk=chunk_mb << 20, persist=persist)
     async def read(name, offset=0, length=None):
         url = name if name.startswith(("http://", "https://")) else map_url(*_split_repo(name))
         return await hub.read(url, offset, length)
     return read
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
-            cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16):
+            cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from the
     **Hugging Face Hub** (with read-ahead caching). Install it, then load by repo id:
 
@@ -547,18 +612,21 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
 
     `name` ("<org>/<repo>/<path>") maps to `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`.
     Caching (default on) prefetches each touched file in the background and serves later reads
-    from disk; `cache=False` streams with no cache, `cache_dir` picks the location,
-    `max_parallel` bounds concurrent range reads, `prefetch=False` disables read-ahead,
-    `chunk_mb` is the prefetch chunk size. `token` is a Bearer header for gated repos. Reads
-    only."""
+    from disk; it **persists by default** (`persist=True`) — in the browser the cache dir is
+    backed by IndexedDB (IDBFS) so it survives page reloads, on the host it is a real dir.
+    `cache=False` streams with no cache, `cache_dir` picks the location, `max_parallel` bounds
+    concurrent range reads, `prefetch=False` disables read-ahead, `chunk_mb` is the prefetch
+    chunk size, `persist=False` keeps an in-session-only (browser MEMFS) cache. `token` is a
+    Bearer header for gated repos. Reads only."""
     ep = endpoint.rstrip("/")
     return _hub_reader(lambda repo, path: "%s/%s/resolve/%s/%s" % (ep, repo, revision, path),
-                       token, cache, cache_dir, max_parallel, prefetch, chunk_mb)
+                       token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)
 
 def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None,
-                    cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16):
+                    cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from
-    **ModelScope (魔搭)** (with read-ahead caching). Same shape and options as `hf_read`:
+    **ModelScope (魔搭)** (with persistent read-ahead caching). Same shape and options as
+    `hf_read` (incl. `persist=True` → IndexedDB-backed in the browser):
 
         webtorch.set_io_read(webtorch.modelscope_read())
         lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
@@ -569,7 +637,7 @@ def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=N
     ep = endpoint.rstrip("/")
     return _hub_reader(
         lambda repo, path: "%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s" % (ep, repo, revision, path),
-        token, cache, cache_dir, max_parallel, prefetch, chunk_mb)
+        token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)
 
 
 # ----------------------------- byte-source helpers (built on io_read) -----------------------------

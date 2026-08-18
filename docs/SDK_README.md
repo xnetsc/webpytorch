@@ -181,9 +181,11 @@ file kicks off a **background whole-file prefetch** (streamed in `chunk_mb` chun
 blocks reads; each range read is served from cache when present, else fetched **as its own
 request right then** (never waiting for the prefetch to reach it) and stored. When a file is
 fully cached it is marked complete, so a **later run reads it from disk with zero network**.
-All range reads share a **bounded queue** (`max_parallel`, default 8). `cache=False` = pure
-streaming; `prefetch=False` = cache without read-ahead. (In the browser the cache is in
-Pyodide's FS — mount IDBFS/OPFS at the cache dir to persist across reloads.)
+The cache is **persistent by default** (`persist=True`): on the host it is a real dir, and in
+the browser it is automatically backed by **IndexedDB (IDBFS)** and synced, so it **survives
+page reloads** with no setup. All range reads share a **bounded queue** (`max_parallel`,
+default 8). `cache=False` = pure streaming; `prefetch=False` = cache without read-ahead;
+`persist=False` = in-session-only (browser MEMFS).
 
 **URL mapping.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`;
 the callback splits the first two segments as the repo and maps the rest to the hub file URL —
