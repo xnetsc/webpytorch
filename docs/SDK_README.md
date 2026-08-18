@@ -92,10 +92,12 @@ onnx = await webtorch.OnnxModel.from_source("/models/any.onnx")  # run ANY onnx 
 
 ## IO injection (no hardcoded IO anywhere)
 
-The library core never touches the filesystem. Every read/write is an **async**
-callback; public APIs also accept a `path` / `bytes` / `dict` and an optional
-`fetch=` injection, auto-distinguished (framework-compatible). Small configs are
-passed as plain objects. See [docs/API.md](docs/API.md).
+The library core never touches the filesystem. Every byte read flows through one
+global async callback `io_read(name, offset, length)` (`webtorch.set_io`) and every
+byte written through its mirror `io_write(name, data, offset)` (`webtorch.set_io_write`).
+Public APIs also accept a `path` / `bytes` / `dict`, auto-distinguished (framework-
+compatible); small configs are passed as plain objects. Because it is one injection
+point, oversized models stream in and out of external storage. See [API.md](API.md).
 
 ## Layout
 
@@ -107,10 +109,10 @@ webtorch/            the importable SDK package
   torchshim.py       `import torch` compatibility
   lm_engine.py       generic decoder (CausalLM + MoE series) + samplers + capture
   quantize.py        streaming quantizer (IO-free core)
-  webio.py           the only IO adapters (async), + auto-distinguishing resolvers
+  webio.py           the only IO layer: global async read + write callbacks + resolvers
   onnxrt.py          generic ONNX runtime
   llm.py / cosyvoice.py / tts.py / detection.py / vl.py / audiofe.py   model impls
 ```
 
 Backend: WgPy (WebGPU/WebGL) in the browser, numpy on the host. See
-[../WGPY_BACKEND.md](../WGPY_BACKEND.md) and [docs/API.md](docs/API.md).
+[WGPY_BACKEND.md](WGPY_BACKEND.md) and [API.md](API.md).
