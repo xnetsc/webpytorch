@@ -1,0 +1,15 @@
+webtorch
+========
+
+This project includes and modifies WgPy (https://github.com/mil-tokyo/wgpy),
+Copyright (c) 2023 The University of Tokyo, Edge Intelligence Systems, Inc.,
+licensed under the MIT License (see LICENSE).
+
+Modifications to WgPy in this repository (under src/, webgl/, webgpu/):
+  - a native batched (3D) matmul kernel (WebGPU WGSL + WebGL GLSL)
+  - graph capture / replay with buffer-id pinning (WebGPU + WebGL)
+  - fused kernels (Adam, softmax, layernorm) and an in-place KV-cache scatter
+  - group-wise int4/int8 (GPTQ-compatible) dequant-matmul kernels
+
+The webtorch SDK (the top-level `webtorch/` package, plus examples/, webapp/,
+tools/, docs/) is original work in this repository and is also MIT-licensed.

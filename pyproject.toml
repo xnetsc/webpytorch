@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webtorch"
+version = "0.1.0"
+description = "PyTorch-compatible ML SDK that trains/runs CNNs, Transformers and LLMs in the browser (WebGPU/WebGL via Pyodide + WgPy), with a transformers-style model + streaming-quantization API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy"]                       # runtime backend is WgPy (browser) / numpy (host)
+keywords = ["pytorch", "webgpu", "webgl", "pyodide", "llm", "quantization", "gptq", "moe", "tts", "onnx"]
+
+[project.optional-dependencies]
+host = ["safetensors"]                          # local (non-browser) tensor IO adapters
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["webtorch*"]

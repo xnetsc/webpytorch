@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>webtorch — PyTorch in the browser (WebGPU / WebGL + Pyodide)</title>
+  <script src="main.js"></script>
+  <script src="../dist/wgpy-main.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 900px; }
+    #log pre { margin: 0.15rem 0; white-space: pre-wrap; font-size: 12px; }
+    select, button { font-size: 14px; padding: 4px 8px; }
+    .row { margin: 0.6rem 0; }
+  </style>
+</head>
+<body>
+  <h1>webtorch</h1>
+  <p>A PyTorch-compatible autograd + CNN/LLM library running on WgPy (WebGPU / WebGL)
+     inside Pyodide. Pick an example and run it in your browser.</p>
+  <div class="row">
+    Backend:
+    <label><input type="checkbox" id="webgpu" value="webgpu" checked />WebGPU</label>
+    <label><input type="checkbox" id="webgl" value="webgl" checked />WebGL</label>
+  </div>
+  <div class="row">
+    Example:
+    <select id="script">
+      <option value="run.py">run.py (torch-shim GPT training)</option>
+      <option value="../examples/train_cnn.py">examples/train_cnn.py</option>
+      <option value="../examples/torch_shim_nanogpt.py">examples/torch_shim_nanogpt.py</option>
+      <option value="../examples/gptq_int4_correctness.py">examples/gptq_int4_correctness.py</option>
+      <option value="../examples/qwen2_exact_match.py">examples/qwen2_exact_match.py</option>
+      <option value="../examples/gguf_infer.py">examples/gguf_infer.py</option>
+      <option value="../examples/llm_qwen_capture.py">examples/llm_qwen_capture.py (GPTQ)</option>
+      <option value="../examples/llm_gguf_capture.py">examples/llm_gguf_capture.py (GGUF)</option>
+      <option value="../examples/vl_vision_check.py">examples/vl_vision_check.py (VL vision port check)</option>
+      <option value="../examples/vl_caption.py">examples/vl_caption.py (Qwen2.5-VL image caption)</option>
+      <option value="../examples/detr_detect.py">examples/detr_detect.py (DETR object detection)</option>
+      <option value="../examples/yolo_detect.py">examples/yolo_detect.py (YOLOv8 object detection)</option>
+      <option value="../examples/tts_speak.py">examples/tts_speak.py (VITS text-to-speech)</option>
+      <option value="../examples/cosy_speak.py">examples/cosy_speak.py (CosyVoice2 text→speech, capture)</option>
+      <option value="../examples/cosy_clone.py">examples/cosy_clone.py (CosyVoice2 zero-shot voice clone)</option>
+      <option value="../examples/moe_check.py">examples/moe_check.py (Qwen2-MoE int4, browser)</option>
+    </select>
+    <button type="button" id="run">Run</button>
+  </div>
+  <div id="log"></div>
+</body>
+</html>

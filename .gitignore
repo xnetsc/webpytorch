@@ -1,0 +1,37 @@
+# ---- large / generated: never commit ----
+# model weights & assets (fetch/build separately — see docs/BUILD.md)
+models/
+*.onnx
+*.npz
+*.safetensors
+*.gguf
+*.wav
+*.pt
+
+# Pyodide runtime + downloaded wheels (see scripts/download-pyodide.sh)
+lib/
+*.whl
+*.tar.bz2
+
+# JS/TS build output
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.wtvenv/
+*.egg
+
+# logs / editor / OS
+*.log
+.vscode/
+.idea/
+.DS_Store
+
+# scratch
+/tmp/
+scratch/

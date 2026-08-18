@@ -1,0 +1,379 @@
+"""Generic transformer-LM decode engine (config-driven, reusable).
+
+Covers the CausalLM *series* — any Qwen2/Qwen3/Llama-style decoder: RMSNorm +
+GQA attention (HF rope) + SwiGLU/MLP or MoE, int4/int8 QuantizedLinear weights,
+a growing KV cache, and a pluggable sampler. It is not tied to any one model:
+weights + config are supplied by a loader, the head + input embeddings are
+pluggable, and samplers are generic (greedy / nucleus / ras).
+
+Used by both plain text LLMs and CosyVoice2's speech-token LM (embedding input +
+custom head + ras sampling) without any model-specific code in the engine.
+"""
+import math
+import numpy as np
+from . import _core as wt
+
+xp = wt.xp
+
+
+# ----------------------------- samplers (generic) -----------------------------
+def sample_greedy(logits, *a, **k):
+    return int(np.asarray(logits).argmax())
+
+def _softmax_np(x):
+    e = np.exp(x - x.max()); return e / e.sum()
+
+def sample_nucleus(logits, top_p=0.8, top_k=25, rng=None, **k):
+    logits = np.asarray(logits, np.float64)
+    p = _softmax_np(logits)
+    idx = np.argsort(-p); psorted = p[idx]
+    keep = []
+    cum = 0.0
+    for i in range(len(idx)):
+        if cum < top_p and len(keep) < top_k:
+            cum += psorted[i]; keep.append(idx[i])
+        else:
+            break
+    keep = np.array(keep)
+    pk = p[keep]; pk = pk / pk.sum()
+    r = (rng or np.random).random()
+    c = np.cumsum(pk)
+    return int(keep[np.searchsorted(c, r)])
+
+def sample_ras(logits, decoded, top_p=0.8, top_k=25, win_size=10, tau_r=0.1, rng=None, **k):
+    """CosyVoice repetition-aware sampling: nucleus, but if the pick repeats too
+    often in the recent window, blacklist it and fall back to a plain random draw."""
+    tid = sample_nucleus(logits, top_p, top_k, rng)
+    recent = decoded[-win_size:]
+    if recent and sum(1 for t in recent if t == tid) >= win_size * tau_r:
+        lg = np.asarray(logits, np.float64).copy(); lg[tid] = -np.inf
+        p = _softmax_np(lg)
+        tid = int((rng or np.random).choice(len(p), p=p))
+    return tid
+
+SAMPLERS = {"greedy": sample_greedy, "nucleus": sample_nucleus, "ras": sample_ras}
+
+
+# ----------------------------- generic LM -----------------------------
+class TransformerLM:
+    """Config-driven decoder. `layers` is a list of dicts of QuantizedLinear
+    (q,k,v,o,gate,up,down) + Tensor norms (in_ln,post_ln); optional MoE fields
+    (see moe_mlp). Weights/config come from a loader; this class only runs it."""
+
+    def __init__(self, cfg):
+        self.H = cfg["H"]; self.L = cfg["L"]; self.NH = cfg["NH"]; self.NKV = cfg["NKV"]
+        self.HD = cfg["HD"]; self.eps = cfg["eps"]; self.theta = cfg["theta"]
+        self.layers = []; self.final_norm = None
+        self.head = None            # callable: hidden(1,H) -> logits(V,)
+        self.embed_next = None      # callable: token_id -> (H,) embedding for the next step
+
+    # ---- math ----
+    def _rms(self, x, w):
+        return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
+
+    def _rope(self, pos, T=1):
+        inv = 1.0 / (self.theta ** (np.arange(0, self.HD, 2, dtype=np.float64) / self.HD))
+        ang = np.arange(pos, pos + T, dtype=np.float64)[:, None] * inv[None, :]
+        emb = np.concatenate([ang, ang], -1)
+        return wt.Tensor(np.cos(emb).astype(np.float32)), wt.Tensor(np.sin(emb).astype(np.float32))
+
+    def _rot(self, x):
+        hd = self.HD
+        return wt.cat([wt._slice_last(x, hd // 2, hd) * (-1.0), wt._slice_last(x, 0, hd // 2)], axis=-1)
+
+    def _mlp(self, lay, x):
+        if lay.get("moe"):
+            return moe_mlp(self, lay, x)
+        return lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+
+    def _block(self, i, h, cos, sin, K, V, mask):
+        H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        lay = self.layers[i]; T = h.shape[0]; sc = 1.0 / math.sqrt(HD)
+        x = self._rms(h, lay["in_ln"])
+        q = lay["q"](x).reshape(T, NH, HD).permute(1, 0, 2)
+        k = lay["k"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+        v = lay["v"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+        q = q * cos + self._rot(q) * sin
+        k = k * cos + self._rot(k) * sin
+        # grow cache
+        if K[i] is None:
+            K[i] = k; V[i] = v
+        else:
+            K[i] = wt.cat([K[i], k], axis=1); V[i] = wt.cat([V[i], v], axis=1)
+        o = wt.gqa_attention(q, K[i], V[i], mask, scale=sc).permute(1, 0, 2).reshape(T, H)
+        h = h + lay["o"](o)
+        x = self._rms(h, lay["post_ln"])
+        h = h + self._mlp(lay, x)
+        return h
+
+    def prefill(self, embs):
+        """embs: (T,H) Tensor prompt embeddings -> (last-hidden Tensor, KV state, pos)."""
+        T = embs.shape[0]
+        cos, sin = self._rope(0, T)
+        mask = wt.Tensor(np.triu(np.full((T, T), -1e9, np.float32), 1))   # (T,T) broadcasts in gqa
+        self.K = [None] * self.L; self.V = [None] * self.L
+        h = embs
+        for i in range(self.L):
+            h = self._block(i, h, cos, sin, self.K, self.V, mask)
+        h = self._rms(h, self.final_norm)
+        last = wt.Tensor(wt._contig(h.data[-1:]))
+        return last, T
+
+    def step(self, emb, pos):
+        """emb: (1,H) Tensor next-token embedding at position `pos` -> (1,hidden)."""
+        cos, sin = self._rope(pos, 1)
+        h = emb
+        for i in range(self.L):
+            h = self._block(i, h, cos, sin, self.K, self.V, None)
+        return self._rms(h, self.final_norm)
+
+    # ---- capture-accelerated decode (WebGPU): fixed KV cache + replay (~20x) ----
+    def _rope_np(self, pos, T=1):
+        inv = 1.0 / (self.theta ** (np.arange(0, self.HD, 2, dtype=np.float64) / self.HD))
+        ang = np.arange(pos, pos + T, dtype=np.float64)[:, None] * inv[None, :]
+        emb = np.concatenate([ang, ang], -1)
+        return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+
+    def init_capture(self, lmax=512):
+        self.lmax = lmax; L, NKV, HD, H = self.L, self.NKV, self.HD, self.H
+        self._cap = wt._adam_backend_ready()
+        if not self._cap:
+            return False
+        self.Kc = [wt.Tensor(wt._zeros((NKV, lmax, HD))) for _ in range(L)]
+        self.Vc = [wt.Tensor(wt._zeros((NKV, lmax, HD))) for _ in range(L)]
+        self.h_in = wt.Tensor(np.zeros((1, H), np.float32))
+        self.cos_b = wt.Tensor(np.zeros((1, HD), np.float32))
+        self.sin_b = wt.Tensor(np.zeros((1, HD), np.float32))
+        self.mask_b = wt.Tensor(np.zeros((1, 1, lmax), np.float32))
+        self.ctl = xp.asarray(np.array([0, 1, NKV, HD, lmax], np.int32))
+        return True
+
+    def _prefill_fixed(self, embs):
+        T = embs.shape[0]; NH, NKV, HD, LMAX, H = self.NH, self.NKV, self.HD, self.lmax, self.H
+        c, s = self._rope_np(0, T); cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
+        m = np.triu(np.full((T, LMAX), -1e9, np.float32), 1); m[:, T:] = -1e9
+        mask = wt.Tensor(m); sc = 1.0 / math.sqrt(HD); h = embs
+        for i, lay in enumerate(self.layers):
+            x = self._rms(h, lay["in_ln"])
+            q = lay["q"](x).reshape(T, NH, HD).permute(1, 0, 2)
+            k = lay["k"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+            v = lay["v"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+            q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
+            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
+            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
+            o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
+            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, H))
+            x = self._rms(h, lay["post_ln"]); h = h + self._mlp(lay, x)
+        last = wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:]))
+        return last
+
+    def _set_inputs(self, emb_vec, pos):
+        NKV, HD, LMAX = self.NKV, self.HD, self.lmax
+        self.h_in.data.buffer.set_data(np.asarray(emb_vec, np.float32))
+        c, s = self._rope_np(pos)
+        self.cos_b.data.buffer.set_data(c.reshape(-1)); self.sin_b.data.buffer.set_data(s.reshape(-1))
+        m = np.zeros((1, 1, LMAX), np.float32); m[0, 0, pos + 1:] = -1e9
+        self.mask_b.data.buffer.set_data(m)
+        self.ctl.buffer.set_data(np.array([pos, 1, NKV, HD, LMAX], np.int32))
+
+    def _decode_fixed(self):
+        NH, NKV, HD, LMAX, H = self.NH, self.NKV, self.HD, self.lmax, self.H
+        sc = 1.0 / math.sqrt(HD); h = self.h_in
+        for i, lay in enumerate(self.layers):
+            x = self._rms(h, lay["in_ln"])
+            q = lay["q"](x).reshape(1, NH, HD).permute(1, 0, 2)
+            k = lay["k"](x).reshape(1, NKV, HD).permute(1, 0, 2)
+            v = lay["v"](x).reshape(1, NKV, HD).permute(1, 0, 2)
+            q = q * self.cos_b + self._rot(q) * self.sin_b
+            k = k * self.cos_b + self._rot(k) * self.sin_b
+            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+            o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
+            h = h + lay["o"](o.permute(1, 0, 2).reshape(1, H))
+            x = self._rms(h, lay["post_ln"]); h = h + self._mlp(lay, x)
+        return self.head(self._rms(h, self.final_norm))
+
+    def generate_captured(self, prompt_embs, max_new, stop_ids, sampler="greedy",
+                          sampler_kwargs=None, seed=0, min_new=0):
+        """WebGPU capture-replay decode: capture one step, replay per token (~20x).
+        Sampling runs on host over the replayed logits (works with any sampler, incl ras)."""
+        skw = dict(sampler_kwargs or {}); rng = np.random.RandomState(seed)
+        fn = SAMPLERS[sampler]; stop_ids = set(stop_ids); stop_arr = np.array(sorted(stop_ids), np.int64)
+        for c in self.Kc: c.data[:] = 0.0
+        for v in self.Vc: v.data[:] = 0.0
+        last = self._prefill_fixed(prompt_embs); P = prompt_embs.shape[0]
+        plat = wt._adam_kernel["platform"]
+        logits0 = self.head(last)                    # first logits (prefill hidden)
+        out = []; pos = P
+        # capture a decode step
+        first = logits0.numpy().reshape(-1)
+        def pick(lg, step):
+            if step < min_new: lg = lg.copy(); lg[stop_arr] = -np.inf
+            return fn(lg, out, rng=rng, **skw)
+        tid = pick(first, 0)
+        captured = False
+        for step in range(max_new):
+            if tid in stop_ids: break
+            out.append(tid)
+            self._set_inputs(self.embed_next(tid).reshape(-1), pos); pos += 1
+            if not captured:
+                plat.beginCapture("lm_decode"); logits_t = self._decode_fixed(); logits_t.numpy()
+                plat.endCapture(); captured = True
+            else:
+                plat.replay("lm_decode")
+            lg = logits_t.numpy().reshape(-1)
+            tid = pick(lg, step + 1)
+        return out
+
+    def generate_stream(self, prompt_ids, max_new, stop_ids, sampler="greedy",
+                        sampler_kwargs=None, seed=0, min_new=0, embed=None):
+        """STREAMING output: yield each decoded token id as it is produced (UI can
+        render live; memory stays bounded). `prompt_ids` = token ids; `embed` (id->vec)
+        defaults to self.embed_next. Uses capture-replay if init_capture() ran."""
+        embed = embed or self.embed_next
+        skw = dict(sampler_kwargs or {}); rng = np.random.RandomState(seed)
+        fn = SAMPLERS[sampler]; stop_ids = set(stop_ids); stop_arr = np.array(sorted(stop_ids), np.int64)
+        prompt_embs = wt.Tensor(np.stack([np.asarray(embed(int(i)), np.float32) for i in prompt_ids]))
+        cap = getattr(self, "_cap", False)
+
+        def pick(lg, step):
+            if step < min_new: lg = lg.copy(); lg[stop_arr] = -np.inf
+            return fn(lg, out, rng=rng, **skw)
+        out = []
+        if not cap:                                    # growing-cache path
+            last, pos = self.prefill(prompt_embs)
+            for step in range(max_new):
+                tid = pick(self.head(last).numpy().reshape(-1), step)
+                if tid in stop_ids: break
+                out.append(tid); yield tid
+                last = self.step(wt.Tensor(np.asarray(embed(tid), np.float32).reshape(1, -1)), pos); pos += 1
+            return
+        # capture-replay path: head is inside the captured decode graph
+        for c in self.Kc: c.data[:] = 0.0
+        for v in self.Vc: v.data[:] = 0.0
+        last = self._prefill_fixed(prompt_embs); P = prompt_embs.shape[0]
+        plat = wt._adam_kernel["platform"]
+        tid = pick(self.head(last).numpy().reshape(-1), 0); pos = P; captured = False
+        for step in range(max_new):
+            if tid in stop_ids: break
+            out.append(tid); yield tid
+            self._set_inputs(np.asarray(embed(tid), np.float32).reshape(-1), pos); pos += 1
+            if not captured:
+                plat.beginCapture("lm_decode"); logits_t = self._decode_fixed(); logits_t.numpy()
+                plat.endCapture(); captured = True
+            else:
+                plat.replay("lm_decode")
+            tid = pick(logits_t.numpy().reshape(-1), step + 1)
+
+    def generate(self, prompt_embs, max_new, stop_ids, sampler="greedy",
+                 sampler_kwargs=None, seed=0, min_new=0):
+        """Autoregressive decode from prompt embeddings. Returns list of token ids.
+        Uses self.head (hidden->logits) and self.embed_next (id->next embedding).
+        For the first `min_new` steps, stop tokens are masked out (ignore-eos), so
+        generation cannot terminate prematurely (mirrors HF min_new_tokens)."""
+        skw = dict(sampler_kwargs or {}); rng = np.random.RandomState(seed)
+        fn = SAMPLERS[sampler]; stop_ids = set(stop_ids)
+        stop_arr = np.array(sorted(stop_ids), np.int64)
+        last, pos = self.prefill(prompt_embs)
+        out = []
+        for step in range(max_new):
+            logits = self.head(last).numpy().reshape(-1)
+            if step < min_new:
+                logits = logits.copy(); logits[stop_arr] = -np.inf
+            tid = fn(logits, out, rng=rng, **skw)
+            if tid in stop_ids:
+                break
+            out.append(tid)
+            emb = wt.Tensor(self.embed_next(tid).reshape(1, -1).astype(np.float32))
+            last = self.step(emb, pos)
+            pos += 1
+        return out
+
+
+# ----------------------------- generic MoE (series-level) -----------------------------
+def moe_mlp(lm, lay, x):
+    """Generic sparse-MoE MLP: router top-k over experts (+ optional shared expert,
+    Qwen-style). `lay['moe']` = dict(gate, experts=[{gate,up,down}], top_k,
+    norm_topk_prob, shared=(gate,up,down)|None, shared_gate=QLinear|None).
+    Runs on host for routing (small) + QuantizedLinear experts on GPU."""
+    m = lay["moe"]; T = x.shape[0]
+    router_logits = m["gate"](x).numpy()                  # (T, n_experts)
+    ne = router_logits.shape[1]; k = m["top_k"]
+    # top-k gates (softmax over full set, then renorm over top-k like Qwen)
+    probs = _softmax_rows(router_logits)
+    topk_idx = np.argpartition(-probs, k - 1, axis=1)[:, :k]
+    topk_w = np.take_along_axis(probs, topk_idx, axis=1)
+    if m.get("norm_topk_prob", True):
+        topk_w = topk_w / topk_w.sum(1, keepdims=True)
+    out = wt.Tensor(np.zeros((T, lm.H), np.float32))
+    # gather tokens per expert (host indices), run each selected expert once
+    for e in range(ne):
+        rows, slot = np.where(topk_idx == e)
+        if len(rows) == 0:
+            continue
+        xe = wt.Tensor(wt._contig(x.data[rows]))          # (m, H)
+        exp = m["experts"][e]
+        ye = exp["down"](wt.silu(exp["gate"](xe)) * exp["up"](xe))
+        w = topk_w[rows, slot].astype(np.float32)
+        ye = ye * wt.Tensor(w.reshape(-1, 1))
+        acc = out.data
+        acc[rows] = acc[rows] + ye.data
+        out = wt.Tensor(acc)
+    if m.get("shared"):
+        s = m["shared"]
+        ys = s["down"](wt.silu(s["gate"](x)) * s["up"](x))
+        if m.get("shared_gate") is not None:
+            g = wt.Tensor(1.0 / (1.0 + np.exp(-m["shared_gate"](x).numpy())))
+            ys = ys * g
+        out = out + ys
+    return out
+
+def _softmax_rows(x):
+    x = np.asarray(x, np.float64); e = np.exp(x - x.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
+
+
+# ----------------------------- generic builder (dense + MoE series) -----------------------------
+def build_lm(cfg, get, linear, tensor):
+    """Construct a TransformerLM from a weight source, dense OR MoE, config-driven.
+
+      cfg    : dict with H,L,NH,NKV,HD,eps,theta (+ optional num_experts, num_experts_per_tok,
+               norm_topk_prob, shared_expert (bool), decoder_sparse_step, mlp_only_layers, head/embed).
+      get(name)  -> np weight for a param name (streams from safetensors/gguf/npz).
+      linear(Wname, bias=True) -> a callable (Tensor -> Tensor) for that weight (int4 QuantizedLinear
+               in the browser, fp32 matmul offline). `bias=True` also loads Wname[:-7]+'.bias' if present.
+      tensor(np) -> wt.Tensor.
+
+    Returns a ready TransformerLM. This is the single generic loader behind the whole
+    CausalLM + MoE series — no per-model code."""
+    lm = TransformerLM(cfg)
+    L = cfg["L"]; ne = cfg.get("num_experts", 0)
+    sparse_step = cfg.get("decoder_sparse_step", 1); only = set(cfg.get("mlp_only_layers", []))
+    P = cfg.get("layer_prefix", "model.layers.")
+    for i in range(L):
+        p = f"{P}{i}."
+        lay = {"in_ln": tensor(get(p + "input_layernorm.weight")),
+               "post_ln": tensor(get(p + "post_attention_layernorm.weight")),
+               "q": linear(p + "self_attn.q_proj.weight"), "k": linear(p + "self_attn.k_proj.weight"),
+               "v": linear(p + "self_attn.v_proj.weight"), "o": linear(p + "self_attn.o_proj.weight", bias=False)}
+        is_moe = ne > 0 and (i not in only) and ((i + 1) % sparse_step == 0)
+        if is_moe:
+            moe = {"gate": linear(p + "mlp.gate.weight", bias=False), "top_k": cfg["num_experts_per_tok"],
+                   "norm_topk_prob": cfg.get("norm_topk_prob", True),
+                   "experts": [{"gate": linear(p + f"mlp.experts.{e}.gate_proj.weight", bias=False),
+                                "up": linear(p + f"mlp.experts.{e}.up_proj.weight", bias=False),
+                                "down": linear(p + f"mlp.experts.{e}.down_proj.weight", bias=False)} for e in range(ne)],
+                   "shared": None}
+            if cfg.get("shared_expert"):
+                moe["shared"] = {"gate": linear(p + "mlp.shared_expert.gate_proj.weight", bias=False),
+                                 "up": linear(p + "mlp.shared_expert.up_proj.weight", bias=False),
+                                 "down": linear(p + "mlp.shared_expert.down_proj.weight", bias=False)}
+                moe["shared_gate"] = linear(p + "mlp.shared_expert_gate.weight", bias=False)
+            lay["moe"] = moe
+        else:
+            lay["gate"] = linear(p + "mlp.gate_proj.weight", bias=False)
+            lay["up"] = linear(p + "mlp.up_proj.weight", bias=False)
+            lay["down"] = linear(p + "mlp.down_proj.weight", bias=False)
+        lm.layers.append(lay)
+    lm.final_norm = tensor(get(cfg.get("final_norm", "model.norm.weight")))
+    return lm
