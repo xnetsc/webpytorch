@@ -44,7 +44,8 @@ webtorch.use_default_io()                    # REQUIRED — built-in browser fet
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
 print(lm.generate("Hello", max_new=64))
 
-# ...or load straight from a model hub by repo id (install the hub read callback):
+# ...or load straight from a model hub by repo id (install the hub read callback).
+# Files are cached locally with background read-ahead, so a later run loads from disk:
 webtorch.set_io_read(webtorch.hf_read())            # or webtorch.modelscope_read() for 魔搭
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
 print(lm.generate("The capital of France is", max_new=8))

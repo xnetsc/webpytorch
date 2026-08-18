@@ -343,54 +343,233 @@ def use_default_io():
 #
 # How they work: a loader turns the repo id you gave it into file names like
 # "<org>/<repo>/config.json", "<org>/<repo>/model.safetensors". The callback splits off the
-# first two segments as the repo, maps the rest to that hub's file URL, and streams the bytes
-# with an HTTP Range request (via `_fetch_range`, same transport as `default_io_read`). A full
-# http(s) URL in `name` is fetched as-is, so mixed sources still work.
+# first two segments as the repo and maps the rest to that hub's file URL. By default it
+# CACHES to a local dir with read-ahead:
+#   * The first partial (ranged) read of a file starts a background whole-file PREFETCH that
+#     streams the file in chunks into a sparse cache — it does NOT block reads.
+#   * Every range read is served from cache if those bytes are already present; otherwise it
+#     fetches JUST that range now (a separate request, so it never waits for the prefetch to
+#     reach that offset) and stores it. The prefetch keeps going and skips ranges already
+#     cached. Once the whole file is present it is marked complete and later runs read it
+#     straight from disk — no network.
+#   * All range reads (prefetch chunks included) go through a bounded queue: at most
+#     `max_parallel` concurrent network reads (configurable).
+# A full http(s) URL in `name` is fetched as-is. Pass cache=False for pure streaming.
 
 def _split_repo(name):
     parts = name.lstrip("/").split("/")
     return "/".join(parts[:2]), "/".join(parts[2:])         # (org/repo, filepath)
 
-def hf_read(revision="main", endpoint="https://huggingface.co", token=None):
+def _default_hub_cache():
+    """Cache root: $WEBTORCH_CACHE, else ~/.cache/webtorch/hub. On the host this persists
+    across runs; in the browser it lives in Pyodide's FS (persist across reloads by mounting
+    IDBFS/OPFS at this path, e.g. via `webtorch.models.webenv`)."""
+    import os
+    return os.environ.get("WEBTORCH_CACHE") or os.path.join(
+        os.path.expanduser("~"), ".cache", "webtorch", "hub")
+
+def _url_key(url):
+    import re
+    return re.sub(r"[^A-Za-z0-9._/-]", "_", url.split("://", 1)[-1])   # readable, filesystem-safe
+
+async def _remote_size(url, headers):
+    """Total byte length of a remote file (needed to drive prefetch). HEAD Content-Length
+    first, then a `bytes=0-0` GET's Content-Range total. None if the server won't say."""
+    try:
+        from pyodide.http import pyfetch
+    except ImportError:
+        pyfetch = None
+    if pyfetch is not None:
+        try:
+            r = await pyfetch(url, method="HEAD", headers=dict(headers or {}))
+            cl = r.headers.get("content-length") or r.headers.get("Content-Length")
+            if cl and str(cl).isdigit(): return int(cl)
+        except Exception: pass
+        try:
+            h = dict(headers or {}); h["Range"] = "bytes=0-0"
+            r = await pyfetch(url, headers=h)
+            cr = r.headers.get("content-range") or r.headers.get("Content-Range")
+            if cr and "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
+                return int(cr.rsplit("/", 1)[-1])
+        except Exception: pass
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers=dict(headers or {}), method="HEAD")
+        with urllib.request.urlopen(req, timeout=60) as f:
+            cl = f.headers.get("Content-Length")
+            if cl and str(cl).isdigit(): return int(cl)
+    except Exception: pass
+    try:
+        req = urllib.request.Request(url, headers=dict(headers or {}))
+        req.add_header("Range", "bytes=0-0")
+        with urllib.request.urlopen(req, timeout=60) as f:
+            cr = f.headers.get("Content-Range")
+            if cr and "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
+                return int(cr.rsplit("/", 1)[-1])
+    except Exception: pass
+    return None
+
+
+class _CachedFile:
+    """Sparse local cache of one remote file + a background whole-file prefetch. A range read
+    is served from the cache when those bytes are present, else fetched on the spot (never
+    waiting for the prefetch to reach it) and stored. Sparse-file writes and coverage updates
+    are synchronous, so they are atomic with respect to the single-threaded event loop; only
+    the network fetches await."""
+    def __init__(self, cache, url):
+        import os
+        self.c = cache; self.url = url
+        self.path = os.path.join(cache.cache_dir, _url_key(url))
+        self.marker = self.path + ".complete"
+        self.covered = []                                    # merged sorted [start,end) present on disk
+        self.size = None
+        self.complete = os.path.exists(self.marker)
+        self._prefetching = False
+
+    def _has(self, a, b):
+        for s, e in self.covered:
+            if s <= a and b <= e: return True
+            if s >= b: break
+        return False
+
+    def _mark(self, a, b):
+        self.covered.append((a, b)); self.covered.sort()
+        out = []
+        for s, e in self.covered:
+            if out and s <= out[-1][1]: out[-1] = (out[-1][0], max(out[-1][1], e))
+            else: out.append((s, e))
+        self.covered = out
+
+    def _read_local(self, offset, length):
+        with open(self.path, "rb") as f:
+            if offset: f.seek(offset)
+            return f.read() if length is None else f.read(length)
+
+    def _store(self, offset, data):
+        import os
+        d = os.path.dirname(self.path)
+        if d:
+            try: os.makedirs(d, exist_ok=True)
+            except Exception: pass
+        if not os.path.exists(self.path):
+            open(self.path, "wb").close()
+        with open(self.path, "r+b") as f:
+            f.seek(offset); f.write(data)
+        self._mark(offset, offset + len(data))
+        if self.size is not None and not self.complete and self._has(0, self.size):
+            try: open(self.marker, "w").close()
+            except Exception: pass
+            self.complete = True
+
+    def _ensure_prefetch(self):
+        if self._prefetching or self.complete or not self.c.prefetch or self.size is None:
+            return
+        self._prefetching = True
+        import asyncio
+        self.c.tasks.append(asyncio.ensure_future(self._prefetch()))
+
+    async def _prefetch(self):
+        try:
+            o = 0
+            while self.size is not None and o < self.size and not self.complete:
+                b = min(self.size, o + self.c.chunk)
+                if not self._has(o, b):
+                    self._store(o, await self.c._net(self.url, o, b - o))
+                o = b
+        except Exception:
+            pass
+
+    async def read(self, offset, length):
+        if self.complete:
+            return self._read_local(offset, length)
+        if self.size is None:
+            self.size = await self.c._size(self.url)
+        end = self.size if length is None else offset + length
+        if self.size is not None and end is not None:
+            end = min(end, self.size)
+        if end is not None and self._has(offset, end):        # cache hit
+            return self._read_local(offset, length)
+        partial = length is not None and not (offset == 0 and (self.size is None or length >= self.size))
+        if partial:
+            self._ensure_prefetch()                           # read-ahead the rest, in background
+        data = await self.c._net(self.url, offset, length)    # miss -> fetch just this range now
+        self._store(offset, data)
+        return data
+
+
+class _HubCache:
+    """Owns the cache dir, the bounded read queue, and one `_CachedFile` per URL."""
+    def __init__(self, cache_dir, headers, max_parallel=8, prefetch=True, chunk=16 << 20):
+        self.cache_dir = cache_dir; self.headers = headers
+        self.max_parallel = max(1, int(max_parallel)); self.prefetch = prefetch
+        self.chunk = int(chunk); self.files = {}; self.tasks = []; self._sem = None
+
+    def _semaphore(self):
+        import asyncio
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self.max_parallel)
+        return self._sem
+
+    async def _net(self, url, offset, length):
+        async with self._semaphore():                         # bounded queue for range reads
+            return await _fetch_range(url, offset, length, self.headers)
+
+    async def _size(self, url):
+        try: return await _remote_size(url, self.headers)
+        except Exception: return None
+
+    async def read(self, url, offset, length):
+        if not self.cache_dir:
+            return await self._net(url, offset, length)       # cache disabled -> pure streaming
+        st = self.files.get(url)
+        if st is None:
+            st = self.files[url] = _CachedFile(self, url)
+        return await st.read(offset, length)
+
+
+def _hub_reader(map_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb):
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    hub = _HubCache((cache_dir or _default_hub_cache()) if cache else None, hdr,
+                    max_parallel=max_parallel, prefetch=prefetch, chunk=chunk_mb << 20)
+    async def read(name, offset=0, length=None):
+        url = name if name.startswith(("http://", "https://")) else map_url(*_split_repo(name))
+        return await hub.read(url, offset, length)
+    return read
+
+def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
+            cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16):
     """Return an `io_read`-shaped async callback that fetches files directly from the
-    **Hugging Face Hub**. Install it, then load by repo id — nothing to pre-download:
+    **Hugging Face Hub** (with read-ahead caching). Install it, then load by repo id:
 
         webtorch.set_io_read(webtorch.hf_read())        # + set_io_write(...) only if quantizing
         lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
-    `name` ("<org>/<repo>/<path>") maps to `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`,
-    read with an HTTP Range request (streaming). `token` (optional) is sent as a Bearer header
-    for gated/private repos; `endpoint` can point at a mirror. Reads only."""
-    hdr = {"Authorization": "Bearer " + token} if token else None
-    async def read(name, offset=0, length=None):
-        if name.startswith(("http://", "https://")):
-            url = name
-        else:
-            repo, path = _split_repo(name)
-            url = "%s/%s/resolve/%s/%s" % (endpoint.rstrip("/"), repo, revision, path)
-        return await _fetch_range(url, offset, length, hdr)
-    return read
+    `name` ("<org>/<repo>/<path>") maps to `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`.
+    Caching (default on) prefetches each touched file in the background and serves later reads
+    from disk; `cache=False` streams with no cache, `cache_dir` picks the location,
+    `max_parallel` bounds concurrent range reads, `prefetch=False` disables read-ahead,
+    `chunk_mb` is the prefetch chunk size. `token` is a Bearer header for gated repos. Reads
+    only."""
+    ep = endpoint.rstrip("/")
+    return _hub_reader(lambda repo, path: "%s/%s/resolve/%s/%s" % (ep, repo, revision, path),
+                       token, cache, cache_dir, max_parallel, prefetch, chunk_mb)
 
-def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None):
+def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None,
+                    cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16):
     """Return an `io_read`-shaped async callback that fetches files directly from
-    **ModelScope (魔搭)**. Same shape as `hf_read`:
+    **ModelScope (魔搭)** (with read-ahead caching). Same shape and options as `hf_read`:
 
         webtorch.set_io_read(webtorch.modelscope_read())
         lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
     `name` ("<org>/<repo>/<path>") maps to
-    `{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}`, read
-    with an HTTP Range request. `revision` defaults to ModelScope's `master`. Reads only."""
-    hdr = {"Authorization": "Bearer " + token} if token else None
-    async def read(name, offset=0, length=None):
-        if name.startswith(("http://", "https://")):
-            url = name
-        else:
-            repo, path = _split_repo(name)
-            url = "%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s" % (
-                endpoint.rstrip("/"), repo, revision, path)
-        return await _fetch_range(url, offset, length, hdr)
-    return read
+    `{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}`;
+    `revision` defaults to ModelScope's `master`. Reads only."""
+    ep = endpoint.rstrip("/")
+    return _hub_reader(
+        lambda repo, path: "%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s" % (ep, repo, revision, path),
+        token, cache, cache_dir, max_parallel, prefetch, chunk_mb)
 
 
 # ----------------------------- byte-source helpers (built on io_read) -----------------------------

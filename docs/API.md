@@ -151,30 +151,42 @@ is a hidden default. Pick the one matching where your files live:
   webtorch.set_io_write(webtorch.default_io_write)
   # or simply: webtorch.use_default_io()
   ```
-- `webtorch.hf_read(revision="main", endpoint=…, token=None)` — returns a callback that
-  fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:
+- `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
+  max_parallel=8, prefetch=True, chunk_mb=16)` — returns a callback that fetches straight
+  from the **Hugging Face Hub**, so you load by repo id, no pre-download:
   ```python
   webtorch.set_io_read(webtorch.hf_read())           # + set_io_write only if you quantize
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
   print(lm.generate("The capital of France is", max_new=8))
   ```
-- `webtorch.modelscope_read(revision="master", endpoint=…, token=None)` — same, for
-  **ModelScope (魔搭)**:
+- `webtorch.modelscope_read(revision="master", endpoint=…, token=None, cache=True, …)` —
+  same options, for **ModelScope (魔搭)**:
   ```python
   webtorch.set_io_read(webtorch.modelscope_read())
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
   ```
 
-**How the hub callbacks work (internal logic).** A loader turns the repo id you passed into
-file names like `"<org>/<repo>/config.json"`, `"<org>/<repo>/model.safetensors"`. The
-callback splits the first two path segments as the repo and maps the rest to that hub's file
-URL — HF: `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`; ModelScope:
-`{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — then
-streams the bytes with an HTTP `Range` request (shared transport `_fetch_range`, with
-exponential-backoff retry so a hundreds-of-reads streamed load survives a transient drop). A
-full `http(s)://` URL in `name` is fetched as-is, so mixed sources work. `token` is sent as a
-Bearer header for gated/private repos. These are **reads only** — set a writer separately if
-you also quantize.
+**Caching & read-ahead (default on).** Each hub reader caches to a local dir
+(`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`, override with `cache_dir`):
+- The first *partial* read of a file starts a **background whole-file prefetch** that streams
+  the file into a sparse cache in `chunk_mb` chunks — it never blocks reads.
+- Every range read is served from cache when those bytes are present; on a miss it fetches
+  **just that range now** (a separate request — it never waits for the prefetch to reach that
+  offset) and stores it. The prefetch keeps going and skips ranges already cached.
+- Once the whole file is cached it is marked complete, so a **later run reads it straight
+  from disk — zero network**. (In the browser the cache lives in Pyodide's FS; mount
+  IDBFS/OPFS at the cache dir to persist across reloads.)
+- All range reads (prefetch chunks included) go through a **bounded queue** — at most
+  `max_parallel` concurrent network reads. `cache=False` disables caching (pure streaming);
+  `prefetch=False` keeps the cache but no read-ahead.
+
+**How the URL mapping works.** A loader turns the repo id into file names like
+`"<org>/<repo>/config.json"`; the callback splits the first two segments as the repo and maps
+the rest to the hub file URL — HF `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`;
+ModelScope `{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` —
+fetched with an HTTP `Range` request (shared transport `_fetch_range`, exponential-backoff
+retry). A full `http(s)://` `name` is fetched as-is. `token` is a Bearer header for
+gated/private repos. **Reads only** — set a writer separately if you also quantize.
 
 Lower-level adapters (built on the two callbacks; normally you won't call them directly):
 `resolve_tensor_reader(src, io=None)`, `resolve_shard_writer(dst, io=None)`,

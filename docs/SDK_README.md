@@ -175,14 +175,23 @@ webtorch.set_io_read(webtorch.modelscope_read())  # ModelScope 魔搭 (revision 
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
 ```
 
-**Internal logic.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`.
-`hf_read`/`modelscope_read` split the first two segments as the repo and map the rest to the
-hub's file URL — HF `…/resolve/{revision}/{path}`, ModelScope
-`…/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — then stream it with
-an HTTP `Range` request (shared transport, retried with backoff so a many-reads load survives
-a transient drop). A full `http(s)://` `name` is fetched as-is. Reads only — install a writer
-separately if you quantize. `default_io_read`/`default_io_write` use the same transport for
-plain paths/URLs and the local (or Pyodide) filesystem.
+**Caching & read-ahead (default on).** Each hub reader caches to a local dir
+(`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`; set `cache_dir=…`). The first partial read of a
+file kicks off a **background whole-file prefetch** (streamed in `chunk_mb` chunks) that never
+blocks reads; each range read is served from cache when present, else fetched **as its own
+request right then** (never waiting for the prefetch to reach it) and stored. When a file is
+fully cached it is marked complete, so a **later run reads it from disk with zero network**.
+All range reads share a **bounded queue** (`max_parallel`, default 8). `cache=False` = pure
+streaming; `prefetch=False` = cache without read-ahead. (In the browser the cache is in
+Pyodide's FS — mount IDBFS/OPFS at the cache dir to persist across reloads.)
+
+**URL mapping.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`;
+the callback splits the first two segments as the repo and maps the rest to the hub file URL —
+HF `…/resolve/{revision}/{path}`, ModelScope
+`…/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — fetched with HTTP
+`Range` (shared transport, backoff retry). A full `http(s)://` `name` is fetched as-is. Reads
+only — install a writer separately if you quantize. `default_io_read`/`default_io_write` use
+the same transport for plain paths/URLs and the local (or Pyodide) filesystem.
 
 ## Layout
 
