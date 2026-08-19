@@ -60,7 +60,8 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 # ranged/streaming access (e.g. int4 weight shards) so a callback can issue an HTTP Range
 # request or seek into local/remote storage.
 from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
-                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read)
+                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
+                    make_cached_reader, http_get, http_size, HttpError)
 
 __all__ = [
     # torch-compatible core
@@ -73,6 +74,9 @@ __all__ = [
     "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
     # built-in / hub read callbacks you install via set_io_read (NOT auto-installed)
     "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
+    # generic cached-reader tool (cache + read-ahead + adaptive concurrency + persistence) for
+    # building your own read callback; hf_read/modelscope_read are clients of it
+    "make_cached_reader", "http_get", "http_size", "HttpError",
     "__version__",
 ]
 

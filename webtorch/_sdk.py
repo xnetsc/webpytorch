@@ -200,10 +200,12 @@ class OnnxModel:
 
 # ---- symmetric global async IO callbacks (REQUIRED; single injection point for ALL reads AND writes) ----
 from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
-                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read)
+                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
+                    make_cached_reader, http_get, http_size, HttpError)
 
 
 # ---- explicit exports --------------------------------------------------------
 __all__ = ["install_torch", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
            "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
-           "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read"]
+           "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
+           "make_cached_reader", "http_get", "http_size", "HttpError"]

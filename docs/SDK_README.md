@@ -198,10 +198,16 @@ behavior. `cache=False` = pure streaming; `prefetch=False` = cache without read-
 **URL mapping.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`;
 the callback splits the first two segments as the repo and maps the rest to the hub file URL —
 HF `…/resolve/{revision}/{path}`, ModelScope
-`…/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}` — fetched with HTTP
-`Range` (shared transport, backoff retry). A full `http(s)://` `name` is fetched as-is. Reads
-only — install a writer separately if you quantize. `default_io_read`/`default_io_write` use
-the same transport for plain paths/URLs and the local (or Pyodide) filesystem.
+`…/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}`. A full `http(s)://`
+`name` is fetched as-is. Reads only — install a writer separately if you quantize.
+
+**Reusable tool.** The caching, read-ahead, adaptive concurrency, and persistence are generic:
+`webtorch.make_cached_reader(fetch, size=…, key=…, …)` wraps *any* async transport with all of
+it, and `hf_read`/`modelscope_read` are just clients supplying a repo-id→URL mapping. Build
+your own cached reader over S3 / a signed CDN / your own server with it — using
+`webtorch.http_get`/`http_size` as the HTTP transport and raising `webtorch.HttpError(status,
+body)` to signal rate-limits. See the API reference. `default_io_read`/`default_io_write` are
+the plain (uncached) transport for paths/URLs and the local (or Pyodide) filesystem.
 
 ## Layout
 

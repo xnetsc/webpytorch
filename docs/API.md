@@ -166,6 +166,33 @@ is a hidden default. Pick the one matching where your files live:
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
   ```
 
+**Build your own cached reader (generic tool).** The caching, background read-ahead, adaptive
+concurrency (see `max_parallel` below), and browser persistence are **not** hub-specific — they
+live in one reusable wrapper, `webtorch.make_cached_reader`, and `hf_read`/`modelscope_read`
+are just clients of it (each supplies only a repo-id→URL mapping). Use it to give your own
+source (S3, a signed CDN, your own server, …) the same behavior:
+
+```python
+async def my_fetch(key, offset, length):     # read a byte range for `key` (length None = whole)
+    ...                                       # raise webtorch.HttpError(429, body) to signal rate-limit
+async def my_size(key):                       # total length of `key` (drives prefetch); optional
+    ...
+reader = webtorch.make_cached_reader(my_fetch, size=my_size, key=lambda name: name,
+                                     cache_dir=None, max_parallel=8, prefetch=True, persist=True)
+webtorch.set_io_read(reader)
+```
+- `fetch(key, offset, length) -> bytes` (async, required): raise `webtorch.HttpError(status,
+  body)` for a 429 / rate-limit response so the limiter can back off; any other exception is a
+  generic error (fatal only when no other read is in flight). `webtorch.http_get(url, offset,
+  length, headers)` is the built-in HTTP-range transport you can call inside `fetch`.
+- `size(key) -> int | None` (async, optional): total length; `webtorch.http_size(url, headers)`
+  probes it for HTTP sources. Return `None` to skip prefetch for that key.
+- `key(name) -> str` (optional): map an incoming `name` to a stable cache/fetch key (default:
+  identity). The hub readers map `"org/repo/path"` to the file URL here so the cache is keyed
+  uniquely per platform.
+- `cache` / `cache_dir` / `max_parallel` / `prefetch` / `chunk_mb` / `persist`: identical to
+  `hf_read`.
+
 **Caching & read-ahead (default on).** Each hub reader caches to a local dir
 (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`, override with `cache_dir`):
 - The first *partial* read of a file starts a **background whole-file prefetch** that streams

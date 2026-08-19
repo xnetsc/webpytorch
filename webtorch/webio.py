@@ -262,7 +262,7 @@ async def io_write(name, data, offset=0, io=None):
 # Not installed automatically. Call `use_default_io()` (or install these individually) to
 # use them; a bare SDK has no IO until you do.
 
-class _HttpError(Exception):
+class HttpError(Exception):
     """A non-2xx HTTP response, carrying the status and a snippet of the body so callers can
     tell a rate-limit apart from a real error and surface the server's message."""
     def __init__(self, status, body=""):
@@ -293,7 +293,7 @@ async def _fetch_once(url, rng, headers):
         data = bytes(await r.bytes())
         status = int(getattr(r, "status", 200) or 200)
         if status not in (200, 206):                        # pyfetch does not raise on 4xx/5xx
-            raise _HttpError(status, data[:2048].decode("utf-8", "replace"))
+            raise HttpError(status, data[:2048].decode("utf-8", "replace"))
         return data
     if url.startswith(("http://", "https://")):             # host: urllib
         import urllib.request, urllib.error
@@ -306,7 +306,7 @@ async def _fetch_once(url, rng, headers):
             body = b""
             try: body = e.read()
             except Exception: pass
-            raise _HttpError(e.code, body[:2048].decode("utf-8", "replace"))
+            raise HttpError(e.code, body[:2048].decode("utf-8", "replace"))
     raise FileNotFoundError(url)                             # not a URL -> caller reads locally
 
 async def _fetch_range(url, offset=0, length=None, headers=None, retries=4):
@@ -498,10 +498,10 @@ class _CachedFile:
     waiting for the prefetch to reach it) and stored. Sparse-file writes and coverage updates
     are synchronous, so they are atomic with respect to the single-threaded event loop; only
     the network fetches await."""
-    def __init__(self, cache, url):
+    def __init__(self, cache, key):
         import os
-        self.c = cache; self.url = url
-        self.path = os.path.join(cache.cache_dir, _url_key(url))
+        self.c = cache; self.key = key
+        self.path = os.path.join(cache.cache_dir, _url_key(key))
         self.marker = self.path + ".complete"
         self.covered = []                                    # merged sorted [start,end) present on disk
         self.size = None
@@ -558,7 +558,7 @@ class _CachedFile:
             while self.size is not None and o < self.size and not self.complete:
                 b = min(self.size, o + self.c.chunk)
                 if not self._has(o, b):
-                    if self._store(o, await self.c._net(self.url, o, b - o)):
+                    if self._store(o, await self.c._net(self.key, o, b - o)):
                         await self.c._flush()                 # persist a completed file
                 o = b
         except Exception:
@@ -568,7 +568,7 @@ class _CachedFile:
         if self.complete:
             return self._read_local(offset, length)
         if self.size is None:
-            self.size = await self.c._size(self.url)
+            self.size = await self.c._size(self.key)
         end = self.size if length is None else offset + length
         if self.size is not None and end is not None:
             end = min(end, self.size)
@@ -577,7 +577,7 @@ class _CachedFile:
         partial = length is not None and not (offset == 0 and (self.size is None or length >= self.size))
         if partial:
             self._ensure_prefetch()                           # read-ahead the rest, in background
-        data = await self.c._net(self.url, offset, length)    # miss -> fetch just this range now
+        data = await self.c._net(self.key, offset, length)    # miss -> fetch just this range now
         if self._store(offset, data):
             await self.c._flush()                             # persist a completed file
         return data
@@ -650,7 +650,7 @@ class _AdaptiveLimiter:
         c = self._c()
         async with c:
             self.inflight -= 1
-            is_rate = isinstance(e, _HttpError) and _is_rate_limited(e.status, e.body)
+            is_rate = isinstance(e, HttpError) and _is_rate_limited(e.status, e.body)
             if not is_rate and self.inflight == 0:
                 c.notify_all(); return "raise"                # solo non-rate error -> genuine failure
             # explicit rate-limit, OR a non-rate error while peers still succeed (undisclosed
@@ -693,53 +693,101 @@ class _AdaptiveLimiter:
             return r
 
 
-class _HubCache:
-    """Owns the cache dir, the adaptive read queue, and one `_CachedFile` per URL."""
-    def __init__(self, cache_dir, headers, max_parallel=8, prefetch=True, chunk=16 << 20, persist=True):
-        self.cache_dir = cache_dir; self.headers = headers
+class _CacheLayer:
+    """Owns a cache dir, the adaptive read queue, and one `_CachedFile` per key. GENERIC — it
+    fetches bytes for a key via the injected `fetch(key, offset, length)` and (optionally)
+    learns a key's total size via `size(key)`. It knows nothing about HTTP or model hubs."""
+    def __init__(self, fetch, size, cache_dir, max_parallel=8, prefetch=True, chunk=16 << 20, persist=True):
+        self.fetch = fetch; self.size_fn = size; self.cache_dir = cache_dir
         self.max_parallel = max(1, int(max_parallel)); self.prefetch = prefetch
         self.chunk = int(chunk); self.persist = persist
         self.files = {}; self.tasks = []; self._loaded = False
         self.limiter = _AdaptiveLimiter(self.max_parallel)
 
-    async def _net(self, url, offset, length):
-        rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
-        return await self.limiter.run(lambda: _fetch_once(url, rng, self.headers))
+    async def _net(self, key, offset, length):               # one adaptive, queued fetch
+        return await self.limiter.run(lambda: self.fetch(key, offset, length))
 
-    async def _size(self, url):
-        try: return await _remote_size(url, self.headers)
+    async def _size(self, key):
+        if self.size_fn is None: return None
+        try: return await self.size_fn(key)
         except Exception: return None
 
     async def _flush(self):
         if self.persist:
             await _persist_flush(self.cache_dir)
 
-    async def read(self, url, offset, length):
+    async def read(self, key, offset, length):
         if not self.cache_dir:
-            return await self._net(url, offset, length)       # cache disabled -> pure streaming
+            return await self._net(key, offset, length)       # cache disabled -> pure streaming
         if not self._loaded:                                  # first use: load prior cache (browser: IDBFS)
             self._loaded = True
             if self.persist:
                 await _persist_load(self.cache_dir)
-        st = self.files.get(url)
+        st = self.files.get(key)
         if st is None:
-            st = self.files[url] = _CachedFile(self, url)
+            st = self.files[key] = _CachedFile(self, key)
         return await st.read(offset, length)
 
 
-def _hub_reader(map_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
-    hdr = {"Authorization": "Bearer " + token} if token else None
-    hub = _HubCache((cache_dir or _default_hub_cache()) if cache else None, hdr,
-                    max_parallel=max_parallel, prefetch=prefetch, chunk=chunk_mb << 20, persist=persist)
+# ============================ generic cached-reader tool ============================
+# `make_cached_reader` wraps ANY async transport with the cache + read-ahead + adaptive
+# concurrency + (browser) persistence used by the hub readers. Use it when you implement your
+# own `set_io_read` callback over a custom source (S3, a signed CDN, your own server, …); the
+# built-in `hf_read` / `modelscope_read` are just clients of it (see below).
+
+async def http_get(url, offset=0, length=None, headers=None):
+    """The built-in HTTP range transport (browser `fetch` / host `urllib`). Raises `HttpError`
+    on a non-2xx status. A ready-made `fetch` building block for `make_cached_reader`."""
+    rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
+    return await _fetch_once(url, rng, headers)
+
+async def http_size(url, headers=None):
+    """Total byte length of an http(s) file (HEAD, else a `bytes=0-0` GET's Content-Range).
+    A ready-made `size` building block for `make_cached_reader` (drives prefetch)."""
+    return await _remote_size(url, headers)
+
+def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
+                       max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
+    """Wrap an async transport with caching + background read-ahead + adaptive concurrency +
+    (browser IndexedDB) persistence, returning an `io_read`-shaped callback
+    `read(name, offset=0, length=None) -> bytes` you can pass to `webtorch.set_io_read`.
+
+      fetch(key, offset, length) -> bytes   (async): read a byte range for `key` (length None =
+          whole file). Raise `webtorch.HttpError(status, body)` for a 429 / rate-limit response
+          so the adaptive limiter can back off; any OTHER exception is a generic error (fatal
+          only when no other read is in flight). Use `webtorch.http_get` for HTTP sources.
+      size(key) -> int | None               (async, optional): total length of `key`, used to
+          drive read-ahead. Return None (or omit) to disable prefetch for that key. `http_size`
+          works for HTTP sources.
+      key(name) -> str                       (optional): map the incoming `name` to a stable
+          cache/fetch key (default: identity). Hub readers map "org/repo/path" -> the file URL
+          here, so the cache is keyed uniquely per platform.
+      cache / cache_dir / max_parallel / prefetch / chunk_mb / persist: same as `hf_read`
+          (see its docstring / the API reference for the full adaptive-concurrency behavior)."""
+    keyfn = key or (lambda n: n)
+    cdir = (cache_dir or _default_hub_cache()) if cache else None
+    layer = _CacheLayer(fetch, size, cdir, max_parallel=max_parallel, prefetch=prefetch,
+                        chunk=chunk_mb << 20, persist=persist)
     async def read(name, offset=0, length=None):
-        url = name if name.startswith(("http://", "https://")) else map_url(*_split_repo(name))
-        return await hub.read(url, offset, length)
+        return await layer.read(keyfn(name), offset, length)
     return read
+
+
+# ---- model-hub readers: thin clients of make_cached_reader over the HTTP transport ----
+def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    async def fetch(url, offset, length): return await http_get(url, offset, length, hdr)
+    async def size(url): return await http_size(url, hdr)
+    def key(name):
+        return name if name.startswith(("http://", "https://")) else to_url(*_split_repo(name))
+    return make_cached_reader(fetch, size=size, key=key, cache=cache, cache_dir=cache_dir,
+                              max_parallel=max_parallel, prefetch=prefetch, chunk_mb=chunk_mb, persist=persist)
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
             cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from the
-    **Hugging Face Hub** (with read-ahead caching). Install it, then load by repo id:
+    **Hugging Face Hub** (a client of `make_cached_reader` over the HTTP transport). Install it,
+    then load by repo id:
 
         webtorch.set_io_read(webtorch.hf_read())        # + set_io_write(...) only if quantizing
         lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
@@ -765,7 +813,7 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
 def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None,
                     cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from
-    **ModelScope (魔搭)** (with persistent read-ahead caching). Same shape and options as
+    **ModelScope (魔搭)** — another client of `make_cached_reader`. Same shape and options as
     `hf_read` (incl. `persist=True` → IndexedDB-backed in the browser):
 
         webtorch.set_io_read(webtorch.modelscope_read())
