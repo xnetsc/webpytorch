@@ -62,8 +62,8 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
                     make_cached_reader, http_get, http_size, HttpError,
-                    default_cache_dir, cache_list, cache_hosts, cache_size, cache_read,
-                    cache_write, cache_delete, cache_clear)
+                    default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
+                    write_cache, delete_cache, clear_cache)
 
 __all__ = [
     # torch-compatible core
@@ -80,8 +80,8 @@ __all__ = [
     # building your own read callback; hf_read/modelscope_read are clients of it
     "make_cached_reader", "http_get", "http_size", "HttpError",
     # persistent-cache management (list/read/write/delete, separated by host/domain)
-    "default_cache_dir", "cache_list", "cache_hosts", "cache_size", "cache_read",
-    "cache_write", "cache_delete", "cache_clear",
+    "default_cache_dir", "list_cache", "cache_hosts", "cache_size", "read_cache",
+    "write_cache", "delete_cache", "clear_cache",
     "__version__",
 ]
 

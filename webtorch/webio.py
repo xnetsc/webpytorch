@@ -788,10 +788,10 @@ def default_cache_dir():
 def _cache_host(key):
     return key.replace("\\", "/").split("/", 1)[0]
 
-async def cache_list(cache_dir=None, host=None):
+async def list_cache(cache_dir=None, host=None):
     """List cached entries (loads the browser IndexedDB cache first). Returns, sorted by key,
     `[{"key", "host", "size", "complete", "path"}]`. `host` (e.g. "huggingface.co") filters to
-    one domain. `key` is the URL without scheme; pass it to `cache_read/cache_delete`."""
+    one domain. `key` is the URL without scheme; pass it to `read_cache/delete_cache`."""
     import os
     root = cache_dir or _default_hub_cache()
     await _persist_load(root)
@@ -816,17 +816,17 @@ async def cache_hosts(cache_dir=None):
     """Per-domain summary so HF vs ModelScope (etc.) are separated:
     `[{"host", "files", "size"}]`, largest first."""
     agg = {}
-    for e in await cache_list(cache_dir):
+    for e in await list_cache(cache_dir):
         a = agg.setdefault(e["host"], {"host": e["host"], "files": 0, "size": 0})
         a["files"] += 1; a["size"] += e["size"]
     return sorted(agg.values(), key=lambda a: -a["size"])
 
 async def cache_size(cache_dir=None, host=None):
     """Total bytes cached (optionally for one `host`)."""
-    return sum(e["size"] for e in await cache_list(cache_dir, host))
+    return sum(e["size"] for e in await list_cache(cache_dir, host))
 
-async def cache_read(key, offset=0, length=None, cache_dir=None):
-    """Read bytes from a cached entry by its `key` (a `cache_list` key or a full URL). Returns
+async def read_cache(key, offset=0, length=None, cache_dir=None):
+    """Read bytes from a cached entry by its `key` (a `list_cache` key or a full URL). Returns
     None if that entry is not cached."""
     import os
     root = cache_dir or _default_hub_cache(); await _persist_load(root)
@@ -837,7 +837,7 @@ async def cache_read(key, offset=0, length=None, cache_dir=None):
         if offset: f.seek(offset)
         return f.read() if length is None else f.read(length)
 
-async def cache_write(key, data, cache_dir=None, complete=True):
+async def write_cache(key, data, cache_dir=None, complete=True):
     """Write/replace a cache entry's bytes (pre-seed the cache). `complete=True` marks it fully
     cached (so a reader serves it from disk). Persists to IndexedDB in the browser."""
     import os
@@ -857,7 +857,7 @@ async def cache_write(key, data, cache_dir=None, complete=True):
         except OSError: pass
     await _persist_flush(root)
 
-async def cache_delete(key, cache_dir=None):
+async def delete_cache(key, cache_dir=None):
     """Delete one cached entry (its data + `.complete` + `.part`). Persists. -> True if it
     existed. (Applies on disk; a live reader created earlier may still hold it in memory.)"""
     import os
@@ -869,12 +869,12 @@ async def cache_delete(key, cache_dir=None):
     await _persist_flush(root)
     return existed
 
-async def cache_clear(cache_dir=None, host=None):
+async def clear_cache(cache_dir=None, host=None):
     """Delete all cached entries (or only one `host`/domain's). Persists. -> # data files
     removed."""
     import os
     root = cache_dir or _default_hub_cache()
-    entries = await cache_list(cache_dir, host)          # loads persistence, host-filtered
+    entries = await list_cache(cache_dir, host)          # loads persistence, host-filtered
     n = 0
     for e in entries:
         for q in (e["path"], e["path"] + ".complete", e["path"] + ".part"):

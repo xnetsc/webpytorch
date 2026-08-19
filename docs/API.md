@@ -203,26 +203,26 @@ ModelScope (`modelscope.cn/…`) entries are separated and can be listed or clea
 - `webtorch.default_cache_dir() -> str` — the dir the readers use by default
   (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`). All functions below take `cache_dir=None`
   meaning this default.
-- `await webtorch.cache_list(cache_dir=None, host=None) -> [ {"key","host","size","complete","path"} ]`
+- `await webtorch.list_cache(cache_dir=None, host=None) -> [ {"key","host","size","complete","path"} ]`
   — every cached entry, sorted by key; `host="huggingface.co"` filters to one domain.
 - `await webtorch.cache_hosts(cache_dir=None) -> [ {"host","files","size"} ]` — per-domain
   summary (largest first), so you can see HF vs ModelScope usage at a glance.
 - `await webtorch.cache_size(cache_dir=None, host=None) -> int` — total bytes cached
   (optionally for one host).
-- `await webtorch.cache_read(key, offset=0, length=None, cache_dir=None) -> bytes | None` —
-  read a cached entry's bytes (a `cache_list` key, or a full URL); `None` if not cached.
-- `await webtorch.cache_write(key, data, cache_dir=None, complete=True) -> None` — write /
+- `await webtorch.read_cache(key, offset=0, length=None, cache_dir=None) -> bytes | None` —
+  read a cached entry's bytes (a `list_cache` key, or a full URL); `None` if not cached.
+- `await webtorch.write_cache(key, data, cache_dir=None, complete=True) -> None` — write /
   replace an entry (pre-seed the cache); `complete=True` marks it fully cached so a reader
   serves it from disk. Persists to IndexedDB in the browser.
-- `await webtorch.cache_delete(key, cache_dir=None) -> bool` — delete one entry (its data +
+- `await webtorch.delete_cache(key, cache_dir=None) -> bool` — delete one entry (its data +
   markers); `True` if it existed. Persists.
-- `await webtorch.cache_clear(cache_dir=None, host=None) -> int` — delete everything (or only
+- `await webtorch.clear_cache(cache_dir=None, host=None) -> int` — delete everything (or only
   one `host`'s entries); returns the number of files removed. Persists.
 
 ```python
 for h in await webtorch.cache_hosts():          # e.g. [{"host":"huggingface.co","files":9,"size":9_999_999}, …]
     print(h["host"], h["files"], h["size"])
-await webtorch.cache_clear(host="modelscope.cn")  # free just the ModelScope cache
+await webtorch.clear_cache(host="modelscope.cn")  # free just the ModelScope cache
 ```
 
 Note: these act on disk; a reader object created earlier may still hold a just-deleted entry
