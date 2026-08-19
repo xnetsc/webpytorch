@@ -262,6 +262,25 @@ async def io_write(name, data, offset=0, io=None):
 # Not installed automatically. Call `use_default_io()` (or install these individually) to
 # use them; a bare SDK has no IO until you do.
 
+class _HttpError(Exception):
+    """A non-2xx HTTP response, carrying the status and a snippet of the body so callers can
+    tell a rate-limit apart from a real error and surface the server's message."""
+    def __init__(self, status, body=""):
+        self.status = int(status); self.body = body or ""
+        super().__init__("HTTP %d%s" % (self.status, (": " + self.body[:300]) if self.body else ""))
+
+# Wording that marks a rate-limit even when the status is not 429 (some hubs use 200/403/404).
+_RATE_WORDS = ("rate limit", "ratelimit", "too many requests", "try again later", "slow down",
+               "quota", "throttl", "限速", "限流", "太快", "过于频繁", "频繁", "请求过多", "超出",
+               "请稍后", "稍后再试")
+
+def _is_rate_limited(status, body):
+    if status == 429:
+        return True
+    t = (body or "").lower()
+    return any(w in t for w in _RATE_WORDS)
+
+
 async def _fetch_once(url, rng, headers):
     try:
         from pyodide.http import pyfetch                     # browser (Pyodide)
@@ -271,13 +290,23 @@ async def _fetch_once(url, rng, headers):
         h = dict(headers or {})
         if rng: h["Range"] = rng
         r = await pyfetch(url, headers=h)
-        return bytes(await r.bytes())
+        data = bytes(await r.bytes())
+        status = int(getattr(r, "status", 200) or 200)
+        if status not in (200, 206):                        # pyfetch does not raise on 4xx/5xx
+            raise _HttpError(status, data[:2048].decode("utf-8", "replace"))
+        return data
     if url.startswith(("http://", "https://")):             # host: urllib
-        import urllib.request
+        import urllib.request, urllib.error
         req = urllib.request.Request(url, headers=dict(headers or {}))
         if rng: req.add_header("Range", rng)
-        with urllib.request.urlopen(req, timeout=60) as f:
-            return f.read()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as f:
+                return f.read()
+        except urllib.error.HTTPError as e:                 # 4xx/5xx -> carry status + body
+            body = b""
+            try: body = e.read()
+            except Exception: pass
+            raise _HttpError(e.code, body[:2048].decode("utf-8", "replace"))
     raise FileNotFoundError(url)                             # not a URL -> caller reads locally
 
 async def _fetch_range(url, offset=0, length=None, headers=None, retries=4):
@@ -554,23 +583,113 @@ class _CachedFile:
         return data
 
 
+# Escalating cooldowns (seconds) applied each time concurrency is forced to 0 by repeated
+# rate-limiting; capped at 3 minutes. A rate-limit after the last one aborts the read.
+_COOLDOWNS = [30, 60, 120, 180]
+
+class _AdaptiveLimiter:
+    """A concurrency gate whose live limit adapts to rate-limiting. `ceiling` is the max
+    parallel network reads. On a **rate-limit** (HTTP 429, or a body with rate-limit wording)
+    the limit halves; at 0 it cools down for an escalating interval (30→60→120→180s) then
+    reopens to 1 and retries; a rate-limit after the last cooldown aborts. On success the
+    limit additively climbs back toward `ceiling`. **Non-rate-limit errors are not retried**
+    — they propagate immediately with the server's message."""
+    def __init__(self, ceiling):
+        self.ceiling = max(1, int(ceiling))
+        self.limit = self.ceiling
+        self.inflight = 0
+        self.succ = 0
+        self.cool_level = 0
+        self.cooling = False
+        self.failed = False
+        self._cond = None
+
+    def _c(self):
+        import asyncio
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def _acquire(self):
+        c = self._c()
+        async with c:
+            while True:
+                if self.failed:
+                    raise RuntimeError("hub reads aborted: still rate-limited after cooling down to 3 min")
+                if self.limit >= 1 and self.inflight < self.limit:
+                    self.inflight += 1
+                    return
+                await c.wait()
+
+    async def _release(self, outcome):
+        """outcome: 'ok' | 'rate' | 'other'. Returns True only if the limiter has truly given
+        up: rate-limited down to 0 concurrency AND nothing else is in flight AND the cooldowns
+        are exhausted. If any request is still in flight the current limit is treated as the
+        sustainable value — no cooldown, no abort — and an in-flight success reopens capacity."""
+        import asyncio
+        c = self._c(); giveup = False
+        async with c:
+            self.inflight -= 1
+            if outcome == "ok":
+                self.cool_level = 0
+                if self.limit == 0:
+                    self.limit = 1; self.succ = 0            # a success reopens from 0
+                else:
+                    self.succ += 1
+                    if self.limit < self.ceiling and self.succ >= 2:
+                        self.limit += 1; self.succ = 0
+            elif outcome == "rate":
+                self.succ = 0
+                self.limit = (self.limit // 2) if self.limit > 1 else 0
+                # only stall/abort when the system is truly dead: limit 0 AND no other request
+                # in flight. While others run, the current limit is the sweet spot — hold it.
+                if self.limit == 0 and self.inflight == 0 and not self.cooling:
+                    if self.cool_level >= len(_COOLDOWNS):
+                        self.failed = True; giveup = True     # count==0 + abort condition -> stop
+                    else:
+                        dur = _COOLDOWNS[self.cool_level]; self.cool_level += 1
+                        self.cooling = True
+                        asyncio.ensure_future(self._cooldown(dur))
+            c.notify_all()
+        return giveup
+
+    async def _cooldown(self, dur):
+        import asyncio
+        await asyncio.sleep(dur)
+        c = self._c()
+        async with c:
+            self.cooling = False
+            if self.limit < 1: self.limit = 1                 # reopen to a single probe
+            c.notify_all()
+
+    async def run(self, attempt):
+        while True:
+            await self._acquire()
+            try:
+                r = await attempt()
+            except Exception as e:
+                rate = isinstance(e, _HttpError) and _is_rate_limited(e.status, e.body)
+                if not rate:
+                    await self._release("other"); raise        # fail fast with the real error
+                if await self._release("rate"):
+                    raise RuntimeError("hub reads aborted after repeated rate-limiting: %s" % e) from e
+                continue                                        # retry (respects reduced limit / cooldown)
+            await self._release("ok")
+            return r
+
+
 class _HubCache:
-    """Owns the cache dir, the bounded read queue, and one `_CachedFile` per URL."""
+    """Owns the cache dir, the adaptive read queue, and one `_CachedFile` per URL."""
     def __init__(self, cache_dir, headers, max_parallel=8, prefetch=True, chunk=16 << 20, persist=True):
         self.cache_dir = cache_dir; self.headers = headers
         self.max_parallel = max(1, int(max_parallel)); self.prefetch = prefetch
         self.chunk = int(chunk); self.persist = persist
-        self.files = {}; self.tasks = []; self._sem = None; self._loaded = False
-
-    def _semaphore(self):
-        import asyncio
-        if self._sem is None:
-            self._sem = asyncio.Semaphore(self.max_parallel)
-        return self._sem
+        self.files = {}; self.tasks = []; self._loaded = False
+        self.limiter = _AdaptiveLimiter(self.max_parallel)
 
     async def _net(self, url, offset, length):
-        async with self._semaphore():                         # bounded queue for range reads
-            return await _fetch_range(url, offset, length, self.headers)
+        rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
+        return await self.limiter.run(lambda: _fetch_once(url, rng, self.headers))
 
     async def _size(self, url):
         try: return await _remote_size(url, self.headers)

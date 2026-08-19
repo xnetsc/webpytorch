@@ -179,8 +179,16 @@ is a hidden default. Pick the one matching where your files live:
   In the browser the cache dir is automatically backed by **IndexedDB (IDBFS)** and synced,
   so the cache **survives page reloads** — no setup needed. `persist=False` keeps an
   in-session-only cache (browser MEMFS, wiped on reload).
-- All range reads (prefetch chunks included) go through a **bounded queue** — at most
-  `max_parallel` concurrent network reads. `cache=False` disables caching (pure streaming);
+- All range reads (prefetch chunks included) go through an **adaptive queue**. `max_parallel`
+  is the **ceiling** of concurrent network reads; the live limit self-tunes to rate-limiting:
+  on a **rate-limit** (HTTP 429, or a response body containing rate-limit wording — "rate
+  limit", "too many requests", "限速", "太快", "频繁", "超出", … in EN or 中文) the limit halves
+  and, at 0, cools down for an escalating interval (30→60→120→180s, capped at 3 min) then
+  reopens and retries; a successful read climbs the limit back toward the ceiling. It only
+  **aborts** when reads are stalled to 0 concurrency **with nothing in flight** and the
+  cooldowns are exhausted — while any request is still succeeding, the current limit is held
+  as the sustainable value. **Non-rate-limit errors are not retried** — they propagate
+  immediately with the server's message. `cache=False` disables caching (pure streaming);
   `prefetch=False` keeps the cache but no read-ahead.
 
 **How the URL mapping works.** A loader turns the repo id into file names like
