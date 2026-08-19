@@ -142,11 +142,17 @@ The library core never touches the filesystem — and it ships with **no default
 read/write raises `RuntimeError` (fail-fast, never a silent fallback). The two are mirror
 images:
 
-```python
-# Option A — built-ins (browser fetch+Range / host+Pyodide open). One explicit call:
-webtorch.use_default_io()
+The callback you install also decides **where bytes come from**:
 
-# Option B — bring your own storage (OPFS / IndexedDB / S3 / socket / …):
+```python
+# Option A — your OWN files (your server / CDN / local disk). NOT a hub: `name` is fetched
+# as-is (browser: relative to the page origin), no caching:
+webtorch.use_default_io()                       # built-in browser fetch+Range / host open
+
+# Option B — load from a model hub by repo id (cached + read-ahead), see §2:
+webtorch.set_io_read(webtorch.hf_read())        # Hugging Face; or webtorch.modelscope_read()
+
+# Option C — bring your own storage (OPFS / IndexedDB / S3 / socket / …):
 async def my_read(name, offset=0, length=None) -> bytes:   # length None = whole file
     ...                                                    # `name` is just a key/URL/path you gave a loader
 async def my_write(name, data, offset=0) -> None:          # offset 0 = whole file
@@ -154,6 +160,10 @@ async def my_write(name, data, offset=0) -> None:          # offset 0 = whole fi
 webtorch.set_io_read(my_read)
 webtorch.set_io_write(my_write)
 ```
+
+> `use_default_io()` is **not** a hub: with it, `from_pretrained("Qwen/Qwen2-0.5B-Instruct")`
+> resolves `"Qwen/Qwen2-0.5B-Instruct/config.json"` relative to your page origin, **not** to
+> Hugging Face. To load by repo id from a hub, install `hf_read()` / `modelscope_read()`.
 
 `offset`/`length` mark ranged/streaming access (int4 weight shards, streamed quantizer
 output) so a callback can issue an HTTP Range request or seek into storage. Public APIs also

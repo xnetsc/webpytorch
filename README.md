@@ -32,23 +32,26 @@ loss = nn.CrossEntropyLoss()(net(x), y); loss.backward(); opt.step()
 
 Loading models needs IO, and **IO is required** — install it once (or use the built-in):
 
+Installing a read callback selects **where the bytes come from** — these are parallel choices:
+
 ```python
 import webtorch
-webtorch.use_default_io()                    # REQUIRED — built-in browser fetch / host open
-# ...or bring your own storage (OPFS / IndexedDB / S3 / …):
-#   async def read(name, offset=0, length=None) -> bytes: ...
-#   async def write(name, data, offset=0) -> None: ...
-#   webtorch.set_io_read(read); webtorch.set_io_write(write)
 
-# Any CausalLM/MoE model, identified by its config — int4 / int8 / fp16:
-lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")
+# (A) Your OWN files (your server / a CDN / local disk). use_default_io() is NOT a hub:
+#     it fetches the `name` string as-is (browser: relative to the page origin), no caching.
+webtorch.use_default_io()                    # built-in browser fetch / host open
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")  # /models/… you host
 print(lm.generate("Hello", max_new=64))
 
-# ...or load straight from a model hub by repo id (install the hub read callback). Files are
-# cached with background read-ahead and persist across page reloads (browser: IndexedDB):
+# (B) Straight from a model hub by repo id — install the hub reader (cached + read-ahead,
+#     persists across page reloads via IndexedDB). This is what maps to Hugging Face / 魔搭:
 webtorch.set_io_read(webtorch.hf_read())            # or webtorch.modelscope_read() for 魔搭
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
 print(lm.generate("The capital of France is", max_new=8))
+
+# (C) Bring your own storage (OPFS / IndexedDB / S3 / …): your own async read/write callbacks.
+#   async def read(name, offset=0, length=None) -> bytes: ...
+#   webtorch.set_io_read(read); webtorch.set_io_write(write)
 
 # Task pipelines: built-in names are pre-registered loaders — add your own, no SDK edit:
 async def load_my_llm(**kw):
@@ -81,9 +84,12 @@ print(gen("Hi", max_new=32))
   LLMs) with `register_pipeline` **without changing the SDK**. Ships text-to-speech
   (CosyVoice2 incl. zero-shot voice cloning, VITS), detection (YOLO/DETR), and
   vision-language (Qwen2.5-VL).
-- **Bring-your-own IO (required)** — the core does no IO itself. Install one global async
-  read + one write callback (`set_io_read`/`set_io_write`), or call `use_default_io()` for
-  the built-in browser-fetch / host-open pair; until then, any load fails fast.
+- **Bring-your-own IO (required) — pick your data source.** The core does no IO itself; the
+  callback you install decides where bytes come from: `use_default_io()` for **your own
+  files** (fetch/open the `name` as-is — *not* a hub, no caching), `hf_read()` /
+  `modelscope_read()` to load **from Hugging Face / ModelScope** by repo id (cached +
+  read-ahead), or your own `set_io_read`/`set_io_write` for any storage. Until one is
+  installed, any load fails fast.
 
 ## Quickstart
 

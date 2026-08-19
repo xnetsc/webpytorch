@@ -138,18 +138,33 @@ to external storage without either fitting in memory. `name` is just a string ha
 your callback (a path, URL, or object key) — the SDK never assumes it is local; the browser
 default resolves it as a URL relative to the page origin.
 
-### Installable read callbacks — built-in and model hubs
-These are `io_read`-shaped async callbacks you **install yourself** via `set_io_read`; none
-is a hidden default. Pick the one matching where your files live:
+### Installable read callbacks — choose your data source
+These are `io_read`-shaped async callbacks you **install yourself** via `set_io_read`; none is
+a hidden default. They are **three parallel data sources** — installing one selects *where the
+bytes come from*. Pick the one matching where your files live:
 
-- `webtorch.default_io_read` / `webtorch.default_io_write` — the built-ins. `default_io_read`
-  reads via browser `fetch`+Range (in Pyodide) or host `urllib`/`open`; `default_io_write`
-  writes via host/Pyodide `open`+seek. Install them yourself, or call `use_default_io()`
-  (which just does `set_io_read(default_io_read); set_io_write(default_io_write)`):
+| install | bytes come from | `name` handling | cache / read-ahead |
+|---|---|---|---|
+| `use_default_io()` (= `default_io_read`/`default_io_write`) | **your own server / local disk** | `name` used **verbatim** as a path/URL (browser: relative to the page origin) | none |
+| `set_io_read(hf_read())` | **Hugging Face Hub** | `"<org>/<repo>/<path>"` → the HF file URL | yes |
+| `set_io_read(modelscope_read())` | **ModelScope (魔搭)** | `"<org>/<repo>/<path>"` → the ModelScope file URL | yes |
+
+> **`use_default_io()` is *not* a hub.** It does no repo-id→URL mapping and no caching — it
+> just `fetch`es / `open`s the `name` string as-is. So with `use_default_io()`,
+> `from_pretrained("Qwen/Qwen2-0.5B-Instruct")` resolves `"Qwen/Qwen2-0.5B-Instruct/config.json"`
+> **relative to your page origin** (e.g. `https://your.site/Qwen/…`), **not** to Hugging Face.
+> To load from a hub by repo id, install `hf_read()` / `modelscope_read()` instead. Use
+> `use_default_io()` when *you* host the weight files (your server, a CDN, `/models/…`, local disk).
+
+- `webtorch.default_io_read` / `webtorch.default_io_write` — the built-ins for **self-hosted /
+  local** files. `default_io_read` reads via browser `fetch`+Range (in Pyodide) or host
+  `urllib`/`open`; `default_io_write` writes via host/Pyodide `open`+seek. `name` is used
+  verbatim (a path or full URL); no hub mapping, no cache. Install them yourself, or call
+  `use_default_io()` (which just does `set_io_read(default_io_read); set_io_write(default_io_write)`):
   ```python
-  webtorch.set_io_read(webtorch.default_io_read)     # explicit form
-  webtorch.set_io_write(webtorch.default_io_write)
-  # or simply: webtorch.use_default_io()
+  webtorch.use_default_io()                           # serve your OWN files (name used as-is)
+  lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")  # /models/… on your server
+  # explicit form: webtorch.set_io_read(webtorch.default_io_read); webtorch.set_io_write(webtorch.default_io_write)
   ```
 - `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
   max_parallel=8, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
