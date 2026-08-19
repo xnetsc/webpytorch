@@ -773,6 +773,123 @@ def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
     return read
 
 
+# ============================ cache management ============================
+# The persistent cache would otherwise grow write-only. These inspect / read / write / delete
+# it, keyed by cache dir (default `default_cache_dir()`). Every entry's key is the URL without
+# scheme, so its FIRST path segment is the HOST/domain — HF ("huggingface.co/…") and ModelScope
+# ("modelscope.cn/…") entries never mix and can be listed/cleared per host. All are async so the
+# browser's IndexedDB-backed cache is loaded first (and flushed after any change).
+
+def default_cache_dir():
+    """The cache directory the hub readers / `make_cached_reader` use by default
+    ($WEBTORCH_CACHE or ~/.cache/webtorch/hub)."""
+    return _default_hub_cache()
+
+def _cache_host(key):
+    return key.replace("\\", "/").split("/", 1)[0]
+
+async def cache_list(cache_dir=None, host=None):
+    """List cached entries (loads the browser IndexedDB cache first). Returns, sorted by key,
+    `[{"key", "host", "size", "complete", "path"}]`. `host` (e.g. "huggingface.co") filters to
+    one domain. `key` is the URL without scheme; pass it to `cache_read/cache_delete`."""
+    import os
+    root = cache_dir or _default_hub_cache()
+    await _persist_load(root)
+    out = []
+    if os.path.isdir(root):
+        for dp, _dn, fns in os.walk(root):
+            for f in fns:
+                if f.endswith(".complete") or f.endswith(".part"):
+                    continue
+                ap = os.path.join(dp, f); key = os.path.relpath(ap, root).replace("\\", "/")
+                h = _cache_host(key)
+                if host is not None and h != host:
+                    continue
+                try: sz = os.path.getsize(ap)
+                except OSError: sz = 0
+                out.append({"key": key, "host": h, "size": sz,
+                            "complete": os.path.exists(ap + ".complete"), "path": ap})
+    out.sort(key=lambda e: e["key"])
+    return out
+
+async def cache_hosts(cache_dir=None):
+    """Per-domain summary so HF vs ModelScope (etc.) are separated:
+    `[{"host", "files", "size"}]`, largest first."""
+    agg = {}
+    for e in await cache_list(cache_dir):
+        a = agg.setdefault(e["host"], {"host": e["host"], "files": 0, "size": 0})
+        a["files"] += 1; a["size"] += e["size"]
+    return sorted(agg.values(), key=lambda a: -a["size"])
+
+async def cache_size(cache_dir=None, host=None):
+    """Total bytes cached (optionally for one `host`)."""
+    return sum(e["size"] for e in await cache_list(cache_dir, host))
+
+async def cache_read(key, offset=0, length=None, cache_dir=None):
+    """Read bytes from a cached entry by its `key` (a `cache_list` key or a full URL). Returns
+    None if that entry is not cached."""
+    import os
+    root = cache_dir or _default_hub_cache(); await _persist_load(root)
+    p = os.path.join(root, _url_key(key))
+    if not os.path.exists(p):
+        return None
+    with open(p, "rb") as f:
+        if offset: f.seek(offset)
+        return f.read() if length is None else f.read(length)
+
+async def cache_write(key, data, cache_dir=None, complete=True):
+    """Write/replace a cache entry's bytes (pre-seed the cache). `complete=True` marks it fully
+    cached (so a reader serves it from disk). Persists to IndexedDB in the browser."""
+    import os
+    root = cache_dir or _default_hub_cache(); await _persist_load(root)
+    p = os.path.join(root, _url_key(key)); d = os.path.dirname(p)
+    if d:
+        try: os.makedirs(d, exist_ok=True)
+        except Exception: pass
+    with open(p, "wb") as f:
+        f.write(bytes(data))
+    marker = p + ".complete"
+    if complete:
+        try: open(marker, "w").close()
+        except Exception: pass
+    else:
+        try: os.remove(marker)
+        except OSError: pass
+    await _persist_flush(root)
+
+async def cache_delete(key, cache_dir=None):
+    """Delete one cached entry (its data + `.complete` + `.part`). Persists. -> True if it
+    existed. (Applies on disk; a live reader created earlier may still hold it in memory.)"""
+    import os
+    root = cache_dir or _default_hub_cache(); await _persist_load(root)
+    p = os.path.join(root, _url_key(key)); existed = os.path.exists(p)
+    for q in (p, p + ".complete", p + ".part"):
+        try: os.remove(q)
+        except OSError: pass
+    await _persist_flush(root)
+    return existed
+
+async def cache_clear(cache_dir=None, host=None):
+    """Delete all cached entries (or only one `host`/domain's). Persists. -> # data files
+    removed."""
+    import os
+    root = cache_dir or _default_hub_cache()
+    entries = await cache_list(cache_dir, host)          # loads persistence, host-filtered
+    n = 0
+    for e in entries:
+        for q in (e["path"], e["path"] + ".complete", e["path"] + ".part"):
+            try: os.remove(q)
+            except OSError: pass
+        n += 1
+    if os.path.isdir(root):                              # prune now-empty subdirs
+        for dp, _dn, _fn in os.walk(root, topdown=False):
+            if dp != root:
+                try: os.rmdir(dp)
+                except OSError: pass
+    await _persist_flush(root)
+    return n
+
+
 # ---- model-hub readers: thin clients of make_cached_reader over the HTTP transport ----
 def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
     hdr = {"Authorization": "Bearer " + token} if token else None

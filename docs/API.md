@@ -193,6 +193,41 @@ webtorch.set_io_read(reader)
 - `cache` / `cache_dir` / `max_parallel` / `prefetch` / `chunk_mb` / `persist`: identical to
   `hf_read`.
 
+#### Managing the persistent cache
+Because the cache persists, it needs housekeeping — list / inspect / read / write / delete /
+clear it, so it never becomes dead data. All are **async** (they load the browser's
+IndexedDB-backed cache first, and flush any change back). Every entry's **key is the URL
+without scheme, so its first path segment is the host/domain** — HF (`huggingface.co/…`) and
+ModelScope (`modelscope.cn/…`) entries are separated and can be listed or cleared per host.
+
+- `webtorch.default_cache_dir() -> str` — the dir the readers use by default
+  (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`). All functions below take `cache_dir=None`
+  meaning this default.
+- `await webtorch.cache_list(cache_dir=None, host=None) -> [ {"key","host","size","complete","path"} ]`
+  — every cached entry, sorted by key; `host="huggingface.co"` filters to one domain.
+- `await webtorch.cache_hosts(cache_dir=None) -> [ {"host","files","size"} ]` — per-domain
+  summary (largest first), so you can see HF vs ModelScope usage at a glance.
+- `await webtorch.cache_size(cache_dir=None, host=None) -> int` — total bytes cached
+  (optionally for one host).
+- `await webtorch.cache_read(key, offset=0, length=None, cache_dir=None) -> bytes | None` —
+  read a cached entry's bytes (a `cache_list` key, or a full URL); `None` if not cached.
+- `await webtorch.cache_write(key, data, cache_dir=None, complete=True) -> None` — write /
+  replace an entry (pre-seed the cache); `complete=True` marks it fully cached so a reader
+  serves it from disk. Persists to IndexedDB in the browser.
+- `await webtorch.cache_delete(key, cache_dir=None) -> bool` — delete one entry (its data +
+  markers); `True` if it existed. Persists.
+- `await webtorch.cache_clear(cache_dir=None, host=None) -> int` — delete everything (or only
+  one `host`'s entries); returns the number of files removed. Persists.
+
+```python
+for h in await webtorch.cache_hosts():          # e.g. [{"host":"huggingface.co","files":9,"size":9_999_999}, …]
+    print(h["host"], h["files"], h["size"])
+await webtorch.cache_clear(host="modelscope.cn")  # free just the ModelScope cache
+```
+
+Note: these act on disk; a reader object created earlier may still hold a just-deleted entry
+in memory for its lifetime — clear the cache between loads or before creating the reader.
+
 **Caching & read-ahead (default on).** Each hub reader caches to a local dir
 (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`, override with `cache_dir`):
 - The first *partial* read of a file starts a **background whole-file prefetch** that streams
