@@ -179,17 +179,40 @@ is a hidden default. Pick the one matching where your files live:
   In the browser the cache dir is automatically backed by **IndexedDB (IDBFS)** and synced,
   so the cache **survives page reloads** — no setup needed. `persist=False` keeps an
   in-session-only cache (browser MEMFS, wiped on reload).
-- All range reads (prefetch chunks included) go through an **adaptive queue**. `max_parallel`
-  is the **ceiling** of concurrent network reads; the live limit self-tunes to rate-limiting:
-  on a **rate-limit** (HTTP 429, or a response body containing rate-limit wording — "rate
-  limit", "too many requests", "限速", "太快", "频繁", "超出", … in EN or 中文) the limit halves
-  and, at 0, cools down for an escalating interval (30→60→120→180s, capped at 3 min) then
-  reopens and retries; a successful read climbs the limit back toward the ceiling. It only
-  **aborts** when reads are stalled to 0 concurrency **with nothing in flight** and the
-  cooldowns are exhausted — while any request is still succeeding, the current limit is held
-  as the sustainable value. **Non-rate-limit errors are not retried** — they propagate
-  immediately with the server's message. `cache=False` disables caching (pure streaming);
+- All range reads (prefetch chunks included) go through an **adaptive queue** governed by
+  `max_parallel` — see the box below. `cache=False` disables caching (pure streaming);
   `prefetch=False` keeps the cache but no read-ahead.
+
+#### `max_parallel` — adaptive concurrency (the read queue)
+`max_parallel` (default **8**) is the **ceiling** on concurrent network range reads, not a
+fixed count. The live limit *self-tunes* to how the server responds, so it drives the pipe as
+fast as the hub allows and backs off under rate-limiting instead of failing:
+
+- **What counts as rate-limiting.** HTTP **429**, or any response whose body contains
+  rate-limit wording — English or 中文: `rate limit`, `too many requests`, `try again later`,
+  `slow down`, `quota`, `throttled`, `限速`, `限流`, `太快`, `过于频繁`, `频繁`, `请求过多`,
+  `超出`, `请稍后`. (Some hubs signal a limit with a 200/403/**404** body rather than 429 —
+  ModelScope does — so the wording check matters.)
+- **Back-off (rate-limited).** The live limit **halves**. It is **not** immediately reduced
+  to 0 while other reads are still succeeding — that current value is treated as the
+  sustainable concurrency and held. A **successful** read additively climbs the limit back up
+  toward the ceiling.
+- **Cooldown (stalled to 0).** Only when the limit reaches **0 concurrency and no read is in
+  flight** does it cool down, for an **escalating** interval — **30 → 60 → 120 → 180s, capped
+  at 3 minutes** — then reopens to a single probe and retries. A success resets the escalation.
+- **Abort (rate-limit).** It raises **only** when it is stalled to 0 concurrency, **nothing is
+  in flight**, and the cooldowns are exhausted (a rate-limit persists past the final 3-minute
+  cooldown). As long as *any* range request is still succeeding, it never aborts — the current
+  limit is simply the best sustainable value.
+- **Non-rate-limit errors are never retried** (a genuine 404, 5xx, malformed response, TLS
+  failure, timeout, …). They propagate with the server's actual message. That raise is
+  **deferred until no range request is in flight** (new reads pause meanwhile), so an error is
+  surfaced from a quiescent state rather than racing other in-flight reads; if nothing is in
+  flight it raises immediately.
+
+Net effect: on a healthy hub it runs up to `max_parallel` reads at once; under throttling it
+settles at the highest concurrency the hub tolerates (cooling down and retrying if pushed to
+zero); and it fails fast, with the real message, on genuine errors.
 
 **How the URL mapping works.** A loader turns the repo id into file names like
 `"<org>/<repo>/config.json"`; the callback splits the first two segments as the repo and maps

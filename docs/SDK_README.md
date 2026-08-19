@@ -184,12 +184,14 @@ fully cached it is marked complete, so a **later run reads it from disk with zer
 The cache is **persistent by default** (`persist=True`): on the host it is a real dir, and in
 the browser it is automatically backed by **IndexedDB (IDBFS)** and synced, so it **survives
 page reloads** with no setup. All range reads share an **adaptive queue**: `max_parallel`
-(default 8) is the ceiling, and the live concurrency self-tunes to rate-limiting — on a 429
-(or a body with rate-limit wording, EN/中文) it halves and cools down (30→60→120→180s, cap
-3 min) then recovers, holding the current value while any request still succeeds and only
-aborting when fully stalled with nothing in flight; non-rate-limit errors fail fast with the
-server's message. `cache=False` = pure streaming; `prefetch=False` = cache without
-read-ahead; `persist=False` = in-session-only (browser MEMFS).
+(default 8) is the *ceiling*, and the live concurrency self-tunes to rate-limiting — on a 429
+(or a body with rate-limit wording, EN/中文) it halves and, if pushed to 0 with nothing in
+flight, cools down (30→60→120→180s, cap 3 min) then recovers, holding the current value while
+any request still succeeds and only aborting when fully stalled with nothing in flight.
+Non-rate-limit errors are never retried and propagate with the server's message (that raise is
+deferred until no read is in flight). See the API reference for the full `max_parallel`
+behavior. `cache=False` = pure streaming; `prefetch=False` = cache without read-ahead;
+`persist=False` = in-session-only (browser MEMFS).
 
 **URL mapping.** A loader turns the repo id into file names like `"<org>/<repo>/config.json"`;
 the callback splits the first two segments as the repo and maps the rest to the hub file URL —
