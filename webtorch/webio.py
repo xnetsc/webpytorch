@@ -588,15 +588,21 @@ class _CachedFile:
 _COOLDOWNS = [30, 60, 120, 180]
 
 class _AdaptiveLimiter:
-    """A concurrency gate whose live limit adapts to rate-limiting. `ceiling` is the max
-    parallel network reads. On a **rate-limit** (HTTP 429, or a body with rate-limit wording)
-    the limit halves; at 0 it cools down for an escalating interval (30→60→120→180s) then
-    reopens to 1 and retries; a rate-limit after the last cooldown aborts. On success the
-    limit additively climbs back toward `ceiling`. Both terminal conditions only fire when
-    **no range request is in flight** — while any read is still succeeding, the current limit
-    is held as the sustainable value. **Non-rate-limit errors are not retried**, but their
-    raise is likewise deferred until nothing is in flight (new reads pause meanwhile), then
-    they propagate with the server's message."""
+    """A concurrency gate whose live limit adapts to a hub's real capacity. `ceiling` is the
+    max parallel network reads; the live `limit` self-tunes:
+
+    - **Success** additively climbs `limit` back toward `ceiling` (and reopens it from 0).
+    - **Explicit rate-limit** (HTTP 429, or a body with rate-limit wording) **halves** `limit`.
+    - **A non-rate-limit error while other reads are still in flight** is treated as an
+      *undisclosed* capacity/rate signal — some servers just error instead of returning 429 —
+      so the concurrency is capped to the number still succeeding (the sweet spot) and the read
+      is retried, NOT raised.
+    - **A non-rate-limit error with no read in flight** is a genuine failure: it is not retried
+      and propagates immediately with the server's message.
+    - When (and only when) an explicit rate-limit drives `limit` to 0 **with nothing in
+      flight**, it cools down for an escalating interval (30→60→120→180s, cap 3 min) then
+      reopens to 1; a rate-limit persisting past the last cooldown aborts. A cooldown/abort
+      never fires while any read is still succeeding."""
     def __init__(self, ceiling):
         self.ceiling = max(1, int(ceiling))
         self.limit = self.ceiling
@@ -605,7 +611,6 @@ class _AdaptiveLimiter:
         self.cool_level = 0
         self.cooling = False
         self.failed = False
-        self.fatal = None                                     # a non-rate error awaiting an idle moment
         self._cond = None
 
     def _c(self):
@@ -620,56 +625,48 @@ class _AdaptiveLimiter:
             while True:
                 if self.failed:
                     raise RuntimeError("hub reads aborted: still rate-limited after cooling down to 3 min")
-                if self.fatal is not None:                    # a fatal error is pending: no new reads;
-                    if self.inflight == 0:                    # once idle, surface it to everyone
-                        raise self.fatal
-                    await c.wait(); continue
                 if self.limit >= 1 and self.inflight < self.limit:
                     self.inflight += 1
                     return
                 await c.wait()
 
-    async def _release(self, outcome, fatal=None):
-        """outcome: 'ok' | 'rate' | 'other'. Returns True only if the limiter has truly given
-        up (rate-limited to 0 concurrency AND nothing in flight AND cooldowns exhausted). A
-        non-rate error registers `fatal` (raised later, once idle) but never changes the limit."""
-        import asyncio
-        c = self._c(); giveup = False
-        async with c:
-            self.inflight -= 1
-            if outcome == "ok":
-                self.cool_level = 0
-                if self.limit == 0:
-                    self.limit = 1; self.succ = 0            # a success reopens from 0
-                else:
-                    self.succ += 1
-                    if self.limit < self.ceiling and self.succ >= 2:
-                        self.limit += 1; self.succ = 0
-            elif outcome == "rate":
-                self.succ = 0
-                self.limit = (self.limit // 2) if self.limit > 1 else 0
-                # only stall/abort when the system is truly dead: limit 0 AND no other request
-                # in flight. While others run, the current limit is the sweet spot — hold it.
-                if self.limit == 0 and self.inflight == 0 and not self.cooling:
-                    if self.cool_level >= len(_COOLDOWNS):
-                        self.failed = True; giveup = True     # count==0 + abort condition -> stop
-                    else:
-                        dur = _COOLDOWNS[self.cool_level]; self.cool_level += 1
-                        self.cooling = True
-                        asyncio.ensure_future(self._cooldown(dur))
-            elif outcome == "other":                          # non-rate error: defer the raise
-                if self.fatal is None and fatal is not None:
-                    self.fatal = fatal
-            c.notify_all()
-        return giveup
-
-    async def _raise_when_idle(self):
-        """Block until no range request is in flight, then raise the pending fatal error."""
+    async def _release_ok(self):
         c = self._c()
         async with c:
-            while self.inflight > 0:
-                await c.wait()
-            raise self.fatal
+            self.inflight -= 1
+            self.cool_level = 0
+            if self.limit == 0:
+                self.limit = 1; self.succ = 0                 # a success reopens from 0
+            else:
+                self.succ += 1
+                if self.limit < self.ceiling and self.succ >= 2:
+                    self.limit += 1; self.succ = 0
+            c.notify_all()
+
+    async def _on_error(self, e):
+        """Classify a failed read -> 'raise' (genuine, propagate e) | 'abort' (rate-limit gave
+        up) | 'retry' (back off and try again)."""
+        import asyncio
+        c = self._c()
+        async with c:
+            self.inflight -= 1
+            is_rate = isinstance(e, _HttpError) and _is_rate_limited(e.status, e.body)
+            if not is_rate and self.inflight == 0:
+                c.notify_all(); return "raise"                # solo non-rate error -> genuine failure
+            # explicit rate-limit, OR a non-rate error while peers still succeed (undisclosed
+            # rate-limit): back off to a sustainable concurrency and retry.
+            self.succ = 0
+            if is_rate:
+                self.limit = (self.limit // 2) if self.limit > 1 else 0
+            else:
+                self.limit = self.inflight                    # peers still running = the sweet spot
+            if self.limit == 0 and self.inflight == 0 and not self.cooling:
+                if self.cool_level >= len(_COOLDOWNS):
+                    self.failed = True; c.notify_all(); return "abort"
+                dur = _COOLDOWNS[self.cool_level]; self.cool_level += 1
+                self.cooling = True
+                asyncio.ensure_future(self._cooldown(dur))
+            c.notify_all(); return "retry"
 
     async def _cooldown(self, dur):
         import asyncio
@@ -686,14 +683,13 @@ class _AdaptiveLimiter:
             try:
                 r = await attempt()
             except Exception as e:
-                rate = isinstance(e, _HttpError) and _is_rate_limited(e.status, e.body)
-                if not rate:                                    # non-rate: no retry, raise once idle
-                    await self._release("other", fatal=e)
-                    await self._raise_when_idle()               # raises e when no read is in flight
-                if await self._release("rate"):
+                action = await self._on_error(e)
+                if action == "raise":
+                    raise e                                     # genuine non-rate error (solo)
+                if action == "abort":
                     raise RuntimeError("hub reads aborted after repeated rate-limiting: %s" % e) from e
                 continue                                        # retry (respects reduced limit / cooldown)
-            await self._release("ok")
+            await self._release_ok()
             return r
 
 
@@ -755,11 +751,13 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
     `cache=False` streams with no cache, `cache_dir` picks the location, `prefetch=False`
     disables read-ahead, `chunk_mb` is the prefetch chunk size, `persist=False` keeps an
     in-session-only (browser MEMFS) cache. `token` is a Bearer header for gated repos.
-    `max_parallel` is the **ceiling** on concurrent range reads; the live limit adapts to
-    rate-limiting (429 or a rate-limit body): it halves under throttling, cools down
-    (30→60→120→180s, cap 3 min) if pushed to 0 with nothing in flight, and climbs back on
-    success — aborting only when a rate-limit persists past the last cooldown with nothing in
-    flight. Non-rate errors are not retried (raise deferred until idle). Reads only."""
+    `max_parallel` is the **ceiling** on concurrent range reads; the live limit adapts to a
+    hub's real capacity. An explicit rate-limit (429 or a rate-limit body) halves it; it cools
+    down (30→60→120→180s, cap 3 min) only if pushed to 0 with nothing in flight, and climbs
+    back on success — aborting only when a rate-limit persists past the last cooldown with
+    nothing in flight. A non-rate error while other reads still succeed is treated as an
+    undisclosed capacity signal (concurrency capped to the in-flight count, read retried); a
+    non-rate error with nothing in flight is genuine and raises immediately. Reads only."""
     ep = endpoint.rstrip("/")
     return _hub_reader(lambda repo, path: "%s/%s/resolve/%s/%s" % (ep, repo, revision, path),
                        token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)

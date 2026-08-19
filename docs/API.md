@@ -204,11 +204,15 @@ fast as the hub allows and backs off under rate-limiting instead of failing:
   in flight**, and the cooldowns are exhausted (a rate-limit persists past the final 3-minute
   cooldown). As long as *any* range request is still succeeding, it never aborts — the current
   limit is simply the best sustainable value.
-- **Non-rate-limit errors are never retried** (a genuine 404, 5xx, malformed response, TLS
-  failure, timeout, …). They propagate with the server's actual message. That raise is
-  **deferred until no range request is in flight** (new reads pause meanwhile), so an error is
-  surfaced from a quiescent state rather than racing other in-flight reads; if nothing is in
-  flight it raises immediately.
+- **Non-rate-limit errors depend on whether reads are in flight.** Some servers throttle by
+  simply erroring (no 429, no rate-limit wording), so a non-rate error is only trusted as
+  *genuine* when it happens with **no other read in flight**: then it is not retried and
+  propagates immediately with the server's actual message (a real 404 / 5xx / malformed
+  response / TLS failure / timeout). But a non-rate error **while other reads are still
+  succeeding** is taken as an *undisclosed* capacity signal — the concurrency is capped to the
+  number still in flight (that is the sweet spot) and the read is **retried**, not raised. A
+  genuinely broken read still surfaces: as concurrency winds down it eventually errors with
+  nothing else in flight, and then raises.
 
 Net effect: on a healthy hub it runs up to `max_parallel` reads at once; under throttling it
 settles at the highest concurrency the hub tolerates (cooling down and retrying if pushed to

@@ -188,8 +188,10 @@ page reloads** with no setup. All range reads share an **adaptive queue**: `max_
 (or a body with rate-limit wording, EN/中文) it halves and, if pushed to 0 with nothing in
 flight, cools down (30→60→120→180s, cap 3 min) then recovers, holding the current value while
 any request still succeeds and only aborting when fully stalled with nothing in flight.
-Non-rate-limit errors are never retried and propagate with the server's message (that raise is
-deferred until no read is in flight). See the API reference for the full `max_parallel`
+A non-rate-limit error is trusted as genuine (raised with the server's message) only when no
+other read is in flight; while other reads still succeed it is treated as an undisclosed
+capacity signal — concurrency is capped to the in-flight count and the read retried (some
+servers throttle by simply erroring). See the API reference for the full `max_parallel`
 behavior. `cache=False` = pure streaming; `prefetch=False` = cache without read-ahead;
 `persist=False` = in-session-only (browser MEMFS).
 
