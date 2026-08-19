@@ -126,7 +126,7 @@ For demos and the common browser case, one explicit call installs the built-ins
 (browser `fetch`+Range for reads / host+Pyodide `open` for reads & writes):
 
 ```python
-webtorch.use_default_io()         # installs default_io_read + default_io_write
+webtorch.use_default_io()         # built-in reader (caches network reads) + writer
 ```
 
 `offset`/`length` are populated for ranged/streaming access (int4 weight shards use an HTTP
@@ -145,27 +145,38 @@ bytes come from*. Pick the one matching where your files live:
 
 | install | bytes come from | `name` handling | cache / read-ahead |
 |---|---|---|---|
-| `use_default_io()` (= `default_io_read`/`default_io_write`) | **your own server / local disk** | `name` used **verbatim** as a path/URL (browser: relative to the page origin) | none |
+| `use_default_io()` | **your own server / local disk** | `name` used **verbatim** as a path/URL (browser: relative to the page origin) | **network reads cached** (browser fetches + http/https URLs); local host files read directly |
 | `set_io_read(hf_read())` | **Hugging Face Hub** | `"<org>/<repo>/<path>"` → the HF file URL | yes |
 | `set_io_read(modelscope_read())` | **ModelScope (魔搭)** | `"<org>/<repo>/<path>"` → the ModelScope file URL | yes |
 
-> **`use_default_io()` is *not* a hub.** It does no repo-id→URL mapping and no caching — it
-> just `fetch`es / `open`s the `name` string as-is. So with `use_default_io()`,
+> **`use_default_io()` is *not* a hub.** It does no repo-id→URL mapping — it just `fetch`es /
+> `open`s the `name` string as-is. So with `use_default_io()`,
 > `from_pretrained("Qwen/Qwen2-0.5B-Instruct")` resolves `"Qwen/Qwen2-0.5B-Instruct/config.json"`
 > **relative to your page origin** (e.g. `https://your.site/Qwen/…`), **not** to Hugging Face.
 > To load from a hub by repo id, install `hf_read()` / `modelscope_read()` instead. Use
 > `use_default_io()` when *you* host the weight files (your server, a CDN, `/models/…`, local disk).
 
-- `webtorch.default_io_read` / `webtorch.default_io_write` — the built-ins for **self-hosted /
-  local** files. `default_io_read` reads via browser `fetch`+Range (in Pyodide) or host
-  `urllib`/`open`; `default_io_write` writes via host/Pyodide `open`+seek. `name` is used
-  verbatim (a path or full URL); no hub mapping, no cache. Install them yourself, or call
-  `use_default_io()` (which just does `set_io_read(default_io_read); set_io_write(default_io_write)`):
+**Caching in `use_default_io()`.** By default it **caches network reads** with the same
+read-ahead + persistence as the hub readers, so a reload / re-run does not re-download: in the
+browser every read is a network fetch (from the page origin) and is cached (IndexedDB-persistent
+by default); on the host, `http(s)://` URLs are cached while a **local file path is read
+directly and never cached** (caching a local file would only duplicate it). Cached entries share
+the same store and management functions (`list_cache` / `clear_cache` / …), keyed by host. Pass
+`use_default_io(cache=False)` for plain, uncached fetch/open; `cache_dir` / `max_parallel` /
+`prefetch` / `chunk_mb` / `persist` mirror `hf_read` and apply to the cached (network) reads.
+
+- `webtorch.use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True)`
+  — install the built-in IO for **self-hosted / local** files (browser `fetch`+Range or host
+  `urllib`/`open`; `name` used verbatim, no hub mapping), caching network reads as above. Writes
+  always go to the local/Pyodide filesystem.
   ```python
-  webtorch.use_default_io()                           # serve your OWN files (name used as-is)
+  webtorch.use_default_io()                           # serve your OWN files (cached; name used as-is)
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")  # /models/… on your server
-  # explicit form: webtorch.set_io_read(webtorch.default_io_read); webtorch.set_io_write(webtorch.default_io_write)
   ```
+- `webtorch.default_io_read` / `webtorch.default_io_write` — the raw (uncached) built-in
+  transports underneath: `default_io_read` reads via browser `fetch`+Range or host `urllib`/`open`;
+  `default_io_write` writes via host/Pyodide `open`+seek. Install directly if you want the
+  transport without caching (equivalent to `use_default_io(cache=False)`).
 - `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
   max_parallel=8, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
   fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:

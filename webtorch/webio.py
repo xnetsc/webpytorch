@@ -357,12 +357,43 @@ async def default_io_write(name, data, offset=0):
         with open(name, "wb") as f:
             f.write(bytes(data))
 
-def use_default_io():
-    """Opt in to the built-in IO: browser `fetch`+Range for reads / host+Pyodide `open`
-    for reads & writes. One explicit call installs BOTH global callbacks. Convenience for
-    demos/examples and the common browser case; production integrators install their own."""
-    set_io_read(default_io_read)
+def _is_url(name):
+    return name.startswith(("http://", "https://"))
+
+def _in_browser():
+    try:
+        import pyodide.http  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
+    """Opt in to the built-in IO for **your own files** (your server / CDN / local disk):
+    browser `fetch`+Range or host `urllib`/`open`, with the `name` used as-is (NOT a hub — no
+    repo-id→URL mapping). Installs both global callbacks in one call.
+
+    By default it **caches network reads** with the same read-ahead + persistence as the hub
+    readers, so a reload / re-run does not re-download: in the browser every read is a network
+    fetch (from the page origin) and is cached (IndexedDB-persistent by default); on the host,
+    `http(s)://` URLs are cached while a **local file path is read directly, never cached**
+    (caching a local file would just duplicate it). `cache=False` restores plain, uncached
+    fetch/open; `cache_dir`/`max_parallel`/`prefetch`/`chunk_mb`/`persist` mirror `hf_read` and
+    apply to the cached (network) reads. Writes always go to the local/Pyodide filesystem."""
     set_io_write(default_io_write)
+    if not cache:
+        set_io_read(default_io_read); return
+    async def fetch(name, offset, length):                   # the network transport (browser fetch / host urllib)
+        return await http_get(name, offset, length)
+    async def size(name):
+        try: return await http_size(name)
+        except Exception: return None
+    cached = make_cached_reader(fetch, size=size, cache_dir=cache_dir, max_parallel=max_parallel,
+                                prefetch=prefetch, chunk_mb=chunk_mb, persist=persist)
+    async def read(name, offset=0, length=None):
+        if _is_url(name) or _in_browser():                   # network read -> cache it
+            return await cached(name, offset, length)
+        return await default_io_read(name, offset, length)   # local host file -> read directly
+    set_io_read(read)
 
 
 # ---- model-hub read callbacks (io_read-shaped; you INSTALL them, they are NOT a default) ----

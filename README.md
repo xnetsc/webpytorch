@@ -38,8 +38,9 @@ Installing a read callback selects **where the bytes come from** — these are p
 import webtorch
 
 # (A) Your OWN files (your server / a CDN / local disk). use_default_io() is NOT a hub:
-#     it fetches the `name` string as-is (browser: relative to the page origin), no caching.
-webtorch.use_default_io()                    # built-in browser fetch / host open
+#     it fetches the `name` string as-is (browser: relative to the page origin). Network reads
+#     are cached by default (persist across reloads); local host files are read directly.
+webtorch.use_default_io()                    # built-in browser fetch / host open, cached
 lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")  # /models/… you host
 print(lm.generate("Hello", max_new=64))
 
@@ -86,10 +87,10 @@ print(gen("Hi", max_new=32))
   vision-language (Qwen2.5-VL).
 - **Bring-your-own IO (required) — pick your data source.** The core does no IO itself; the
   callback you install decides where bytes come from: `use_default_io()` for **your own
-  files** (fetch/open the `name` as-is — *not* a hub, no caching), `hf_read()` /
-  `modelscope_read()` to load **from Hugging Face / ModelScope** by repo id (cached +
-  read-ahead), or your own `set_io_read`/`set_io_write` for any storage. Until one is
-  installed, any load fails fast.
+  files** (fetch/open the `name` as-is — *not* a hub; network reads cached, local files read
+  directly), `hf_read()` / `modelscope_read()` to load **from Hugging Face / ModelScope** by
+  repo id (cached + read-ahead), or your own `set_io_read`/`set_io_write` for any storage.
+  Until one is installed, any load fails fast.
 
 ## Quickstart
 

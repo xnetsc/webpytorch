@@ -146,8 +146,9 @@ The callback you install also decides **where bytes come from**:
 
 ```python
 # Option A — your OWN files (your server / CDN / local disk). NOT a hub: `name` is fetched
-# as-is (browser: relative to the page origin), no caching:
-webtorch.use_default_io()                       # built-in browser fetch+Range / host open
+# as-is (browser: relative to the page origin). Network reads are cached by default (persist
+# across reloads); local host files are read directly. (cache=False for plain fetch/open.)
+webtorch.use_default_io()                       # built-in browser fetch+Range / host open, cached
 
 # Option B — load from a model hub by repo id (cached + read-ahead), see §2:
 webtorch.set_io_read(webtorch.hf_read())        # Hugging Face; or webtorch.modelscope_read()
@@ -176,7 +177,8 @@ The SDK ships ready-made `io_read`-shaped callbacks — you pass one to `set_io_
 never auto-installed:
 
 ```python
-# Built-ins (browser fetch+Range / host urllib+open). use_default_io() just installs both:
+# Raw (uncached) built-in transports. use_default_io() installs a CACHED reader over these
+# for network reads (== use_default_io(cache=False) installs these two directly):
 webtorch.set_io_read(webtorch.default_io_read); webtorch.set_io_write(webtorch.default_io_write)
 
 # Load straight from a hub by repo id — no separate download step:
