@@ -109,11 +109,11 @@ webtorch/            ← the SDK package  (public API in __init__.py; internals 
   _sdk.py              transformers-style facade + task pipeline registry
   lm_engine.py         generic decoder (CausalLM + MoE series) + samplers + capture
   quantize.py          streaming quantizer (IO-free core)
-  webio.py             the only IO layer: two global async callbacks (read + write) + resolvers
+  webio.py             the only IO layer: global read/write callbacks, hub readers, cached-reader tool + cache mgmt
   onnxrt.py            generic ONNX runtime
   torchshim.py         `import torch` compatibility
   cosyvoice.py tts.py detection.py vl.py audiofe.py   model implementations (internal)
-examples/            runnable examples (loaded by the web demo)
+examples/            runnable examples (loaded by the web demo; io_cache_tools.py runs on the host too)
 webapp/              browser demo harness (index.html, worker.js, main.js) + run.py
 serve-coi.mjs        dev server with COOP/COEP + HTTP Range
 tools/               weight-preparation scripts

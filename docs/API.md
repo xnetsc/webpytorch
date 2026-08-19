@@ -228,6 +228,10 @@ await webtorch.cache_clear(host="modelscope.cn")  # free just the ModelScope cac
 Note: these act on disk; a reader object created earlier may still hold a just-deleted entry
 in memory for its lifetime — clear the cache between loads or before creating the reader.
 
+A complete, runnable demo of `make_cached_reader` (with `HttpError` rate-limit handling) and
+every cache-management function is in **`examples/io_cache_tools.py`** — it uses no GPU or
+models, so it runs on the host directly (`python examples/io_cache_tools.py`).
+
 **Caching & read-ahead (default on).** Each hub reader caches to a local dir
 (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`, override with `cache_dir`):
 - The first *partial* read of a file starts a **background whole-file prefetch** that streams
