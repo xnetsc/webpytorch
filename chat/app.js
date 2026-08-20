@@ -9,12 +9,13 @@ let modelLoaded = false;
 
 // Presets are EXAMPLES ONLY — any ModelScope repo/file works via the two inputs.
 const PRESETS = [
+  { label: 'Qwen3.8-27B · 3-bit UD-Q3_K_XL (13.2 GB) — default', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-Q3_K_XL.gguf' },
+  { label: 'Qwen3.8-27B · UD-IQ3_XXS (10.9 GB)', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-IQ3_XXS.gguf' },
   { label: 'Qwen3-4B-Instruct · Q4_K_M (2.5 GB) — smallest practical', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf' },
   { label: 'Qwen3-4B-Instruct · UD-Q3_K_XL (2.1 GB)', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-UD-Q3_K_XL.gguf' },
   { label: 'Qwen3-8B · Q4_K_M (5.0 GB)', repo: 'unsloth/Qwen3-8B-GGUF', file: 'Qwen3-8B-Q4_K_M.gguf' },
   { label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL (13.8 GB)', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
   { label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL (13.8 GB)', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
-  { label: 'Qwen3.8-27B · UD-Q3_K_XL (13.2 GB)', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-Q3_K_XL.gguf' },
   { label: '— custom (type a repo/file below) —', repo: '', file: '' },
 ];
 

@@ -18,6 +18,7 @@ point of the design.
 The layer exposes the same shape contract as the softmax path: `(T, H) -> (T, H)`, with an
 explicit `state` object so prefill and step-by-step decode share one implementation.
 """
+import math
 import numpy as np
 
 from . import _core as wt
@@ -57,6 +58,15 @@ def causal_conv1d(x, weight, bias=None, state=None):
         tail = ext[-(W - 1):] if T >= 1 else prev
         state[:] = tail
     return out
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(np.asarray(x, np.float32), -60, 60)))
+
+
+def _softplus(x):
+    x = np.asarray(x, np.float32)
+    return np.where(x > 20, x, np.log1p(np.exp(np.clip(x, -60, 20))))
 
 
 def _silu(x):
@@ -100,11 +110,35 @@ class LinearAttention:
     """
 
     def __init__(self, cfg, w, eps=1e-6):
-        self.hk = int(cfg["n_k_heads"]); self.hv = int(cfg["n_v_heads"])
-        self.dk = int(cfg["k_head_dim"]); self.dv = int(cfg["v_head_dim"])
+        self.hk = int(cfg.get("n_k_heads") or 0); self.hv = int(cfg.get("n_v_heads") or 0)
+        self.dk = int(cfg.get("k_head_dim") or 0); self.dv = int(cfg.get("v_head_dim") or 0)
         self.conv_width = int(cfg.get("conv_kernel_dim", 0) or 0)
-        self.H = int(cfg["hidden"]); self.w = w; self.eps = eps
+        self.H = int(cfg.get("hidden") or 0); self.w = w; self.eps = eps
+        self._infer_dims()                                   # fill anything the config omitted
         self.rep = max(1, self.hv // max(1, self.hk))        # key/value head grouping
+
+    def _infer_dims(self):
+        """Derive any head/dim the config did not state from the weights themselves, so a file
+        that omits the ssm.* metadata still loads. Nothing here is model-specific: the shapes
+        come from the tensors the model ships."""
+        A = self.w.get("A"); nrm = self.w.get("norm"); cw = self.w.get("conv_w")
+        if not self.hv and A is not None:
+            self.hv = int(np.asarray(A).size)                # one decay scale per value head
+        if not self.dv and nrm is not None:
+            n = int(np.asarray(nrm).size)
+            self.dv = n if (not self.hv or n != self.hv) else n
+        if cw is not None:
+            conv_dim = int(np.asarray(cw).shape[0])          # 2*hk*dk + hv*dv channels
+            if not self.dk: self.dk = self.dv or 0
+            if self.hv and self.dv and self.dk and not self.hk:
+                key_total = max(0, conv_dim - self.hv * self.dv)
+                self.hk = max(1, key_total // (2 * self.dk))
+        if not self.dk: self.dk = self.dv
+        if not self.dv: self.dv = self.dk
+        if not self.hk: self.hk = self.hv or 1
+        if not self.hv: self.hv = self.hk or 1
+        if not self.dk or not self.dv:
+            raise ValueError("cannot determine linear-attention head dims from config or weights")
 
     def new_state(self):
         ch = self.hk * self.dk * 2 + self.hv * self.dv
@@ -127,24 +161,49 @@ class LinearAttention:
         sequential); prefill and single-token decode use the same code."""
         x = np.asarray(x, np.float32)
         T = x.shape[0]
-        q = self._proj("q", x).reshape(T, self.hk, self.dk)
-        k = self._proj("k", x).reshape(T, self.hk, self.dk)
-        v = self._proj("v", x).reshape(T, self.hv, self.dv)
+        nq = self.hk * self.dk; nk = nq
+        if self.w.get("qkv") is not None:          # single fused [q|k|v] projection
+            flat0 = self._proj("qkv", x).reshape(T, -1)
+            q = flat0[:, :nq].reshape(T, self.hk, self.dk)
+            k = flat0[:, nq:nq + nk].reshape(T, self.hk, self.dk)
+            v = flat0[:, nq + nk:nq + nk + self.hv * self.dv].reshape(T, self.hv, self.dv)
+        else:                                      # separate projections
+            q = self._proj("q", x).reshape(T, self.hk, self.dk)
+            k = self._proj("k", x).reshape(T, self.hk, self.dk)
+            v = self._proj("v", x).reshape(T, self.hv, self.dv)
         if self.conv_width > 1 and self.w.get("conv_w") is not None:
             flat = np.concatenate([q.reshape(T, -1), k.reshape(T, -1), v.reshape(T, -1)], 1)
             flat = causal_conv1d(flat, self.w["conv_w"], self.w.get("conv_b"), state.conv)
             flat = _silu(flat)
-            nq = self.hk * self.dk; nk = nq
             q = flat[:, :nq].reshape(T, self.hk, self.dk)
             k = flat[:, nq:nq + nk].reshape(T, self.hk, self.dk)
             v = flat[:, nq + nk:].reshape(T, self.hv, self.dv)
+        # queries and keys are L2-normalised, and q carries the 1/sqrt(d) scale
+        q = _l2norm(q, self.eps) * (1.0 / math.sqrt(self.dk))
         k = _l2norm(k, self.eps)
-        # gates: decay in (0,1] via sigmoid(-softplus) style, write strength via sigmoid
-        a = self._proj("a", x); dt = self._proj("dt", x)
-        decay = (1.0 / (1.0 + np.exp(-np.clip(a, -60, 60)))) if a is not None else np.ones((T, self.hv), np.float32)
-        beta = (1.0 / (1.0 + np.exp(-np.clip(dt, -60, 60)))) if dt is not None else np.ones((T, self.hv), np.float32)
+
+        # Write strength: beta = sigmoid(W_beta x)  (its own projection).
+        b_raw = self._proj("beta", x)
+        beta = (_sigmoid(b_raw) if b_raw is not None
+                else np.ones((T, self.hv), np.float32))
+
+        # Forget gate: decay = exp(softplus(W_alpha x + dt_bias) * A), with A <= 0 so the decay
+        # stays in (0, 1]. `dt_bias` and `A` are per-head vectors from the model.
+        a_raw = self._proj("alpha", x)
+        if a_raw is not None:
+            a_raw = a_raw.reshape(T, -1)
+            dtb = self.w.get("dt_bias")
+            if dtb is not None:
+                a_raw = a_raw + np.asarray(dtb, np.float32).reshape(1, -1)
+            g = _softplus(a_raw)
+            A = self.w.get("A")
+            if A is not None:
+                g = g * np.asarray(A, np.float32).reshape(1, -1)
+            decay = np.exp(np.clip(g, -60, 0))
+        else:
+            decay = np.ones((T, self.hv), np.float32)
         decay = np.broadcast_to(decay.reshape(T, -1)[:, :self.hv], (T, self.hv))
-        beta = np.broadcast_to(beta.reshape(T, -1)[:, :self.hv], (T, self.hv))
+        beta = np.broadcast_to(np.asarray(beta, np.float32).reshape(T, -1)[:, :self.hv], (T, self.hv))
 
         qh = np.repeat(q, self.rep, axis=1) if self.rep > 1 else q      # group k/q heads to v heads
         kh = np.repeat(k, self.rep, axis=1) if self.rep > 1 else k
@@ -152,12 +211,18 @@ class LinearAttention:
         S = state.S
         for t in range(T):                                    # inherently sequential recurrence
             out[t] = gated_delta_step(S, qh[t], kh[t], v[t], decay[t], beta[t])
+        if self.w.get("norm") is not None:
+            gw = np.asarray(self.w["norm"], np.float32).reshape(-1)
+            if gw.size == self.dv:                            # per-head weight -> normalise per head
+                out = (out / np.sqrt((out * out).mean(-1, keepdims=True) + self.eps)
+                       * gw.reshape(1, 1, self.dv))
+            else:                                             # one weight over the flattened row
+                flat_y = out.reshape(T, -1)
+                out = (flat_y / np.sqrt((flat_y * flat_y).mean(-1, keepdims=True) + self.eps)
+                       * gw.reshape(1, -1)).reshape(T, self.hv, self.dv)
         y = out.reshape(T, self.hv * self.dv)
-        if self.w.get("norm") is not None:                    # output RMSNorm
-            g = np.asarray(self.w["norm"], np.float32)
-            y = y / np.sqrt((y * y).mean(-1, keepdims=True) + self.eps) * g
-        if self.w.get("g") is not None:                       # swish output gate
-            y = y * _silu(self._proj("g", x))
+        if self.w.get("g") is not None:                       # swish output gate (z)
+            y = y * _silu(np.asarray(self._proj("g", x), np.float32).reshape(T, -1)[:, :y.shape[1]])
         o = self.w.get("o")
         if o is None:
             return y

@@ -1,7 +1,8 @@
 """webtorch.llm -- LLM inference engine with graph-capture acceleration.
 
-High-level API for running quantized (AutoGPTQ int4) LLMs in the browser on top
-of webtorch/WgPy, with a WebGPU graph-capture fast path for decode.
+High-level API for running LLMs in the browser on top of webtorch/WgPy — AutoGPTQ
+safetensors or llama.cpp GGUF, at int4 / int8 / fp16 — with a WebGPU graph-capture fast
+path for decode.
 
     import llm
     model = await llm.GPTQModel.load("/models/qwen7b-gptq")
@@ -19,8 +20,11 @@ What it does:
     per-op Python dispatch overhead -- ~20x faster decode). WebGL falls back to a
     correct, un-captured growing-cache path (WebGL can't do in-place capture).
 
-Architecturally identical for any qwen2 / llama AutoGPTQ model; tested on
-Qwen2.5-3B/7B-Instruct-GPTQ-Int4.
+Nothing here is tied to a model family. Shapes, head dims, rope, MoE and hybrid
+(state-space / linear-attention) blocks all come from the model's own config or GGUF
+metadata, optional pieces (QK-norm, fused QKV, fused Q+output-gate, sparse MoE, recurrent
+blocks) are detected from the tensors the file actually contains, and the tokenizer's special
+tokens and chat layout are read from the vocabulary the model ships.
 """
 import json, math, time
 import numpy as np
@@ -504,6 +508,37 @@ class CausalLM:
         self.top_k = int(m("expert_used_count", default=0, required=False) or 0)
         self.norm_topk = True; self.sparse_step = 1; self.mlp_only = set()
         self.has_shared_expert = False
+        # ---- hybrid / state-space blocks, read from the file's own metadata ----
+        # A GGUF declares these under its arch namespace whenever some blocks are recurrent
+        # (linear attention / SSM) instead of softmax attention. Nothing here names a model:
+        # a file that declares them gets the recurrent path, a file that does not gets the
+        # plain decoder path.
+        interval = int(m("full_attention_interval", default=0, required=False) or 0)
+        recurrent = m("attention.recurrent_layers", default=None, required=False)
+        if recurrent:
+            self.layer_types = ["linear_attention" if bool(r) else "full_attention"
+                                for r in list(recurrent)[:self.L]]
+        elif interval > 1:
+            self.layer_types = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                                for i in range(self.L)]
+        else:
+            self.layer_types = ["full_attention"] * self.L
+        self.is_hybrid = any(t != "full_attention" for t in self.layer_types)
+        d_state = int(m("ssm.state_size", default=0, required=False) or 0)
+        d_inner = int(m("ssm.inner_size", default=0, required=False) or 0)
+        n_group = int(m("ssm.group_count", default=0, required=False) or 0)
+        dt_rank = int(m("ssm.time_step_rank", default=0, required=False) or 0)
+        self.linear_cfg = {
+            "n_k_heads": n_group, "n_v_heads": dt_rank,
+            "k_head_dim": d_state,
+            "v_head_dim": (d_inner // dt_rank) if dt_rank else 0,
+            "conv_kernel_dim": int(m("ssm.conv_kernel", default=0, required=False) or 0),
+            "hidden": self.H}
+        # partial rope: the file says how many dims are rotated
+        n_rot = int(m("rope.dimension_count", default=0, required=False) or 0)
+        self.rope_dim = n_rot if n_rot else self.HD
+        self.partial_rotary = (self.rope_dim / self.HD) if self.HD else 1.0
+        self.attn_output_gate = False        # set below if the weights show a gate
         _eos = [meta.get("tokenizer.ggml.eos_token_id"), meta.get("tokenizer.ggml.eot_token_id")]
         self.tok = BPETokenizer({t: i for i, t in enumerate(meta["tokenizer.ggml.tokens"])},
                                 meta.get("tokenizer.ggml.merges", []))
@@ -523,26 +558,25 @@ class CausalLM:
                     ", ".join("%s (%d tensors)" % (k, v) for k, v in sorted(bad.items())),
                     ", ".join(sorted(G.SUPPORTED_NAMES))))
 
-        # Preflight the architecture too: this engine is a Llama-style decoder (per-layer
-        # attn_q/attn_k/attn_v or a fused attn_qkv, attn_norm, ffn_norm, ffn_*). Report a
-        # structural mismatch from the header rather than after downloading gigabytes.
+        # Preflight the architecture from the header: a block must be something this engine
+        # can run — softmax attention (separate q/k/v or a fused qkv) or a recurrent
+        # linear-attention / state-space block (ssm_* tensors). Report a mismatch now rather
+        # than after downloading gigabytes.
         names = set(self._ginfo)
         if "blk.0.attn_norm.weight" in names:
-            missing = [t for t in ("blk.0.ffn_norm.weight",) if t not in names]
-            fused = "blk.0.attn_qkv.weight" in names
-            split = all(("blk.0.attn_%s.weight" % x) in names for x in ("q", "k", "v"))
-            ssm = sorted(n.split(".", 2)[-1] for n in names
-                         if n.startswith("blk.0.ssm") or n.startswith("blk.0.attn_gate"))
-            if missing or not (fused or split):
+            post = any(("blk.0." + n + ".weight") in names
+                       for n in ("ffn_norm", "post_attention_norm"))
+            attn = (all(("blk.0.attn_%s.weight" % x) in names for x in ("q", "k", "v"))
+                    or "blk.0.attn_qkv.weight" in names)
+            recurrent = any(n.startswith("blk.0.ssm_") for n in names)
+            if not post or not (attn or recurrent):
+                missing = []
+                if not post: missing.append("a post-attention norm (ffn_norm/post_attention_norm)")
+                if not (attn or recurrent):
+                    missing.append("attention (attn_q/k/v or attn_qkv) or recurrent (ssm_*) tensors")
                 raise NotImplementedError(
-                    "this GGUF's %r architecture is not the Llama-style decoder this engine "
-                    "implements: layer 0 %s%s. Unsupported layer tensors: %s. Models with "
-                    "state-space / gated-linear-attention blocks need those operators; use a "
-                    "GGUF whose blocks are standard attention + FFN." % (
-                        arch,
-                        "lacks " + ", ".join(missing) if missing else "",
-                        "" if (fused or split) else (" and has no attn_q/k/v or attn_qkv"),
-                        ", ".join(ssm) or "n/a"))
+                    "this GGUF's %r blocks are not a shape this engine implements: layer 0 "
+                    "lacks %s." % (arch, "; ".join(missing)))
         bad = sorted({G.GGML_NAMES.get(t["type"], "type%d" % t["type"])
                       for t in infos if t["type"] not in G.SUPPORTED_TYPES})
         if bad:                                               # e.g. IQ4_XS / IQ2_M i-quants
@@ -586,11 +620,44 @@ class CausalLM:
             async def opt_norm(nm, _p=p):                      # QK-norm (qwen3-style) if present
                 n = _p + nm + ".weight"
                 return wt.Tensor(await self._gload(n)) if n in self._ginfo else None
+            # The post-attention norm is called `ffn_norm` by most converters and
+            # `post_attention_norm` by others; take whichever this file has.
+            post_name = next((n for n in ("ffn_norm", "post_attention_norm")
+                              if (p + n + ".weight") in self._ginfo), None)
+            if post_name is None:
+                raise NotImplementedError(
+                    "GGUF block %d has no post-attention norm (looked for ffn_norm / "
+                    "post_attention_norm)" % i)
             lay = {"in_ln": wt.Tensor(await self._gload(p + "attn_norm.weight")),
-                   "post_ln": wt.Tensor(await self._gload(p + "ffn_norm.weight")),
-                   "q": await qb("attn_q"), "k": await qb("attn_k"), "v": await qb("attn_v"),
-                   "o": await qb("attn_output"),
-                   "qn": await opt_norm("attn_q_norm"), "kn": await opt_norm("attn_k_norm")}
+                   "post_ln": wt.Tensor(await self._gload(p + post_name + ".weight"))}
+            has_ssm = any(n.startswith(p + "ssm_") for n in self._ginfo)
+            if has_ssm or self._is_linear_layer(i):
+                # Recurrent (linear-attention / state-space) block. Every piece is optional and
+                # located by name, so any converter's layout loads as long as the tensors exist.
+                async def opt_g(nm, _p=p):
+                    n = _p + nm
+                    return await self._gload(n) if n in self._ginfo else None
+                async def opt_qb(nm, _p=p):
+                    return (await qb(nm, _p)) if (_p + nm + ".weight") in self._ginfo else None
+                w = {"qkv": await opt_qb("attn_qkv"), "g": await opt_qb("attn_gate"),
+                     "q": await opt_qb("attn_q"), "k": await opt_qb("attn_k"),
+                     "v": await opt_qb("attn_v"),
+                     "beta": await opt_qb("ssm_beta"), "alpha": await opt_qb("ssm_alpha"),
+                     "o": await opt_qb("ssm_out"),
+                     "A": await opt_g("ssm_a"), "dt_bias": await opt_g("ssm_dt.bias"),
+                     "norm": await opt_g("ssm_norm.weight"),
+                     "conv_w": await opt_g("ssm_conv1d.weight"),
+                     "conv_b": await opt_g("ssm_conv1d.bias")}
+                if w["conv_w"] is not None and w["conv_w"].ndim > 2:
+                    w["conv_w"] = w["conv_w"].reshape(w["conv_w"].shape[0], -1)
+                from . import linear_attn as la
+                lay["linear"] = la.LinearAttention(dict(self.linear_cfg), w, eps=self.eps)
+                self.layer_types[i] = "linear_attention"
+            else:
+                lay.update({
+                    "q": await qb("attn_q"), "k": await qb("attn_k"), "v": await qb("attn_v"),
+                    "o": await qb("attn_output"),
+                    "qn": await opt_norm("attn_q_norm"), "kn": await opt_norm("attn_k_norm")})
             if (p + "ffn_gate_inp.weight") in self._ginfo:     # sparse-MoE block
                 # llama.cpp stacks experts: ffn_{gate,up,down}_exps = (n_experts, out, in)
                 gate_x = await self._gload(p + "ffn_gate_exps.weight")
@@ -756,14 +823,36 @@ class CausalLM:
         return lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
 
     def _qkv(self, lay, x, T):
-        """q,k,v projections -> (heads, T, HD). Applies Qwen3-style QK-norm (per-head RMSNorm
-        over head_dim, before rope) when `lay` carries `qn`/`kn` weights; a no-op otherwise."""
-        q = lay["q"](x).reshape(T, self.NH, self.HD)
+        """q,k,v projections -> (heads, T, HD). Applies per-head QK-norm (RMSNorm over head_dim,
+        before rope) when `lay` carries `qn`/`kn` weights.
+
+        Some decoders fuse an output GATE into the query projection: it then emits
+        2 * n_heads * head_dim, laid out per head as [q | gate]. That is detected from the
+        projection's own width — not from a model name — and the gate is stashed on the layer
+        for `_attn_out` to apply."""
+        qraw = lay["q"](x)
+        wide = int(np.prod(qraw.shape)) // max(T, 1) >= 2 * self.NH * self.HD
+        if wide:                                        # fused [q | gate] per head
+            qg = qraw.reshape(T, self.NH, 2 * self.HD)
+            q = wt._slice_last(qg, 0, self.HD)
+            lay["_gate"] = wt._slice_last(qg, self.HD, 2 * self.HD).reshape(T, self.NH * self.HD)
+        else:
+            q = qraw.reshape(T, self.NH, self.HD)
+            lay["_gate"] = None
         k = lay["k"](x).reshape(T, self.NKV, self.HD)
         if lay.get("qn") is not None: q = self._rms(q, lay["qn"])
         if lay.get("kn") is not None: k = self._rms(k, lay["kn"])
         v = lay["v"](x).reshape(T, self.NKV, self.HD).permute(1, 0, 2)
         return q.permute(1, 0, 2), k.permute(1, 0, 2), v
+
+    def _attn_out(self, lay, o, T):
+        """Attention output -> hidden. Applies the sigmoid output gate when the query projection
+        carried one (see `_qkv`), then the output projection."""
+        y = o.permute(1, 0, 2).reshape(T, self.NH * self.HD)
+        g = lay.get("_gate")
+        if g is not None:
+            y = y * g.sigmoid()
+        return lay["o"](y)
 
     def _embed_ids(self, ids, embeds=None):
         """Input embeddings for a prompt. `embeds` (T,H) overrides the token lookup — the hook
@@ -809,7 +898,7 @@ class CausalLM:
                 wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
                 wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
                 o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
-                h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
+                h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
@@ -834,7 +923,7 @@ class CausalLM:
             wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(1, NH * HD))
+            h = h + self._attn_out(lay, o, 1)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
@@ -854,7 +943,7 @@ class CausalLM:
                 q, k, v = self._qkv(lay, x, T)
                 q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
                 o = cache.attn(i, q, k, v, pos, scale=sc)
-                h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
+                h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
