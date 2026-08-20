@@ -2760,6 +2760,8 @@ def _gptq_matmul(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0):
             "tensors": [xf.buffer.buffer_id, qweight.buffer.buffer_id, qzeros.buffer.buffer_id, scales.buffer.buffer_id, of.buffer.buffer_id, meta.buffer_id],
             "workGroups": {"x": (N + 63) // 64, "y": 1 if gemv else (M + 3) // 4, "z": 1}})
         return of
+    if not GPU:
+        return _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff)
     _webgl_ready()
     plat = _copy_kernel["plat"]
     if key not in _gptq_k["gl"]:
@@ -2774,6 +2776,35 @@ def _gptq_matmul(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0):
                      {"name": "M", "value": M, "type": "int"}, {"name": "N", "value": N, "type": "int"},
                      {"name": "K", "value": K, "type": "int"}, {"name": "gs", "value": gs, "type": "int"}]})
     return of
+
+
+def _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0, block=2048):
+    """CPU/numpy fallback for the int4/int8 matmul (no WebGPU/WebGL backend).
+
+    The weights stay PACKED in memory and are unpacked one column block at a time, so peak
+    memory is the packed model plus one small block — never the full fp32 weight. That is what
+    lets a multi-billion-parameter 4-bit model run in a fraction of its fp32 footprint."""
+    x = np.asarray(xf, np.float32)
+    qw = np.asarray(qweight); qz = np.asarray(qzeros); sc = np.asarray(scales, np.float32)
+    per = 32 // bits; qmax = (1 << bits) - 1
+    Kp = int(qw.shape[0]) * per
+    g = np.arange(Kp) // gs                       # group index per contracted row
+    out = np.empty((int(x.shape[0]), N), np.float32)
+    for c0 in range(0, N, block):                 # column blocks bound the temporary
+        c1 = min(N, c0 + block)
+        qwb = qw[:, c0:c1]
+        q = np.empty((Kp, c1 - c0), np.int32)
+        for r in range(per):
+            q[r::per] = (qwb >> (bits * r)) & qmax
+        # zeros are packed along N (per column), unpack the columns this block needs
+        z_full = np.empty((int(qz.shape[0]), N), np.int32)
+        for r in range(per):
+            z_full[:, r::per] = (qz >> (bits * r)) & qmax
+        z = z_full[:, c0:c1]; del z_full
+        w = (sc[g, c0:c1] * (q - (z[g] + zoff))).astype(np.float32)
+        out[:, c0:c1] = x @ w
+        del q, z, w
+    return out
 
 
 class QuantizedLinear(Module):
