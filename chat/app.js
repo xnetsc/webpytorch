@@ -3,9 +3,23 @@
 const $ = (s) => document.querySelector(s);
 const worker = new Worker('worker.js');
 let seq = 0; const pending = new Map();
-let messages = [];           // {role, content, attachments:[{kind,name,text,dataUrl}]}
+// Conversations live in localStorage so the sidebar survives a reload.
+// Each: {id, title, messages:[{role, content, attachments:[{kind,name,text,dataUrl}]}], updated}
+const STORE = 'webtorch-chat-convs';
+let convs = [];
+let curId = null;
 let attachments = [];
 let modelLoaded = false;
+
+function loadConvs() {
+  try { convs = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch (e) { convs = []; }
+  if (!Array.isArray(convs)) convs = [];
+}
+function saveConvs() {
+  try { localStorage.setItem(STORE, JSON.stringify(convs)); } catch (e) { /* quota */ }
+}
+function current() { return convs.find(c => c.id === curId) || null; }
+
 
 // Presets are EXAMPLES ONLY — any ModelScope repo/file works via the two inputs.
 const PRESETS = [
@@ -28,12 +42,30 @@ worker.onmessage = (e) => {
   if (m.type === 'result') {
     const p = pending.get(m.id); pending.delete(m.id);
     if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
-  } else if (m.type === 'status') { $('#modelStatus').textContent = m.text; }
+  } else if (m.type === 'status') {
+    $('#modelStatus').textContent = m.text;
+    $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
+  }
   else if (m.type === 'progress') { showProgress(m.bytes); }
-  else if (m.type === 'loaded') { modelLoaded = true; setBar(1); refreshCache(); }
+  else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'log') { console.log('[py]', m.text); }
 };
 function setBar(f) { $('#bar').style.width = Math.min(100, f * 100) + '%'; }
+// A model stays resident until it is released, so loading is blocked while one is held —
+// otherwise a second multi-GB model would be pulled in on top of the first.
+function syncButtons() {
+  $('#loadBtn').disabled = modelLoaded;
+  $('#releaseBtn').disabled = !modelLoaded;
+  $('#loadBtn').title = modelLoaded ? 'Release the current model first' : '';
+  // Nothing in the conversation area is usable until a model is actually ready to answer.
+  const off = !modelLoaded;
+  ['#input', '#send', '#toolFile', '#toolCam', '#toolUrl', '#newChat'].forEach(sel => {
+    const el = $(sel); if (el) el.disabled = off;
+  });
+  $('#input').placeholder = off ? 'Load a model in ⚙ Settings to start chatting'
+                                : 'Send a message…';
+  $('#composer').classList.toggle('locked', off);
+}
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
 let expected = 0;
 function showProgress(bytes) {
@@ -56,9 +88,13 @@ $('#loadBtn').onclick = async () => {
   if (m) expected = parseFloat(m[1]) * 1e9;
   try { await call('load', { repo, file }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) { $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message); }
-  finally { $('#loadBtn').disabled = false; }
+  finally { syncButtons(); }
 };
-$('#releaseBtn').onclick = async () => { await call('release'); modelLoaded = false; setBar(0); $('#progressText').textContent=''; };
+$('#releaseBtn').onclick = async () => {
+  await call('release'); modelLoaded = false; setBar(0);
+  $('#progressText').textContent = ''; syncButtons();
+  note('Model released. Its files stay cached, so loading it again is fast.');
+};
 
 // ---- cache ----
 async function refreshCache() {
@@ -134,8 +170,47 @@ $('#toolCam').onclick = async () => {
 };
 
 // ---- chat ----
+function newConv(activate = true) {
+  const c = { id: 'c' + Date.now() + Math.random().toString(36).slice(2, 6),
+              title: 'New chat', messages: [], updated: Date.now() };
+  convs.unshift(c); if (activate) curId = c.id;
+  saveConvs(); renderConvs(); render();
+  return c;
+}
+function ensureConv() { return current() || newConv(); }
+function titleFrom(text) {
+  const t = (text || '').replace(/\s+/g, ' ').trim();
+  return t ? (t.length > 38 ? t.slice(0, 38) + '…' : t) : 'New chat';
+}
+function renderConvs() {
+  const el = $('#convList'); el.innerHTML = '';
+  if (!convs.length) { el.innerHTML = '<p class="hint" style="padding:6px 10px">no conversations yet</p>'; return; }
+  convs.forEach(c => {
+    const d = document.createElement('div');
+    d.className = 'conv' + (c.id === curId ? ' active' : '');
+    const t = document.createElement('span'); t.className = 't'; t.textContent = c.title;
+    const x = document.createElement('span'); x.className = 'x'; x.textContent = '✕';
+    x.title = 'Delete conversation';
+    x.onclick = (e) => {
+      e.stopPropagation();
+      convs = convs.filter(v => v.id !== c.id);
+      if (curId === c.id) curId = convs.length ? convs[0].id : null;
+      saveConvs(); renderConvs(); render();
+    };
+    d.onclick = () => { curId = c.id; renderConvs(); render(); };
+    d.append(t, x); el.appendChild(d);
+  });
+}
+
 function render() {
   const el = $('#messages'); el.innerHTML = '';
+  const conv = current();
+  const messages = conv ? conv.messages : [];
+  if (!messages.length) {
+    el.innerHTML = '<div class="msg bot"><div class="who">AI</div><div class="body">' +
+      'Pick a model in ⚙ Settings, load it, and start chatting.</div></div>';
+    return;
+  }
   messages.forEach(m => {
     const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
     const w = document.createElement('div'); w.className = 'who'; w.textContent = m.role === 'user' ? 'You' : 'AI';
@@ -169,24 +244,28 @@ $('#composer').onsubmit = async (e) => {
   const text = $('#input').value.trim();
   if (!text && !attachments.length) return;
   if (!modelLoaded) return note('Load a model first (left panel).');
+  const conv = ensureConv();
   const msg = { role: 'user', content: text, attachments };
-  messages.push(msg); attachments = []; renderAttachments();
-  $('#input').value = ''; render();
-  messages.push({ role: 'assistant', content: '…' }); render();
+  conv.messages.push(msg); attachments = []; renderAttachments();
+  if (conv.messages.length === 1) conv.title = titleFrom(text);
+  $('#input').value = ''; render(); renderConvs();
+  conv.messages.push({ role: 'assistant', content: '…' }); render();
   try {
     const out = await call('generate', { prompt: promptFor(msg), max_new: 256 });
-    messages[messages.length - 1].content = out;
-  } catch (err) { messages[messages.length - 1].content = 'Error: ' + err.message; }
-  render();
+    conv.messages[conv.messages.length - 1].content = out;
+  } catch (err) { conv.messages[conv.messages.length - 1].content = 'Error: ' + err.message; }
+  conv.updated = Date.now(); saveConvs(); render();
 };
 $('#input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#composer').requestSubmit(); }
 });
-$('#newChat').onclick = () => { messages = []; attachments = []; render(); renderAttachments(); };
+$('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv(); };
+$('#openSettings').onclick = () => { $('#settingsDlg').showModal(); refreshCache(); };
+$('#closeSettings').onclick = () => $('#settingsDlg').close();
 
 // ---- export / import (real .zip containing JSON) ----
 $('#exportBtn').onclick = async () => {
-  const payload = { version: 1, exported: new Date().toISOString(), messages };
+  const payload = { version: 2, exported: new Date().toISOString(), conversations: convs };
   const blob = await WTZip.zip([{ name: 'chat.json', data: JSON.stringify(payload, null, 2) }]);
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -201,12 +280,20 @@ $('#importFile').onchange = async (e) => {
     const name = Object.keys(entries).find(k => k.endsWith('.json'));
     if (!name) throw new Error('no .json inside the zip');
     const data = JSON.parse(entries[name]);
-    if (!Array.isArray(data.messages)) throw new Error('not a webtorch chat export');
-    messages = data.messages; render(); note('Imported ' + messages.length + ' messages.');
+    let added;
+    if (Array.isArray(data.conversations)) added = data.conversations;
+    else if (Array.isArray(data.messages))            // v1 export: a single conversation
+      added = [{ id: 'c' + Date.now(), title: titleFrom((data.messages[0] || {}).content),
+                 messages: data.messages, updated: Date.now() }];
+    else throw new Error('not a webtorch chat export');
+    convs = added.concat(convs); curId = convs[0] && convs[0].id;
+    saveConvs(); renderConvs(); render();
+    note('Imported ' + added.length + ' conversation(s).');
   } catch (err) { alert('Import failed: ' + err.message); }
   e.target.value = '';
 };
 
-fillPresets(); render();
+loadConvs(); if (!convs.length) newConv(); else curId = convs[0].id;
+fillPresets(); renderConvs(); render(); syncButtons();
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
 call('boot').then(refreshCache).catch(e => $('#modelStatus').textContent = 'runtime failed: ' + e.message);

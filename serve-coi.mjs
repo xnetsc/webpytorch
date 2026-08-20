@@ -27,8 +27,40 @@ function setCommon(res, ctype) {
   if (ctype) res.setHeader('Content-Type', ctype);
 }
 
+// Same-origin proxy for model downloads.
+// A cross-origin-isolated page (which SharedArrayBuffer, and therefore the GPU backend,
+// requires) can only read a remote file if that host sends CORS headers. Model hosts
+// generally do not, so the page fetches `/ms/<path>` from us and we relay it — passing the
+// Range header through in both directions so tensors can still be streamed.
+const PROXY = { '/ms/': 'https://modelscope.cn/', '/hf/': 'https://huggingface.co/' };
+
+async function proxy(req, res, prefix, origin) {
+  const rest = req.url.slice(prefix.length);
+  const target = origin + rest.replace(/^\/+/, '');
+  const headers = { 'User-Agent': 'webtorch-chat' };
+  if (req.headers.range) headers.Range = req.headers.range;
+  const r = await fetch(target, { headers, redirect: 'follow' });
+  res.statusCode = r.status;
+  for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+    const v = r.headers.get(h);
+    if (v) res.setHeader(h, v);
+  }
+  // same-origin response: safe under COEP, and readable by the page
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Cache-Control', 'no-store');
+  if (req.method === 'HEAD' || !r.body) { res.end(); return; }
+  const buf = Buffer.from(await r.arrayBuffer());
+  res.end(buf);
+}
+
 createServer(async (req, res) => {
   try {
+    for (const [prefix, origin] of Object.entries(PROXY)) {
+      if (req.url.startsWith(prefix)) {
+        setCommon(res);
+        return await proxy(req, res, prefix, origin);
+      }
+    }
     let path = decodeURIComponent(req.url.split('?')[0]);
     if (path === '/') path = '/index.html';
     if (path.endsWith('/')) path += 'index.html';

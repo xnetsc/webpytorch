@@ -33,12 +33,13 @@ async function boot() {
     try { pyodide.FS.writeFile(`${PKG}/${m}`, await fetchText(`../${PKG}/${m}`)); }
     catch (e) { log('skip ' + m + ': ' + e.message); }
   }
+  // Model files come from ModelScope, fetched directly: its `resolve` route and the CDN it
+  // redirects to send `Access-Control-Allow-Origin: *` and allow Range, so a cross-origin
+  // isolated page can stream them. The SDK does the ranged reads and its own persistent cache.
   await pyodide.runPythonAsync(`
 import sys, json
 sys.path.insert(0, "/")
 import webtorch
-# Downloads always come from ModelScope, with the SDK's persistent (IndexedDB-backed) cache
-# so a model is fetched once and reused across reloads.
 webtorch.set_io_read(webtorch.modelscope_read())
 webtorch.set_io_write(webtorch.default_io_write)
 _MODEL = {"m": None, "id": None}

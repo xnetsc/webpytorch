@@ -968,11 +968,16 @@ def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=N
         lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
     `name` ("<org>/<repo>/<path>") maps to
-    `{endpoint}/api/v1/models/{org}/{repo}/repo?Revision={revision}&FilePath={path}`;
-    `revision` defaults to ModelScope's `master`. Reads only."""
+    `{endpoint}/models/{org}/{repo}/resolve/{revision}/{path}`; `revision` defaults to
+    ModelScope's `master`.
+
+    This `resolve` route is used rather than the `/api/v1/.../repo?FilePath=` one because it
+    (and the CDN it redirects large files to) returns `Access-Control-Allow-Origin: *` and
+    allows the `Range` header — so a browser page, which can only read a cross-origin file when
+    the host opts in, can stream weights directly. Reads only."""
     ep = endpoint.rstrip("/")
     return _hub_reader(
-        lambda repo, path: "%s/api/v1/models/%s/repo?Revision=%s&FilePath=%s" % (ep, repo, revision, path),
+        lambda repo, path: "%s/models/%s/resolve/%s/%s" % (ep, repo, revision, path),
         token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)
 
 

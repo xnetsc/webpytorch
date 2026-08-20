@@ -4,6 +4,8 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
 
 - **Any model, not a fixed list.** The dropdown is only a set of examples — type any
   ModelScope `org/repo` and file to load it. Downloads always come from ModelScope.
+- **Conversations** live in the sidebar (stored locally); model and cache settings are behind
+  the ⚙ Settings button. The composer stays locked until a model is ready.
 - **Cached.** Model files are stored by the SDK's persistent cache (IndexedDB-backed), so the
   second load is instant. The sidebar lists what is cached and can delete entries.
 - **Status.** Loading and download progress are shown while the model streams in.

@@ -6,9 +6,19 @@
 body{margin:0;font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
      background:var(--bg);color:var(--fg)}
 #app{display:flex;height:100vh}
-#sidebar{width:310px;flex:none;background:var(--panel);border-right:1px solid var(--line);
-         padding:14px;overflow-y:auto}
-.brand{font-weight:700;font-size:18px;margin-bottom:14px}
+#sidebar{width:270px;flex:none;background:var(--panel);border-right:1px solid var(--line);
+         padding:12px;display:flex;flex-direction:column;gap:10px}
+.side-top{flex:none}
+.side-bottom{flex:none;border-top:1px solid var(--line);padding-top:10px}
+.convs{flex:1;overflow-y:auto;margin:0 -4px}
+.conv{display:flex;align-items:center;gap:6px;padding:8px 10px;border-radius:8px;cursor:pointer}
+.conv:hover{background:var(--code)}
+.conv.active{background:var(--code);font-weight:600}
+.conv .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.conv .x{opacity:0;color:var(--danger);padding:0 4px}
+.conv:hover .x{opacity:1}
+button.wide{width:100%;margin-top:0}
+.brand{font-weight:700;font-size:18px;margin-bottom:10px}
 .brand span{color:var(--accent);margin-left:5px}
 .panel{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
 .panel h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
@@ -51,3 +61,15 @@ button:disabled{opacity:.5;cursor:not-allowed}
 #hintbar{max-width:760px;margin:0 auto 10px;width:100%;padding:0 16px}
 #camDlg{border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--fg)}
 #cam{width:420px;max-width:80vw;border-radius:8px;display:block}
+
+/* settings dialog */
+#settingsDlg{border:1px solid var(--line);border-radius:14px;background:var(--panel);
+             color:var(--fg);width:430px;max-width:92vw;padding:18px}
+#settingsDlg::backdrop{background:rgba(0,0,0,.45)}
+.dlg-head{display:flex;align-items:center;justify-content:space-between}
+.dlg-head h2{margin:0;font-size:17px}
+.dlg-head button{margin:0;border:none;background:none;font-size:16px}
+#composer .tools button{font-size:15px;padding:6px 8px}
+
+#composer.locked{opacity:.55}
+#composer.locked #input{cursor:not-allowed}
