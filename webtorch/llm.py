@@ -1094,7 +1094,12 @@ class CausalLM:
             q = self._rope1(q); k = self._rope1(k)
             wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-            o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
+            # One dispatch for the single decode position; falls back for anything the
+            # fused kernel does not cover.
+            o = (wt.gqa_decode(q, self.Kc[i], self.Vc[i], self.mask_b, sc) if wt._GQA_FUSED
+                 else None)
+            if o is None:
+                o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
             h = h + self._attn_out(lay, o, 1)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)

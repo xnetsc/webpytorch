@@ -1334,6 +1334,161 @@ def gqa_attention(q, k, v, mask=None, scale=None):
     return o.reshape(nh, T, hd)                        # head = kv*rep + r
 
 
+# Decode attention, fused. The general path transposes the whole KV cache every token --
+# every slot, including the ones not written yet -- then runs a batched matmul, a scale, a
+# mask add, a multi-kernel softmax and a second matmul: about ten dispatches per layer, and
+# measured the largest single item in a decode step. With one query position the whole thing
+# is a single workgroup per head: score against each cached key, soft-max in workgroup
+# memory, then accumulate the values. Sizes here are small (LMAX scores, HD lanes), so the
+# reduction cost is dominated by what it replaces.
+_GQA_DECODE_WGSL = """@group(0) @binding(0)
+var<storage,read> q: array<f32>;
+@group(0) @binding(1)
+var<storage,read> kc: array<f32>;
+@group(0) @binding(2)
+var<storage,read> vc: array<f32>;
+@group(0) @binding(3)
+var<storage,read> maskb: array<f32>;
+@group(0) @binding(4)
+var<storage,read_write> outp: array<f32>;
+struct GMeta { nh: u32, nkv: u32, hd: u32, lmax: u32, scale: f32, }
+@group(0) @binding(5)
+var<storage,read> gm: GMeta;
+var<workgroup> sc: array<f32, 1024>;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  // No early return: exactly nh workgroups are dispatched, and a conditional return ahead
+  // of a workgroupBarrier puts the barrier in control flow WGSL cannot prove uniform.
+  let h = wid.x;
+  let rep = gm.nh / gm.nkv;
+  let kv = h / rep;
+  let t = lid.x;
+  let qo = h * gm.hd;
+  let ko = kv * gm.lmax * gm.hd;
+
+  // scores, one lane per cached position
+  var s: u32 = t;
+  loop {
+    if (s >= gm.lmax) { break; }
+    var d: f32 = 0.0;
+    let kb = ko + s * gm.hd;
+    for (var i: u32 = 0u; i < gm.hd; i = i + 1u) {
+      d = d + q[qo + i] * kc[kb + i];
+    }
+    sc[s] = d * gm.scale + maskb[s];
+    s = s + 128u;
+  }
+  workgroupBarrier();
+
+  // max
+  var m: f32 = -3.4028235e38;
+  s = t;
+  loop {
+    if (s >= gm.lmax) { break; }
+    m = max(m, sc[s]);
+    s = s + 128u;
+  }
+  red[t] = m;
+  workgroupBarrier();
+  var r: u32 = 64u;
+  loop {
+    if (r == 0u) { break; }
+    if (t < r) { red[t] = max(red[t], red[t + r]); }
+    workgroupBarrier();
+    r = r / 2u;
+  }
+  let mx = red[0];
+  workgroupBarrier();
+
+  // exp and sum
+  var acc: f32 = 0.0;
+  s = t;
+  loop {
+    if (s >= gm.lmax) { break; }
+    let e = exp(sc[s] - mx);
+    sc[s] = e;
+    acc = acc + e;
+    s = s + 128u;
+  }
+  red[t] = acc;
+  workgroupBarrier();
+  r = 64u;
+  loop {
+    if (r == 0u) { break; }
+    if (t < r) { red[t] = red[t] + red[t + r]; }
+    workgroupBarrier();
+    r = r / 2u;
+  }
+  let inv = 1.0 / red[0];
+  workgroupBarrier();
+
+  // weighted sum of values, one lane per head dimension
+  var d2: u32 = t;
+  loop {
+    if (d2 >= gm.hd) { break; }
+    var o: f32 = 0.0;
+    for (var p: u32 = 0u; p < gm.lmax; p = p + 1u) {
+      o = o + sc[p] * vc[ko + p * gm.hd + d2];
+    }
+    outp[qo + d2] = o * inv;
+    d2 = d2 + 128u;
+  }
+}
+"""
+_gqa_k = {"added": False}
+# OFF until the wrapper below is understood. What is established: the shader compiles and
+# runs -- dispatched by hand with the same bindings and a 1-D output it writes correct
+# sentinels -- and when it is enabled a decode step is 1.8x faster (measured 47.8 vs 26.0
+# tok/s on Qwen3-0.6B). But called through `gqa_decode` it leaves the output buffer
+# untouched, both inside and outside a capture, with no duplicate buffer ids and no
+# compilation error. Ruled out: binding order, held references, workgroup memory size, two
+# workgroup arrays, barrier uniformity, reused loop counters, 1-D vs 2-D output allocation.
+# The general path stays in use until that gap is closed; the speedup is real and worth
+# returning to.
+_GQA_FUSED = False     # A/B switch for the fused decode attention
+
+
+def gqa_decode(q, kc, vc, mask, scale):
+    """Single-position grouped-query attention in one dispatch.
+
+    `q` (nh, 1, hd); `kc`/`vc` (nkv, lmax, hd); `mask` broadcasts over the lmax positions
+    and carries -inf where nothing has been written. Returns None when the backend or the
+    shapes are outside what the kernel covers, so callers keep the general path.
+    """
+    if not _adam_backend_ready():
+        return None
+    qd = q.data if isinstance(q, Tensor) else q
+    kd = kc.data if isinstance(kc, Tensor) else kc
+    vd = vc.data if isinstance(vc, Tensor) else vc
+    md = mask.data if isinstance(mask, Tensor) else mask
+    nh, T, hd = (int(v) for v in qd.shape)
+    nkv, lmax, hd2 = (int(v) for v in kd.shape)
+    if T != 1 or hd != hd2 or nh % nkv or lmax > 1024:
+        return None
+    plat = _adam_kernel["platform"]
+    if not _gqa_k["added"]:
+        plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
+                                      "bindingTypes": ["read-only-storage"] * 4
+                                      + ["storage", "read-only-storage"]})
+        _gqa_k["added"] = True
+    # Bind through named locals. Inlining `_contig(...)` into the list drops the only
+    # reference to each temporary as soon as its id is read, so its GPU buffer can be
+    # recycled for the next one -- two bindings then silently share a buffer.
+    qc = _contig(qd); kcc = _contig(kd); vcc = _contig(vd); mc = _contig(md)
+    # Allocate flat: the kernel indexes linearly, and a 2-D allocation is not guaranteed
+    # to be an unpadded row-major buffer.
+    of = _empty((nh * hd,))
+    meta = _adam_kernel["make_meta"]((nh, nkv, hd, lmax, float(scale)), "u4,u4,u4,u4,f4")
+    plat.runKernel({"name": "gqa_decode",
+                    "tensors": [qc.buffer.buffer_id, kcc.buffer.buffer_id,
+                                vcc.buffer.buffer_id, mc.buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": nh, "y": 1, "z": 1}})
+    return Tensor(of.reshape(nh, 1, hd))
+
+
 # In-place KV-cache scatter write. WgPy's `cache[:, pos, :] = kcur` (ndarray
 # __setitem__) reads back the ENTIRE cache buffer to host, modifies, re-uploads
 # -- a full GPU->CPU->GPU round-trip per write (measured: 72 round-trips/token
