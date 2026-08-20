@@ -289,7 +289,83 @@ def dequant(ttype, raw, n):
         hi = _IQ4NL[(qs >> 4)]                                       # (blk,8,16)
         vals = np.concatenate([lo, hi], axis=2)                      # (blk,8,32)
         return (vals * dl[:, :, None]).reshape(-1)[:n]
+    if name in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"):
+        return _dequant_iq(name, u8, n)
     raise NotImplementedError("dequant not implemented for %s" % name)
+
+
+def _dequant_iq(name, u8, n):
+    """i-quants: the packed bytes are INDICES into ggml's codebook grids (see webtorch.iqtables,
+    extracted from ggml-common.h) plus a sign pattern and a per-sub-block scale. Vectorized
+    transcriptions of ggml's dequantize_row_iq* reference implementations."""
+    from . import iqtables as T
+    blk = n // 256
+    nb32 = 8                                     # QK_K/32 sub-blocks of 32 values
+    if name == "IQ2_XXS":                        # d | qs[32] uint16  -> 2+64 = 66 bytes
+        b = u8[:blk * 66].reshape(blk, 66)
+        d = _f16(b[:, 0:2])
+        a32 = np.ascontiguousarray(b[:, 2:66]).view(np.uint32).reshape(blk, nb32, 2)
+        a8 = a32.view(np.uint8).reshape(blk, nb32, 8)          # aux8 = first 4 bytes
+        db = d[:, :, None] * (0.5 + (a32[:, :, 1] >> 28).astype(np.float32))[:, :, None] * 0.25
+        idx = a8[:, :, 0:4].astype(np.int32)                   # (blk,nb32,4) grid index
+        sidx = ((a32[:, :, 1:2] >> (7 * np.arange(4))) & 127).astype(np.int32)
+        vals = T.IQ2XXS_GRID_U8[idx].astype(np.float32) * T.SIGNS[sidx]   # (blk,nb32,4,8)
+        return (vals.reshape(blk, nb32, 32) * db).reshape(-1)[:n]
+    if name == "IQ2_XS":                         # d | qs[32] uint16 | scales[8] -> 2+64+8 = 74
+        b = u8[:blk * 74].reshape(blk, 74)
+        d = _f16(b[:, 0:2])
+        qs = np.ascontiguousarray(b[:, 2:66]).view(np.uint16).reshape(blk, nb32, 4).astype(np.int32)
+        sc = b[:, 66:74]
+        db = np.stack([(0.5 + (sc & 0xF).astype(np.float32)) * 0.25,
+                       (0.5 + (sc >> 4).astype(np.float32)) * 0.25], -1)   # (blk,nb32,2)
+        db = d[:, :, None] * np.repeat(db, 2, axis=2)                      # l//2 -> (blk,nb32,4)
+        vals = T.IQ2XS_GRID_U8[qs & 511].astype(np.float32) * T.SIGNS[qs >> 9]
+        return (vals * db[:, :, :, None]).reshape(-1)[:n]
+    if name == "IQ2_S":                          # d | qs[64] | signs[32] | qh[8] | scales[8] = 82
+        b = u8[:blk * 82].reshape(blk, 82)
+        d = _f16(b[:, 0:2])
+        # ggml: `signs = qs + QK_K/8` — the sign bytes are the upper half of the qs field
+        qs = b[:, 2:34].reshape(blk, nb32, 4).astype(np.int32)
+        sg = b[:, 34:66].reshape(blk, nb32, 4).astype(np.int32)
+        qh = b[:, 66:74].astype(np.int32)
+        sc = b[:, 74:82]
+        db = np.stack([(0.5 + (sc & 0xF).astype(np.float32)) * 0.25,
+                       (0.5 + (sc >> 4).astype(np.float32)) * 0.25], -1)
+        db = d[:, :, None] * np.repeat(db, 2, axis=2)
+        hi = ((qh[:, :, None] << (8 - 2 * np.arange(4))) & 0x300)
+        # IQ2_S uses the sign byte directly as a mask (not a ksigns index)
+        vals = T.IQ2S_GRID_U8[qs | hi].astype(np.float32) * T.SIGNS_BYTE[sg]
+        return (vals * db[:, :, :, None]).reshape(-1)[:n]
+    if name == "IQ3_XXS":                        # d | qs[96] (64 idx + 32 scales/signs) = 98
+        b = u8[:blk * 98].reshape(blk, 98)
+        d = _f16(b[:, 0:2])
+        qs = b[:, 2:66].reshape(blk, nb32, 8).astype(np.int32)              # 8 grid idx / sub-block
+        a32 = np.ascontiguousarray(b[:, 66:98]).view(np.uint32).reshape(blk, nb32)
+        db = d * (0.5 + (a32 >> 28).astype(np.float32)) * 0.5               # (blk,nb32)
+        sidx = ((a32[:, :, None] >> (7 * np.arange(4))) & 127).astype(np.int32)
+        g = T.IQ3XXS_GRID_U8[qs].astype(np.float32).reshape(blk, nb32, 4, 8)  # pairs -> 8 values
+        vals = g * T.SIGNS[sidx]
+        return (vals.reshape(blk, nb32, 32) * db[:, :, None]).reshape(-1)[:n]
+    if name == "IQ3_S":                          # d | qs[64] | qh[8] | signs[32] | scales[4] = 110
+        b = u8[:blk * 110].reshape(blk, 110)
+        d = _f16(b[:, 0:2])
+        qs = b[:, 2:66].reshape(blk, nb32, 8).astype(np.int32)
+        qh = b[:, 66:74].astype(np.int32)
+        sg = b[:, 74:106].reshape(blk, nb32, 4).astype(np.int32)
+        sc = b[:, 106:110]
+        dbp = np.stack([(1 + 2 * (sc & 0xF)).astype(np.float32),
+                        (1 + 2 * (sc >> 4)).astype(np.float32)], -1).reshape(blk, nb32)
+        db = d * dbp                                                        # (blk,nb32)
+        # high bit per grid index: even slots from bit (8-2l), odd from (7-2l)
+        sh_e = (8 - 2 * np.arange(4)); sh_o = (7 - 2 * np.arange(4))
+        hi = np.empty((b.shape[0], nb32, 8), np.int32)
+        hi[:, :, 0::2] = (qh[:, :, None] << sh_e) & 256
+        hi[:, :, 1::2] = (qh[:, :, None] << sh_o) & 256
+        g = T.IQ3S_GRID_U8[qs | hi].astype(np.float32).reshape(blk, nb32, 4, 8)
+        # IQ3_S uses the sign byte directly as a mask (not a ksigns index)
+        vals = g * T.SIGNS_BYTE[sg]
+        return (vals.reshape(blk, nb32, 32) * db[:, :, None]).reshape(-1)[:n]
+    raise NotImplementedError(name)
 
 
 # block byte size per type (for slicing a tensor's raw bytes)
@@ -297,7 +373,9 @@ _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),
           "Q4_K": (256, 144), "Q6_K": (256, 210),
           "IQ4_NL": (32, 18), "IQ4_XS": (256, 136),
-          "Q5_K": (256, 176), "Q3_K": (256, 110), "Q2_K": (256, 84)}
+          "Q5_K": (256, 176), "Q3_K": (256, 110), "Q2_K": (256, 84),
+          "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ2_S": (256, 82),
+          "IQ3_XXS": (256, 98), "IQ3_S": (256, 110)}
 
 
 # Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the

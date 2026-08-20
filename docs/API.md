@@ -207,9 +207,10 @@ model a stable task name or plugging in a non-CausalLM architecture.
 ## GGUF quantization support
 `.gguf` files are loaded generically (architecture read from the file's own `{arch}.*`
 metadata). Dequantization is implemented for **F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K,
-Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS** — which covers the common builds (`Q4_K_M`, `Q5_K_M`,
-`Q6_K`, `Q8_0`, `IQ4_XS`) including mixed/"dynamic" files that combine several of these. The
-remaining i-quants (IQ1/IQ2/IQ3 families) are **not** supported.
+Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS** — the common
+builds (`Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0`, `IQ4_XS`) and the mixed/"dynamic" files that combine
+several of these. The i-quants index ggml's codebook grids, kept as data in
+`webtorch/iqtables.py` (extracted from `ggml-common.h`). Only the 1-bit IQ1 family is missing.
 
 Both the quantization types and the architecture are **checked up front from the header**, so
 an unsupported file fails in seconds naming exactly what is missing, instead of after
