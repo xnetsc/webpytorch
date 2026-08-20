@@ -77,6 +77,114 @@ class AutoModelForCausalLM:
         return await _llm.CausalLM.from_fp16(p, lmax=lmax, quantize=q)   # q=None → run fp16
 
 
+# ---- ONE unified entry point for every model type ---------------------------
+class Model:
+    """Uniform handle returned by `webtorch.load(...)`, whatever the model is.
+
+    The specialised APIs (`AutoModelForCausalLM`, `pipeline`, `OnnxModel`, …) stay available —
+    this is the single door that covers all of them, so callers do not have to know which one a
+    given model needs:
+
+        m = await webtorch.load("Qwen/Qwen3-0.6B")            # LLM (repo id / dir / .gguf)
+        print(m.generate("Hello", max_new=64))
+        print(m("Hello"))                                     # calling it does the natural thing
+
+        m = await webtorch.load("/models/any.onnx")            # ONNX graph
+        outs = m.run({"input": arr})
+
+        m = await webtorch.load(task="text-to-speech")         # any registered pipeline/task
+        wav = m("hello")
+
+        m = await webtorch.load("/models/vlm", encoder="my-vision")   # multimodal
+        print(m.generate("Describe this.", media=img))
+
+    `.kind` says what was loaded ("causal-lm" / "onnx" / a task name), `.impl` is the underlying
+    object, and any attribute not defined here is forwarded to it — so nothing is hidden."""
+
+    def __init__(self, impl, kind):
+        self.impl = impl; self.kind = kind
+
+    def __getattr__(self, name):                 # forward everything else to the impl
+        return getattr(self.__dict__["impl"], name)
+
+    def __repr__(self):
+        return "<webtorch.Model kind=%s impl=%s>" % (self.kind, type(self.impl).__name__)
+
+    # inference verbs, in the order they are tried by the unified `infer`
+    _VERBS = ("generate", "run", "synth", "detect", "transcribe", "classify", "encode")
+
+    def infer(self, *a, **kw):
+        """**The unified inference call** — the same method for every model type.
+
+            m.infer("Hello", max_new=32)          # LLM      -> text
+            m.infer(text)                          # TTS      -> waveform
+            m.infer(audio)                         # ASR      -> text
+            m.infer(image, threshold=0.3)          # detection-> boxes
+            m.infer({"input": arr})                # ONNX     -> outputs
+            m.infer("Describe this.", media=img)   # multimodal
+
+        It dispatches to whatever the underlying model exposes (`__call__`, then `generate` /
+        `run` / `synth` / `detect` / `transcribe` / `classify` / `encode`), so callers never
+        branch on model type. `m(...)` is a shorthand for this."""
+        impl = self.impl
+        if callable(impl):
+            return impl(*a, **kw)
+        for m in self._VERBS:
+            f = getattr(impl, m, None)
+            if f is not None:
+                return f(*a, **kw)
+        raise TypeError("don't know how to run %r — it exposes none of %s"
+                        % (type(self.impl), ", ".join(self._VERBS)))
+
+    # `run` is an alias so ONNX-style callers keep working through the same door
+    def run(self, *a, **kw):
+        return self.infer(*a, **kw)
+
+    def stream(self, *a, **kw):
+        """Streaming inference where the model supports it (LLMs); otherwise yields the single
+        non-streaming result, so callers can always use the same loop."""
+        f = getattr(self.impl, "stream", None)
+        if f is not None:
+            return f(*a, **kw)
+        return iter([self.infer(*a, **kw)])
+
+    def __call__(self, *a, **kw):
+        return self.infer(*a, **kw)
+
+
+async def load(source=None, task=None, dtype="auto", encoder=None, **kw):
+    """**The unified loader.** Point it at anything and get a `Model` back:
+
+      source: a model dir / repo id ("org/repo" with a hub reader installed), a `.gguf` file,
+              a `.onnx` file, or omitted when `task=` names a registered pipeline.
+      task:   force a task ("text-to-speech", "asr", "object-detection", …); with `source` it
+              selects the pipeline's model name.
+      dtype:  "auto" | "fp16" | "int4" | "int8" (LLMs).
+      encoder: name of a registered media encoder -> a multimodal model.
+
+    Detection is by content, not by model name: `.onnx`/`.gguf` by extension, otherwise the
+    served `config.json` decides (a decoder config -> the generic CausalLM/MoE/hybrid engine).
+    Every specialised API remains available and unchanged."""
+    from . import multimodal, webio
+    if source is None:
+        if task is None:
+            raise ValueError("load() needs a `source` (path/repo/file) or a `task=`")
+        return Model(await pipeline(task, kw.pop("model", "auto"), **kw), task)
+
+    src = str(source).rstrip("/")
+    if src.endswith(".onnx"):
+        return Model(await OnnxModel.from_source(src), "onnx")
+    if task is not None:                                   # explicit task -> registry
+        return Model(await pipeline(task, kw.pop("model", "auto"), path=src, **kw), task)
+    lm = await AutoModelForCausalLM.from_pretrained(
+        src, dtype=dtype, **{k: kw[k] for k in ("bits", "lmax") if k in kw})
+    if encoder is not None:                                # decoder + media encoder
+        enc = await multimodal.load_encoder(encoder, **kw.get("encoder_kwargs", {}))
+        return Model(multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id")),
+                     "multimodal")
+    return Model(lm, "causal-lm")
+
+
 # Dedicated quantization interface (IO-free core `Quantizer.stream(...)` + framework-
 # compatible `Quantizer.quantize(src, dst, config, ...)` accepting path|callback|bytes).
 # Output is AutoGPTQ int4/int8, loadable by auto_gptq / vLLM / transformers / this SDK.
@@ -256,9 +364,13 @@ register_pipeline("text-generation", "auto", _load_causal, default=True)
 # ---- generic ONNX (any model) -----------------------------------------------
 class OnnxModel:
     @staticmethod
-    async def from_url(url):
+    async def from_source(src, io=None):
         from . import onnxrt
-        return await onnxrt.OnnxModel.from_url(url)
+        return await onnxrt.OnnxModel.from_source(src, io)
+
+    @staticmethod
+    async def from_url(url):                     # back-compat alias
+        return await OnnxModel.from_source(url)
 
 
 # ---- symmetric global async IO callbacks (REQUIRED; single injection point for ALL reads AND writes) ----
@@ -270,7 +382,7 @@ from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_writ
 
 
 # ---- explicit exports --------------------------------------------------------
-__all__ = ["install_torch", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
+__all__ = ["install_torch", "load", "Model", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
            "register_task", "list_pipelines", "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
            "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
            "make_cached_reader", "http_get", "http_size", "HttpError",

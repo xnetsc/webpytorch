@@ -577,8 +577,40 @@ class CausalLM:
             sin = np.concatenate([sin, np.zeros((sin.shape[0], pad), np.float32)], -1)
         return cos, sin
 
+    def _logits(self, hlast):
+        return wt.cat([blk(hlast) for blk in self.head], axis=-1).numpy()[0]
+
     def _head_argmax(self, hlast):
-        return int(wt.cat([blk(hlast) for blk in self.head], axis=-1).numpy()[0].argmax())
+        return self._pick(self._logits(hlast))
+
+    def _pick(self, logits):
+        """Turn logits into a token id using the current sampling parameters. Greedy when
+        `temperature <= 0` (or no sampling params were given), otherwise temperature +
+        top-k/top-p nucleus sampling. Parameters come from `generate(...)` / `load(...)`."""
+        sp = getattr(self, "_sampling", None)
+        if not sp or not sp.get("do_sample"):
+            return int(np.asarray(logits).argmax())
+        from . import lm_engine
+        return int(lm_engine.sample_nucleus(
+            np.asarray(logits, np.float32) / max(float(sp.get("temperature", 1.0)), 1e-5),
+            top_p=float(sp.get("top_p", 1.0)), top_k=int(sp.get("top_k", 0) or 10 ** 9),
+            rng=sp.get("rng")))
+
+    def _set_sampling(self, temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
+                      **_ignored):
+        """Install generation parameters. Defaults set at load time are kept; anything passed to
+        generate() overrides them for that call."""
+        base = dict(getattr(self, "gen_defaults", {}) or {})
+        for k, v in (("temperature", temperature), ("top_p", top_p),
+                     ("top_k", top_k), ("seed", seed), ("do_sample", do_sample)):
+            if v is not None:
+                base[k] = v
+        if base.get("do_sample") is None:
+            base["do_sample"] = float(base.get("temperature", 0) or 0) > 0
+        if base.get("seed") is not None:
+            base["rng"] = np.random.default_rng(int(base["seed"]))
+        self._sampling = base
+        return base
 
     def _init_state(self):
         L, NKV, HD, LMAX, H = self.L, self.NKV, self.HD, self.lmax, self.H
@@ -708,10 +740,14 @@ class CausalLM:
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
 
-    def stream(self, prompt, max_new=48, system="You are a helpful assistant."):
+    def stream(self, prompt, max_new=48, system="You are a helpful assistant.",
+               temperature=None, top_p=None, top_k=None, seed=None, do_sample=None, **_kw):
         """Streaming decode: yield each new token's text as it is produced (render live,
-        bounded memory). WebGPU replays a captured step per token; WebGL grows a cache."""
+        bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
+        Takes the same generation parameters as `generate` (temperature/top_p/top_k/seed)."""
         eot = self.tok.SPECIALS["<|im_end|>"]
+        self._set_sampling(temperature, top_p, top_k, seed, do_sample)
+        self._reset_linear_state()
         ids = self.tok.encode_chat(prompt, system); P = len(ids)
         if not self._gpu:
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
@@ -729,10 +765,11 @@ class CausalLM:
         while n < max_new and nxt != eot:
             yield self.tok.decode([nxt]); n += 1
             self._set_inputs(nxt, pos); plat.replay("decode")
-            nxt = int(logits_t.numpy()[0].argmax()); pos += 1
+            nxt = self._pick(logits_t.numpy()[0]); pos += 1
 
     def generate(self, prompt, max_new=48, system="You are a helpful assistant.",
-                 ids=None, embeds=None):
+                 ids=None, embeds=None, temperature=None, top_p=None, top_k=None, seed=None,
+                 do_sample=None, **_kw):
         """ChatML prompt -> greedy decode -> GenResult. WebGPU replays a captured
         decode step per token (~20x); WebGL uses a correct growing-cache forward.
         For live token-by-token output use `stream(...)`.
@@ -745,6 +782,7 @@ class CausalLM:
         if ids is None:
             ids = self.tok.encode_chat(prompt, system)
         P = len(ids)
+        self._set_sampling(temperature, top_p, top_k, seed, do_sample)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
         if not self._gpu:                              # WebGL fallback
@@ -777,7 +815,7 @@ class CausalLM:
         while len(gen) < max_new:
             self._set_inputs(nxt, pos)
             plat.replay("decode")
-            nxt = int(logits_t.numpy()[0].argmax()); pos += 1; steps += 1
+            nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
             if nxt == eot:
                 break
             gen.append(nxt)
