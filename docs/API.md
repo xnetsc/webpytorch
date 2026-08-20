@@ -222,6 +222,70 @@ this is what makes GGUF work without a GPU).
   callback (str urls read via the global `io_read`; `io=` overrides per call).
   `.run({name: ndarray}) -> [outputs]`. ~50 ops; runs any registered graph.
 
+## Bringing up the GPU backend  (`webtorch.initMain` / `initWorker` / `backend`)
+
+Tensor ops run on WebGPU (or WebGL) through a backend that spans **two JavaScript contexts**:
+the main thread owns the device, the worker reaches it over shared memory. Both halves must
+be initialised, in this order — the worker's half after the main thread's, and **before
+Pyodide starts**.
+
+Getting it wrong does not raise. Every op silently falls back to numpy inside wasm: still
+correct, roughly two orders of magnitude slower. That failure mode is why the SDK owns the
+handshake instead of leaving it to callers, and why the live backend is queryable.
+
+**Main thread** — load `dist/wgpy-main.js`, then `webtorch/js/webtorch-main.js`:
+
+```html
+<script src="../dist/wgpy-main.js"></script>
+<script src="../webtorch/js/webtorch-main.js"></script>
+```
+```js
+const worker = new Worker('worker.js');
+// Picks the first backend this browser can actually provide and tells the worker.
+// Hold every message to the worker until it resolves.
+const { backend } = await webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] });
+console.log('compute:', backend);            // 'webgpu' | 'webgl' | 'cpu'
+```
+
+- `backendOrder` — preference order; entries the browser cannot provide are skipped.
+- `requireGpu: true` — throw instead of reporting `'cpu'`, when a CPU fallback is useless
+  to you.
+
+**Worker** — load `dist/wgpy-worker.js` and the Pyodide loader, then
+`webtorch/js/webtorch-worker.js`. One call brings up the backend, Pyodide, the matching
+backend wheel and the package modules, in the order they require:
+
+```js
+importScripts('../lib/pyodide/pyodide.js');
+importScripts('../dist/wgpy-worker.js');
+importScripts('../webtorch/js/webtorch-worker.js');
+
+const { pyodide, backend } = await webtorch.initWorker({
+  baseURL: '../',                            // prefix for dist/ and webtorch/
+  onStatus: (t) => postMessage({ type: 'status', text: t }),
+});
+```
+
+`backend` is what actually came up, probed after the fact — not what was requested. The
+module list lives in the bootstrap, so callers do not track it.
+
+**From Python** — the same question, answerable inside the runtime:
+
+- `webtorch.backend() -> "webgpu" | "webgl" | "cpu"` — what ops will really run on.
+- `webtorch.has_gpu() -> bool`
+- `webtorch.require_gpu(what="this model") -> str` — raise unless a GPU backend is live,
+  naming the usual cause. Call it **before** a long download, so a misconfigured page fails
+  in a second instead of after several gigabytes and a very slow first reply:
+
+```python
+import webtorch
+webtorch.require_gpu("Qwen3-30B")            # fails fast if the handshake was missed
+m = await webtorch.load("unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/…Q3_K_XL.gguf")
+```
+
+Show the value in your UI rather than inferring it from how long a reply takes — a silent
+CPU fallback is otherwise indistinguishable from "the model is big".
+
 ## IO injection — REQUIRED global read + write callbacks
 Every byte the SDK reads or writes — weights, configs, tokenizers, ONNX graphs, npz,
 quantized shards, index/config json — flows through **two** global async callbacks. The
@@ -333,31 +397,59 @@ webtorch.set_io_read(reader)
 - `cache` / `cache_dir` / `max_parallel` / `prefetch` / `chunk_mb` / `persist`: identical to
   `hf_read`.
 
+#### How the cache is stored
+The unit of storage is a **chunk**, matching the unit of download: in the browser each chunk
+is its own IndexedDB record, written as it arrives. Three consequences worth knowing:
+
+- **Memory does not grow with file size.** A 13 GB model costs the same live bytes as a
+  400 MB one, because no object accumulates the file. (Pyodide's IDBFS is *not* used for
+  this: it keeps a file's whole contents in the wasm heap and only copies them to IndexedDB
+  on `syncfs`, so a multi-GB download would be buffered entirely in memory.)
+- **An interrupted download resumes.** The set of stored chunks *is* the coverage map, so a
+  reload, a closed tab or a dropped connection costs only the chunks that were in flight.
+- **Nothing is rewritten** as the download grows, and there is no flush step.
+
+What this bounds is growth with file size, not absolute footprint. The live set is roughly
+`(max_parallel + chunks spanned by the current read) × chunk`, so the defaults (8 × 16 MB)
+peak near 144 MB; lower `max_parallel` or `chunk_mb` to trade throughput for footprint. It
+is not a hard cap — the wasm heap never shrinks, and asking for a whole multi-GB file in one
+`read` still returns one.
+
+The file's total length is often unknowable in a browser: `Content-Length` and
+`Content-Range` are not CORS-safelisted, and some hosts (ModelScope among them) do not
+expose them. That does not disable caching — chunk indices never needed the total, and the
+size is learnt from the first short chunk.
+
 #### Managing the persistent cache
 Because the cache persists, it needs housekeeping — list / inspect / read / write / delete /
-clear it, so it never becomes dead data. All are **async** (they load the browser's
-IndexedDB-backed cache first, and flush any change back). Every entry's **key is the URL
+clear it, so it never becomes dead data. All are **async**. Every entry's **key is the URL
 without scheme, so its first path segment is the host/domain** — HF (`huggingface.co/…`) and
 ModelScope (`modelscope.cn/…`) entries are separated and can be listed or cleared per host.
 
 - `webtorch.default_cache_dir() -> str` — the dir the readers use by default
   (`$WEBTORCH_CACHE` or `~/.cache/webtorch/hub`). All functions below take `cache_dir=None`
   meaning this default.
-- `await webtorch.list_cache(cache_dir=None, host=None) -> [ {"key","host","size","complete","path"} ]`
+- `await webtorch.list_cache(cache_dir=None, host=None) -> [ {"key","host","size","complete","total","path"} ]`
   — every cached entry, sorted by key; `host="huggingface.co"` filters to one domain.
+  `size` is what is actually stored, so a partly-downloaded entry reports its real extent;
+  `total` is the file's full length once known (`None` if the host never revealed it), and
+  `complete` says whether every chunk is present.
 - `await webtorch.cache_hosts(cache_dir=None) -> [ {"host","files","size"} ]` — per-domain
   summary (largest first), so you can see HF vs ModelScope usage at a glance.
 - `await webtorch.cache_size(cache_dir=None, host=None) -> int` — total bytes cached
   (optionally for one host).
 - `await webtorch.read_cache(key, offset=0, length=None, cache_dir=None) -> bytes | None` —
   read a cached entry's bytes (a `list_cache` key, or a full URL); `None` if not cached.
+- `await webtorch.read_cache(...)` reads only the chunks the range touches, so it stays cheap
+  on a multi-GB entry. It returns `None` if the range crosses a gap in a partial entry.
 - `await webtorch.write_cache(key, data, cache_dir=None, complete=True) -> None` — write /
-  replace an entry (pre-seed the cache); `complete=True` marks it fully cached so a reader
-  serves it from disk. Persists to IndexedDB in the browser.
-- `await webtorch.delete_cache(key, cache_dir=None) -> bool` — delete one entry (its data +
-  markers); `True` if it existed. Persists.
+  replace an entry (pre-seed the cache), stored chunk by chunk; `complete=True` marks it
+  fully cached so a reader serves it without touching the network. Replaces any existing
+  entry rather than merging with its chunks.
+- `await webtorch.delete_cache(key, cache_dir=None) -> bool` — delete one entry: every chunk
+  plus its metadata; `True` if it existed.
 - `await webtorch.clear_cache(cache_dir=None, host=None) -> int` — delete everything (or only
-  one `host`'s entries); returns the number of files removed. Persists.
+  one `host`'s entries); returns the number of entries removed.
 
 ```python
 for h in await webtorch.cache_hosts():          # e.g. [{"host":"huggingface.co","files":9,"size":9_999_999}, …]
@@ -365,8 +457,8 @@ for h in await webtorch.cache_hosts():          # e.g. [{"host":"huggingface.co"
 await webtorch.clear_cache(host="modelscope.cn")  # free just the ModelScope cache
 ```
 
-Note: these act on disk; a reader object created earlier may still hold a just-deleted entry
-in memory for its lifetime — clear the cache between loads or before creating the reader.
+Note: these act on storage; a reader object created earlier may still hold chunks it already
+read — clear the cache between loads, or before creating the reader.
 
 A complete, runnable demo of `make_cached_reader` (with `HttpError` rate-limit handling) and
 every cache-management function is in **`examples/io_cache_tools.py`** — it uses no GPU or

@@ -505,6 +505,7 @@ class _Store:
         raise NotImplementedError
 
     async def put(self, key, i, data):
+        """-> True when stored, False when storage is full (the caller keeps streaming)."""
         raise NotImplementedError
 
     async def delete(self, key):
@@ -594,6 +595,7 @@ class _DiskStore(_Store):
         if i not in set(m["have"]):
             m["have"] = sorted(set(m["have"]) | {i})
             self._write_meta(key, m)
+        return True
 
     async def delete(self, key):
         import os
@@ -622,6 +624,14 @@ class _DiskStore(_Store):
         p, _mp = self._paths(key)
         try: return os.path.getsize(p)
         except OSError: return 0
+
+
+def _is_quota_error(e):
+    """True for the browser's "storage is full" signal, whatever it is wrapped in."""
+    name = getattr(e, "name", "") or ""
+    text = "%s %s" % (name, e)
+    return ("QuotaExceeded" in text or "quota" in text.lower()
+            or "NS_ERROR_DOM_QUOTA" in text)
 
 
 def _idb_req(req):
@@ -653,6 +663,7 @@ class _IdbStore(_Store):
     def __init__(self, root):
         self.root = root                       # kept only so entries stay separable per cache dir
         self.db = None
+        self.full = False                      # set once the origin's quota is exhausted
 
     async def open(self):
         if self.db is not None:
@@ -713,7 +724,17 @@ class _IdbStore(_Store):
         return bytes(v.to_py()) if hasattr(v, "to_py") else bytes(v)
 
     async def put(self, key, i, data):
+        """Store one chunk. Returns False when storage is full rather than raising.
+
+        A model can legitimately be larger than the origin's storage quota -- the browser
+        grants roughly a share of free disk, which is unrelated to what the GPU can run.
+        Because chunks are independent, a cache that only holds part of a file is still
+        useful: the stored chunks are served from storage and the rest streams. So hitting
+        the quota degrades caching instead of failing the load.
+        """
         await self.open()
+        if self.full:
+            return False
         from js import Uint8Array
         try:
             buf = Uint8Array.new(len(data))
@@ -721,8 +742,16 @@ class _IdbStore(_Store):
         except Exception:
             from pyodide.ffi import to_js
             buf = to_js(data)
-        await _idb_req(self._store(self.CHUNKS, "readwrite").put(buf, self._ck(key, i)))
-        del buf                                # nothing here outlives the write
+        try:
+            await _idb_req(self._store(self.CHUNKS, "readwrite").put(buf, self._ck(key, i)))
+        except Exception as e:
+            if _is_quota_error(e):
+                self.full = True               # stop trying; reads keep working, writes stream
+                return False
+            raise
+        finally:
+            del buf                            # nothing here outlives the write
+        return True
 
     async def delete(self, key):
         await self.open()
@@ -823,8 +852,9 @@ class _CachedFile:
         off = i * self.chunk
         n = self.chunk if self.size is None else max(0, min(self.chunk, self.size - off))
         data = await self.c._net(self.key, off, n)
-        await self.c.store.put(self.key, i, data)
-        self.have.add(i)
+        stored = await self.c.store.put(self.key, i, data)
+        if stored:                            # a refused write must not look like a hit
+            self.have.add(i)
         if self.size is None and len(data) < self.chunk:
             self.size = off + len(data)       # short read == EOF
             await self.c.store.set_meta(self.key, size=self.size, chunk=self.chunk)
@@ -855,6 +885,9 @@ class _CachedFile:
                 cnt = self._count()
                 if cnt is not None and i >= cnt:
                     break
+                if getattr(self.c.store, "full", False):
+                    break                              # storage is full: reading on would
+                                                       # only re-download what cannot be kept
                 if i not in self.have:
                     b = await self._chunk_bytes(i)     # stored; the bytes are dropped here
                     short = len(b) < self.chunk
