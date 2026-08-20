@@ -809,6 +809,17 @@ class CausalLM:
             self._set_inputs(nxt, pos); plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
 
+    def release(self):
+        """Free this model's weights (layers, embeddings, head, KV cache). The object must not
+        be used afterwards; load it again to use it. See `webtorch.release`."""
+        from . import _sdk
+        _sdk._free(self)
+        return self
+
+    def _check_live(self):
+        if self.__dict__.get("_released"):
+            raise RuntimeError("this model has been released; load it again to use it")
+
     def generate(self, prompt, max_new=48, system="You are a helpful assistant.",
                  ids=None, embeds=None, temperature=None, top_p=None, top_k=None, seed=None,
                  do_sample=None, **_kw):
@@ -820,6 +831,7 @@ class CausalLM:
         embeddings to decode from a sequence assembled elsewhere. That is the generic hook used
         for multimodality (image/audio embeddings spliced into the token embeddings) — see
         `webtorch.MultimodalLM` — so no model-specific decode path is needed."""
+        self._check_live()
         eot = self.tok.SPECIALS["<|im_end|>"]
         if ids is None:
             ids = self.tok.encode_chat(prompt, system)

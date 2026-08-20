@@ -45,6 +45,21 @@ m3 = await webtorch.load("Qwen/Qwen3-0.6B")      # released -> loads fresh
   raises. `webtorch.release_all()` releases everything; `webtorch.loaded_models()` lists what
   is held; `load(..., reuse=False)` forces a separate instance.
 
+### Releasing any model — `webtorch.release(model)`
+On-demand load/unload has to work for **every** entry point, not just `load()`. `release()`
+frees a model however it was built — a `Model`, an `AutoModelForCausalLM.from_pretrained()`
+result, a `pipeline(...)` task object, an `OnnxModel`, or a `MultimodalLM`:
+
+```python
+lm = await webtorch.AutoModelForCausalLM.from_pretrained(path)   # not via load()
+...
+webtorch.release(lm)          # weights dropped; using it afterwards raises
+```
+`model.release()` / `pipe.release()` work directly too, and task objects and `Model` are
+context managers (`with await webtorch.load(...) as m:`). Releasing also clears any `load()`
+cache entry, so a later `load()` rebuilds. Repeated load/release keeps memory flat: the freed
+weights are reused by the next load.
+
 ## Generation parameters
 `generate(...)` / `stream(...)` take `temperature`, `top_p`, `top_k`, `seed`, `do_sample`.
 Greedy is the default (`temperature<=0`); with sampling, a given `seed` is reproducible.

@@ -121,7 +121,10 @@ class Model:
         """Free this model: drop its weights and remove it from the loaded-model cache, so a
         later `load()` of the same source builds a fresh one. Idempotent."""
         _LOADED.pop(self.__dict__.get("_key"), None)
+        impl = self.__dict__.get("impl")
         self.__dict__["impl"] = None
+        if impl is not None:
+            _free(impl)                       # actually drop the weights, not just our handle
         return self
 
     # so `with await webtorch.load(...) as m:` frees the weights on exit
@@ -188,7 +191,7 @@ def release_all():
     """Release every cached model (frees their weights). Returns how many were released."""
     n = 0
     for m in list(_LOADED.values()):
-        m.release(); n += 1
+        m.release(); n += 1          # Model.release frees the impl's weights too
     _LOADED.clear()
     return n
 
@@ -283,7 +286,25 @@ Quantizer = _q.Quantizer
 #   image-to-text           : .generate(prompt, image=…)
 #   text-generation         : .generate(prompt, …) ; .stream(prompt, …)
 
-class _TextToSpeech:
+class _TaskBase:
+    """Shared behaviour for task wrappers: releasing a task object frees the model behind it,
+    so pipelines take part in on-demand load/unload like every other entry point."""
+    def release(self):
+        impl = self.__dict__.get("_impl")
+        self.__dict__["_impl"] = None
+        if impl is not None:
+            _free(impl)
+        return self
+
+    @property
+    def released(self):
+        return self.__dict__.get("_impl") is None
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.release(); return False
+
+
+class _TextToSpeech(_TaskBase):
     """`pipe(text)` -> waveform; `pipe(text, reference_audio=…, reference_text=…)` clones
     (generic knob; models without `.can_clone` raise NotImplementedError)."""
     def __init__(self, impl): self._impl = impl
@@ -297,22 +318,22 @@ class _TextToSpeech:
             return self._impl.clone(text, reference_audio, reference_text, **kw)
         return self._impl.synth(text, **kw)
 
-class _ObjectDetection:
+class _ObjectDetection(_TaskBase):
     def __init__(self, impl): self._impl = impl
     def __call__(self, image, threshold=None, **kw):
         return self._impl.detect(image, **({} if threshold is None else {"threshold": threshold}), **kw)
 
-class _ImageToText:
+class _ImageToText(_TaskBase):
     def __init__(self, impl): self._impl = impl
     def __call__(self, image, prompt="Describe the image.", **kw):
         return self._impl.generate(prompt, image=image, **kw)
 
-class _TextGeneration:
+class _TextGeneration(_TaskBase):
     def __init__(self, impl): self._impl = impl
     def __call__(self, prompt, **kw): return self._impl.generate(prompt, **kw)
     def stream(self, prompt, **kw): return self._impl.stream(prompt, **kw)
 
-class _SpeechToText:
+class _SpeechToText(_TaskBase):
     """`pipe(audio)` -> text. Audio is a waveform (ndarray/list) or whatever the impl accepts;
     `sampling_rate=` is forwarded when given. Protocol: `.transcribe(audio, …) -> str`."""
     def __init__(self, impl): self._impl = impl
@@ -322,14 +343,14 @@ class _SpeechToText:
         if sampling_rate is not None: kw["sampling_rate"] = sampling_rate
         return self._impl.transcribe(audio, **kw)
 
-class _AudioClassification:
+class _AudioClassification(_TaskBase):
     """`pipe(audio)` -> labels/scores. Protocol: `.classify(audio, …)`."""
     def __init__(self, impl): self._impl = impl
     @property
     def sampling_rate(self): return getattr(self._impl, "sr", 16000)
     def __call__(self, audio, **kw): return self._impl.classify(audio, **kw)
 
-class _Generic:
+class _Generic(_TaskBase):
     """Fallback wrapper for a task webtorch has no built-in protocol for. It forwards the call
     to the impl (`impl(...)`, else `impl.run(...)`) and proxies attribute access, so a third
     party can register an entirely NEW task type without changing the SDK."""
@@ -463,9 +484,71 @@ from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_writ
 
 
 # ---- explicit exports --------------------------------------------------------
-__all__ = ["install_torch", "load", "Model", "loaded_models", "release_all", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
+__all__ = ["install_torch", "load", "Model", "release", "loaded_models", "release_all", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
            "register_task", "list_pipelines", "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
            "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
            "make_cached_reader", "http_get", "http_size", "HttpError",
            "default_cache_dir", "list_cache", "cache_hosts", "cache_size", "read_cache",
            "write_cache", "delete_cache", "clear_cache"]
+
+
+# ---- releasing models: free weights on demand, whatever loaded them --------------------
+# Browsers have a hard memory ceiling, so "load a model, use it, unload it, load another" has
+# to work for EVERY entry point — not just `webtorch.load()`. `release(model)` frees any model
+# object: a `Model`, an `AutoModelForCausalLM.from_pretrained` result, a `pipeline(...)` task
+# object, an `OnnxModel`, or a `MultimodalLM`.
+
+# Attributes that hold the bulk of a model's memory (weights, caches, tensor buffers).
+_HEAVY = ("layers", "embed", "head", "final_norm", "Kc", "Vc", "h_in", "cos_b", "sin_b",
+          "mask_b", "ctl", "vision", "graph", "nodes", "initializers", "_ginfo", "_idx",
+          "_shard_hdr", "conv_state", "rec_state", "_state", "impl", "_impl", "lm", "encoder")
+
+
+def _free(obj, _seen=None):
+    """Drop an object's heavy attributes (recursively through wrappers), so the GPU/host
+    buffers they hold become collectable. Returns True if anything was freed."""
+    if obj is None:
+        return False
+    _seen = _seen if _seen is not None else set()
+    if id(obj) in _seen:
+        return False
+    _seen.add(id(obj))
+    freed = False
+    own = getattr(obj, "release", None)          # respect a model's own release hook
+    if callable(own) and getattr(own, "__self__", None) is obj and not getattr(obj, "_releasing", False):
+        try:
+            obj._releasing = True
+            own(); freed = True
+        except Exception:
+            pass
+        finally:
+            obj._releasing = False
+        return freed
+    for name in _HEAVY:
+        if name in getattr(obj, "__dict__", {}):
+            inner = obj.__dict__[name]
+            if hasattr(inner, "__dict__") and not isinstance(inner, (list, dict, tuple)):
+                _free(inner, _seen)              # wrapper -> free what it wraps
+            obj.__dict__[name] = None
+            freed = True
+    if freed:
+        obj.__dict__["_released"] = True     # so using it afterwards gives a clear error
+    return freed
+
+
+def release(model):
+    """**Free a model's weights, however it was loaded.** Works on the result of
+    `webtorch.load()`, `AutoModelForCausalLM.from_pretrained()`, `pipeline()`,
+    `OnnxModel.from_source()` or `MultimodalLM` — so you can load a model, use it, unload it,
+    and load another within a fixed memory budget.
+
+        lm = await webtorch.AutoModelForCausalLM.from_pretrained(path)
+        ...
+        webtorch.release(lm)          # weights dropped; the object must not be used again
+
+    Also removes the model from the `load()` cache, so a later `load()` of the same source
+    builds a fresh one. Returns True if anything was freed. Idempotent."""
+    for key, m in list(_LOADED.items()):         # drop any cache entry pointing at it
+        if m is model or m.__dict__.get("impl") is model:
+            _LOADED.pop(key, None)
+    return _free(model)

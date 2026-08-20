@@ -35,7 +35,7 @@ from ._core import *                                  # Tensor, Module, Linear, 
 from . import _core as core                           # full core (incl. kernels) if needed
 
 # ---- high-level SDK surface (transformers/torch style) ----
-from ._sdk import (install_torch, load, Model, loaded_models, release_all, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
+from ._sdk import (install_torch, load, Model, release, loaded_models, release_all, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
                    register_pipeline, register_task, list_pipelines, OnnxModel)
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
@@ -71,7 +71,7 @@ __all__ = [
     # torch-compatible core
     "install_torch", "Tensor", "core",
     # THE unified entry point: one loader for every model type
-    "load", "Model", "loaded_models", "release_all",
+    "load", "Model", "release", "loaded_models", "release_all",
     # generic model / tokenizer / quantization / pipeline / onnx entry points
     "AutoTokenizer", "AutoModelForCausalLM", "pipeline", "register_pipeline", "register_task",
     "list_pipelines", "Quantizer", "OnnxModel",
