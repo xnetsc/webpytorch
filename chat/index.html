@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>webtorch chat</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">webtorch<span>chat</span></div>
+
+    <section class="panel">
+      <h3>Model</h3>
+      <select id="preset"></select>
+      <div class="row">
+        <input id="repo" placeholder="org/repo (any ModelScope model)" />
+      </div>
+      <div class="row">
+        <input id="file" placeholder="file.gguf (or blank for a HF-format dir)" />
+      </div>
+      <p class="hint">Presets are examples only — any ModelScope model works.
+         Downloads always come from ModelScope.</p>
+      <button id="loadBtn" class="primary">Load model</button>
+      <button id="releaseBtn">Release (free memory)</button>
+      <div id="modelStatus" class="status">no model loaded</div>
+      <div class="bar"><div id="bar" class="fill"></div></div>
+      <div id="progressText" class="hint"></div>
+    </section>
+
+    <section class="panel">
+      <h3>Cached models</h3>
+      <button id="refreshCache">Refresh</button>
+      <button id="clearCache" class="danger">Clear all</button>
+      <div id="cacheList" class="cache"></div>
+    </section>
+
+    <section class="panel">
+      <h3>Conversation</h3>
+      <button id="exportBtn">Export (.zip)</button>
+      <button id="importBtn">Import (.zip)</button>
+      <input type="file" id="importFile" accept=".zip" hidden />
+      <button id="newChat">New chat</button>
+    </section>
+  </aside>
+
+  <main id="main">
+    <div id="messages"></div>
+    <div id="attachments"></div>
+    <form id="composer">
+      <div class="tools">
+        <button type="button" id="toolFile" title="Attach a file">📎 File</button>
+        <button type="button" id="toolCam"  title="Capture from camera">📷 Camera</button>
+        <button type="button" id="toolUrl"  title="Fetch a URL">🔗 URL</button>
+        <input type="file" id="fileInput" hidden />
+      </div>
+      <textarea id="input" rows="1" placeholder="Send a message…"></textarea>
+      <button id="send" class="primary" type="submit">Send</button>
+    </form>
+    <div id="hintbar" class="hint"></div>
+  </main>
+</div>
+
+<dialog id="camDlg">
+  <video id="cam" autoplay playsinline></video>
+  <div class="row">
+    <button id="camShot" class="primary">Capture</button>
+    <button id="camCancel">Cancel</button>
+  </div>
+</dialog>
+
+<script src="zip.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

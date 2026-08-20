@@ -39,13 +39,47 @@ def _bytes_to_unicode():
     return {b: chr(c) for b, c in zip(bs, cs)}
 
 
-class BPETokenizer:
-    """GPT-2/Qwen-style byte-level BPE (vocab.json + merges.txt)."""
-    SPECIALS = {"<|endoftext|>": 151643, "<|im_start|>": 151644, "<|im_end|>": 151645}
+# Chat formats, keyed by a marker token the MODEL's own vocabulary declares. This is discovery,
+# not a model whitelist: whichever marker a tokenizer actually contains selects the format, so
+# a model family the SDK has never heard of still works as long as it uses one of these
+# conventions (and falls back to a plain transcript otherwise).
+_CHAT_FORMATS = (
+    ("<|im_start|>", "chatml"),            # Qwen, Yi, and many others
+    ("<|start_header_id|>", "llama3"),     # Llama 3.x
+    ("<start_of_turn>", "gemma"),          # Gemma
+    ("[INST]", "mistral"),                 # Mistral / Mixtral
+)
+# Tokens that end a turn, in the order we prefer them. Again: whichever the model HAS.
+_EOT_CANDIDATES = ("<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|end|>", "</s>",
+                   "<|endoftext|>", "<|end_of_text|>")
 
-    def __init__(self, vocab, merges):
+
+class BPETokenizer:
+    """Byte-level BPE (vocab + merges), with the special tokens and chat format discovered
+    from the model itself.
+
+    Nothing here is tied to a model family: the special-token ids come from the vocabulary the
+    model ships, the end-of-turn id from the model's own metadata (or the first end-of-turn
+    marker its vocabulary defines), and the chat layout from whichever marker token the
+    vocabulary contains. A model using none of the known conventions still works through a
+    plain `role: content` transcript."""
+
+    def __init__(self, vocab, merges, eos_ids=None, chat_format=None):
         self.enc = vocab
         self.dec = {i: t for t, i in vocab.items()}
+        # discover specials that this vocabulary actually defines
+        self.SPECIALS = {t: vocab[t] for t in
+                         ("<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|eot_id|>",
+                          "<|start_header_id|>", "<|end_header_id|>", "<start_of_turn>",
+                          "<end_of_turn>", "<|end_of_text|>", "<|end|>", "<s>", "</s>")
+                         if t in vocab}
+        self.chat_format = chat_format or next(
+            (f for tok, f in _CHAT_FORMATS if tok in vocab), "plain")
+        eos = [int(i) for i in (eos_ids or []) if i is not None]
+        eos += [vocab[t] for t in _EOT_CANDIDATES if t in vocab]
+        # de-duplicate, keep order; may be empty -> generation then stops at max_new
+        self.eos_ids = list(dict.fromkeys(eos))
+        self.eot = self.eos_ids[0] if self.eos_ids else -1
         self.b2u = _bytes_to_unicode(); self.u2b = {v: k for k, v in self.b2u.items()}
         self.ranks = {tuple(m.split()): i for i, m in enumerate(merges)}
         try:
@@ -72,15 +106,51 @@ class BPETokenizer:
         ids = []
         for chunk in self.re.findall(self.pat, text):
             s = "".join(self.b2u[b] for b in chunk.encode("utf-8"))
-            ids.extend(self.enc[p] for p in self._bpe(s))
+            for p in self._bpe(s):
+                i = self.enc.get(p)
+                if i is None:                     # incomplete vocab: fall back to its bytes
+                    for ch in p:
+                        j = self.enc.get(ch)
+                        if j is not None: ids.append(j)
+                else:
+                    ids.append(i)
         return ids
 
+    def _sp(self, name):
+        return self.SPECIALS.get(name)
+
     def encode_chat(self, user, system="You are a helpful assistant."):
-        seq = []
-        for role, content in [("system", system), ("user", user)]:
-            seq += [self.SPECIALS["<|im_start|>"]] + self.encode(role + "\n" + content)
-            seq += [self.SPECIALS["<|im_end|>"]] + self.encode("\n")
-        return seq + [self.SPECIALS["<|im_start|>"]] + self.encode("assistant\n")
+        """Render a chat prompt in whatever format this model's vocabulary indicates."""
+        f = self.chat_format
+        if f == "chatml":
+            ims, ime = self._sp("<|im_start|>"), self._sp("<|im_end|>")
+            seq = []
+            for role, content in (("system", system), ("user", user)):
+                seq += [ims] + self.encode(role + "\n" + content) + [ime] + self.encode("\n")
+            return seq + [ims] + self.encode("assistant\n")
+        if f == "llama3":
+            sh, eh = self._sp("<|start_header_id|>"), self._sp("<|end_header_id|>")
+            eot = self._sp("<|eot_id|>")
+            seq = []
+            bos = self._sp("<|begin_of_text|>")
+            if bos is not None: seq.append(bos)
+            for role, content in (("system", system), ("user", user)):
+                seq += [sh] + self.encode(role) + [eh] + self.encode("\n\n" + content) + [eot]
+            return seq + [sh] + self.encode("assistant") + [eh] + self.encode("\n\n")
+        if f == "gemma":
+            sot, eot = self._sp("<start_of_turn>"), self._sp("<end_of_turn>")
+            # Gemma has no system role: fold it into the first user turn
+            body = (system + "\n\n" + user) if system else user
+            return ([sot] + self.encode("user\n" + body) + [eot] + self.encode("\n")
+                    + [sot] + self.encode("model\n"))
+        if f == "mistral":
+            bos = self._sp("<s>")
+            seq = [bos] if bos is not None else []
+            body = (system + "\n\n" + user) if system else user
+            return seq + self.encode("[INST] " + body + " [/INST]")
+        # plain transcript — works for a base model or an unknown convention
+        pre = (system + "\n\n") if system else ""
+        return self.encode(pre + "User: " + user + "\nAssistant:")
 
     def decode(self, ids):
         buf = bytearray()
@@ -329,7 +399,10 @@ class CausalLM:
 
         vocab = await webio.read_json(self.base + "vocab.json")
         merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
-        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")])
+        _e = cfg.get("eos_token_id")
+        _eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
+        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
+                                eos_ids=_eos)
 
         imeta = await webio.read_json(self.base + "model.safetensors.index.json")
         self._idx = imeta.get("weight_map")
@@ -431,6 +504,7 @@ class CausalLM:
         self.top_k = int(m("expert_used_count", default=0, required=False) or 0)
         self.norm_topk = True; self.sparse_step = 1; self.mlp_only = set()
         self.has_shared_expert = False
+        _eos = [meta.get("tokenizer.ggml.eos_token_id"), meta.get("tokenizer.ggml.eot_token_id")]
         self.tok = BPETokenizer({t: i for i, t in enumerate(meta["tokenizer.ggml.tokens"])},
                                 meta.get("tokenizer.ggml.merges", []))
         self._ginfo = {t["name"]: t for t in infos}; self._gds = ds
@@ -567,7 +641,10 @@ class CausalLM:
 
         vocab = await webio.read_json(self.base + "vocab.json")
         merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
-        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")])
+        _e = cfg.get("eos_token_id")
+        _eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
+        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
+                                eos_ids=_eos)
 
         try:                                                   # sharded models have an index
             imeta = await webio.read_json(self.base + "model.safetensors.index.json")
@@ -787,7 +864,7 @@ class CausalLM:
         """Streaming decode: yield each new token's text as it is produced (render live,
         bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
         Takes the same generation parameters as `generate` (temperature/top_p/top_k/seed)."""
-        eot = self.tok.SPECIALS["<|im_end|>"]
+        eot = self.tok.eot
         self._set_sampling(temperature, top_p, top_k, seed, do_sample)
         self._reset_linear_state()
         ids = self.tok.encode_chat(prompt, system); P = len(ids)
@@ -832,7 +909,7 @@ class CausalLM:
         for multimodality (image/audio embeddings spliced into the token embeddings) — see
         `webtorch.MultimodalLM` — so no model-specific decode path is needed."""
         self._check_live()
-        eot = self.tok.SPECIALS["<|im_end|>"]
+        eot = self.tok.eot
         if ids is None:
             ids = self.tok.encode_chat(prompt, system)
         P = len(ids)
