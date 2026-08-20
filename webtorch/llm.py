@@ -891,6 +891,13 @@ class CausalLM:
 
     # ---- math ----
     def _rms(self, x, w):
+        # One fused dispatch where the backend has it. Written as an expression this is six
+        # kernels, and on this stack a dispatch costs about the same whatever its size, so
+        # the two norms in every layer add up to a large share of a decode step.
+        if getattr(self, "_gpu", False) and wt._RMS_FUSED:   # _gpu is unset while building
+            r = wt.rmsnorm(x, w, self.eps)
+            if r is not None:
+                return r
         return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
 
     def _rot(self, x):
@@ -903,6 +910,16 @@ class CausalLM:
         if rd < hd:
             parts.append(wt._slice_last(x, rd, hd))
         return wt.cat(parts, axis=-1)
+
+    def _rope1(self, t):
+        """Rotary embedding for the single decode position, fused into one dispatch where
+        the backend allows it (see wt.rope_decode). The expression form is ~8 launches."""
+        if getattr(self, "_gpu", False) and wt._ROPE_FUSED:
+            r = wt.rope_decode(t, self.cos_b, self.sin_b, self.HD,
+                               getattr(self, "rope_dim", self.HD))
+            if r is not None:
+                return r
+        return t * self.cos_b + self._rot(t) * self.sin_b
 
     def _rope_np(self, pos, T=1):
         """rope cos/sin of shape (T, HD). With `partial_rotary_factor < 1` (Qwen3.5/3.8 style)
@@ -1074,8 +1091,7 @@ class CausalLM:
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
             q, k, v = self._qkv(lay, x, 1)
-            q = q * self.cos_b + self._rot(q) * self.sin_b
-            k = k * self.cos_b + self._rot(k) * self.sin_b
+            q = self._rope1(q); k = self._rope1(k)
             wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)

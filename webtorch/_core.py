@@ -2014,6 +2014,158 @@ void main() {
 """.replace("FETCH", _GL_FETCH)
 
 
+# A decode step is dominated by kernel launches, not bandwidth: on this stack every
+# dispatch costs ~21us whatever its size, and RMS norm as an expression is six of them
+# (square, mean, add eps, sqrt, divide, scale). Two per layer across 28 layers is most of
+# the step. Fused, it is one launch. eps travels as its bit pattern because the meta
+# buffer carries u32 words.
+_RMS_WGSL = """@group(0) @binding(0)
+var<storage,read> x: array<f32>;
+@group(0) @binding(1)
+var<storage,read> w: array<f32>;
+@group(0) @binding(2)
+var<storage,read_write> outp: array<f32>;
+struct RMeta { T: u32, H: u32, epsbits: u32, }
+@group(0) @binding(3)
+var<storage,read> rm: RMeta;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wg.x;
+  if (row >= rm.T) { return; }
+  let t = lid.x;
+  let base = row * rm.H;
+  var s: f32 = 0.0;
+  var i: u32 = t;
+  loop {
+    if (i >= rm.H) { break; }
+    let v = x[base + i];
+    s = s + v * v;
+    i = i + 256u;
+  }
+  red[t] = s;
+  workgroupBarrier();
+  var k: u32 = 128u;
+  loop {
+    if (k == 0u) { break; }
+    if (t < k) { red[t] = red[t] + red[t + k]; }
+    workgroupBarrier();
+    k = k / 2u;
+  }
+  let scale = inverseSqrt(red[0] / f32(rm.H) + bitcast<f32>(rm.epsbits));
+  var j: u32 = t;
+  loop {
+    if (j >= rm.H) { break; }
+    outp[base + j] = x[base + j] * scale * w[j];
+    j = j + 256u;
+  }
+}
+"""
+_rms_k = {"added": False}
+_RMS_FUSED = True      # A/B switch for the fused path
+_ROPE_FUSED = True     # A/B switch for the fused rope
+
+
+def rmsnorm(x, w, eps):
+    """Fused RMS norm: `x * rsqrt(mean(x^2) + eps) * w`, one dispatch instead of six.
+
+    Returns None when there is no WebGPU backend, so callers keep their own expression.
+    Inference-only: no autograd node is built, which is why the graph path stays intact.
+    """
+    if not _adam_backend_ready():
+        return None
+    xd = x.data if isinstance(x, Tensor) else x
+    wd = w.data if isinstance(w, Tensor) else w
+    shape = tuple(xd.shape)
+    H = int(shape[-1])
+    T = 1
+    for d in shape[:-1]:
+        T *= int(d)
+    plat = _adam_kernel["platform"]
+    if not _rms_k["added"]:
+        plat.addKernel("rmsnorm", {"source": _RMS_WGSL,
+                                   "bindingTypes": ["read-only-storage", "read-only-storage",
+                                                    "storage", "read-only-storage"]})
+        _rms_k["added"] = True
+    xd = _contig(xd)
+    of = _empty((T, H))
+    ebits = int(np.float32(eps).view(np.uint32))
+    meta = _adam_kernel["make_meta"]((T, H, ebits), "u4,u4,u4")
+    plat.runKernel({"name": "rmsnorm",
+                    "tensors": [xd.buffer.buffer_id, _contig(wd).buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": T, "y": 1, "z": 1}})
+    return Tensor(of.reshape(*shape))
+
+
+# Rope written as `x*cos + rotate_half(x)*sin` is about eight dispatches per tensor: two or
+# three slices, a negation, a concat, then two multiplies and an add. Twice per layer across
+# a deep model that is the largest single block of launches in a decode step. Fused, it is
+# one. Decode only: there cos/sin are a single row indexed by position within the head, so
+# the mapping is just `i % HD`.
+_ROPE_WGSL = """@group(0) @binding(0)
+var<storage,read> x: array<f32>;
+@group(0) @binding(1)
+var<storage,read> cosb: array<f32>;
+@group(0) @binding(2)
+var<storage,read> sinb: array<f32>;
+@group(0) @binding(3)
+var<storage,read_write> outp: array<f32>;
+struct PMeta { n: u32, HD: u32, rd: u32, }
+@group(0) @binding(4)
+var<storage,read> pm: PMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= pm.n) { return; }
+  let d = i % pm.HD;
+  let half = pm.rd / 2u;
+  var rot: f32;
+  if (d < half) {
+    rot = -x[i + half];
+  } else if (d < pm.rd) {
+    rot = x[i - half];
+  } else {
+    rot = x[i];                      // pass-through tail: sin is 0 here, value is inert
+  }
+  outp[i] = x[i] * cosb[d] + rot * sinb[d];
+}
+"""
+_rope_k = {"added": False}
+
+
+def rope_decode(x, cos, sin, HD, rd):
+    """Fused rotary embedding for a single position: `x*cos + rotate_half(x)*sin`.
+
+    Returns None without a WebGPU backend so callers keep their expression. `cos`/`sin` are
+    one row of length HD. `rd` is the rotated prefix for partial rope; the tail passes
+    through unchanged, matching the unfused form.
+    """
+    if not _adam_backend_ready():
+        return None
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    shape = tuple(xd.shape)
+    n = 1
+    for d in shape:
+        n *= int(d)
+    plat = _adam_kernel["platform"]
+    if not _rope_k["added"]:
+        plat.addKernel("rope", {"source": _ROPE_WGSL,
+                                "bindingTypes": ["read-only-storage"] * 3 + ["storage",
+                                                                             "read-only-storage"]})
+        _rope_k["added"] = True
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+    of = _empty((n,))
+    meta = _adam_kernel["make_meta"]((n, int(HD), int(rd)), "u4,u4,u4")
+    plat.runKernel({"name": "rope",
+                    "tensors": [xd.buffer.buffer_id, cd.buffer.buffer_id, sd.buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(of.reshape(*shape))
+
+
 def _emb_kernels():
     if _adam_backend_ready():
         if not _emb_k["added"]:
