@@ -44,9 +44,12 @@
     <h3>Model</h3>
     <div id="envInfo" class="hint">detecting environment…</div>
     <select id="preset"></select>
-    <div class="row"><input id="repo" placeholder="org/repo (any ModelScope model)" /></div>
-    <div class="row"><input id="file" placeholder="file.gguf (blank for a HF-format dir)" /></div>
-    <p class="hint">Presets are examples — any ModelScope model works. Downloads come from ModelScope.</p>
+    <div id="customBox" hidden>
+      <div class="row">
+        <input id="modelId" placeholder="org/repo/file.gguf  — or org/repo for a HF-format dir" />
+      </div>
+    </div>
+    <p class="hint">Pick “custom” to load any other ModelScope model. Downloads come from ModelScope.</p>
     <div class="row">
       <button id="loadBtn" class="primary">Load model</button>
       <button id="releaseBtn">Release</button>

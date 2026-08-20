@@ -143,7 +143,12 @@ function fillPresets() {
     o.textContent = p.label + tag + dflt + fit;
     sel.appendChild(o);
   });
-  sel.onchange = () => { const p = PRESETS[sel.value]; $('#repo').value = p.repo; $('#file').value = p.file; };
+  sel.onchange = () => {
+    const p = PRESETS[sel.value];
+    // one box, and only for a model that is not in the list
+    $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : '';
+    $('#customBox').hidden = !!p.repo;
+  };
   // Default to Qwen3.8-27B 3-bit; if this machine cannot hold it, default to the best that fits.
   sel.value = PRESETS.indexOf(best); sel.onchange();
   $('#envInfo').textContent = envSummary() + (
@@ -153,8 +158,10 @@ function fillPresets() {
     : ' — the default is too large here, so ' + best.label + ' is selected');
 }
 $('#loadBtn').onclick = async () => {
-  const repo = $('#repo').value.trim(), file = $('#file').value.trim();
-  if (!repo) return alert('Enter a ModelScope repo (org/repo).');
+  // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
+  const id = $('#modelId').value.trim();
+  if (!id) return alert('Enter a model as org/repo/file.gguf (or org/repo).');
+  const repo = id, file = '';
   $('#loadBtn').disabled = true; setBar(0); expected = 0;
   const chosen = PRESETS[$('#preset').value];
   if (chosen && chosen.gb) expected = chosen.gb * 1e9;
