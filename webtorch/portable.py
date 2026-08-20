@@ -62,10 +62,17 @@ async def model_groups(cache_dir=None):
         key = e["key"]
         name = key.rsplit("/", 1)[0] if "/" in key else key
         g = groups.setdefault(name, {"name": name, "label": _label(name, key),
-                                     "keys": [], "size": 0, "files": 0})
+                                     "keys": [], "size": 0, "total": 0, "files": 0,
+                                     "complete": True, "partial": []})
         g["keys"].append(key)
         g["size"] += e["size"]
+        # `total` is the full length where the host revealed it; fall back to what is held
+        # so a partial group never claims to be smaller than it is.
+        g["total"] += e.get("total") or e["size"]
         g["files"] += 1
+        if not e["complete"]:
+            g["complete"] = False
+            g["partial"].append(key)
     return sorted(groups.values(), key=lambda g: g["name"])
 
 
@@ -115,6 +122,24 @@ async def export_model(keys, write, cache_dir=None, on_progress=None):
     keys = list(keys)
     if not keys:
         raise ValueError("nothing to export")
+
+    # Refuse before writing a byte. A half-downloaded entry would otherwise produce a file
+    # that looks like a model and is not one, and the failure would surface later, in
+    # whatever tried to read it.
+    store = webio._make_store(cache_dir or webio._default_hub_cache())
+    await store.open()
+    incomplete = []
+    for k in keys:
+        m = await store.meta(k)
+        if not m["complete"]:
+            have = await store.have(k)
+            held = sum(1 for _ in have)
+            want = ("?" if m["size"] is None
+                    else (m["size"] + m["chunk"] - 1) // m["chunk"])
+            incomplete.append("%s (%s of %s chunks)" % (k, held, want))
+    if incomplete:
+        raise ValueError("cannot export a model that is not fully downloaded: "
+                         + "; ".join(incomplete))
 
     written = [0]
 

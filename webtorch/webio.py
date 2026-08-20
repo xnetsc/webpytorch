@@ -387,8 +387,11 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, ch
     async def size(name):
         try: return await http_size(name)
         except Exception: return None
-    cached = make_cached_reader(fetch, size=size, cache_dir=cache_dir, max_parallel=max_parallel,
-                                prefetch=prefetch, chunk_mb=chunk_mb, persist=persist)
+    tr = throttle_reads(fetch, max_parallel, http_rate_limited)
+    if prefetch:
+        tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
+    cached = make_cached_reader(tr, size=size, cache_dir=cache_dir,
+                                chunk_mb=chunk_mb, persist=persist)
     async def read(name, offset=0, length=None):
         if _is_url(name) or _in_browser():                   # network read -> cache it
             return await cached(name, offset, length)
@@ -539,7 +542,9 @@ class _DiskStore(_Store):
                 m = json.load(f)
         except Exception:
             m = {}
-        m.setdefault("size", None); m.setdefault("chunk", _CHUNK_DEFAULT)
+        # No stored chunk size means the entry is new, so the reader's configured size
+        # applies. Defaulting here would silently override it.
+        m.setdefault("size", None); m.setdefault("chunk", None)
         m.setdefault("have", []); m.setdefault("complete", False)
         return m
 
@@ -570,7 +575,7 @@ class _DiskStore(_Store):
     async def get(self, key, i):
         import os
         m = self._read_meta(key)
-        if i not in set(m["have"]):
+        if i not in set(m["have"]) or not m["chunk"]:
             return None
         p, _mp = self._paths(key)
         try:
@@ -590,6 +595,9 @@ class _DiskStore(_Store):
         if not os.path.exists(p):
             open(p, "wb").close()
         m = self._read_meta(key)
+        if not m["chunk"]:
+            m["chunk"] = _CHUNK_DEFAULT
+            self._write_meta(key, m)
         with open(p, "r+b") as f:
             f.seek(i * m["chunk"]); f.write(data)
         if i not in set(m["have"]):
@@ -691,7 +699,7 @@ class _IdbStore(_Store):
         m = await _idb_req(self._store(self.META, "readonly").get(key))
         d = m.to_py() if m is not None and hasattr(m, "to_py") else (m or None)
         d = dict(d) if d else {}
-        return {"size": d.get("size"), "chunk": d.get("chunk", _CHUNK_DEFAULT),
+        return {"size": d.get("size"), "chunk": d.get("chunk"),
                 "complete": bool(d.get("complete", False))}
 
     async def set_meta(self, key, **kw):
@@ -788,30 +796,63 @@ def _in_browser():
 # Progress is reported on bytes SERVED, not bytes fetched. A model already in the cache
 # does no network at all, and counting fetches leaves that load looking frozen -- which is
 # exactly what a cache is for. Counting reads covers both, with one number.
-_progress = {"cb": None}
+_progress = {"cb": None, "state": {}}
 
 
 def set_read_progress(cb):
-    """Install `cb(key, done, total)`, called as reads are served. `None` clears it.
+    """Install `cb(info)`, called as reads are served -- how far a LOAD has got. `None` clears it.
 
-    `done` is the cumulative bytes served for that key by the current reader; `total` is
-    the file's size, or None when the host never revealed it. Fires for cached reads and
-    network reads alike, so a load shows progress whichever way the bytes arrive.
+    `info` is a dict, so it can gain fields without breaking callers:
+
+        key       the entry being read
+        done      cumulative bytes served for it since the hook was installed
+        total     its full length, or None when it is not known
+        elapsed   seconds since the first read of this entry
+        rate      bytes/second being served, smoothed over recent reads
+
+    This is deliberately about loading, not about transport. `read(name, offset, length)`
+    is the whole contract; whether the bytes come from HTTP, a local file, OPFS or a
+    database is the callback's business, so there is no download speed here -- a reader
+    backed by a local disk has no download. For that, see `set_download_progress`, which
+    belongs to the HTTP transport the hub readers are built on.
     """
     _progress["cb"] = cb
+    _progress["state"].clear()      # a fresh hook measures a fresh load, not the last one
 
 
 def get_read_progress():
     return _progress["cb"]
 
 
+def _prog_state(key):
+    st = _progress["state"].get(key)
+    if st is None:
+        import time
+        now = time.monotonic()
+        st = _progress["state"][key] = {"t0": now, "t": now, "done": 0, "rate": 0.0}
+    return st
+
+
 def _report(key, done, total):
     cb = _progress["cb"]
-    if cb is not None:
-        try:
-            cb(key, done, total)
-        except Exception:
-            pass                              # a broken meter must not break a load
+    if cb is None:
+        return
+    import time
+    st = _prog_state(key)
+    now = time.monotonic()
+    dt = now - st["t"]
+    if dt >= 0.2:                             # smooth over a window, not per read
+        a = 0.4                               # recent enough to feel live, steady enough to read
+        st["rate"] = a * ((done - st["done"]) / dt) + (1 - a) * st["rate"]
+        st["t"] = now; st["done"] = done
+    el = max(now - st["t0"], 1e-6)
+    try:
+        # Until the window has produced a figure, the average since the first read is the
+        # honest answer -- better than reporting zero while bytes are plainly moving.
+        cb({"key": key, "done": done, "total": total, "elapsed": now - st["t0"],
+            "rate": st["rate"] or (done / el)})
+    except Exception:
+        pass                                  # a broken meter must not break a load
 
 
 def _make_store(root):
@@ -848,7 +889,6 @@ class _CachedFile:
         self.have = set()                     # chunk indices in storage == the coverage map
         self.complete = False
         self.served = 0                       # cumulative bytes handed to the caller
-        self._prefetching = False
         self._loaded = False
 
     async def _load(self):
@@ -874,11 +914,15 @@ class _CachedFile:
         simply requested at full width; one that comes back short is the last one, which
         is where the total length is learnt.
         """
-        if i in self.have:
-            b = await self.c.store.get(self.key, i)
-            if b is not None:
-                return b
-            self.have.discard(i)              # record vanished (evicted) -> refetch
+        # Always ask the cache first, never a remembered answer. Whoever else is filling
+        # this entry -- a transport reading ahead, another tab, a previous session -- writes
+        # to the same store, and a set captured when the entry was opened would send us
+        # back to the reader for bytes that are already here.
+        b = await self.c.store.get(self.key, i)
+        if b is not None:
+            self.have.add(i)
+            return b
+        self.have.discard(i)
         off = i * self.chunk
         n = self.chunk if self.size is None else max(0, min(self.chunk, self.size - off))
         data = await self.c._net(self.key, off, n)
@@ -896,37 +940,6 @@ class _CachedFile:
             await self.c.store.set_meta(self.key, complete=True)
         return data
 
-    def _ensure_prefetch(self):
-        if self._prefetching or self.complete or not self.c.prefetch or self.size is None:
-            return
-        self._prefetching = True
-        import asyncio
-        self.c.tasks.append(asyncio.ensure_future(self._prefetch()))
-
-    async def _prefetch(self):
-        """Fill the gaps in the background, one chunk at a time, holding none of them.
-
-        With the total length unknown this also discovers it, by walking forward until a
-        chunk comes back short.
-        """
-        try:
-            i = 0
-            while not self.complete:
-                cnt = self._count()
-                if cnt is not None and i >= cnt:
-                    break
-                if getattr(self.c.store, "full", False):
-                    break                              # storage is full: reading on would
-                                                       # only re-download what cannot be kept
-                if i not in self.have:
-                    b = await self._chunk_bytes(i)     # stored; the bytes are dropped here
-                    short = len(b) < self.chunk
-                    del b
-                    if short:
-                        break
-                i += 1
-        except Exception:
-            pass
 
     async def read(self, offset, length):
         await self._load()
@@ -943,8 +956,6 @@ class _CachedFile:
             return b""
         c0 = offset // self.chunk
         c1 = (end - 1) // self.chunk
-        if not self.complete and any(i not in self.have for i in range(c0, c1 + 1)):
-            self._ensure_prefetch()                    # read-ahead the rest, in background
         out = bytearray(end - offset)                  # filled in place: no second full copy
         pos = 0
         for i in range(c0, c1 + 1):
@@ -971,9 +982,12 @@ class _AdaptiveLimiter:
     max parallel network reads; the live `limit` self-tunes:
 
     - **Success** additively climbs `limit` back toward `ceiling` (and reopens it from 0).
-    - **Explicit rate-limit** (HTTP 429, or a body with rate-limit wording) **halves** `limit`.
+    - **Explicit rate-limit** **halves** `limit`. What counts as one is decided by the
+      `is_rate_limited(exc)` predicate the transport supplies -- this gate caches, it does not
+      know whether the reader behind it speaks HTTP or reads a local disk. With no predicate,
+      nothing is treated as rate limiting and only the rules below apply.
     - **A non-rate-limit error while other reads are still in flight** is treated as an
-      *undisclosed* capacity/rate signal — some servers just error instead of returning 429 —
+      *undisclosed* capacity signal — a transport may simply error instead of saying so —
       so the concurrency is capped to the number still succeeding (the sweet spot) and the read
       is retried, NOT raised.
     - **A non-rate-limit error with no read in flight** is a genuine failure: it is not retried
@@ -982,7 +996,8 @@ class _AdaptiveLimiter:
       flight**, it cools down for an escalating interval (30→60→120→180s, cap 3 min) then
       reopens to 1; a rate-limit persisting past the last cooldown aborts. A cooldown/abort
       never fires while any read is still succeeding."""
-    def __init__(self, ceiling):
+    def __init__(self, ceiling, is_rate_limited=None):
+        self.is_rate_limited = is_rate_limited   # supplied by the transport, not assumed here
         self.ceiling = max(1, int(ceiling))
         self.limit = self.ceiling
         self.inflight = 0
@@ -1003,7 +1018,7 @@ class _AdaptiveLimiter:
         async with c:
             while True:
                 if self.failed:
-                    raise RuntimeError("hub reads aborted: still rate-limited after cooling down to 3 min")
+                    raise RuntimeError("still rate-limited after cooling down to 3 min")
                 if self.limit >= 1 and self.inflight < self.limit:
                     self.inflight += 1
                     return
@@ -1029,7 +1044,11 @@ class _AdaptiveLimiter:
         c = self._c()
         async with c:
             self.inflight -= 1
-            is_rate = isinstance(e, HttpError) and _is_rate_limited(e.status, e.body)
+            # Asked of the transport, not decided here: the cache does not know what a
+            # reader speaks, so it cannot know what "rate limited" looks like. Without a
+            # classifier no error counts as rate limiting, and the transport-agnostic rules
+            # below still apply.
+            is_rate = bool(self.is_rate_limited and self.is_rate_limited(e))
             if not is_rate and self.inflight == 0:
                 c.notify_all(); return "raise"                # solo non-rate error -> genuine failure
             # explicit rate-limit, OR a non-rate error while peers still succeed (undisclosed
@@ -1066,26 +1085,32 @@ class _AdaptiveLimiter:
                 if action == "raise":
                     raise e                                     # genuine non-rate error (solo)
                 if action == "abort":
-                    raise RuntimeError("hub reads aborted after repeated rate-limiting: %s" % e) from e
+                    # The transport's own error is the message; this only says why the gate
+                    # stopped retrying it.
+                    raise RuntimeError("gave up after repeated rate-limiting: %s" % e) from e
                 continue                                        # retry (respects reduced limit / cooldown)
             await self._release_ok()
             return r
 
 
 class _CacheLayer:
-    """Owns a cache dir, the adaptive read queue, and one `_CachedFile` per key. GENERIC — it
-    fetches bytes for a key via the injected `fetch(key, offset, length)` and (optionally)
-    learns a key's total size via `size(key)`. It knows nothing about HTTP or model hubs."""
-    def __init__(self, fetch, size, cache_dir, max_parallel=8, prefetch=True, chunk=16 << 20, persist=True):
+    """Owns a cache dir and one `_CachedFile` per key. Caching, and nothing else.
+
+    Bytes it does not have come from the injected `fetch(key, offset, length)`, and a key's
+    total length from the injected `size(key)`. It does not know what those callbacks speak,
+    so it does not throttle them, does not decide how many may run at once, and does not
+    interpret their failures -- an error from the reader is raised as it came, because only
+    the reader knows what went wrong. Concurrency limits, rate-limit handling and backoff
+    belong to the transport, which is where the meaning of a 429 exists."""
+    def __init__(self, fetch, size, cache_dir, chunk=16 << 20, persist=True):
         self.fetch = fetch; self.size_fn = size; self.cache_dir = cache_dir
-        self.max_parallel = max(1, int(max_parallel)); self.prefetch = prefetch
         self.chunk = int(chunk); self.persist = persist
         self.files = {}; self.tasks = []; self._loaded = False
-        self.limiter = _AdaptiveLimiter(self.max_parallel)
         self.store = _make_store(cache_dir) if cache_dir else None
 
-    async def _net(self, key, offset, length):               # one adaptive, queued fetch
-        return await self.limiter.run(lambda: self.fetch(key, offset, length))
+    async def _net(self, key, offset, length):
+        """Bytes the cache does not have. Whatever the reader raises bubbles up unchanged."""
+        return await self.fetch(key, offset, length)
 
     async def _size(self, key):
         if self.size_fn is None: return None
@@ -1116,39 +1141,181 @@ class _CacheLayer:
 # own `set_io_read` callback over a custom source (S3, a signed CDN, your own server, …); the
 # built-in `hf_read` / `modelscope_read` are just clients of it (see below).
 
+# Download speed is a property of THESE TOOLS, not of the SDK. `hf_read` /
+# `modelscope_read` / `use_default_io` are convenience functions we ship -- a kind of user
+# callback, not part of the contract -- and they happen to speak HTTP, which is the only
+# reason a download speed exists to report. The SDK's own contract is
+# `read(name, offset, length) -> bytes`; a reader someone writes over a local disk has no
+# download to measure. Loading progress lives with the loader, in `set_read_progress`.
+_dl = {"cb": None, "t0": None, "t": 0.0, "n": 0, "last": 0, "rate": 0.0}
+
+
+def set_download_progress(cb):
+    """Install `cb(info)` for the built-in HTTP transport these tools use. `None` clears it.
+
+        url    the request that just completed
+        bytes  cumulative bytes received since the hook was installed
+        rate   bytes/second, smoothed -- the download speed
+
+    Fires for anything going through `http_get`, which is what `hf_read`,
+    `modelscope_read` and `use_default_io` are built on. A reader of your own that does not
+    use `http_get` will not report here, and should not: it may not be downloading anything.
+    """
+    import time
+    _dl.update({"cb": cb, "t0": time.monotonic(), "t": time.monotonic(),
+                "n": 0, "last": 0, "rate": 0.0})
+
+
+def get_download_progress():
+    return _dl["cb"]
+
+
+def _note_download(url, n):
+    cb = _dl["cb"]
+    if cb is None:
+        return
+    import time
+    now = time.monotonic()
+    _dl["n"] += n
+    dt = now - _dl["t"]
+    if dt >= 0.2:
+        a = 0.4
+        _dl["rate"] = a * ((_dl["n"] - _dl["last"]) / dt) + (1 - a) * _dl["rate"]
+        _dl["t"] = now; _dl["last"] = _dl["n"]
+    el = max(now - (_dl["t0"] or now), 1e-6)
+    try:
+        cb({"url": url, "bytes": _dl["n"], "rate": _dl["rate"] or (_dl["n"] / el)})
+    except Exception:
+        pass
+
+
+def http_rate_limited(exc):
+    """True when `exc` from the HTTP transport means "slow down".
+
+    This is the transport's own knowledge -- a 429, or a body that says so in as many words
+    -- and it is handed to `make_cached_reader` rather than assumed by it, because the cache
+    has no idea what its reader speaks.
+    """
+    return isinstance(exc, HttpError) and _is_rate_limited(exc.status, exc.body)
+
+
 async def http_get(url, offset=0, length=None, headers=None):
     """The built-in HTTP range transport (browser `fetch` / host `urllib`). Raises `HttpError`
     on a non-2xx status. A ready-made `fetch` building block for `make_cached_reader`."""
     rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
-    return await _fetch_once(url, rng, headers)
+    data = await _fetch_once(url, rng, headers)
+    _note_download(url, len(data))            # this transport IS HTTP, so it has a speed
+    return data
 
 async def http_size(url, headers=None):
     """Total byte length of an http(s) file (HEAD, else a `bytes=0-0` GET's Content-Range).
     A ready-made `size` building block for `make_cached_reader` (drives prefetch)."""
     return await _remote_size(url, headers)
 
-def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
-                       max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
-    """Wrap an async transport with caching + background read-ahead + adaptive concurrency +
-    (browser IndexedDB) persistence, returning an `io_read`-shaped callback
-    `read(name, offset=0, length=None) -> bytes` you can pass to `webtorch.set_io_read`.
+def throttle_reads(fetch, max_parallel=8, is_rate_limited=None):
+    """Wrap a transport with an adaptive concurrency gate. Returns a `fetch`-shaped callable.
 
-      fetch(key, offset, length) -> bytes   (async): read a byte range for `key` (length None =
-          whole file). Raise `webtorch.HttpError(status, body)` for a 429 / rate-limit response
-          so the adaptive limiter can back off; any OTHER exception is a generic error (fatal
-          only when no other read is in flight). Use `webtorch.http_get` for HTTP sources.
-      size(key) -> int | None               (async, optional): total length of `key`, used to
-          drive read-ahead. Return None (or omit) to disable prefetch for that key. `http_size`
-          works for HTTP sources.
+    This belongs to the transport, not to the cache: how many requests a host will take at
+    once, what it does when pushed too hard, and what "slow down" even looks like are facts
+    about the thing being read, and only its reader knows them. Compose it around your own
+    reader before handing that to `make_cached_reader`; the built-in HTTP tools do exactly
+    that.
+
+    `is_rate_limited(exc) -> bool` tells the gate which failures mean "slow down" -- for
+    HTTP that is `http_rate_limited`. See `_AdaptiveLimiter` for how the limit self-tunes.
+    """
+    lim = _AdaptiveLimiter(max_parallel, is_rate_limited)
+
+    async def gated(key, offset, length):
+        return await lim.run(lambda: fetch(key, offset, length))
+    return gated
+
+
+def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None):
+    """Wrap a transport so that touching a file starts filling the cache with the rest of it.
+
+    Reading sixteen bytes of a header usually means the whole file is wanted, but only the
+    transport knows whether fetching ahead is a good idea -- whether ranges are cheap, whether
+    the host minds, whether the bytes even come from somewhere worth reading ahead from. So
+    the policy lives here, not in the cache: this fetches the remaining chunks in the
+    background and writes them through the cache's own write interface. The cached reader
+    then simply finds them and never calls the transport for those ranges again.
+
+    Returns a `fetch`-shaped callable to hand to `make_cached_reader`.
+    """
+    import asyncio
+    chunk = chunk_mb << 20
+    started = set()
+    tasks = []
+
+    async def fill(k):
+        try:
+            store = _make_store(cache_dir or _default_hub_cache())
+            await store.open()
+            total = await size(k) if size is not None else None
+            meta = await store.meta(k)
+            if total is not None and meta["size"] is None:
+                await store.set_meta(k, size=total, chunk=chunk)
+            have = await store.have(k)
+            i = 0
+            while total is None or i * chunk < total:
+                if i not in have:
+                    n = chunk if total is None else min(chunk, total - i * chunk)
+                    b = await fetch(k, i * chunk, n)
+                    if not await store.put(k, i, b):
+                        return                       # storage full: stop, reads still work
+                    if total is None and len(b) < chunk:
+                        await store.set_meta(k, size=i * chunk + len(b), chunk=chunk)
+                        break
+                i += 1
+            m = await store.meta(k)
+            if m["size"] is not None:
+                need = (m["size"] + chunk - 1) // chunk
+                if len(await store.have(k)) >= need:
+                    await store.set_meta(k, complete=True)
+        except Exception:
+            pass                                     # read-ahead is an optimisation, never a failure
+
+    async def ahead(k, offset, length):
+        if k not in started:
+            started.add(k)
+            tasks.append(asyncio.ensure_future(fill(k)))
+        return await fetch(k, offset, length)
+
+    return ahead
+
+
+def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
+                       chunk_mb=16, persist=True):
+    """Wrap an async transport with the cache, giving back an `io_read`-shaped callback
+    `read(name, offset=0, length=None) -> bytes` for `webtorch.set_io_read`.
+
+    Caching, and only caching. Bytes it already has come from storage; bytes it does not
+    come from `fetch`, and are kept. It does not read ahead, does not decide how many
+    requests may run at once, and does not interpret failures -- whatever `fetch` raises is
+    raised as it came, because only `fetch` knows what went wrong. Those are properties of
+    the transport, so they are composed around it before it gets here:
+
+        tr = throttle_reads(my_fetch, max_parallel=8, is_rate_limited=my_classifier)
+        tr = prefetch_whole_file(tr, size=my_size, cache_dir=None)   # optional
+        webtorch.set_io_read(make_cached_reader(tr, size=my_size))
+
+    which is exactly what `hf_read` and `modelscope_read` do. The cache is also reachable on
+    its own through `read_cache` / `write_cache`, which is how a transport that wants to fill
+    it in the background does so.
+
+      fetch(key, offset, length) -> bytes   (async): read a byte range for `key`
+          (length None = whole file). `webtorch.http_get` is a ready-made HTTP one.
+      size(key) -> int | None               (async, optional): total length of `key`. Without
+          it the length is learnt from the first short read.
       key(name) -> str                       (optional): map the incoming `name` to a stable
-          cache/fetch key (default: identity). Hub readers map "org/repo/path" -> the file URL
-          here, so the cache is keyed uniquely per platform.
-      cache / cache_dir / max_parallel / prefetch / chunk_mb / persist: same as `hf_read`
-          (see its docstring / the API reference for the full adaptive-concurrency behavior)."""
+          cache key (default: identity). The hub readers map "org/repo/path" -> the file URL,
+          so one platform's cache never collides with another's.
+      cache / cache_dir / chunk_mb / persist: where and how the entries are stored.
+    """
     keyfn = key or (lambda n: n)
     cdir = (cache_dir or _default_hub_cache()) if cache else None
-    layer = _CacheLayer(fetch, size, cdir, max_parallel=max_parallel, prefetch=prefetch,
-                        chunk=chunk_mb << 20, persist=persist)
+    layer = _CacheLayer(fetch, size, cdir, chunk=chunk_mb << 20, persist=persist)
     async def read(name, offset=0, length=None):
         return await layer.read(keyfn(name), offset, length)
     return read
@@ -1207,9 +1374,14 @@ async def cache_size(cache_dir=None, host=None):
 
 
 async def read_cache(key, offset=0, length=None, cache_dir=None):
-    """Read bytes from a cached entry by its `key` (a `list_cache` key or a full URL).
-    Reads only the chunks the range touches, so this stays cheap on a multi-GB entry.
-    Returns None if nothing is cached for that key."""
+    """Read bytes from the cache. Returns None on a miss -- nothing else happens.
+
+    This is local storage and nothing else. It never fetches, never falls back, and has no
+    idea where the data would otherwise come from; on a miss the caller decides what to do,
+    which is usually to read it from wherever it lives and hand it to `write_cache`. Only
+    the chunks the range touches are read, so this stays cheap on a multi-GB entry. None
+    also means a hole: a range that crosses a gap in a partly-filled entry is a miss.
+    """
     root = cache_dir or _default_hub_cache()
     store = _make_store(root)
     await store.open()
@@ -1237,19 +1409,51 @@ async def read_cache(key, offset=0, length=None, cache_dir=None):
     return bytes(out)
 
 
-async def write_cache(key, data, cache_dir=None, complete=True):
-    """Write/replace a cache entry's bytes (pre-seed the cache). Stored chunk by chunk, so
-    seeding a large entry does not need it all resident at once on the storage side.
-    `complete=True` marks it fully cached, so a reader serves it without any network."""
+async def write_cache(key, data, cache_dir=None, offset=None, complete=None, total=None):
+    """Put bytes into the cache. A later `read_cache` (or a reader built on it) finds them.
+
+    This is local storage and nothing else -- IndexedDB in a browser, files on a host. It
+    fetches nothing and knows nothing about where `data` came from; that is the caller's
+    business. Which is exactly how a transport fills it: read a range however you read
+    ranges, then write it here, and the next read of that range never reaches you again.
+
+    `offset=None` (the default) replaces the whole entry with `data`. Passing an `offset`
+    writes just that span and leaves the rest, so a file can be filled chunk by chunk as it
+    arrives -- give `total` on the first such write if the full length is known, so progress
+    and completeness can be reported. `complete` sets the "whole file is here" flag; leaving
+    it None updates it automatically once every chunk is present.
+    """
     root = cache_dir or _default_hub_cache()
     store = _make_store(root)
     await store.open()
-    await store.delete(key)                            # replace, never merge with older chunks
     data = bytes(data)
-    chunk = _CHUNK_DEFAULT
-    await store.set_meta(key, size=len(data), chunk=chunk, complete=bool(complete))
-    for i in range((len(data) + chunk - 1) // chunk):
-        await store.put(key, i, data[i * chunk:(i + 1) * chunk])
+
+    if offset is None:                                 # replace the entry outright
+        await store.delete(key)
+        chunk = _CHUNK_DEFAULT
+        await store.set_meta(key, size=len(data), chunk=chunk,
+                             complete=True if complete is None else bool(complete))
+        for i in range((len(data) + chunk - 1) // chunk):
+            await store.put(key, i, data[i * chunk:(i + 1) * chunk])
+        return
+
+    meta = await store.meta(key)
+    chunk = meta["chunk"] or _CHUNK_DEFAULT
+    if meta["size"] is None and total is not None:
+        await store.set_meta(key, size=int(total), chunk=chunk)
+        meta = await store.meta(key)
+    if offset % chunk or (len(data) % chunk and
+                          (meta["size"] is None or offset + len(data) < meta["size"])):
+        raise ValueError("a partial write must start on a %d-byte boundary and run to the "
+                         "next one (or to the end of the file)" % chunk)
+    for j in range(0, len(data), chunk):
+        await store.put(key, (offset + j) // chunk, data[j:j + chunk])
+    if complete is not None:
+        await store.set_meta(key, complete=bool(complete))
+    elif meta["size"] is not None:
+        need = (meta["size"] + chunk - 1) // chunk
+        if len(await store.have(key)) >= need:
+            await store.set_meta(key, complete=True)
 
 
 async def delete_cache(key, cache_dir=None):
@@ -1280,8 +1484,16 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     async def size(url): return await http_size(url, hdr)
     def key(name):
         return name if name.startswith(("http://", "https://")) else to_url(*_split_repo(name))
-    return make_cached_reader(fetch, size=size, key=key, cache=cache, cache_dir=cache_dir,
-                              max_parallel=max_parallel, prefetch=prefetch, chunk_mb=chunk_mb, persist=persist)
+    # Composed the way the layers actually stack: the HTTP transport carries its own
+    # concurrency and rate-limit handling, and the cache is wrapped around the result.
+    # Stacked the way the responsibilities actually sit: the HTTP transport carries its own
+    # concurrency and rate-limit handling, optionally reads ahead into the cache, and the
+    # cache is wrapped around the result and only ever asks for what it does not have.
+    tr = throttle_reads(fetch, max_parallel, http_rate_limited)
+    if prefetch:
+        tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
+    return make_cached_reader(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
+                              chunk_mb=chunk_mb, persist=persist)
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
             cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
