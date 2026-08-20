@@ -289,7 +289,7 @@ def dequant(ttype, raw, n):
         hi = _IQ4NL[(qs >> 4)]                                       # (blk,8,16)
         vals = np.concatenate([lo, hi], axis=2)                      # (blk,8,32)
         return (vals * dl[:, :, None]).reshape(-1)[:n]
-    if name in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"):
+    if name in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"):
         return _dequant_iq(name, u8, n)
     raise NotImplementedError("dequant not implemented for %s" % name)
 
@@ -346,6 +346,53 @@ def _dequant_iq(name, u8, n):
         g = T.IQ3XXS_GRID_U8[qs].astype(np.float32).reshape(blk, nb32, 4, 8)  # pairs -> 8 values
         vals = g * T.SIGNS[sidx]
         return (vals.reshape(blk, nb32, 32) * db[:, :, None]).reshape(-1)[:n]
+    if name == "IQ1_S":                          # d | qs[32] | qh[8] uint16 = 2+32+16 = 50
+        b = u8[:blk * 50].reshape(blk, 50)
+        d = _f16(b[:, 0:2])                                    # (blk,1)
+        qs = b[:, 2:34].reshape(blk, nb32, 4).astype(np.uint16)
+        qh = np.ascontiguousarray(b[:, 34:50]).view(np.uint16).reshape(blk, nb32)
+        # per sub-block scale and the shared +/-0.125 offset, both carried in qh's high bits
+        dl = d * (2 * ((qh >> 12) & 7).astype(np.float32) + 1.0)               # (blk,nb32)
+        delta = np.where((qh & 0x8000) != 0, -T.IQ1S_DELTA, T.IQ1S_DELTA).astype(np.float32)
+        # grid index: 8 low bits from qs, 3 high bits from qh, a different triple per l
+        shift = (3 * np.arange(4, dtype=np.uint16))[None, None, :]
+        idx = qs | (((qh[:, :, None] >> shift) & 7) << 8)                      # (blk,nb32,4)
+        g = T.IQ1S_GRID_I8[idx].astype(np.float32)                             # (blk,nb32,4,8)
+        out = dl[:, :, None, None] * (g + delta[:, :, None, None])
+        return out.reshape(-1)[:n]
+
+    if name == "IQ1_M":                          # qs[32] | qh[16] | scales[8] = 56, no separate d
+        b = u8[:blk * 56].reshape(blk, 56)
+        qs = b[:, 0:32].reshape(blk, nb32, 4).astype(np.uint16)
+        qh = b[:, 32:48].reshape(blk, nb32, 2).astype(np.uint16)
+        sc = np.ascontiguousarray(b[:, 48:56]).view(np.uint16).reshape(blk, 4)
+        # the block scale is spread over the four scale words' spare nibbles
+        su = ((sc[:, 0] >> 12) | ((sc[:, 1] >> 8) & 0x00f0)
+              | ((sc[:, 2] >> 4) & 0x0f00) | (sc[:, 3] & 0xf000)).astype(np.uint16)
+        d = _f16(su.view(np.uint8).reshape(blk, 2))                            # (blk,1)
+        ib = np.arange(nb32)
+        # two half-sub-block scales per 32 values, packed 3 bits each
+        s_lo = (sc[:, ib // 2] >> (6 * (ib % 2) + 0)) & 7
+        s_hi = (sc[:, ib // 2] >> (6 * (ib % 2) + 3)) & 7
+        dl1 = d * (2 * s_lo.astype(np.float32) + 1.0)
+        dl2 = d * (2 * s_hi.astype(np.float32) + 1.0)
+        idx = np.empty((blk, nb32, 4), np.uint16)
+        idx[:, :, 0] = qs[:, :, 0] | ((qh[:, :, 0] << 8) & 0x700)
+        idx[:, :, 1] = qs[:, :, 1] | ((qh[:, :, 0] << 4) & 0x700)
+        idx[:, :, 2] = qs[:, :, 2] | ((qh[:, :, 1] << 8) & 0x700)
+        idx[:, :, 3] = qs[:, :, 3] | ((qh[:, :, 1] << 4) & 0x700)
+        dq = T.IQ1S_DELTA
+        delta = np.stack([np.where((qh[:, :, 0] & 0x08) != 0, -dq, dq),
+                          np.where((qh[:, :, 0] & 0x80) != 0, -dq, dq),
+                          np.where((qh[:, :, 1] & 0x08) != 0, -dq, dq),
+                          np.where((qh[:, :, 1] & 0x80) != 0, -dq, dq)],
+                         axis=-1).astype(np.float32)                           # (blk,nb32,4)
+        g = T.IQ1S_GRID_I8[idx].astype(np.float32)                             # (blk,nb32,4,8)
+        # the first two groups of 8 take the low scale, the last two the high one
+        dl = np.stack([dl1, dl1, dl2, dl2], axis=-1)                           # (blk,nb32,4)
+        out = dl[:, :, :, None] * (g + delta[:, :, :, None])
+        return out.reshape(-1)[:n]
+
     if name == "IQ3_S":                          # d | qs[64] | qh[8] | signs[32] | scales[4] = 110
         b = u8[:blk * 110].reshape(blk, 110)
         d = _f16(b[:, 0:2])
@@ -375,7 +422,8 @@ _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "IQ4_NL": (32, 18), "IQ4_XS": (256, 136),
           "Q5_K": (256, 176), "Q3_K": (256, 110), "Q2_K": (256, 84),
           "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ2_S": (256, 82),
-          "IQ3_XXS": (256, 98), "IQ3_S": (256, 110)}
+          "IQ3_XXS": (256, 98), "IQ3_S": (256, 110),
+          "IQ1_S": (256, 50), "IQ1_M": (256, 56)}
 
 
 # Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the
