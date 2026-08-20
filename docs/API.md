@@ -73,6 +73,38 @@ Greedy is the default (`temperature<=0`); with sampling, a given `seed` is repro
   - `lm.init_capture(lmax)` → enable WebGPU capture-replay decode (~20×).
   - `lm.generate_stream(prompt_ids, max_new, stop_ids, sampler, …)` → yields tokens.
 
+## Multimodal — any decoder + any media encoder
+Multimodality is not tied to one model family. Every VLM/ALM does the same three things:
+**encode** media into embeddings that live in the decoder's hidden space, **splice** them into
+the token embeddings at placeholder-token positions, then **decode** normally. Only the encoder
+and the placeholder id differ, so that is all a new modality supplies.
+
+- `webtorch.register_encoder(name, loader, default=False)` — register a media encoder.
+  `loader(**kw)` is async and returns an object implementing the **encoder protocol**:
+  `.token_id` (the placeholder token spliced over), `.encode(media, **kw) -> (n, H)` and
+  optionally `.n_tokens(media)`. `webtorch.list_encoders()` / `load_encoder(name)` discover
+  and build them.
+- `webtorch.MultimodalLM(lm, encoder, placeholder_id=None)` — pair **any** CausalLM (the whole
+  generic decoder family: Llama/Qwen2/Qwen3, dense or MoE, int4/int8/fp16) with **any**
+  registered encoder. `.generate(prompt, media=None, …)` falls back to plain text generation
+  when `media` is None, so a multimodal model is a strict superset of a text one.
+  `.embed_prompt(ids, media)` / `.build_prompt(...)` expose the assembled embeddings.
+- `webtorch.splice_embeddings(token_embeds, ids, media_embeds, placeholder_id)` — the shared
+  splice step, usable on its own.
+- Decoders accept prebuilt inputs directly: `generate(..., ids=…, embeds=…)`. That is the
+  generic hook the multimodal path uses, so no model-specific decode path is required.
+
+```python
+class MyVision:                          # any third-party encoder
+    token_id = 151655
+    def n_tokens(self, img, **kw): return 4
+    def encode(self, img, **kw): return embeddings          # (n, H)
+webtorch.register_encoder("my-vision", loader, default=True)
+
+m = await webtorch.load("/models/decoder", encoder="my-vision")   # or MultimodalLM(lm, enc)
+print(m.generate("Describe this.", media=img))
+```
+
 ## Quantizer  (`webtorch.Quantizer`)
 - `await Quantizer.stream(read_tensor, has_tensor, names, write_shard, bits=4, group_size=128, shard_bytes=…)`
   — **IO-free** streaming core; all callbacks are async and awaited. Returns a manifest

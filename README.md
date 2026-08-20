@@ -85,6 +85,12 @@ print(gen("Hi", max_new=32))
   LLMs) with `register_pipeline` **without changing the SDK**. Ships text-to-speech
   (CosyVoice2 incl. zero-shot voice cloning, VITS), detection (YOLO/DETR), and
   vision-language (Qwen2.5-VL).
+- **Multimodal, generically** — `register_encoder` + `MultimodalLM` pair **any** decoder with
+  **any** media encoder (encode → splice at placeholder tokens → decode), so vision/audio is
+  not tied to one model family; decoders also accept prebuilt `ids=`/`embeds=`.
+- **One loader, one call** — `webtorch.load(...)` handles a model dir, hub repo id, `.gguf`,
+  `.onnx` or a task, and `model.infer(...)`/`model(...)` runs any of them. Loading the same
+  model twice reuses it instead of re-downloading; `model.release()` frees it.
 - **Bring-your-own IO (required) — pick your data source.** The core does no IO itself; the
   callback you install decides where bytes come from: `use_default_io()` for **your own
   files** (fetch/open the `name` as-is — *not* a hub; network reads cached, local files read
