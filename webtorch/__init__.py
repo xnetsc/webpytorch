@@ -35,7 +35,8 @@ from ._core import *                                  # Tensor, Module, Linear, 
 from . import _core as core                           # full core (incl. kernels) if needed
 
 # ---- high-level SDK surface (transformers/torch style) ----
-from ._sdk import install_torch, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline, register_pipeline, OnnxModel
+from ._sdk import (install_torch, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
+                   register_pipeline, register_task, list_pipelines, OnnxModel)
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
 from .lm_engine import TransformerLM, build_lm, SAMPLERS
@@ -69,7 +70,8 @@ __all__ = [
     # torch-compatible core
     "install_torch", "Tensor", "core",
     # generic model / tokenizer / quantization / pipeline / onnx entry points
-    "AutoTokenizer", "AutoModelForCausalLM", "pipeline", "register_pipeline", "Quantizer", "OnnxModel",
+    "AutoTokenizer", "AutoModelForCausalLM", "pipeline", "register_pipeline", "register_task",
+    "list_pipelines", "Quantizer", "OnnxModel",
     # generic decoder engine (CausalLM + MoE series)
     "TransformerLM", "build_lm", "SAMPLERS",
     # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None

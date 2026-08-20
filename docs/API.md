@@ -61,6 +61,27 @@ identical across models (the concrete model is never a public interface):
 - `"object-detection"` → `pipe(image, threshold=…) -> detections`.
 - `"image-to-text"` → `pipe(image, prompt=…) -> text`.
 - `"text-generation"` → `pipe(prompt, max_new=…) -> text`; `.stream(prompt) -> tokens`.
+- `"automatic-speech-recognition"` (aliases `"asr"`, `"speech-to-text"`) →
+  `pipe(audio, sampling_rate=…) -> text`; `.sampling_rate`.
+- `"audio-classification"` → `pipe(audio) -> labels/scores`; `.sampling_rate`.
+
+**The task list is open too.** `pipeline()` accepts *any* task name: register a model under a
+name webtorch has never heard of and it is wrapped in a generic forwarder (calls the impl, or
+its `.run(...)`, and proxies attributes). For a new task that deserves its own uniform call
+signature, register the wrapper with `webtorch.register_task(task, wrapper)`.
+`webtorch.list_pipelines()` returns `{task: [model names]}` (or a list for one task) so callers
+can discover what is registered instead of hard-coding names.
+
+```python
+class MyASR:                                    # any third-party model
+    sr = 16000
+    def transcribe(self, audio, **kw): return "..."
+webtorch.register_pipeline("asr", "my-asr", lambda **kw: _load(), default=True)
+asr = await webtorch.pipeline("asr");  text = asr(waveform)
+
+webtorch.register_pipeline("feature-extraction", "my-embed", loader)   # a brand-new task
+emb = await webtorch.pipeline("feature-extraction", "my-embed")        # generic wrapper
+```
 
 **The `model="…"` names are registry keys, not a whitelist.** The SDK *pre-registers* a
 few built-in loaders for convenience — `"cosyvoice2"`/`"vits"` (TTS), `"yolo"`/`"detr"`

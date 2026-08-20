@@ -123,33 +123,83 @@ class _TextGeneration:
     def __call__(self, prompt, **kw): return self._impl.generate(prompt, **kw)
     def stream(self, prompt, **kw): return self._impl.stream(prompt, **kw)
 
+class _SpeechToText:
+    """`pipe(audio)` -> text. Audio is a waveform (ndarray/list) or whatever the impl accepts;
+    `sampling_rate=` is forwarded when given. Protocol: `.transcribe(audio, …) -> str`."""
+    def __init__(self, impl): self._impl = impl
+    @property
+    def sampling_rate(self): return getattr(self._impl, "sr", 16000)
+    def __call__(self, audio, sampling_rate=None, **kw):
+        if sampling_rate is not None: kw["sampling_rate"] = sampling_rate
+        return self._impl.transcribe(audio, **kw)
+
+class _AudioClassification:
+    """`pipe(audio)` -> labels/scores. Protocol: `.classify(audio, …)`."""
+    def __init__(self, impl): self._impl = impl
+    @property
+    def sampling_rate(self): return getattr(self._impl, "sr", 16000)
+    def __call__(self, audio, **kw): return self._impl.classify(audio, **kw)
+
+class _Generic:
+    """Fallback wrapper for a task webtorch has no built-in protocol for. It forwards the call
+    to the impl (`impl(...)`, else `impl.run(...)`) and proxies attribute access, so a third
+    party can register an entirely NEW task type without changing the SDK."""
+    def __init__(self, impl): self._impl = impl
+    def __call__(self, *a, **kw):
+        f = self._impl if callable(self._impl) else getattr(self._impl, "run", None)
+        if f is None:
+            raise TypeError("pipeline impl %r is not callable and has no .run()" % type(self._impl))
+        return f(*a, **kw)
+    def __getattr__(self, name): return getattr(self._impl, name)
+
 _WRAPPERS = {"text-to-speech": _TextToSpeech, "object-detection": _ObjectDetection,
-             "image-to-text": _ImageToText, "text-generation": _TextGeneration}
+             "image-to-text": _ImageToText, "text-generation": _TextGeneration,
+             "automatic-speech-recognition": _SpeechToText,
+             "audio-classification": _AudioClassification}
 _TASK_ALIASES = {"tts": "text-to-speech", "detection": "object-detection",
                  "visual-question-answering": "image-to-text", "vl": "image-to-text",
-                 "causal-lm": "text-generation"}
+                 "causal-lm": "text-generation",
+                 "asr": "automatic-speech-recognition",
+                 "speech-to-text": "automatic-speech-recognition",
+                 "stt": "automatic-speech-recognition"}
 _REGISTRY = {t: {} for t in _WRAPPERS}
 _DEFAULTS = {}
 
+def register_task(task, wrapper):
+    """Register a NEW task type (its uniform call interface). `wrapper(impl)` returns the
+    object `pipeline()` hands back. Only needed for a task webtorch has no protocol for —
+    otherwise a generic forwarding wrapper is used automatically."""
+    _WRAPPERS[_TASK_ALIASES.get(task, task)] = wrapper
+
 def register_pipeline(task, name, loader, default=False):
     """Register a model for a task so `pipeline(task, name)` can load it. `loader(**kw)`
-    is async and returns an impl implementing the task protocol. Third-party models plug
-    in here without modifying the SDK."""
+    is async and returns an impl implementing the task protocol. Third-party models — and
+    entirely new task names — plug in here without modifying the SDK."""
     task = _TASK_ALIASES.get(task, task)
     _REGISTRY.setdefault(task, {})[name] = loader
     if default or task not in _DEFAULTS: _DEFAULTS[task] = name
 
+def list_pipelines(task=None):
+    """Registered models: `{task: [names]}`, or `[names]` for one task. Lets callers discover
+    what is available instead of hard-coding model names."""
+    if task is not None:
+        return sorted(_REGISTRY.get(_TASK_ALIASES.get(task, task), {}))
+    return {t: sorted(m) for t, m in _REGISTRY.items() if m}
+
 async def pipeline(task, model="auto", **kw):
     """transformers-style task pipeline -> a uniform task object (same methods across
-    models). The concrete model is internal; add your own via `register_pipeline`."""
+    models). The concrete model is internal; add your own via `register_pipeline` (and a new
+    task type via `register_task`). Unknown task names still work through a generic wrapper."""
     task = _TASK_ALIASES.get(task, task)
     reg = _REGISTRY.get(task)
-    if reg is None: raise ValueError("unknown task: %s (have %s)" % (task, list(_REGISTRY)))
+    if not reg:
+        raise ValueError("no model registered for task %r (registered: %s) — add one with "
+                         "register_pipeline(task, name, loader)" % (task, sorted(list_pipelines())))
     name = _DEFAULTS.get(task) if model in ("auto", None) else model
     if name not in reg:
-        raise ValueError("no model %r for task %r (registered: %s)" % (name, task, list(reg)))
+        raise ValueError("no model %r for task %r (registered: %s)" % (name, task, sorted(reg)))
     impl = await reg[name](**kw)
-    return _WRAPPERS[task](impl)
+    return _WRAPPERS.get(task, _Generic)(impl)
 
 
 # ---- built-in model loaders (registered; each returns a protocol-conforming impl) ----
@@ -208,7 +258,7 @@ from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_writ
 
 # ---- explicit exports --------------------------------------------------------
 __all__ = ["install_torch", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
-           "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
+           "register_task", "list_pipelines", "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
            "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
            "make_cached_reader", "http_get", "http_size", "HttpError",
            "default_cache_dir", "list_cache", "cache_hosts", "cache_size", "read_cache",
