@@ -22,16 +22,58 @@ function current() { return convs.find(c => c.id === curId) || null; }
 
 
 // Presets are EXAMPLES ONLY — any ModelScope repo/file works via the two inputs.
+// Examples only — any ModelScope repo/file works through the two inputs below.
+// Full-size models at 3-bit-ish quantization, across several families and both dense and MoE,
+// so the picker is not tied to one vendor or one architecture. `gb` drives the environment fit.
 const PRESETS = [
-  { label: 'Qwen3.8-27B · 3-bit UD-Q3_K_XL (13.2 GB) — default', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-Q3_K_XL.gguf' },
-  { label: 'Qwen3.8-27B · UD-IQ3_XXS (10.9 GB)', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-IQ3_XXS.gguf' },
-  { label: 'Qwen3-4B-Instruct · Q4_K_M (2.5 GB) — smallest practical', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf' },
-  { label: 'Qwen3-4B-Instruct · UD-Q3_K_XL (2.1 GB)', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-UD-Q3_K_XL.gguf' },
-  { label: 'Qwen3-8B · Q4_K_M (5.0 GB)', repo: 'unsloth/Qwen3-8B-GGUF', file: 'Qwen3-8B-Q4_K_M.gguf' },
-  { label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL (13.8 GB)', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
-  { label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL (13.8 GB)', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
-  { label: '— custom (type a repo/file below) —', repo: '', file: '' },
+  { gb: 13.2, label: 'Qwen3.8-27B · 3-bit UD-Q3_K_XL', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-Q3_K_XL.gguf' },
+  { gb: 10.9, label: 'Qwen3.8-27B · UD-IQ3_XXS', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-IQ3_XXS.gguf' },
+  { gb: 13.0, label: 'Qwen3-32B · dense · UD-IQ3_XXS', repo: 'unsloth/Qwen3-32B-GGUF', file: 'Qwen3-32B-UD-IQ3_XXS.gguf' },
+  { gb: 10.8, label: 'Gemma-3-27B-it · dense · UD-IQ3_XXS', repo: 'unsloth/gemma-3-27b-it-GGUF', file: 'gemma-3-27b-it-UD-IQ3_XXS.gguf' },
+  { gb: 11.9, label: 'Mistral-Small-3.2-24B · dense · UD-Q3_K_XL', repo: 'unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF', file: 'Mistral-Small-3.2-24B-Instruct-2506-UD-Q3_K_XL.gguf' },
+  { gb: 9.4,  label: 'Mistral-Small-3.2-24B · dense · UD-IQ3_XXS', repo: 'unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF', file: 'Mistral-Small-3.2-24B-Instruct-2506-UD-IQ3_XXS.gguf' },
+  { gb: 11.5, label: 'gpt-oss-20B · MoE · Q3_K_M', repo: 'unsloth/gpt-oss-20b-GGUF', file: 'gpt-oss-20b-Q3_K_M.gguf' },
+  { gb: 13.8, label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
+  { gb: 13.8, label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
+  { gb: 0,    label: '— custom (type a repo/file below) —', repo: '', file: '' },
 ];
+
+// What this machine can actually take: RAM, how much the browser will let us cache, and
+// whether the GPU backend is available. Used to order the picker, never to hide anything.
+let ENV = { ramGB: 0, quotaGB: 0, cores: 0, webgpu: false, budgetGB: 0 };
+async function detectEnv() {
+  ENV.cores = navigator.hardwareConcurrency || 0;
+  ENV.ramGB = navigator.deviceMemory || 0;            // coarse, Chrome-only; 0 = unknown
+  try {
+    // Persistent storage lifts the eviction risk and usually the quota, which decides how big
+    // a model can be cached at all.
+    if (navigator.storage && navigator.storage.persist) {
+      try { await navigator.storage.persist(); } catch (e) { /* user may decline */ }
+    }
+    const est = await navigator.storage.estimate();
+    ENV.quotaGB = (est.quota || 0) / 1e9;
+  } catch (e) { ENV.quotaGB = 0; }
+  try {
+    if (navigator.gpu) {
+      const ad = await navigator.gpu.requestAdapter();
+      ENV.webgpu = !!ad;
+      if (ad && ad.limits) ENV.maxBufferGB = (ad.limits.maxBufferSize || 0) / 1e9;
+    }
+  } catch (e) { ENV.webgpu = false; }
+  // A model must both fit in memory and fit in the cache. Leave room for the runtime.
+  const mem = ENV.ramGB ? ENV.ramGB * 0.55 : 12;      // unknown RAM -> assume a typical laptop
+  const disk = ENV.quotaGB ? ENV.quotaGB * 0.8 : 999;
+  ENV.budgetGB = Math.min(mem, disk);
+  return ENV;
+}
+function envSummary() {
+  const p = [];
+  p.push(ENV.ramGB ? ENV.ramGB + ' GB RAM' : 'RAM unknown');
+  if (ENV.cores) p.push(ENV.cores + ' cores');
+  p.push(ENV.quotaGB ? ENV.quotaGB.toFixed(0) + ' GB cache quota' : 'quota unknown');
+  p.push(ENV.webgpu ? 'WebGPU' : 'CPU only');
+  return p.join(' · ') + ' → fits ≈' + ENV.budgetGB.toFixed(1) + ' GB';
+}
 
 function call(cmd, args) {
   const id = ++seq;
@@ -75,17 +117,47 @@ function showProgress(bytes) {
 
 // ---- model ----
 function fillPresets() {
-  const sel = $('#preset');
-  PRESETS.forEach((p, i) => { const o = document.createElement('option'); o.value = i; o.textContent = p.label; sel.appendChild(o); });
+  const sel = $('#preset'); sel.innerHTML = '';
+  const custom = PRESETS[PRESETS.length - 1];
+  const DEFAULT = PRESETS[0];                       // Qwen3.8-27B 3-bit: always the default
+  const models = PRESETS.slice(0, -1).filter(m => m !== DEFAULT);
+  // The default stays pinned at the top; the rest are ordered by what this machine can hold
+  // (largest that fits first), with anything over budget kept but flagged.
+  const fits = models.filter(m => m.gb <= ENV.budgetGB).sort((a, b) => b.gb - a.gb);
+  const over = models.filter(m => m.gb > ENV.budgetGB).sort((a, b) => a.gb - b.gb);
+  const ordered = [DEFAULT].concat(fits, over, [custom]);
+  // Default to Qwen3.8-27B 3-bit when this machine can hold it; otherwise the largest that
+  // fits; and when nothing fits (a phone, say) the smallest, so the pick is at least plausible.
+  const smallest = models.concat([DEFAULT]).slice().sort((a, b) => a.gb - b.gb)[0];
+  const noneFit = fits.length === 0 && DEFAULT.gb > ENV.budgetGB;
+  const best = (DEFAULT.gb <= ENV.budgetGB) ? DEFAULT : (fits[0] || smallest);
+  ordered.forEach((p) => {
+    const o = document.createElement('option');
+    o.value = PRESETS.indexOf(p);
+    const tag = p.gb ? ' (' + p.gb.toFixed(1) + ' GB)' : '';
+    // one verdict per entry — fits, or does not
+    const fit = !p.gb ? ''
+      : p.gb > ENV.budgetGB ? ' ⚠ too big for this device'
+      : (p === best ? ' ✓ best fit here' : '');
+    const dflt = (p === DEFAULT) ? ' — default' : '';
+    o.textContent = p.label + tag + dflt + fit;
+    sel.appendChild(o);
+  });
   sel.onchange = () => { const p = PRESETS[sel.value]; $('#repo').value = p.repo; $('#file').value = p.file; };
-  sel.value = 0; sel.onchange();
+  // Default to Qwen3.8-27B 3-bit; if this machine cannot hold it, default to the best that fits.
+  sel.value = PRESETS.indexOf(best); sel.onchange();
+  $('#envInfo').textContent = envSummary() + (
+      noneFit ? ' — no preset fits this device; the smallest is selected, and you can enter any '
+                + 'other model below'
+    : best === DEFAULT ? ''
+    : ' — the default is too large here, so ' + best.label + ' is selected');
 }
 $('#loadBtn').onclick = async () => {
   const repo = $('#repo').value.trim(), file = $('#file').value.trim();
   if (!repo) return alert('Enter a ModelScope repo (org/repo).');
   $('#loadBtn').disabled = true; setBar(0); expected = 0;
-  const m = /\((\d+(?:\.\d+)?)\s*GB\)/.exec(PRESETS[$('#preset').value]?.label || '');
-  if (m) expected = parseFloat(m[1]) * 1e9;
+  const chosen = PRESETS[$('#preset').value];
+  if (chosen && chosen.gb) expected = chosen.gb * 1e9;
   try { await call('load', { repo, file }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) { $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message); }
   finally { syncButtons(); }
@@ -294,6 +366,7 @@ $('#importFile').onchange = async (e) => {
 };
 
 loadConvs(); if (!convs.length) newConv(); else curId = convs[0].id;
-fillPresets(); renderConvs(); render(); syncButtons();
+renderConvs(); render(); syncButtons();
+detectEnv().then(fillPresets);
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
 call('boot').then(refreshCache).catch(e => $('#modelStatus').textContent = 'runtime failed: ' + e.message);

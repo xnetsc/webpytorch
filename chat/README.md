@@ -24,16 +24,10 @@ node serve-coi.mjs . 8119     # COOP/COEP + HTTP Range
 ```
 
 ## What actually fits in a browser
-A browser tab is not a workstation. Practical guidance:
-
-| model | 4-bit size | in a browser |
-|---|---|---|
-| Qwen3-4B-Instruct | ~2.5 GB | works |
-| Qwen3-8B | ~5 GB | works on a machine with headroom |
-| Qwen3-30B-A3B (MoE) | ~14 GB | download and memory are a real obstacle |
-| Qwen3.8-27B | ~13 GB | **not yet runnable** — its blocks are state-space /
-  gated-linear-attention, which this engine does not implement yet; the loader says so
-  up front instead of downloading first |
+Every preset is a full-size model (11-14 GB at 3-4 bit) — small models are not worth the
+plumbing. The first load of one is a long download; afterwards it comes from the cache.
+Split multi-part GGUFs (`...-00001-of-00002.gguf`) are not supported yet, so the presets are
+all single-file builds.
 
 Everything runs on the CPU path unless WebGPU is available, in which case the int4/int8
 kernels are used.
