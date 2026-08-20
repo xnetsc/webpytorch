@@ -2,50 +2,32 @@
    progress, generates, and exposes the SDK's cache-management calls. */
 importScripts('../lib/pyodide/pyodide.js');
 importScripts('../dist/wgpy-worker.js');
-
-const PKG = 'webtorch';
-const PKG_MODULES = ['__init__.py', '_core.py', '_sdk.py', 'torchshim.py', 'ggufload.py',
-  'hfcompat.py', 'webenv.py', 'llm.py', 'vl.py', 'detection.py', 'tts.py', 'webio.py',
-  'onnxrt.py', 'lm_engine.py', 'quantize.py', 'audiofe.py', 'cosyvoice.py',
-  'multimodal.py', 'iqtables.py'];
+importScripts('../webtorch/js/webtorch-worker.js');
 
 let pyodide = null, ready = false;
 const send = (m) => postMessage(m);
 const log = (t) => send({ type: 'log', text: t });
 
-async function fetchText(u) { const r = await fetch(u); if (!r.ok) throw new Error(u + ': ' + r.status); return r.text(); }
 
 async function boot() {
   if (ready) return;
-  send({ type: 'status', text: 'starting Python runtime…' });
-  pyodide = await loadPyodide({ indexURL: '../lib/pyodide/', stdout: log, stderr: log });
-  self.pyodide = pyodide;
-  send({ type: 'status', text: 'loading numpy…' });
-  await pyodide.loadPackage(['micropip', 'numpy']);
-  send({ type: 'status', text: 'installing GPU backend…' });
-  try {
-    const mp = pyodide.pyimport('micropip');
-    await mp.install('../dist/wgpy_webgpu-1.0.0-py3-none-any.whl');
-  } catch (e) { log('WebGPU backend unavailable (' + e.message + '), using CPU'); }
-  send({ type: 'status', text: 'loading webtorch…' });
-  try { pyodide.FS.mkdir(PKG); } catch (e) {}
-  for (const m of PKG_MODULES) {
-    try { pyodide.FS.writeFile(`${PKG}/${m}`, await fetchText(`../${PKG}/${m}`)); }
-    catch (e) { log('skip ' + m + ': ' + e.message); }
-  }
+  // The SDK brings up the backend, Pyodide and the package in the order they require.
+  const r = await webtorch.initWorker({
+    baseURL: '../', stdout: log, stderr: log,
+    onStatus: (t) => send({ type: 'status', text: t }),
+  });
+  pyodide = r.pyodide;
   // Model files come from ModelScope, fetched directly: its `resolve` route and the CDN it
   // redirects to send `Access-Control-Allow-Origin: *` and allow Range, so a cross-origin
   // isolated page can stream them. The SDK does the ranged reads and its own persistent cache.
   await pyodide.runPythonAsync(`
-import sys, json
-sys.path.insert(0, "/")
-import webtorch
+import json, webtorch
 webtorch.set_io_read(webtorch.modelscope_read())
 webtorch.set_io_write(webtorch.default_io_write)
 _MODEL = {"m": None, "id": None}
 `);
+  send({ type: 'backend', name: r.backend });
   ready = true;
-  send({ type: 'status', text: 'ready' });
   send({ type: 'ready' });
 }
 

@@ -2,6 +2,10 @@
    management, camera/file/URL tools, and zip export/import of the conversation. */
 const $ = (s) => document.querySelector(s);
 const worker = new Worker('worker.js');
+// One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
+// must not be spoken to, so `call` waits on it.
+const gpuInit = webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] })
+  .then(r => r.backend, () => 'cpu');
 let seq = 0; const pending = new Map();
 // Conversations live in localStorage so the sidebar survives a reload.
 // Each: {id, title, messages:[{role, content, attachments:[{kind,name,text,dataUrl}]}], updated}
@@ -113,7 +117,9 @@ function envSummary() {
 
 function call(cmd, args) {
   const id = ++seq;
-  return new Promise((res, rej) => { pending.set(id, { res, rej }); worker.postMessage({ id, cmd, args }); });
+  const p = new Promise((res, rej) => pending.set(id, { res, rej }));
+  gpuInit.then(() => worker.postMessage({ id, cmd, args }));
+  return p;
 }
 worker.onmessage = (e) => {
   const m = e.data;
@@ -127,6 +133,14 @@ worker.onmessage = (e) => {
   else if (m.type === 'progress') { showProgress(m.bytes); }
   else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'log') { console.log('[py]', m.text); }
+  else if (m.type === 'backend') {
+    ENV.backend = m.name;
+    // A CPU fallback is the difference between seconds and minutes per reply, so it is
+    // stated rather than left for the user to infer from the wait.
+    $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
+      ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
+      : ' — compute: ' + m.name);
+  }
 };
 function setBar(f) { $('#bar').style.width = Math.min(100, f * 100) + '%'; }
 // A model stays resident until it is released, so loading is blocked while one is held —
