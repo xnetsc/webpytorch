@@ -372,27 +372,39 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
 
 **Build your own cached reader (generic tool).** The caching, background read-ahead, adaptive
 concurrency (see `max_parallel` below), and browser persistence are **not** hub-specific — they
-live inside the ready-made readers `hf_read`/`modelscope_read`, which
-are just clients of it (each supplies only a repo-id→URL mapping). Use it to give your own
-source (S3, a signed CDN, your own server, …) the same behavior:
+live inside the ready-made readers `hf_read`/`modelscope_read`. Writing a callback for your
+own source (S3, a signed CDN, your own server) means composing the same pieces yourself: read
+from the cache, and on a miss read from wherever the bytes live and put them in the cache.
 
 ```python
-async def my_fetch(key, offset, length):     # read a byte range for `key` (length None = whole)
-    ...                                       # raise webtorch.HttpError(429, body) to signal rate-limit
-async def my_size(key):                       # total length of `key` (drives prefetch); optional
-    ...
-reader = webtorch.make_cached_reader(my_fetch, size=my_size, key=lambda name: name,
-                                     cache_dir=None, max_parallel=8, prefetch=True, persist=True)
-webtorch.set_io_read(reader)
+async def my_read(name, offset=0, length=None):
+    hit = await webtorch.read_cache(name, offset, length)
+    if hit is not None:                       # cached -> done, nothing else happens
+        return hit
+    data = await my_fetch(name, offset, length)   # your transport: HTTP, S3, a local disk…
+    await webtorch.write_cache(name, data, offset=offset, total=await my_size(name))
+    return data
+
+webtorch.set_io_read(my_read)
 ```
-- `fetch(key, offset, length) -> bytes` (async, required): raise `webtorch.HttpError(status,
-  body)` for a 429 / rate-limit response so the limiter can back off; any other exception is a
-  generic error (fatal only when no other read is in flight). `webtorch.http_get(url, offset,
-  length, headers)` is the built-in HTTP-range transport you can call inside `fetch`.
-- `size(key) -> int | None` (async, optional): total length; `webtorch.http_size(url, headers)`
-  probes it for HTTP sources. Return `None` to skip prefetch for that key.
-- `key(name) -> str` (optional): map an incoming `name` to a stable cache/fetch key (default:
-  identity). The hub readers map `"org/repo/path"` to the file URL here so the cache is keyed
+
+That is the whole model. The cache never fetches and never decides what an error means -- it
+does not know what your transport speaks. Anything transport-shaped is yours to add around it,
+and two ready-made pieces are here if your transport is HTTP:
+
+- `webtorch.http_get(url, offset, length, headers)` -- the built-in HTTP range transport.
+- `webtorch.http_size(url, headers)` -- its length probe. Returns `None` when the host does not
+  expose `Content-Length` (ModelScope does not, cross-origin); the readers then learn the length
+  from the first short read.
+- `webtorch.throttle_reads(fetch, max_parallel=8, is_rate_limited=…)` -- concurrency and
+  rate-limit backoff. `webtorch.http_rate_limited` is the HTTP classifier (429, or a body that
+  says so). This belongs to the transport: only it knows what "slow down" looks like.
+- `webtorch.prefetch_whole_file(fetch, size=…)` -- reads the rest of a touched file in the
+  background and writes it through the cache, so later reads never reach your transport at all.
+
+Note that `write_cache(..., offset=…)` is what lets a transport fill an entry chunk by chunk as
+the bytes arrive, rather than holding a multi-gigabyte file to write it in one go.
+
   uniquely per platform.
 - `cache` / `cache_dir` / `max_parallel` / `prefetch` / `chunk_mb` / `persist`: identical to
   `hf_read`.
@@ -460,7 +472,7 @@ await webtorch.clear_cache(host="modelscope.cn")  # free just the ModelScope cac
 Note: these act on storage; a reader object created earlier may still hold chunks it already
 read — clear the cache between loads, or before creating the reader.
 
-A complete, runnable demo of `make_cached_reader` (with `HttpError` rate-limit handling) and
+A complete, runnable demo of a cache-backed read callback (with `HttpError` rate-limit handling) and
 every cache-management function is in **`examples/io_cache_tools.py`** — it uses no GPU or
 models, so it runs on the host directly (`python examples/io_cache_tools.py`).
 

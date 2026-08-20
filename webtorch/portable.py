@@ -199,27 +199,23 @@ async def export_model(keys, write, cache_dir=None, on_progress=None):
 
 
 async def _fill_entry(key, read, size, cache_dir=None, chunk_mb=16, on_progress=None):
-    """Fill one cache entry from `read(offset, length) -> bytes`, chunk by chunk."""
-    store = webio._make_store(cache_dir or webio._default_hub_cache())
-    await store.open()
-    await store.delete(key)                  # replace, never merge with older chunks
+    """Fill one cache entry from `read(offset, length) -> bytes`, a span at a time."""
     chunk = chunk_mb << 20
-    await store.set_meta(key, size=size, chunk=chunk, complete=False)
+    await webio.delete_cache(key, cache_dir)       # replace, never merge with older bytes
     done = 0
-    i = 0
     while done < size:
         n = min(chunk, size - done)
         b = await read(done, n)
         if not b:
             raise ValueError("import ended early: %d of %d bytes for %r" % (done, size, key))
-        if not await store.put(key, i, bytes(b)):
-            raise RuntimeError("storage is full: %r could not be imported completely" % key)
+        # Through write_cache, which is what records the bytes as present; putting chunks
+        # into the store directly leaves them invisible to every reader.
+        await webio.write_cache(key, bytes(b), cache_dir, offset=done, total=size,
+                                chunk_mb=chunk_mb)
         done += len(b)
-        i += 1
         if on_progress is not None:
             on_progress(done)
         del b
-    await store.set_meta(key, complete=True)
     return done
 
 

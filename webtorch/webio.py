@@ -390,8 +390,8 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, ch
     tr = throttle_reads(fetch, max_parallel, http_rate_limited)
     if prefetch:
         tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    cached = _cache_through(tr, size=size, cache_dir=cache_dir,
-                                chunk_mb=chunk_mb, persist=persist)
+    cached = _cached_read(tr, size=size, cache_dir=cache_dir,
+                                chunk_mb=chunk_mb)
     async def read(name, offset=0, length=None):
         if _is_url(name) or _in_browser():                   # network read -> cache it
             return await cached(name, offset, length)
@@ -486,6 +486,34 @@ async def _remote_size(url, headers):
 _CHUNK_DEFAULT = 16 << 20
 
 
+def _merge(spans, lo, hi):
+    """Add [lo, hi) to a sorted, disjoint span list, coalescing anything it meets.
+
+    Writes arrive in whatever pieces the transport read, so 0-16 followed by 16-32 has to
+    become 0-32 rather than two records -- otherwise a file written in many small pieces
+    accumulates a span per piece. Once every byte is present the list is a single span,
+    which is also how "complete" is recognised.
+    """
+    if hi <= lo:
+        return list(spans)
+    out = []
+    placed = False
+    for a, b in sorted(list(spans) + [[lo, hi]]):
+        if out and a <= out[-1][1]:                    # touching or overlapping -> one span
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _covered_from(spans, offset):
+    """How far a contiguous run starting at `offset` reaches, or None if it does not start."""
+    for a, b in spans:
+        if a <= offset < b:
+            return b
+    return None
+
+
 class _Store:
     """Chunk-addressed cache storage. Chunk size is fixed per entry at creation and kept in
     its metadata, so indices stay meaningful across sessions."""
@@ -546,6 +574,7 @@ class _DiskStore(_Store):
         # applies. Defaulting here would silently override it.
         m.setdefault("size", None); m.setdefault("chunk", None)
         m.setdefault("have", []); m.setdefault("complete", False)
+        m.setdefault("covered", [])            # byte spans actually present, merged
         return m
 
     def _write_meta(self, key, m):
@@ -560,7 +589,8 @@ class _DiskStore(_Store):
 
     async def meta(self, key):
         m = self._read_meta(key)
-        return {"size": m["size"], "chunk": m["chunk"], "complete": m["complete"]}
+        return {"size": m["size"], "chunk": m["chunk"], "complete": m["complete"],
+                "covered": [list(x) for x in m["covered"]]}
 
     async def set_meta(self, key, **kw):
         m = self._read_meta(key)
@@ -575,7 +605,7 @@ class _DiskStore(_Store):
     async def get(self, key, i):
         import os
         m = self._read_meta(key)
-        if i not in set(m["have"]) or not m["chunk"]:
+        if not m["chunk"]:
             return None
         p, _mp = self._paths(key)
         try:
@@ -700,7 +730,8 @@ class _IdbStore(_Store):
         d = m.to_py() if m is not None and hasattr(m, "to_py") else (m or None)
         d = dict(d) if d else {}
         return {"size": d.get("size"), "chunk": d.get("chunk"),
-                "complete": bool(d.get("complete", False))}
+                "complete": bool(d.get("complete", False)),
+                "covered": [list(x) for x in (d.get("covered") or [])]}
 
     async def set_meta(self, key, **kw):
         await self.open()
@@ -855,122 +886,19 @@ def _report(key, done, total):
         pass                                  # a broken meter must not break a load
 
 
+_stores = {}
+
+
 def _make_store(root):
-    """IndexedDB in the browser, real files on the host -- same chunk-addressed interface."""
-    return _IdbStore(root) if _in_browser() else _DiskStore(root)
+    """IndexedDB in the browser, real files on the host -- same chunk-addressed interface.
 
-
-class _CachedFile:
-    """One remote file, cached chunk by chunk, with a background whole-file read-ahead.
-
-    A read is served from stored chunks; any chunk it needs that is missing is fetched on
-    the spot -- never waiting for the read-ahead to reach it -- written through to storage,
-    and only then used.
-
-    On memory: what this bounds is *growth with file size*. A 13 GB file costs the same
-    live bytes as a 400 MB one, because nothing accumulates. It is not a hard cap. The
-    live set is roughly
-
-        (max_parallel + chunks spanned by the current read) x chunk
-
-    so with the defaults (8 x 16 MB) a read of one chunk peaks near 144 MB, and each chunk
-    is briefly duplicated while it is copied into the JS heap on its way to IndexedDB.
-    Beyond that: the wasm heap never shrinks, so the high-water mark persists; repeated
-    allocations of this size fragment it; and a caller that asks for a whole multi-GB file
-    in one read still gets exactly what it asked for. Lower `max_parallel` or `chunk_mb` to
-    trade throughput for footprint.
+    One instance per root, reused: opening a fresh IndexedDB connection on every read would
+    cost more than the read.
     """
-
-    def __init__(self, cache, key):
-        self.c = cache
-        self.key = key
-        self.size = None
-        self.chunk = cache.chunk
-        self.have = set()                     # chunk indices in storage == the coverage map
-        self.complete = False
-        self.served = 0                       # cumulative bytes handed to the caller
-        self._loaded = False
-
-    async def _load(self):
-        """Adopt whatever a previous session stored for this key."""
-        if self._loaded:
-            return
-        self._loaded = True
-        m = await self.c.store.meta(self.key)
-        self.size = m["size"]
-        self.chunk = m["chunk"] or self.c.chunk
-        self.complete = m["complete"]
-        self.have = await self.c.store.have(self.key)
-
-    def _count(self):
-        return None if self.size is None else (self.size + self.chunk - 1) // self.chunk
-
-    async def _chunk_bytes(self, i):
-        """Chunk `i`, fetched and stored first if it is not there yet.
-
-        The total length is often unknowable in a browser: `Content-Length` and
-        `Content-Range` are not CORS-safelisted, so a cross-origin host that does not
-        expose them leaves the size unknown. That must not disable caching, so a chunk is
-        simply requested at full width; one that comes back short is the last one, which
-        is where the total length is learnt.
-        """
-        # Always ask the cache first, never a remembered answer. Whoever else is filling
-        # this entry -- a transport reading ahead, another tab, a previous session -- writes
-        # to the same store, and a set captured when the entry was opened would send us
-        # back to the reader for bytes that are already here.
-        b = await self.c.store.get(self.key, i)
-        if b is not None:
-            self.have.add(i)
-            return b
-        self.have.discard(i)
-        off = i * self.chunk
-        n = self.chunk if self.size is None else max(0, min(self.chunk, self.size - off))
-        data = await self.c._net(self.key, off, n)
-        stored = await self.c.store.put(self.key, i, data)
-        if stored:                            # a refused write must not look like a hit
-            self.have.add(i)
-        if self.size is None and len(data) < self.chunk:
-            self.size = off + len(data)       # short read == EOF
-            await self.c.store.set_meta(self.key, size=self.size, chunk=self.chunk)
-        elif self.size is None:
-            await self.c.store.set_meta(self.key, chunk=self.chunk)
-        cnt = self._count()
-        if cnt is not None and not self.complete and len(self.have) >= cnt:
-            self.complete = True
-            await self.c.store.set_meta(self.key, complete=True)
-        return data
-
-
-    async def read(self, offset, length):
-        await self._load()
-        if self.size is None:
-            self.size = await self.c._size(self.key)   # None whenever the host hides it
-            if self.size is not None:
-                await self.c.store.set_meta(self.key, size=self.size, chunk=self.chunk)
-        if length is None and self.size is None:
-            return await self.c._net(self.key, offset, None)   # open-ended, unknown extent
-        end = self.size if length is None else offset + length
-        if self.size is not None:
-            end = min(end, self.size)
-        if end <= offset:
-            return b""
-        c0 = offset // self.chunk
-        c1 = (end - 1) // self.chunk
-        out = bytearray(end - offset)                  # filled in place: no second full copy
-        pos = 0
-        for i in range(c0, c1 + 1):
-            base = i * self.chunk
-            b = await self._chunk_bytes(i)
-            lo = max(offset, base) - base
-            hi = min(end, base + len(b)) - base        # a short chunk is the file's end
-            if hi > lo:
-                out[pos:pos + (hi - lo)] = b[lo:hi]
-                pos += hi - lo
-            short = len(b) < self.chunk
-            del b
-            if short:
-                break
-        return bytes(out[:pos])
+    st = _stores.get(root)
+    if st is None:
+        st = _stores[root] = _IdbStore(root) if _in_browser() else _DiskStore(root)
+    return st
 
 
 # Escalating cooldowns (seconds) applied each time concurrency is forced to 0 by repeated
@@ -1093,49 +1021,6 @@ class _AdaptiveLimiter:
             return r
 
 
-class _CacheLayer:
-    """Owns a cache dir and one `_CachedFile` per key. Caching, and nothing else.
-
-    Bytes it does not have come from the injected `fetch(key, offset, length)`, and a key's
-    total length from the injected `size(key)`. It does not know what those callbacks speak,
-    so it does not throttle them, does not decide how many may run at once, and does not
-    interpret their failures -- an error from the reader is raised as it came, because only
-    the reader knows what went wrong. Concurrency limits, rate-limit handling and backoff
-    belong to the transport, which is where the meaning of a 429 exists."""
-    def __init__(self, fetch, size, cache_dir, chunk=16 << 20, persist=True):
-        self.fetch = fetch; self.size_fn = size; self.cache_dir = cache_dir
-        self.chunk = int(chunk); self.persist = persist
-        self.files = {}; self.tasks = []; self._loaded = False
-        self.store = _make_store(cache_dir) if cache_dir else None
-
-    async def _net(self, key, offset, length):
-        """Bytes the cache does not have. Whatever the reader raises bubbles up unchanged."""
-        return await self.fetch(key, offset, length)
-
-    async def _size(self, key):
-        if self.size_fn is None: return None
-        try: return await self.size_fn(key)
-        except Exception: return None
-
-    async def read(self, key, offset, length):
-        if not self.cache_dir:
-            data = await self._net(key, offset, length)       # cache disabled -> pure streaming
-            self.served = getattr(self, "served", 0) + len(data)
-            _report(key, self.served, None)
-            return data
-        if not self._loaded:
-            self._loaded = True
-            await self.store.open()
-        st = self.files.get(key)
-        if st is None:
-            st = self.files[key] = _CachedFile(self, key)
-        data = await st.read(offset, length)
-        st.served += len(data)
-        _report(key, st.served, st.size)
-        return data
-
-
-# ============================ generic cached-reader tool ============================
 # The HTTP transport, the throttle and the read-ahead below are the pieces a read
 # concurrency + (browser) persistence used by the hub readers. Use it when you implement your
 # own `set_io_read` callback over a custom source (S3, a signed CDN, your own server, …); the
@@ -1250,29 +1135,32 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
 
     async def fill(k):
         try:
-            store = _make_store(cache_dir or _default_hub_cache())
-            await store.open()
             total = await size(k) if size is not None else None
-            meta = await store.meta(k)
-            if total is not None and meta["size"] is None:
-                await store.set_meta(k, size=total, chunk=chunk)
-            have = await store.have(k)
-            i = 0
-            while total is None or i * chunk < total:
-                if i not in have:
-                    n = chunk if total is None else min(chunk, total - i * chunk)
-                    b = await fetch(k, i * chunk, n)
-                    if not await store.put(k, i, b):
-                        return                       # storage full: stop, reads still work
-                    if total is None and len(b) < chunk:
-                        await store.set_meta(k, size=i * chunk + len(b), chunk=chunk)
-                        break
-                i += 1
-            m = await store.meta(k)
-            if m["size"] is not None:
-                need = (m["size"] + chunk - 1) // chunk
-                if len(await store.have(k)) >= need:
-                    await store.set_meta(k, complete=True)
+            off = 0
+            while total is None or off < total:
+                # Skip what is already there, then read and keep the next span. Everything
+                # goes through write_cache, which is what records the bytes as present --
+                # writing chunks behind its back leaves them invisible to every reader.
+                have = await read_cache(k, off, 1, cache_dir)
+                if have is not None:
+                    store = _make_store(cache_dir or _default_hub_cache())
+                    await store.open()
+                    reach = _covered_from((await store.meta(k))["covered"], off)
+                    if reach is not None:
+                        off = reach
+                        continue
+                n = chunk if total is None else min(chunk, total - off)
+                b = await fetch(k, off, n)
+                if not b:
+                    break
+                await write_cache(k, b, cache_dir, offset=off,
+                                  total=total if total is not None
+                                  else (off + len(b) if len(b) < n else None),
+                                  chunk_mb=chunk_mb)
+                off += len(b)
+                if len(b) < n:
+                    break                                # short read == end of file
+                del b
         except Exception:
             pass                                     # read-ahead is an optimisation, never a failure
 
@@ -1285,49 +1173,48 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
     return ahead
 
 
-def _cache_through(fetch, size=None, key=None, cache=True, cache_dir=None,
-                       chunk_mb=16, persist=True):
-    """Cache-with-miss-fill, used by the readers below. INTERNAL.
+def _cached_read(fetch, size=None, key=None, cache=True, cache_dir=None, chunk_mb=16):
+    """Compose a read callback: serve from the cache, and on a miss read and keep the rest.
 
-    Not part of the API. The cache has exactly two entry points -- `read_cache` and
-    `write_cache` -- and exactly two places they are used: inside a read/write callback, and
-    for managing the cache. A third public "cached reader" concept would just be a second
-    way to say the first one. What lives here is the part that is genuinely fiddly and that
-    both hub readers need: mapping a byte range onto chunks, serving a range that is partly
-    cached, learning a file's length from a short read when the host will not reveal it,
-    clamping past EOF, and assembling the answer without duplicating it in memory.
-
-    Writing your own callback? Use `read_cache` / `write_cache` directly -- see the hub
-    readers for the shape.
-
-    Caching, and only caching. Bytes it already has come from storage; bytes it does not
-    come from `fetch`, and are kept. It does not read ahead, does not decide how many
-    requests may run at once, and does not interpret failures -- whatever `fetch` raises is
-    raised as it came, because only `fetch` knows what went wrong. Those are properties of
-    the transport, so they are composed around it before it gets here:
-
-        tr = throttle_reads(my_fetch, max_parallel=8, is_rate_limited=my_classifier)
-        tr = prefetch_whole_file(tr, size=my_size, cache_dir=None)   # optional
-        webtorch.set_io_read(_cache_through(tr, size=my_size))
-
-    which is exactly what `hf_read` and `modelscope_read` do. The cache is also reachable on
-    its own through `read_cache` / `write_cache`, which is how a transport that wants to fill
-    it in the background does so.
-
-      fetch(key, offset, length) -> bytes   (async): read a byte range for `key`
-          (length None = whole file). `webtorch.http_get` is a ready-made HTTP one.
-      size(key) -> int | None               (async, optional): total length of `key`. Without
-          it the length is learnt from the first short read.
-      key(name) -> str                       (optional): map the incoming `name` to a stable
-          cache key (default: identity). The hub readers map "org/repo/path" -> the file URL,
-          so one platform's cache never collides with another's.
-      cache / cache_dir / chunk_mb / persist: where and how the entries are stored.
+    INTERNAL -- this is just the two public cache calls put together, and it is what the
+    hub readers below are made of. Writing your own callback is the same six lines; see
+    `read_cache` / `write_cache`.
     """
     keyfn = key or (lambda n: n)
     cdir = (cache_dir or _default_hub_cache()) if cache else None
-    layer = _CacheLayer(fetch, size, cdir, chunk=chunk_mb << 20, persist=persist)
+    known = {}
+    served = {}
+
     async def read(name, offset=0, length=None):
-        return await layer.read(keyfn(name), offset, length)
+        k = keyfn(name)
+        if cdir is None:
+            data = await fetch(k, offset, length)      # caching off -> straight through
+            served[k] = served.get(k, 0) + len(data)
+            _report(k, served[k], None)
+            return data
+        hit = await read_cache(k, offset, length, cdir)
+        if hit is not None and (length is None or len(hit) >= length):
+            served[k] = served.get(k, 0) + len(hit)    # cached bytes are still loaded bytes
+            _report(k, served[k], known.get(k))
+            return hit
+        got = len(hit) if hit else 0
+        if k not in known and size is not None:
+            try: known[k] = await size(k)
+            except Exception: known[k] = None
+        total = known.get(k)
+        want = None if length is None else length - got
+        data = await fetch(k, offset + got, want)
+        # A short answer means the file ends here -- often the only way to learn its length,
+        # since a cross-origin host need not expose Content-Length.
+        if total is None and want is not None and len(data) < want:
+            total = offset + got + len(data)
+            known[k] = total
+        await write_cache(k, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
+        out = (hit or b"") + data
+        served[k] = served.get(k, 0) + len(out)
+        _report(k, served[k], total)
+        return out
+
     return read
 
 
@@ -1361,7 +1248,11 @@ async def list_cache(cache_dir=None, host=None):
         if host is not None and h != host:
             continue
         m = await store.meta(key)
-        out.append({"key": key, "host": h, "size": await store.stored(key),
+        # What is actually held, summed from the spans -- not the file's extent on disk.
+        # A sparse file whose last byte was written looks full-size to the filesystem while
+        # holding almost nothing, and reporting that would overstate every partial entry.
+        held = sum(b - a for a, b in m["covered"])
+        out.append({"key": key, "host": h, "size": held,
                     "complete": m["complete"], "total": m["size"],
                     "path": os.path.join(root, _url_key(key))})
     out.sort(key=lambda e: e["key"])
@@ -1389,37 +1280,45 @@ async def read_cache(key, offset=0, length=None, cache_dir=None):
     This is local storage and nothing else. It never fetches, never falls back, and has no
     idea where the data would otherwise come from; on a miss the caller decides what to do,
     which is usually to read it from wherever it lives and hand it to `write_cache`. Only
-    the chunks the range touches are read, so this stays cheap on a multi-GB entry. None
-    also means a hole: a range that crosses a gap in a partly-filled entry is a miss.
+    the chunks the range touches are read, so this stays cheap on a multi-GB entry.
+
+    A range that runs into a gap returns everything up to the gap -- a short result, not a
+    failure -- so the caller can ask its transport for just the remainder instead of the
+    whole range again. `None` means the very first byte is missing, i.e. nothing to build on.
     """
     root = cache_dir or _default_hub_cache()
     store = _make_store(root)
     await store.open()
     m = await store.meta(key)
-    have = await store.have(key)
-    if not have:
+    cov = m["covered"]
+    reach = _covered_from(cov, offset)
+    if reach is None:                                  # the first byte is not here
         return None
-    chunk = m["chunk"]
-    total = m["size"] if m["size"] is not None else (max(have) + 1) * chunk
+    chunk = m["chunk"] or _CHUNK_DEFAULT
+    total = m["size"] if m["size"] is not None else reach
     end = total if length is None else min(offset + length, total)
+    end = min(end, reach)                              # stop where the run stops
     if end <= offset:
-        return b""
+        return None
     out = bytearray(end - offset)
     pos = 0
     for i in range(offset // chunk, (end - 1) // chunk + 1):
         base = i * chunk
         b = await store.get(key, i)
+        if b is None:
+            break
         lo = max(offset, base) - base
-        hi = min(end, base + chunk) - base
-        if b is None:                                  # hole in a partial entry
-            return None
+        hi = min(min(end, base + chunk) - base, len(b))
+        if hi <= lo:
+            break
         out[pos:pos + (hi - lo)] = b[lo:hi]
         pos += hi - lo
         del b
-    return bytes(out)
+    return bytes(out[:pos]) if pos else None
 
 
-async def write_cache(key, data, cache_dir=None, offset=None, complete=None, total=None):
+async def write_cache(key, data, cache_dir=None, offset=None, complete=None, total=None,
+                      chunk_mb=None):
     """Put bytes into the cache. A later `read_cache` (or a reader built on it) finds them.
 
     This is local storage and nothing else -- IndexedDB in a browser, files on a host. It
@@ -1428,10 +1327,11 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
     ranges, then write it here, and the next read of that range never reaches you again.
 
     `offset=None` (the default) replaces the whole entry with `data`. Passing an `offset`
-    writes just that span and leaves the rest, so a file can be filled chunk by chunk as it
-    arrives -- give `total` on the first such write if the full length is known, so progress
-    and completeness can be reported. `complete` sets the "whole file is here" flag; leaving
-    it None updates it automatically once every chunk is present.
+    writes just that span and leaves the rest, so a file can be filled as it arrives, in
+    whatever ranges the transport happened to read -- there is no alignment to respect,
+    because how the bytes are chunked underneath is not the caller's problem. Give `total`
+    when the full length is known, so progress and completeness can be reported. `complete`
+    sets the "whole file is here" flag; leaving it None sets it once every chunk is present.
     """
     root = cache_dir or _default_hub_cache()
     store = _make_store(root)
@@ -1440,30 +1340,48 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
 
     if offset is None:                                 # replace the entry outright
         await store.delete(key)
-        chunk = _CHUNK_DEFAULT
-        await store.set_meta(key, size=len(data), chunk=chunk,
+        chunk = (chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT
+        await store.set_meta(key, size=len(data), chunk=chunk, covered=[[0, len(data)]],
                              complete=True if complete is None else bool(complete))
         for i in range((len(data) + chunk - 1) // chunk):
             await store.put(key, i, data[i * chunk:(i + 1) * chunk])
         return
 
     meta = await store.meta(key)
-    chunk = meta["chunk"] or _CHUNK_DEFAULT
-    if meta["size"] is None and total is not None:
-        await store.set_meta(key, size=int(total), chunk=chunk)
+    chunk = meta["chunk"] or ((chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT)
+    if meta["chunk"] is None or (meta["size"] is None and total is not None):
+        await store.set_meta(key, size=None if total is None else int(total), chunk=chunk)
         meta = await store.meta(key)
-    if offset % chunk or (len(data) % chunk and
-                          (meta["size"] is None or offset + len(data) < meta["size"])):
-        raise ValueError("a partial write must start on a %d-byte boundary and run to the "
-                         "next one (or to the end of the file)" % chunk)
-    for j in range(0, len(data), chunk):
-        await store.put(key, (offset + j) // chunk, data[j:j + chunk])
+    # Any offset, any length. How the bytes are chunked underneath is this function's
+    # business, not the caller's -- a transport writes the range it happened to read.
+    # Storage is chunked at a fixed size, but a chunk need not be full and may have holes
+    # in it; which bytes are actually present is kept as a merged span list, so writing
+    # 0-16 and then 16-32 leaves one span rather than two, and a file that ends up complete
+    # is a single span.
+    first, last = offset // chunk, (offset + len(data) - 1) // chunk
+    for i in range(first, last + 1):
+        base = i * chunk
+        lo, hi = max(offset, base), min(offset + len(data), base + chunk)
+        piece = data[lo - offset:hi - offset]
+        if lo == base and (hi - lo == chunk or
+                           (meta["size"] is not None and hi >= meta["size"])):
+            await store.put(key, i, piece)             # a whole chunk, or the file's tail
+            continue
+        cur = await store.get(key, i)
+        buf = bytearray(cur if cur is not None else b"")
+        if len(buf) < hi - base:                       # grow to hold this span
+            buf.extend(b"\x00" * (hi - base - len(buf)))
+        buf[lo - base:hi - base] = piece
+        await store.put(key, i, bytes(buf))
+    await store.set_meta(key, covered=_merge(meta["covered"], offset, offset + len(data)))
+    meta = await store.meta(key)
+
     if complete is not None:
         await store.set_meta(key, complete=bool(complete))
     elif meta["size"] is not None:
-        need = (meta["size"] + chunk - 1) // chunk
-        if len(await store.have(key)) >= need:
-            await store.set_meta(key, complete=True)
+        cov = meta["covered"]
+        if len(cov) == 1 and cov[0][0] <= 0 and cov[0][1] >= meta["size"]:
+            await store.set_meta(key, complete=True)   # one span covering it all
 
 
 async def delete_cache(key, cache_dir=None):
@@ -1502,8 +1420,8 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     tr = throttle_reads(fetch, max_parallel, http_rate_limited)
     if prefetch:
         tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    return _cache_through(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
-                              chunk_mb=chunk_mb, persist=persist)
+    return _cached_read(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
+                              chunk_mb=chunk_mb)
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
             cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
