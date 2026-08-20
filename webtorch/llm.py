@@ -185,6 +185,33 @@ _READ_BYTES = 64 << 20
 _HEAD_BLK = 4096
 
 
+def _source_bits(infos, G):
+    """Int width that preserves what a GGUF actually stores.
+
+    The engine's kernels read one packed layout, so GGUF weights are converted into it --
+    which means a width has to be chosen. Deriving it from the file's own bits-per-weight
+    keeps `dtype="auto"` meaning the same thing it means for an AutoGPTQ directory: run at
+    the precision that was downloaded, rather than silently taking an 8-bit file to 4.
+    Measured from the block type holding the most weights, via its own byte count, so it
+    needs no per-format table and no per-model knowledge.
+    """
+    weight = {}
+    for t in infos:
+        if not t["name"].startswith("blk."):
+            continue
+        n = 1
+        for d in t["dims"]:
+            n *= int(d)
+        weight[t["type"]] = weight.get(t["type"], 0) + n
+    if not weight:
+        return 4
+    # Weighted by element count, not tensor count: a block holds a handful of huge weight
+    # matrices and many tiny F32 norms, so counting tensors would let the norms decide.
+    dom = max(weight, key=weight.get)
+    bpw = G.tensor_nbytes(dom, 4096) * 8.0 / 4096
+    return 8 if bpw > 4.5 else 4
+
+
 class _RowTable:
     """A 2-D weight that is only ever read by row, exposed with ndarray-style indexing.
 
@@ -564,9 +591,16 @@ class CausalLM:
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
     @classmethod
-    async def from_gguf(cls, url, lmax=320, bits=4, quantize=True):
+    async def from_gguf(cls, url, lmax=320, bits=None, quantize=True):
         """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
         they run on the same capture-accelerated engine. `url` is the served .gguf file.
+
+        `bits=None` (the default) takes the width from the file itself, so an 8-bit GGUF
+        runs at int8 instead of being quietly reduced to int4. Note that the conversion
+        itself is a kernel-format limitation, not a property of the format: the engine
+        reads one packed layout, so k-quant super-blocks are re-approximated by the
+        kernel's group scale/zero scheme. Running GGUF blocks natively would need a
+        kernel per quantization type.
 
         **Architecture-generic**: shape/rope/eps are read from GGUF's own `{arch}.*` metadata
         keys (the format's convention), and optional pieces are detected from the tensors —
@@ -576,10 +610,6 @@ class CausalLM:
         SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error."""
         from . import ggufload as G
         self = cls(None); self.lmax = lmax; self._gguf = url
-        self.bits = bits                                      # int4 or int8 (same kernels/optims)
-        # `quantize=False` (dtype="fp16") keeps the dequantized weights unquantized, so a GGUF
-        # runs on the numpy/CPU path too — the int kernel is GPU-only.
-        self._qbits = bits if quantize else 0
         size = 12 << 20
         while True:
             buf = await self._grng(0, size - 1)
@@ -589,6 +619,11 @@ class CausalLM:
                 size <<= 1
                 if size > (128 << 20):
                     raise
+        # `bits=None` follows the file (see _source_bits); an explicit width still wins.
+        self.bits = int(bits) if bits else _source_bits(infos, G)
+        # `quantize=False` (dtype="fp16") keeps the dequantized weights unquantized, so a GGUF
+        # runs on the numpy/CPU path too — the int kernel is GPU-only.
+        self._qbits = self.bits if quantize else 0
         arch = meta.get("general.architecture")
         if not arch:
             raise ValueError("GGUF has no general.architecture")

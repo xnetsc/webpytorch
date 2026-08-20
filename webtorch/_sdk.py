@@ -57,17 +57,20 @@ class AutoModelForCausalLM:
     `.generate()` model. No model-specific code.
 
     `dtype`:
-      - "auto"  (default): AutoGPTQ dir → int at its declared bits; GGUF → int`bits`;
-        plain fp16/bf16 HF dir → run **fp16** (unquantized).
+      - "auto"  (default): AutoGPTQ dir → int at its declared bits; GGUF → int at the
+        width the file itself stores (an 8-bit GGUF stays int8); plain fp16/bf16 HF dir →
+        run **fp16** (unquantized).
       - "fp16": force unquantized fp16 execution (plain HF dir).
       - "int4"/"int8": for a plain fp16 HF dir, quantize every linear on load; for GGUF,
         requantize to that width. (An AutoGPTQ dir always loads at its own stored bits.)
     """
     @staticmethod
-    async def from_pretrained(path, dtype="auto", bits=4, lmax=320):
+    async def from_pretrained(path, dtype="auto", bits=None, lmax=320):
         from . import llm as _llm, webio
         p = path.rstrip("/")
         if p.endswith(".gguf"):
+            # "auto" means the same here as for an AutoGPTQ dir: keep the stored
+            # precision (bits=None lets the loader read it off the file).
             gb = 8 if dtype == "int8" else (4 if dtype == "int4" else bits)
             # dtype="fp16" runs a GGUF unquantized (works without a GPU; the int kernel is
             # GPU-only). "auto"/int4/int8 requantize to the int engine as before.

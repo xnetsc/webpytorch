@@ -2041,12 +2041,19 @@ def embedding(weight, idx):
     vocab, dim = weight.data.shape
     M = flat.shape[0]
     if not (_adam_backend_ready() or _webgl_ready()):
-        onehot = xp.asarray(np.eye(vocab, dtype=np.float32)[flat.astype(np.int64)])
-        out = Tensor((onehot @ weight.data).reshape(*(ish + (dim,))), weight.requires_grad, (weight,), "embedding")
+        # Gather the rows directly. Selecting them with a one-hot matmul costs O(M*vocab)
+        # and builds a (vocab, vocab) identity first -- at a 152k vocab that is terabytes,
+        # so this path could never run a real model. The backward is the matching
+        # scatter-add, which also handles a token repeated in the batch.
+        ids = flat.astype(np.int64)
+        out = Tensor(weight.data[ids].reshape(*(ish + (dim,))),
+                     weight.requires_grad, (weight,), "embedding")
 
         def _bw():
             if weight.requires_grad:
-                weight._accum(_swap_last2(onehot) @ _contig(out.grad.reshape(-1, dim)))
+                dw = np.zeros_like(weight.data)
+                np.add.at(dw, ids, _contig(out.grad.reshape(-1, dim)))
+                weight._accum(dw)
         out._backward = _bw
         return out
 
