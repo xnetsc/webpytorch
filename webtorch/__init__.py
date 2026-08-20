@@ -63,13 +63,15 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 # browser-fetch+Range / host-open pair in one explicit call. `offset`/`length` mark
 # ranged/streaming access (e.g. int4 weight shards) so a callback can issue an HTTP Range
 # request or seek into local/remote storage.
-from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
+from .webio import (set_read_progress, get_read_progress,
+                    set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
                     make_cached_reader, http_get, http_size, HttpError,
                     default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
                     write_cache, delete_cache, clear_cache)
 
 __all__ = [
+    "set_read_progress", "get_read_progress",
     "export_model", "import_model", "model_groups",
     "backend", "has_gpu", "require_gpu",
     # torch-compatible core

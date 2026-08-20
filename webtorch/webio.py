@@ -785,6 +785,35 @@ def _in_browser():
         return False
 
 
+# Progress is reported on bytes SERVED, not bytes fetched. A model already in the cache
+# does no network at all, and counting fetches leaves that load looking frozen -- which is
+# exactly what a cache is for. Counting reads covers both, with one number.
+_progress = {"cb": None}
+
+
+def set_read_progress(cb):
+    """Install `cb(key, done, total)`, called as reads are served. `None` clears it.
+
+    `done` is the cumulative bytes served for that key by the current reader; `total` is
+    the file's size, or None when the host never revealed it. Fires for cached reads and
+    network reads alike, so a load shows progress whichever way the bytes arrive.
+    """
+    _progress["cb"] = cb
+
+
+def get_read_progress():
+    return _progress["cb"]
+
+
+def _report(key, done, total):
+    cb = _progress["cb"]
+    if cb is not None:
+        try:
+            cb(key, done, total)
+        except Exception:
+            pass                              # a broken meter must not break a load
+
+
 def _make_store(root):
     """IndexedDB in the browser, real files on the host -- same chunk-addressed interface."""
     return _IdbStore(root) if _in_browser() else _DiskStore(root)
@@ -818,6 +847,7 @@ class _CachedFile:
         self.chunk = cache.chunk
         self.have = set()                     # chunk indices in storage == the coverage map
         self.complete = False
+        self.served = 0                       # cumulative bytes handed to the caller
         self._prefetching = False
         self._loaded = False
 
@@ -1064,14 +1094,20 @@ class _CacheLayer:
 
     async def read(self, key, offset, length):
         if not self.cache_dir:
-            return await self._net(key, offset, length)       # cache disabled -> pure streaming
+            data = await self._net(key, offset, length)       # cache disabled -> pure streaming
+            self.served = getattr(self, "served", 0) + len(data)
+            _report(key, self.served, None)
+            return data
         if not self._loaded:
             self._loaded = True
             await self.store.open()
         st = self.files.get(key)
         if st is None:
             st = self.files[key] = _CachedFile(self, key)
-        return await st.read(offset, length)
+        data = await st.read(offset, length)
+        st.served += len(data)
+        _report(key, st.served, st.size)
+        return data
 
 
 # ============================ generic cached-reader tool ============================

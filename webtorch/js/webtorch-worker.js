@@ -12,11 +12,21 @@
 (function (root) {
   const wt = root.webtorch || (root.webtorch = {});
 
-  // The package's own module list: SDK knowledge, so callers do not have to track it.
-  const MODULES = ['__init__.py', '_core.py', '_sdk.py', 'backend.py', 'torchshim.py',
-    'ggufload.py', 'hfcompat.py', 'webenv.py', 'llm.py', 'linear_attn.py', 'vl.py',
-    'detection.py', 'tts.py', 'webio.py', 'onnxrt.py', 'lm_engine.py', 'quantize.py',
-    'audiofe.py', 'cosyvoice.py', 'multimodal.py', 'iqtables.py'];
+  // The package's own inventory, read from a manifest generated with it, so adding a
+  // module never needs an edit here. The inline list is the fallback for a tree served
+  // without the manifest, and is only ever a floor.
+  const FALLBACK = ["__init__.py", "_core.py", "_sdk.py", "audiofe.py", "backend.py", "cosyvoice.py", "detection.py", "ggufload.py", "hfcompat.py", "iqtables.py", "linear_attn.py", "llm.py", "lm_engine.py", "multimodal.py", "onnxrt.py", "portable.py", "quantize.py", "torchshim.py", "tts.py", "vl.py", "webenv.py", "webio.py"];
+
+  async function moduleList(base) {
+    try {
+      const r = await fetch(base + 'webtorch/modules.json');
+      if (r.ok) {
+        const m = (await r.json()).modules;
+        if (Array.isArray(m) && m.length) return m;
+      }
+    } catch (e) { /* fall through */ }
+    return FALLBACK;
+  }
 
   // Set by the main thread before it sends anything else (see webtorch-main.js).
   let announced = null;
@@ -69,7 +79,7 @@
 
     say('loading webtorch…');
     try { pyodide.FS.mkdir('webtorch'); } catch (e) { /* already there */ }
-    for (const m of MODULES) {
+    for (const m of await moduleList(base)) {
       try { pyodide.FS.writeFile('webtorch/' + m, await text(base + 'webtorch/' + m)); }
       catch (e) { console.warn('webtorch: skipped ' + m + ': ' + e.message); }
     }

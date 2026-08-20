@@ -130,7 +130,7 @@ worker.onmessage = (e) => {
     $('#modelStatus').textContent = m.text;
     $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
   }
-  else if (m.type === 'progress') { showProgress(m.bytes); }
+  else if (m.type === 'progress') { if (m.total) expected = m.total; showProgress(m.bytes); }
   else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'log') { console.log('[py]', m.text); }
   else if (m.type === 'backend') {
@@ -161,7 +161,8 @@ function syncButtons() {
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
 let expected = 0;
 function showProgress(bytes) {
-  $('#progressText').textContent = 'downloaded ' + fmt(bytes) + (expected ? ' of ~' + fmt(expected) : '');
+  // "read", not "downloaded": the same meter covers a load served entirely from cache.
+  $('#progressText').textContent = 'read ' + fmt(bytes) + (expected ? ' of ' + fmt(expected) : '');
   if (expected) setBar(bytes / expected); else setBar(((bytes / 5e8) % 1));
 }
 
@@ -245,20 +246,73 @@ async function refreshCache() {
   try {
     const c = await call('cacheList');
     const el = $('#cacheList'); el.innerHTML = '';
-    if (!c.items.length) { el.innerHTML = '<p class="hint">nothing cached yet</p>'; return; }
+    if (!(c.groups || []).length) { el.innerHTML = '<p class="hint">nothing cached yet</p>'; return; }
     const head = document.createElement('p'); head.className = 'hint';
     head.textContent = 'total ' + fmt(c.total);
     el.appendChild(head);
-    c.items.sort((a, b) => b.size - a.size).forEach(it => {
+    // Listed per model rather than per file, because that is the unit you export, delete
+    // or reuse -- a multi-file model is one thing, not five rows.
+    c.groups.sort((a, b) => b.size - a.size).forEach(g => {
       const d = document.createElement('div'); d.className = 'item';
       const k = document.createElement('span'); k.className = 'k';
-      k.title = it.key; k.textContent = it.key.split('/').pop() + ' · ' + fmt(it.size);
-      const b = document.createElement('button'); b.textContent = 'delete';
-      b.onclick = async () => { await call('cacheDelete', { key: it.key }); refreshCache(); };
-      d.append(k, b); el.appendChild(d);
+      k.title = g.keys.join('\n');
+      k.textContent = g.label + ' · ' + fmt(g.size) + (g.files > 1 ? ' · ' + g.files + ' files' : '');
+      const ex = document.createElement('button'); ex.textContent = 'export';
+      ex.title = g.files > 1 ? 'Save as a .zip' : 'Save the file itself';
+      ex.onclick = () => exportModel(g);
+      const del = document.createElement('button'); del.textContent = 'delete';
+      del.onclick = async () => {
+        for (const key of g.keys) await call('cacheDelete', { key });
+        refreshCache();
+      };
+      d.append(k, ex, del); el.appendChild(d);
     });
   } catch (e) { $('#cacheList').innerHTML = '<p class="hint">cache unavailable: ' + e.message + '</p>'; }
 }
+
+// A single-file model is saved as itself, so the exported file IS the model and any other
+// tool reads it; several files become one .zip. The bytes stream from the SDK straight to
+// disk through the picked handle, so a 12 GB model never becomes a Blob.
+async function exportModel(g) {
+  if (!window.showSaveFilePicker) {
+    note('This browser cannot save large files directly (no File System Access API).');
+    return;
+  }
+  const one = g.keys.length === 1;
+  const name = one ? g.keys[0].split('/').pop() : g.label.split(' ')[0].replace(/\//g, '_') + '.zip';
+  let handle;
+  try {
+    handle = await window.showSaveFilePicker({ suggestedName: name });
+  } catch (e) { return; }                       // the person cancelled
+  note('Exporting ' + name + ' …');
+  try {
+    const n = await call('exportModel', { keys: g.keys, handle });
+    note('Exported ' + name + ' (' + fmt(n) + ').');
+  } catch (e) { note('Export failed: ' + e.message); }
+  setBar(0); $('#progressText').textContent = '';
+}
+
+$('#importModel').onclick = () => $('#importFileModel').click();
+$('#importFileModel').onchange = async (e) => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  // A .zip carries its own file names; a bare file does not, so it needs the cache key it
+  // should be restored under -- which is what the loader will look for.
+  let key = '';
+  if (!/\.zip$/i.test(f.name)) {
+    key = prompt('Restore under which model id?\n(e.g. unsloth/Qwen3-0.6B-GGUF/' + f.name + ')', '');
+    if (!key) return;
+    key = 'modelscope.cn/models/' + key.replace(/^\/+/, '').replace(
+      /^([^/]+\/[^/]+)\//, '$1/resolve/master/');
+  }
+  note('Importing ' + f.name + ' …');
+  try {
+    const keys = JSON.parse(await call('importModel', { file: f, key }));
+    note('Imported ' + keys.length + ' file(s). Load it from Settings without downloading.');
+    refreshCache();
+  } catch (err) { note('Import failed: ' + err.message); }
+};
+
 $('#refreshCache').onclick = refreshCache;
 $('#clearCache').onclick = async () => { if (confirm('Delete every cached model file?')) { await call('cacheClear'); refreshCache(); } };
 
