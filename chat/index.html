@@ -51,6 +51,16 @@
     </div>
     <p class="hint">Pick “custom” to load any other ModelScope model. Downloads come from ModelScope.</p>
     <div class="row">
+      <label for="gpuMem" class="hint">GPU memory</label>
+      <input id="gpuMem" type="number" min="1" step="1" placeholder="auto" />
+      <span class="hint">GB</span>
+      <button id="gpuMemClear" class="ghost">auto</button>
+    </div>
+    <p class="hint">The browser never reports how much memory a GPU has, so the figure above
+      is estimated from system RAM — right for unified memory (Apple silicon, phones,
+      integrated GPUs), too high for a discrete GPU whose VRAM is smaller. Set it to your
+      card’s VRAM if you have one.</p>
+    <div class="row">
       <button id="loadBtn" class="primary">Load model</button>
       <button id="releaseBtn">Release</button>
     </div>

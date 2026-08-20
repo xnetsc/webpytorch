@@ -41,10 +41,28 @@ const PRESETS = [
 // What this machine can actually take: RAM, how much the browser will let us cache, and
 // whether the GPU backend is available. Used to order the picker, never to hide anything.
 let ENV = { ramGB: 0, quotaGB: 0, cores: 0, webgpu: false, persisted: false, runGB: Infinity };
-const RUNTIME_GB = 1.5;                               // interpreter + activations + KV cache
+const RUNTIME_GB = 1.5;            // interpreter + activations + KV cache, alongside the weights
+
+// How big a model can run is decided by memory the GPU can reach, and that differs by
+// topology:
+//   * unified memory (Apple silicon, phones, integrated GPUs) — the GPU draws from system
+//     RAM, so system RAM is the ceiling and there is no separate pool to account for;
+//   * dedicated VRAM (discrete GPUs) — the ceiling is VRAM, which is typically far smaller
+//     than system RAM.
+// WebGPU does not report total GPU memory in either case (deliberately — it fingerprints),
+// and it cannot be measured: buffers are allocated lazily, and even writing every byte
+// keeps succeeding because the OS pages. Probing a 16 GB machine here handed out 25.8 GB
+// lazily and 21.5 GB fully written, so an allocation probe measures the OS's willingness
+// to swap, not usable memory. What is left is a derived estimate — so it is stated in the
+// UI and can be overridden by someone who knows the actual VRAM.
+const GPU_OVERRIDE_KEY = 'webtorch.gpuMemGB';
+function gpuOverrideGB() {
+  const v = parseFloat(localStorage.getItem(GPU_OVERRIDE_KEY) || '');
+  return isFinite(v) && v > 0 ? v : 0;
+}
 async function detectEnv() {
   ENV.cores = navigator.hardwareConcurrency || 0;
-  ENV.ramGB = navigator.deviceMemory || 0;            // 0 = not reported (Safari/Firefox)
+  ENV.ramGB = navigator.deviceMemory || 0;          // 0 = not reported (Safari/Firefox)
   try {
     // Persistence only protects the cache from eviction. It does not decide what can run.
     if (navigator.storage && navigator.storage.persist) {
@@ -57,26 +75,40 @@ async function detectEnv() {
     if (navigator.gpu) {
       const ad = await navigator.gpu.requestAdapter();
       ENV.webgpu = !!ad;
-      if (ad && ad.limits) ENV.maxBufferGB = (ad.limits.maxBufferSize || 0) / 1e9;
+      if (ad) {
+        const L = ad.limits || {};
+        // Real, spec'd caps — but per allocation, not totals. They bound the largest single
+        // tensor; a value above the 4 GiB spec default is also evidence of a larger pool.
+        ENV.perAllocGB = Math.max(L.maxBufferSize || 0, L.maxStorageBufferBindingSize || 0) / 1e9;
+        ENV.gpuName = ad.info ? [ad.info.vendor, ad.info.architecture].filter(Boolean).join(' ') : '';
+      }
     }
   } catch (e) { ENV.webgpu = false; }
 
-  // What can actually RUN is bounded by memory, not by disk. Weights stay packed at their
-  // quantized width, so a 13 GB 3-bit file needs roughly 13 GB resident; add slack for the
-  // runtime, activations and KV cache. The storage quota is a *caching* limit — it is only
-  // ~60% of currently-free disk, it moves as disk frees up, and a model that does not fit
-  // it still streams and runs, just without being cached. So it must not gate the list.
-  ENV.runGB = ENV.ramGB ? Math.max(0, ENV.ramGB - RUNTIME_GB) : Infinity;
+  // Weights stay packed at their quantized width, so a 13 GB 3-bit file needs ~13 GB
+  // resident. Disk quota is NOT part of this: it is a caching limit (~60% of free disk,
+  // and it moves), and a model that exceeds it still streams and runs, just uncached.
+  const ramCeil = ENV.ramGB ? Math.max(0, ENV.ramGB - RUNTIME_GB) : Infinity;
+  const override = gpuOverrideGB();
+  ENV.override = !!override;
+  // Unified memory is the common case in a browser (phones, Macs, integrated GPUs) and is
+  // also the safe assumption, since it ties the ceiling to RAM, which IS reported. A
+  // discrete GPU with less VRAM than RAM cannot be detected, hence the override.
+  ENV.gpuCeilGB = override || ramCeil;
+  ENV.runGB = Math.min(ramCeil, ENV.gpuCeilGB);
   return ENV;
 }
 function envSummary() {
   const p = [];
   p.push(ENV.ramGB ? ENV.ramGB + ' GB RAM' : 'RAM not reported');
   if (ENV.cores) p.push(ENV.cores + ' cores');
-  p.push(ENV.webgpu ? 'WebGPU' : 'CPU only');
+  p.push(ENV.webgpu ? ('WebGPU' + (ENV.gpuName ? ' (' + ENV.gpuName + ')' : '')) : 'CPU only');
   p.push(ENV.quotaGB ? ENV.quotaGB.toFixed(1) + ' GB cache quota' : 'quota unknown');
   return p.join(' · ') + ' → can run up to '
-       + (ENV.runGB === Infinity ? 'unknown' : '≈' + ENV.runGB.toFixed(1) + ' GB');
+       + (ENV.runGB === Infinity ? 'unknown' : '≈' + ENV.runGB.toFixed(1) + ' GB')
+       + (ENV.override ? ' (your GPU memory setting)'
+                       : ENV.webgpu ? ' (estimated — set GPU memory below if your GPU has its own)'
+                                    : '');
 }
 
 function call(cmd, args) {
@@ -120,6 +152,20 @@ function showProgress(bytes) {
 }
 
 // ---- model ----
+// The estimate is the machine's, the correction is the user's — applying it re-runs the
+// same detection path so the list, the pick and the summary all move together.
+function wireGpuMem() {
+  const box = $('#gpuMem'); if (!box) return;
+  const cur = gpuOverrideGB(); if (cur) box.value = cur;
+  const apply = async (v) => {
+    if (v > 0) localStorage.setItem(GPU_OVERRIDE_KEY, String(v));
+    else localStorage.removeItem(GPU_OVERRIDE_KEY);
+    await detectEnv(); fillPresets();
+  };
+  box.onchange = () => apply(parseFloat(box.value));
+  $('#gpuMemClear').onclick = () => { box.value = ''; apply(0); };
+}
+
 function fillPresets() {
   const sel = $('#preset'); sel.innerHTML = '';
   const custom = PRESETS[PRESETS.length - 1];
@@ -379,6 +425,6 @@ $('#importFile').onchange = async (e) => {
 
 loadConvs(); if (!convs.length) newConv(); else curId = convs[0].id;
 renderConvs(); render(); syncButtons();
-detectEnv().then(fillPresets);
+detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
 call('boot').then(refreshCache).catch(e => $('#modelStatus').textContent = 'runtime failed: ' + e.message);
