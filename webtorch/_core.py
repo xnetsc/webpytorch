@@ -2848,26 +2848,46 @@ class Adam:
 #   scales  (nG, N) f32,  nG = K/group_size
 #   dequant: w[k,n] = scales[k//gs, n] * (q[k,n] - zero[k//gs, n])
 # Quantization is PER-TENSOR (independent) -> naturally streamable.
-def _gptq_quantize(W, group_size=32, bits=4):
-    K, N = W.shape
+def _gptq_quantize(W, group_size=32, bits=4, from_out_in=False, block=2048):
+    """Quantize a weight to packed int`bits` with per-group scales and zero points.
+
+    Columns are independent, so this walks them in blocks: a whole-tensor int32 staging
+    array is 356 MB on a 27B feed-forward weight and the packing shift doubles it, which no
+    32-bit heap will give. Blocked, the peak is set by `block`, not by the tensor.
+
+    `from_out_in=True` means `W` is the (out, in) layout the loaders hold, and the (in, out)
+    the packing wants is produced one block at a time -- so the full transposed copy, another
+    356 MB, never exists either.
+    """
+    K, N = (W.shape[1], W.shape[0]) if from_out_in else W.shape
     per = 32 // bits
     qmax = (1 << bits) - 1
     assert K % group_size == 0 and K % per == 0 and N % per == 0, "dims must divide group/pack size"
     nG = K // group_size
     scales = np.zeros((nG, N), np.float32)
     zeros = np.zeros((nG, N), np.int32)
-    q = np.zeros((K, N), np.int32)
-    for g in range(nG):
-        blk = W[g * group_size:(g + 1) * group_size]
-        wmin = blk.min(0); wmax = blk.max(0)
-        sc = (wmax - wmin) / qmax
-        sc[sc == 0] = 1e-8
-        zp = np.clip(np.round(-wmin / sc), 0, qmax).astype(np.int32)
-        scales[g] = sc; zeros[g] = zp
-        q[g * group_size:(g + 1) * group_size] = np.clip(np.round(blk / sc) + zp, 0, qmax).astype(np.int32)
-    # vectorized bit-packing (was a per-element Python loop -> slow for GGUF requant)
-    sh_k = (np.arange(per, dtype=np.int32) * bits).reshape(1, per, 1)
-    qweight = np.bitwise_or.reduce(q.reshape(K // per, per, N) << sh_k, axis=1).astype(np.int32)
+    qweight = np.empty((K // per, N), np.int32)
+    for n0 in range(0, N, block):
+        n1 = min(N, n0 + block)
+        Wb = np.ascontiguousarray(W[n0:n1].T) if from_out_in else W[:, n0:n1]
+        qb = np.empty((K, n1 - n0), np.int32)
+        for g in range(nG):
+            blk = Wb[g * group_size:(g + 1) * group_size]
+            wmin = blk.min(0); wmax = blk.max(0)
+            sc = (wmax - wmin) / qmax
+            sc[sc == 0] = 1e-8
+            zp = np.clip(np.round(-wmin / sc), 0, qmax).astype(np.int32)
+            scales[g, n0:n1] = sc; zeros[g, n0:n1] = zp
+            qb[g * group_size:(g + 1) * group_size] = np.clip(np.round(blk / sc) + zp,
+                                                             0, qmax).astype(np.int32)
+        # Pack `per` rows into each u32, accumulating in place rather than building a
+        # (K/per, per, N) shifted copy.
+        qv = qb.reshape(K // per, per, n1 - n0)
+        acc = np.zeros((K // per, n1 - n0), np.int32)
+        for j in range(per):
+            acc |= qv[:, j, :] << np.int32(j * bits)
+        qweight[:, n0:n1] = acc
+        del Wb, qb, qv, acc
     sh_n = (np.arange(per, dtype=np.int32) * bits).reshape(1, 1, per)
     qzeros = np.bitwise_or.reduce(zeros.reshape(nG, N // per, per) << sh_n, axis=2).astype(np.int32)
     return qweight, qzeros, scales, K, N

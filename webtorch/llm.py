@@ -580,13 +580,17 @@ class CausalLM:
         runnable without a GPU (the int kernel is GPU-only)."""
         if getattr(self, "_qbits", None) == 0:
             return wt.UnquantizedLinear(W_out_in, bias)
-        W = np.ascontiguousarray(W_out_in.T)                 # (in, out)
-        K, N = W.shape; per = 32 // self.bits
+        # Handed over in its (out, in) layout: the quantizer transposes one column block at
+        # a time, so the full (in, out) copy -- 356 MB on a 27B feed-forward weight, on top
+        # of the 356 MB the tensor already occupies -- is never built.
+        N, K = W_out_in.shape; per = 32 // self.bits
         kmul = self.gs if self.gs % per == 0 else self.gs * per
         Kp = K + (-K) % kmul; Np = N + (-N) % per
+        src = W_out_in
         if Kp != K or Np != N:
-            W = np.pad(W, ((0, Kp - K), (0, Np - N)))
-        qw, qz, sc, _, _ = wt._gptq_quantize(W, self.gs, self.bits)
+            src = np.pad(src, ((0, Np - N), (0, Kp - K)))
+        qw, qz, sc, _, _ = wt._gptq_quantize(src, self.gs, self.bits, from_out_in=True)
+        del src
         b = np.zeros((N,), np.float32) if bias is None else np.asarray(bias, np.float32)
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
