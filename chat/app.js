@@ -40,15 +40,15 @@ const PRESETS = [
 
 // What this machine can actually take: RAM, how much the browser will let us cache, and
 // whether the GPU backend is available. Used to order the picker, never to hide anything.
-let ENV = { ramGB: 0, quotaGB: 0, cores: 0, webgpu: false, budgetGB: 0 };
+let ENV = { ramGB: 0, quotaGB: 0, cores: 0, webgpu: false, persisted: false, runGB: Infinity };
+const RUNTIME_GB = 1.5;                               // interpreter + activations + KV cache
 async function detectEnv() {
   ENV.cores = navigator.hardwareConcurrency || 0;
-  ENV.ramGB = navigator.deviceMemory || 0;            // coarse, Chrome-only; 0 = unknown
+  ENV.ramGB = navigator.deviceMemory || 0;            // 0 = not reported (Safari/Firefox)
   try {
-    // Persistent storage lifts the eviction risk and usually the quota, which decides how big
-    // a model can be cached at all.
+    // Persistence only protects the cache from eviction. It does not decide what can run.
     if (navigator.storage && navigator.storage.persist) {
-      try { await navigator.storage.persist(); } catch (e) { /* user may decline */ }
+      try { ENV.persisted = await navigator.storage.persist(); } catch (e) { ENV.persisted = false; }
     }
     const est = await navigator.storage.estimate();
     ENV.quotaGB = (est.quota || 0) / 1e9;
@@ -60,19 +60,23 @@ async function detectEnv() {
       if (ad && ad.limits) ENV.maxBufferGB = (ad.limits.maxBufferSize || 0) / 1e9;
     }
   } catch (e) { ENV.webgpu = false; }
-  // A model must both fit in memory and fit in the cache. Leave room for the runtime.
-  const mem = ENV.ramGB ? ENV.ramGB * 0.55 : 12;      // unknown RAM -> assume a typical laptop
-  const disk = ENV.quotaGB ? ENV.quotaGB * 0.8 : 999;
-  ENV.budgetGB = Math.min(mem, disk);
+
+  // What can actually RUN is bounded by memory, not by disk. Weights stay packed at their
+  // quantized width, so a 13 GB 3-bit file needs roughly 13 GB resident; add slack for the
+  // runtime, activations and KV cache. The storage quota is a *caching* limit — it is only
+  // ~60% of currently-free disk, it moves as disk frees up, and a model that does not fit
+  // it still streams and runs, just without being cached. So it must not gate the list.
+  ENV.runGB = ENV.ramGB ? Math.max(0, ENV.ramGB - RUNTIME_GB) : Infinity;
   return ENV;
 }
 function envSummary() {
   const p = [];
-  p.push(ENV.ramGB ? ENV.ramGB + ' GB RAM' : 'RAM unknown');
+  p.push(ENV.ramGB ? ENV.ramGB + ' GB RAM' : 'RAM not reported');
   if (ENV.cores) p.push(ENV.cores + ' cores');
-  p.push(ENV.quotaGB ? ENV.quotaGB.toFixed(0) + ' GB cache quota' : 'quota unknown');
   p.push(ENV.webgpu ? 'WebGPU' : 'CPU only');
-  return p.join(' · ') + ' → fits ≈' + ENV.budgetGB.toFixed(1) + ' GB';
+  p.push(ENV.quotaGB ? ENV.quotaGB.toFixed(1) + ' GB cache quota' : 'quota unknown');
+  return p.join(' · ') + ' → can run up to '
+       + (ENV.runGB === Infinity ? 'unknown' : '≈' + ENV.runGB.toFixed(1) + ' GB');
 }
 
 function call(cmd, args) {
@@ -119,43 +123,44 @@ function showProgress(bytes) {
 function fillPresets() {
   const sel = $('#preset'); sel.innerHTML = '';
   const custom = PRESETS[PRESETS.length - 1];
-  const DEFAULT = PRESETS[0];                       // Qwen3.8-27B 3-bit: always the default
-  const models = PRESETS.slice(0, -1).filter(m => m !== DEFAULT);
-  // The default stays pinned at the top; the rest are ordered by what this machine can hold
-  // (largest that fits first), with anything over budget kept but flagged.
-  const fits = models.filter(m => m.gb <= ENV.budgetGB).sort((a, b) => b.gb - a.gb);
-  const over = models.filter(m => m.gb > ENV.budgetGB).sort((a, b) => a.gb - b.gb);
-  const ordered = [DEFAULT].concat(fits, over, [custom]);
-  // Default to Qwen3.8-27B 3-bit when this machine can hold it; otherwise the largest that
-  // fits; and when nothing fits (a phone, say) the smallest, so the pick is at least plausible.
-  const smallest = models.concat([DEFAULT]).slice().sort((a, b) => a.gb - b.gb)[0];
-  const noneFit = fits.length === 0 && DEFAULT.gb > ENV.budgetGB;
-  const best = (DEFAULT.gb <= ENV.budgetGB) ? DEFAULT : (fits[0] || smallest);
-  ordered.forEach((p) => {
-    const o = document.createElement('option');
-    o.value = PRESETS.indexOf(p);
-    const tag = p.gb ? ' (' + p.gb.toFixed(1) + ' GB)' : '';
-    // one verdict per entry — fits, or does not
-    const fit = !p.gb ? ''
-      : p.gb > ENV.budgetGB ? ' ⚠ too big for this device'
-      : (p === best ? ' ✓ best fit here' : '');
-    const dflt = (p === DEFAULT) ? ' — default' : '';
-    o.textContent = p.label + tag + dflt + fit;
-    sel.appendChild(o);
-  });
+  const DEFAULT = PRESETS[0];                       // Qwen3.8-27B 3-bit
+  const models = PRESETS.slice(0, -1);
+
   sel.onchange = () => {
     const p = PRESETS[sel.value];
-    // one box, and only for a model that is not in the list
+    // one box, shown only for a model that is not in the list
     $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : '';
     $('#customBox').hidden = !!p.repo;
   };
-  // Default to Qwen3.8-27B 3-bit; if this machine cannot hold it, default to the best that fits.
+
+  // Hide only what this device genuinely cannot run: weights that exceed usable memory.
+  // Exceeding the cache quota is not a reason to hide anything — such a model still runs,
+  // it just re-downloads instead of being cached, so it gets a note rather than exclusion.
+  const runnable = models.filter(m => m.gb <= ENV.runGB).sort((a, b) => b.gb - a.gb);
+  const smallest = models.slice().sort((a, b) => a.gb - b.gb)[0];
+  const noneRun  = runnable.length === 0;
+  const shown    = noneRun ? [smallest] : runnable;  // never present an empty list
+  const best     = runnable.includes(DEFAULT) ? DEFAULT : (runnable[0] || smallest);
+
+  shown.concat([custom]).forEach((p) => {
+    const o = document.createElement('option');
+    o.value = PRESETS.indexOf(p);
+    const note = !p.gb ? '' : noneRun ? ' ⚠ larger than this device\u2019s memory'
+                                      : (p === best ? ' ✓ recommended' : '');
+    o.textContent = p.label + (p.gb ? ' (' + p.gb.toFixed(1) + ' GB)' : '') + note;
+    sel.appendChild(o);
+  });
+
   sel.value = PRESETS.indexOf(best); sel.onchange();
+  // Said once, about the machine — not repeated on every row it happens to apply to.
+  const cacheNote = ENV.quotaGB && best.gb > ENV.quotaGB
+    ? ' Note: the cache quota is smaller than this model, so part of it re-downloads each session'
+      + (ENV.persisted ? '.' : ' and the cache may be evicted (persistent storage was declined).')
+    : '';
   $('#envInfo').textContent = envSummary() + (
-      noneFit ? ' — no preset fits this device; the smallest is selected, and you can enter any '
-                + 'other model below'
+      noneRun ? ' — no listed model fits in memory; showing the smallest, or enter another below'
     : best === DEFAULT ? ''
-    : ' — the default is too large here, so ' + best.label + ' is selected');
+    : ' — the default needs more memory, so ' + best.label + ' is selected') + cacheNote;
 }
 $('#loadBtn').onclick = async () => {
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
