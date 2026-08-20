@@ -127,6 +127,13 @@ class CausalLM:
             it falls back to hidden_size // num_heads for models that omit it.
           * QK-norm (Qwen3) is detected from the weights at load time, not from the model name.
           * MoE fields (num_experts / num_experts_per_tok / …) drive the sparse path."""
+        # Multimodal/composite configs nest the decoder under `text_config` (and the vision
+        # tower under `vision_config`); use the text sub-config when present.
+        if "text_config" in cfg and "hidden_size" in (cfg.get("text_config") or {}):
+            self.full_cfg = cfg
+            cfg = dict(cfg["text_config"])
+        else:
+            self.full_cfg = cfg
         self.H = cfg["hidden_size"]; self.L = cfg["num_hidden_layers"]
         self.NH = cfg["num_attention_heads"]
         self.NKV = cfg.get("num_key_value_heads", self.NH)
@@ -140,6 +147,36 @@ class CausalLM:
         self.sparse_step = int(cfg.get("decoder_sparse_step", 1) or 1)
         self.mlp_only = set(cfg.get("mlp_only_layers", []) or [])
         self.has_shared_expert = bool(cfg.get("shared_expert_intermediate_size", 0))
+        # ---- hybrid linear-attention models (Gated DeltaNet family) ----
+        # `layer_types` marks each layer "full_attention" or "linear_attention"; when absent,
+        # `full_attention_interval` (every Nth layer is full) is used; otherwise all-full.
+        types = cfg.get("layer_types") or []
+        interval = int(cfg.get("full_attention_interval", 0) or 0)
+        if types:
+            self.layer_types = list(types)
+        elif interval > 1:
+            self.layer_types = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                                for i in range(self.L)]
+        else:
+            self.layer_types = ["full_attention"] * self.L
+        self.is_hybrid = any(t != "full_attention" for t in self.layer_types)
+        self.linear_cfg = {
+            "n_k_heads": int(cfg.get("linear_num_key_heads", 0) or 0),
+            "n_v_heads": int(cfg.get("linear_num_value_heads", 0) or 0),
+            "k_head_dim": int(cfg.get("linear_key_head_dim", 0) or 0),
+            "v_head_dim": int(cfg.get("linear_value_head_dim", 0) or 0),
+            "conv_kernel_dim": int(cfg.get("linear_conv_kernel_dim", 0) or 0),
+            "hidden": self.H,
+        }
+        # partial rope: only the first `partial_rotary_factor` of head_dim is rotated
+        rp = cfg.get("rope_parameters") or {}
+        self.theta = float(rp.get("rope_theta", self.theta))
+        self.partial_rotary = float(cfg.get("partial_rotary_factor",
+                                            rp.get("partial_rotary_factor", 1.0)) or 1.0)
+        self.rope_dim = int(self.HD * self.partial_rotary) // 2 * 2 or self.HD
+        self.attn_output_gate = bool(cfg.get("attn_output_gate", False))
+        # resolved from the text sub-config (nested configs put it there, not at the top level)
+        self.tie_embeddings = bool(cfg.get("tie_word_embeddings", False))
 
     def _is_moe_layer(self, i):
         return (self.n_experts > 0 and i not in self.mlp_only
@@ -149,6 +186,27 @@ class CausalLM:
         """Load an optional norm weight (e.g. Qwen3's q_norm/k_norm); None when absent."""
         return wt.Tensor(await self._np(name)) if name in self._idx else None
 
+    async def _build_linear_attn(self, i, p, lin):
+        """Build one linear-attention (Gated DeltaNet) layer. Weight names follow the
+        `linear_attn.*` convention of this model family; every piece is optional so variants
+        with/without conv, gate or output norm all load."""
+        from . import linear_attn as la
+        async def opt_lin(nm):
+            return await lin(p + nm) if (p + nm + ".weight") in self._idx else None
+        async def opt_arr(nm):
+            return await self._np(p + nm) if (p + nm) in self._idx else None
+        base = "linear_attn."
+        w = {"q": await opt_lin(base + "q_proj"), "k": await opt_lin(base + "k_proj"),
+             "v": await opt_lin(base + "v_proj"), "o": await opt_lin(base + "out_proj"),
+             "a": await opt_lin(base + "a_proj"), "dt": await opt_lin(base + "dt_proj"),
+             "g": await opt_lin(base + "g_proj"),
+             "conv_w": await opt_arr(base + "conv1d.weight"),
+             "conv_b": await opt_arr(base + "conv1d.bias"),
+             "norm": await opt_arr(base + "norm.weight")}
+        if w["conv_w"] is not None and w["conv_w"].ndim == 3:   # (C,1,W) -> (C,W)
+            w["conv_w"] = w["conv_w"].reshape(w["conv_w"].shape[0], -1)
+        return la.LinearAttention(dict(self.linear_cfg), w, eps=self.eps)
+
     async def _build_layer(self, i, lin):
         """Build one decoder layer generically from the served weights. `lin(prefix)` is the
         format's linear factory (int4 for AutoGPTQ, fp16/quantized for plain HF), so this is
@@ -156,11 +214,15 @@ class CausalLM:
         name: QK-norm (`self_attn.{q,k}_norm.weight`, Qwen3) and a sparse-MoE block."""
         p = "model.layers.%d." % i
         lay = {"in_ln": wt.Tensor(await self._np(p + "input_layernorm.weight")),
-               "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight")),
-               "q": await lin(p + "self_attn.q_proj"), "k": await lin(p + "self_attn.k_proj"),
-               "v": await lin(p + "self_attn.v_proj"), "o": await lin(p + "self_attn.o_proj"),
-               "qn": await self._opt_norm(p + "self_attn.q_norm.weight"),
-               "kn": await self._opt_norm(p + "self_attn.k_norm.weight")}
+               "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight"))}
+        if self._is_linear_layer(i):                    # recurrent linear-attention layer
+            lay["linear"] = await self._build_linear_attn(i, p, lin)
+        else:                                           # softmax attention layer
+            lay.update({
+                "q": await lin(p + "self_attn.q_proj"), "k": await lin(p + "self_attn.k_proj"),
+                "v": await lin(p + "self_attn.v_proj"), "o": await lin(p + "self_attn.o_proj"),
+                "qn": await self._opt_norm(p + "self_attn.q_norm.weight"),
+                "kn": await self._opt_norm(p + "self_attn.k_norm.weight")})
         if self._is_moe_layer(i):                       # sparse layer: router + experts
             moe = {"gate": await lin(p + "mlp.gate"), "top_k": self.top_k,
                    "norm_topk": self.norm_topk,
@@ -263,7 +325,7 @@ class CausalLM:
         cfg = await webio.read_json(self.base + "config.json")
         self._apply_cfg(cfg)
         self.gs = cfg["quantization_config"]["group_size"]; self.bits = cfg["quantization_config"]["bits"]
-        tie = cfg.get("tie_word_embeddings", False)
+        tie = self.tie_embeddings
 
         vocab = await webio.read_json(self.base + "vocab.json")
         merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
@@ -459,7 +521,7 @@ class CausalLM:
             self.bits = self._qbits                        # gs keeps the default 128
         cfg = await webio.read_json(self.base + "config.json")
         self._apply_cfg(cfg)
-        tie = cfg.get("tie_word_embeddings", False)
+        tie = self.tie_embeddings
 
         vocab = await webio.read_json(self.base + "vocab.json")
         merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
@@ -490,20 +552,39 @@ class CausalLM:
         return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
 
     def _rot(self, x):
-        hd = self.HD
-        return wt.cat([wt._slice_last(x, hd // 2, hd) * (-1.0), wt._slice_last(x, 0, hd // 2)], axis=-1)
+        """rotate_half. With partial rope the swap happens WITHIN the rotated prefix
+        (`rope_dim`); the pass-through tail is appended unchanged (it is multiplied by sin=0,
+        so its value is irrelevant — only the layout must line up)."""
+        hd = self.HD; rd = getattr(self, "rope_dim", hd)
+        half = rd // 2
+        parts = [wt._slice_last(x, half, rd) * (-1.0), wt._slice_last(x, 0, half)]
+        if rd < hd:
+            parts.append(wt._slice_last(x, rd, hd))
+        return wt.cat(parts, axis=-1)
 
     def _rope_np(self, pos, T=1):
-        inv = 1.0 / (self.theta ** (np.arange(0, self.HD, 2, dtype=np.float64) / self.HD))
+        """rope cos/sin of shape (T, HD). With `partial_rotary_factor < 1` (Qwen3.5/3.8 style)
+        only the first `rope_dim` dims are rotated: the tail gets cos=1, sin=0, which is the
+        identity under `x*cos + rot(x)*sin`, so the forward paths need no special case."""
+        rd = getattr(self, "rope_dim", self.HD)
+        inv = 1.0 / (self.theta ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
         ang = np.arange(pos, pos + T, dtype=np.float64)[:, None] * inv[None, :]
-        emb = np.concatenate([ang, ang], -1)
-        return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+        emb = np.concatenate([ang, ang], -1)                  # (T, rd)
+        cos = np.cos(emb).astype(np.float32); sin = np.sin(emb).astype(np.float32)
+        if rd < self.HD:                                      # pad the un-rotated tail: identity
+            pad = self.HD - rd
+            cos = np.concatenate([cos, np.ones((cos.shape[0], pad), np.float32)], -1)
+            sin = np.concatenate([sin, np.zeros((sin.shape[0], pad), np.float32)], -1)
+        return cos, sin
 
     def _head_argmax(self, hlast):
         return int(wt.cat([blk(hlast) for blk in self.head], axis=-1).numpy()[0].argmax())
 
     def _init_state(self):
         L, NKV, HD, LMAX, H = self.L, self.NKV, self.HD, self.lmax, self.H
+        # recurrent states for linear-attention layers (fixed size, independent of length)
+        self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
+                          for lay in getattr(self, "layers", [])]
         if self._gpu:                                  # capture path: fixed scatter cache + persistent inputs
             self.Kc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(L)]
             self.Vc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(L)]
@@ -540,6 +621,25 @@ class CausalLM:
             return wt.Tensor(np.asarray(embeds, np.float32))
         return wt.Tensor(self.embed[np.asarray(ids, np.int64)].astype(np.float32))
 
+    def _reset_linear_state(self):
+        """Clear every linear-attention layer's recurrent state (start of a generation)."""
+        for st in getattr(self, "lin_state", []) or []:
+            if st is not None:
+                st.reset()
+
+    def _is_linear_layer(self, i):
+        """True when layer `i` is a linear-attention (recurrent state) layer rather than softmax
+        attention. Driven by the config's `layer_types` / `full_attention_interval`."""
+        lt = getattr(self, "layer_types", None)
+        return bool(lt) and i < len(lt) and lt[i] != "full_attention"
+
+    def _linear_mixer(self, i, lay, x, T):
+        """Run a linear-attention layer's recurrence -> (T, H) Tensor. The per-layer state lives
+        in `self.lin_state[i]`, so prefill and incremental decode share one implementation."""
+        st = self.lin_state[i]
+        y = lay["linear"].forward(x.numpy() if hasattr(x, "numpy") else np.asarray(x), st)
+        return wt.Tensor(np.asarray(y, np.float32))
+
     def _prefill(self, ids, embeds=None):
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
         c, s = self._rope_np(0, T)
@@ -550,12 +650,15 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q, k, v = self._qkv(lay, x, T)
-            q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
-            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
-            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
-            o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
+            if self._is_linear_layer(i):                       # recurrent (fixed-state) layer
+                h = h + self._linear_mixer(i, lay, x, T)
+            else:                                              # softmax attention layer
+                q, k, v = self._qkv(lay, x, T)
+                q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
+                wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
+                wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
+                o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
+                h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
@@ -594,10 +697,13 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q, k, v = self._qkv(lay, x, T)
-            q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
-            o = cache.attn(i, q, k, v, pos, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
+            if self._is_linear_layer(i):                       # recurrent (fixed-state) layer
+                h = h + self._linear_mixer(i, lay, x, T)
+            else:
+                q, k, v = self._qkv(lay, x, T)
+                q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
+                o = cache.attn(i, q, k, v, pos, scale=sc)
+                h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
@@ -639,6 +745,7 @@ class CausalLM:
         if ids is None:
             ids = self.tok.encode_chat(prompt, system)
         P = len(ids)
+        self._reset_linear_state()                     # fresh recurrent state per generation
 
         if not self._gpu:                              # WebGL fallback
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
