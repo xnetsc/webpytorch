@@ -421,9 +421,9 @@ def _split_repo(name):
     return "/".join(parts[:2]), "/".join(parts[2:])         # (org/repo, filepath)
 
 def _default_hub_cache():
-    """Cache root: $WEBTORCH_CACHE, else ~/.cache/webtorch/hub. On the host this persists
-    across runs; in the browser it lives in Pyodide's FS (persist across reloads by mounting
-    IDBFS/OPFS at this path, e.g. via `webtorch.models.webenv`)."""
+    """Cache namespace: $WEBTORCH_CACHE, else ~/.cache/webtorch/hub. On the host it is a real
+    directory. In the browser it only names the entries -- they are IndexedDB records written
+    per chunk, not files, so nothing here goes through Pyodide's FS."""
     import os
     return os.environ.get("WEBTORCH_CACHE") or os.path.join(
         os.path.expanduser("~"), ".cache", "webtorch", "hub")
@@ -471,110 +471,370 @@ async def _remote_size(url, headers):
     return None
 
 
-# ---- browser persistence: back the cache dir with IndexedDB so it survives page reloads ----
-# On the host the cache dir is already a real disk (persistent). In the browser Pyodide's
-# default FS (MEMFS) is wiped on reload, so we mount IDBFS at the cache dir and syncfs it:
-# load prior contents on first use, flush each newly-completed file back to IndexedDB.
-_persist = {"mounted": set(), "loaded": set()}
+# ---- chunk stores: the cache's persistence layer -----------------------------------
+# The unit of storage is a chunk, matching the unit of download. Pyodide's IDBFS cannot be
+# used for model-sized files: it holds a file's whole contents in the wasm heap and its
+# persistence unit is the file, so a multi-GB download is buffered entirely in memory and
+# every sync rewrites the whole record -- chunking the download does not help while the
+# storage granularity is the file. Writing chunk-by-chunk fixes both: memory holds one
+# chunk, an interrupted download keeps the chunks it already wrote, and nothing is ever
+# rewritten. Which chunks exist IS the coverage map, so resuming needs no extra bookkeeping.
 
-def _browser_fs():
-    try:
-        from js import pyodide as _p          # exposed by the Pyodide worker bootstrap
-        return _p.FS
-    except Exception:
-        return None                           # host / non-Pyodide -> real disk, already persistent
+_CHUNK_DEFAULT = 16 << 20
 
-async def _fs_syncfs(FS, populate):
-    from js import Promise
-    from pyodide.ffi import create_proxy
-    def executor(resolve, reject):
-        def cb(err):
-            (reject if err else resolve)(err if err else None)
-        FS.syncfs(populate, create_proxy(cb))
-    return await Promise.new(create_proxy(executor))
 
-async def _persist_load(cache_dir):
-    """Mount IDBFS at cache_dir and load prior contents (IndexedDB -> FS), once. No-op on host."""
-    if not cache_dir or cache_dir in _persist["loaded"]:
-        return
-    FS = _browser_fs()
-    if FS is None:
-        _persist["loaded"].add(cache_dir); return
-    cur = ""
-    for part in cache_dir.strip("/").split("/"):
-        cur += "/" + part
-        try: FS.mkdir(cur)
-        except Exception: pass                # already exists
-    if cache_dir not in _persist["mounted"] and hasattr(FS.filesystems, "IDBFS"):
+class _Store:
+    """Chunk-addressed cache storage. Chunk size is fixed per entry at creation and kept in
+    its metadata, so indices stay meaningful across sessions."""
+
+    async def open(self):
+        pass
+
+    async def meta(self, key):
+        """-> {"size": int|None, "chunk": int, "complete": bool} (defaults if absent)."""
+        raise NotImplementedError
+
+    async def set_meta(self, key, **kw):
+        raise NotImplementedError
+
+    async def have(self, key):
+        """-> set of chunk indices currently stored."""
+        raise NotImplementedError
+
+    async def get(self, key, i):
+        raise NotImplementedError
+
+    async def put(self, key, i, data):
+        raise NotImplementedError
+
+    async def delete(self, key):
+        raise NotImplementedError
+
+    async def keys(self):
+        raise NotImplementedError
+
+    async def stored(self, key):
+        """-> bytes currently held for this key."""
+        raise NotImplementedError
+
+
+class _DiskStore(_Store):
+    """Host filesystem: one sparse file per entry plus a small sidecar recording which
+    chunks are present, so an interrupted download resumes here too."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def _paths(self, key):
+        import os
+        p = os.path.join(self.root, _url_key(key))
+        return p, p + ".meta"
+
+    def _read_meta(self, key):
+        import json, os
+        _p, mp = self._paths(key)
         try:
-            FS.mount(FS.filesystems.IDBFS, {}, cache_dir); _persist["mounted"].add(cache_dir)
-        except Exception: pass
-    if cache_dir in _persist["mounted"]:
-        try: await _fs_syncfs(FS, True)       # populate FS <- IndexedDB
-        except Exception: pass
-    _persist["loaded"].add(cache_dir)
+            with open(mp, "r") as f:
+                m = json.load(f)
+        except Exception:
+            m = {}
+        m.setdefault("size", None); m.setdefault("chunk", _CHUNK_DEFAULT)
+        m.setdefault("have", []); m.setdefault("complete", False)
+        return m
 
-async def _persist_flush(cache_dir):
-    """Flush newly-written cache files FS -> IndexedDB. No-op on host / when not IDBFS-mounted."""
-    FS = _browser_fs()
-    if FS is None or cache_dir not in _persist["mounted"]:
-        return
-    try: await _fs_syncfs(FS, False)          # push FS -> IndexedDB
-    except Exception: pass
-
-
-class _CachedFile:
-    """Sparse local cache of one remote file + a background whole-file prefetch. A range read
-    is served from the cache when those bytes are present, else fetched on the spot (never
-    waiting for the prefetch to reach it) and stored. Sparse-file writes and coverage updates
-    are synchronous, so they are atomic with respect to the single-threaded event loop; only
-    the network fetches await."""
-    def __init__(self, cache, key):
-        import os
-        self.c = cache; self.key = key
-        self.path = os.path.join(cache.cache_dir, _url_key(key))
-        self.marker = self.path + ".complete"
-        self.covered = []                                    # merged sorted [start,end) present on disk
-        self.size = None
-        self.complete = os.path.exists(self.marker)
-        self._prefetching = False
-
-    def _has(self, a, b):
-        for s, e in self.covered:
-            if s <= a and b <= e: return True
-            if s >= b: break
-        return False
-
-    def _mark(self, a, b):
-        self.covered.append((a, b)); self.covered.sort()
-        out = []
-        for s, e in self.covered:
-            if out and s <= out[-1][1]: out[-1] = (out[-1][0], max(out[-1][1], e))
-            else: out.append((s, e))
-        self.covered = out
-
-    def _read_local(self, offset, length):
-        with open(self.path, "rb") as f:
-            if offset: f.seek(offset)
-            return f.read() if length is None else f.read(length)
-
-    def _store(self, offset, data):
-        import os
-        d = os.path.dirname(self.path)
+    def _write_meta(self, key, m):
+        import json, os
+        p, mp = self._paths(key)
+        d = os.path.dirname(mp)
         if d:
             try: os.makedirs(d, exist_ok=True)
             except Exception: pass
-        if not os.path.exists(self.path):
-            open(self.path, "wb").close()
-        with open(self.path, "r+b") as f:
-            f.seek(offset); f.write(data)
-        self._mark(offset, offset + len(data))
-        if self.size is not None and not self.complete and self._has(0, self.size):
-            try: open(self.marker, "w").close()
+        with open(mp, "w") as f:
+            json.dump(m, f)
+
+    async def meta(self, key):
+        m = self._read_meta(key)
+        return {"size": m["size"], "chunk": m["chunk"], "complete": m["complete"]}
+
+    async def set_meta(self, key, **kw):
+        m = self._read_meta(key)
+        for k, v in kw.items():
+            if v is not None:
+                m[k] = v
+        self._write_meta(key, m)
+
+    async def have(self, key):
+        return set(self._read_meta(key)["have"])
+
+    async def get(self, key, i):
+        import os
+        m = self._read_meta(key)
+        if i not in set(m["have"]):
+            return None
+        p, _mp = self._paths(key)
+        try:
+            with open(p, "rb") as f:
+                f.seek(i * m["chunk"])
+                return f.read(m["chunk"])
+        except OSError:
+            return None
+
+    async def put(self, key, i, data):
+        import os
+        p, _mp = self._paths(key)
+        d = os.path.dirname(p)
+        if d:
+            try: os.makedirs(d, exist_ok=True)
             except Exception: pass
-            self.complete = True
-            return True                                       # just completed -> caller persists
+        if not os.path.exists(p):
+            open(p, "wb").close()
+        m = self._read_meta(key)
+        with open(p, "r+b") as f:
+            f.seek(i * m["chunk"]); f.write(data)
+        if i not in set(m["have"]):
+            m["have"] = sorted(set(m["have"]) | {i})
+            self._write_meta(key, m)
+
+    async def delete(self, key):
+        import os
+        existed = False
+        for q in self._paths(key):
+            try:
+                os.remove(q); existed = True
+            except OSError:
+                pass
+        return existed
+
+    async def keys(self):
+        import os
+        out = []
+        if os.path.isdir(self.root):
+            for dp, _dn, fns in os.walk(self.root):
+                for f in fns:
+                    if f.endswith(".meta"):
+                        continue
+                    ap = os.path.join(dp, f)
+                    out.append(os.path.relpath(ap, self.root).replace("\\", "/"))
+        return sorted(out)
+
+    async def stored(self, key):
+        import os
+        p, _mp = self._paths(key)
+        try: return os.path.getsize(p)
+        except OSError: return 0
+
+
+def _idb_req(req):
+    """An IDBRequest as an awaitable."""
+    from js import Promise
+    from pyodide.ffi import create_proxy
+    def executor(resolve, reject):
+        def ok(_e=None): resolve(req.result)
+        def err(_e=None): reject(req.error)
+        req.onsuccess = create_proxy(ok)
+        req.onerror = create_proxy(err)
+    return Promise.new(create_proxy(executor))
+
+
+class _IdbStore(_Store):
+    """Browser: one IndexedDB record per chunk.
+
+    Each chunk is written through as it arrives, so the wasm heap holds one chunk rather
+    than one model, whatever the file's size. Nothing is rewritten as the download grows,
+    and the set of stored chunk records is itself the coverage map, so a download that was
+    interrupted -- by a reload, a closed tab, a network failure -- resumes from exactly
+    what it had.
+    """
+
+    DB = "webtorch-chunks"
+    CHUNKS = "chunks"
+    META = "meta"
+
+    def __init__(self, root):
+        self.root = root                       # kept only so entries stay separable per cache dir
+        self.db = None
+
+    async def open(self):
+        if self.db is not None:
+            return
+        from js import indexedDB
+        from pyodide.ffi import create_proxy
+        req = indexedDB.open(self.DB, 1)
+        def upgrade(_e=None):
+            db = req.result
+            if not db.objectStoreNames.contains(self.CHUNKS):
+                db.createObjectStore(self.CHUNKS)
+            if not db.objectStoreNames.contains(self.META):
+                db.createObjectStore(self.META)
+        req.onupgradeneeded = create_proxy(upgrade)
+        self.db = await _idb_req(req)
+
+    def _store(self, name, mode):
+        return self.db.transaction(name, mode).objectStore(name)
+
+    def _ck(self, key, i):
+        return "%s#%d" % (key, i)
+
+    async def meta(self, key):
+        await self.open()
+        m = await _idb_req(self._store(self.META, "readonly").get(key))
+        d = m.to_py() if m is not None and hasattr(m, "to_py") else (m or None)
+        d = dict(d) if d else {}
+        return {"size": d.get("size"), "chunk": d.get("chunk", _CHUNK_DEFAULT),
+                "complete": bool(d.get("complete", False))}
+
+    async def set_meta(self, key, **kw):
+        await self.open()
+        cur = await self.meta(key)
+        for k, v in kw.items():
+            if v is not None:
+                cur[k] = v
+        from pyodide.ffi import to_js
+        from js import Object
+        await _idb_req(self._store(self.META, "readwrite").put(
+            to_js(cur, dict_converter=Object.fromEntries), key))
+
+    async def have(self, key):
+        await self.open()
+        from js import IDBKeyRange
+        rng = IDBKeyRange.bound(key + "#", key + "#\uffff")
+        ks = await _idb_req(self._store(self.CHUNKS, "readonly").getAllKeys(rng))
+        out = set()
+        for k in (ks or []):
+            try: out.add(int(str(k).rsplit("#", 1)[1]))
+            except (ValueError, IndexError): pass
+        return out
+
+    async def get(self, key, i):
+        await self.open()
+        v = await _idb_req(self._store(self.CHUNKS, "readonly").get(self._ck(key, i)))
+        if v is None:
+            return None
+        return bytes(v.to_py()) if hasattr(v, "to_py") else bytes(v)
+
+    async def put(self, key, i, data):
+        await self.open()
+        from js import Uint8Array
+        try:
+            buf = Uint8Array.new(len(data))
+            buf.assign(data)                   # one copy into the JS heap
+        except Exception:
+            from pyodide.ffi import to_js
+            buf = to_js(data)
+        await _idb_req(self._store(self.CHUNKS, "readwrite").put(buf, self._ck(key, i)))
+        del buf                                # nothing here outlives the write
+
+    async def delete(self, key):
+        await self.open()
+        from js import IDBKeyRange
+        rng = IDBKeyRange.bound(key + "#", key + "#\uffff")
+        existed = bool(await self.have(key))
+        await _idb_req(self._store(self.CHUNKS, "readwrite").delete(rng))
+        await _idb_req(self._store(self.META, "readwrite").delete(key))
+        return existed
+
+    async def keys(self):
+        await self.open()
+        ks = await _idb_req(self._store(self.META, "readonly").getAllKeys())
+        return sorted(str(k) for k in (ks or []))
+
+    async def stored(self, key):
+        """Summed from the chunk records, so a partial entry reports what it really holds."""
+        await self.open()
+        from js import IDBKeyRange
+        rng = IDBKeyRange.bound(key + "#", key + "#\uffff")
+        vals = await _idb_req(self._store(self.CHUNKS, "readonly").getAll(rng))
+        return int(sum(int(v.byteLength) for v in (vals or [])))
+
+
+def _in_browser():
+    try:
+        import js                                   # noqa: F401
+        from js import indexedDB                    # noqa: F401
+        return True
+    except Exception:
         return False
+
+
+def _make_store(root):
+    """IndexedDB in the browser, real files on the host -- same chunk-addressed interface."""
+    return _IdbStore(root) if _in_browser() else _DiskStore(root)
+
+
+class _CachedFile:
+    """One remote file, cached chunk by chunk, with a background whole-file read-ahead.
+
+    A read is served from stored chunks; any chunk it needs that is missing is fetched on
+    the spot -- never waiting for the read-ahead to reach it -- written through to storage,
+    and only then used.
+
+    On memory: what this bounds is *growth with file size*. A 13 GB file costs the same
+    live bytes as a 400 MB one, because nothing accumulates. It is not a hard cap. The
+    live set is roughly
+
+        (max_parallel + chunks spanned by the current read) x chunk
+
+    so with the defaults (8 x 16 MB) a read of one chunk peaks near 144 MB, and each chunk
+    is briefly duplicated while it is copied into the JS heap on its way to IndexedDB.
+    Beyond that: the wasm heap never shrinks, so the high-water mark persists; repeated
+    allocations of this size fragment it; and a caller that asks for a whole multi-GB file
+    in one read still gets exactly what it asked for. Lower `max_parallel` or `chunk_mb` to
+    trade throughput for footprint.
+    """
+
+    def __init__(self, cache, key):
+        self.c = cache
+        self.key = key
+        self.size = None
+        self.chunk = cache.chunk
+        self.have = set()                     # chunk indices in storage == the coverage map
+        self.complete = False
+        self._prefetching = False
+        self._loaded = False
+
+    async def _load(self):
+        """Adopt whatever a previous session stored for this key."""
+        if self._loaded:
+            return
+        self._loaded = True
+        m = await self.c.store.meta(self.key)
+        self.size = m["size"]
+        self.chunk = m["chunk"] or self.c.chunk
+        self.complete = m["complete"]
+        self.have = await self.c.store.have(self.key)
+
+    def _count(self):
+        return None if self.size is None else (self.size + self.chunk - 1) // self.chunk
+
+    async def _chunk_bytes(self, i):
+        """Chunk `i`, fetched and stored first if it is not there yet.
+
+        The total length is often unknowable in a browser: `Content-Length` and
+        `Content-Range` are not CORS-safelisted, so a cross-origin host that does not
+        expose them leaves the size unknown. That must not disable caching, so a chunk is
+        simply requested at full width; one that comes back short is the last one, which
+        is where the total length is learnt.
+        """
+        if i in self.have:
+            b = await self.c.store.get(self.key, i)
+            if b is not None:
+                return b
+            self.have.discard(i)              # record vanished (evicted) -> refetch
+        off = i * self.chunk
+        n = self.chunk if self.size is None else max(0, min(self.chunk, self.size - off))
+        data = await self.c._net(self.key, off, n)
+        await self.c.store.put(self.key, i, data)
+        self.have.add(i)
+        if self.size is None and len(data) < self.chunk:
+            self.size = off + len(data)       # short read == EOF
+            await self.c.store.set_meta(self.key, size=self.size, chunk=self.chunk)
+        elif self.size is None:
+            await self.c.store.set_meta(self.key, chunk=self.chunk)
+        cnt = self._count()
+        if cnt is not None and not self.complete and len(self.have) >= cnt:
+            self.complete = True
+            await self.c.store.set_meta(self.key, complete=True)
+        return data
 
     def _ensure_prefetch(self):
         if self._prefetching or self.complete or not self.c.prefetch or self.size is None:
@@ -584,34 +844,59 @@ class _CachedFile:
         self.c.tasks.append(asyncio.ensure_future(self._prefetch()))
 
     async def _prefetch(self):
+        """Fill the gaps in the background, one chunk at a time, holding none of them.
+
+        With the total length unknown this also discovers it, by walking forward until a
+        chunk comes back short.
+        """
         try:
-            o = 0
-            while self.size is not None and o < self.size and not self.complete:
-                b = min(self.size, o + self.c.chunk)
-                if not self._has(o, b):
-                    if self._store(o, await self.c._net(self.key, o, b - o)):
-                        await self.c._flush()                 # persist a completed file
-                o = b
+            i = 0
+            while not self.complete:
+                cnt = self._count()
+                if cnt is not None and i >= cnt:
+                    break
+                if i not in self.have:
+                    b = await self._chunk_bytes(i)     # stored; the bytes are dropped here
+                    short = len(b) < self.chunk
+                    del b
+                    if short:
+                        break
+                i += 1
         except Exception:
             pass
 
     async def read(self, offset, length):
-        if self.complete:
-            return self._read_local(offset, length)
+        await self._load()
         if self.size is None:
-            self.size = await self.c._size(self.key)
+            self.size = await self.c._size(self.key)   # None whenever the host hides it
+            if self.size is not None:
+                await self.c.store.set_meta(self.key, size=self.size, chunk=self.chunk)
+        if length is None and self.size is None:
+            return await self.c._net(self.key, offset, None)   # open-ended, unknown extent
         end = self.size if length is None else offset + length
-        if self.size is not None and end is not None:
+        if self.size is not None:
             end = min(end, self.size)
-        if end is not None and self._has(offset, end):        # cache hit
-            return self._read_local(offset, length)
-        partial = length is not None and not (offset == 0 and (self.size is None or length >= self.size))
-        if partial:
-            self._ensure_prefetch()                           # read-ahead the rest, in background
-        data = await self.c._net(self.key, offset, length)    # miss -> fetch just this range now
-        if self._store(offset, data):
-            await self.c._flush()                             # persist a completed file
-        return data
+        if end <= offset:
+            return b""
+        c0 = offset // self.chunk
+        c1 = (end - 1) // self.chunk
+        if not self.complete and any(i not in self.have for i in range(c0, c1 + 1)):
+            self._ensure_prefetch()                    # read-ahead the rest, in background
+        out = bytearray(end - offset)                  # filled in place: no second full copy
+        pos = 0
+        for i in range(c0, c1 + 1):
+            base = i * self.chunk
+            b = await self._chunk_bytes(i)
+            lo = max(offset, base) - base
+            hi = min(end, base + len(b)) - base        # a short chunk is the file's end
+            if hi > lo:
+                out[pos:pos + (hi - lo)] = b[lo:hi]
+                pos += hi - lo
+            short = len(b) < self.chunk
+            del b
+            if short:
+                break
+        return bytes(out[:pos])
 
 
 # Escalating cooldowns (seconds) applied each time concurrency is forced to 0 by repeated
@@ -734,6 +1019,7 @@ class _CacheLayer:
         self.chunk = int(chunk); self.persist = persist
         self.files = {}; self.tasks = []; self._loaded = False
         self.limiter = _AdaptiveLimiter(self.max_parallel)
+        self.store = _make_store(cache_dir) if cache_dir else None
 
     async def _net(self, key, offset, length):               # one adaptive, queued fetch
         return await self.limiter.run(lambda: self.fetch(key, offset, length))
@@ -743,17 +1029,12 @@ class _CacheLayer:
         try: return await self.size_fn(key)
         except Exception: return None
 
-    async def _flush(self):
-        if self.persist:
-            await _persist_flush(self.cache_dir)
-
     async def read(self, key, offset, length):
         if not self.cache_dir:
             return await self._net(key, offset, length)       # cache disabled -> pure streaming
-        if not self._loaded:                                  # first use: load prior cache (browser: IDBFS)
+        if not self._loaded:
             self._loaded = True
-            if self.persist:
-                await _persist_load(self.cache_dir)
+            await self.store.open()
         st = self.files.get(key)
         if st is None:
             st = self.files[key] = _CachedFile(self, key)
@@ -820,104 +1101,106 @@ def _cache_host(key):
     return key.replace("\\", "/").split("/", 1)[0]
 
 async def list_cache(cache_dir=None, host=None):
-    """List cached entries (loads the browser IndexedDB cache first). Returns, sorted by key,
-    `[{"key", "host", "size", "complete", "path"}]`. `host` (e.g. "huggingface.co") filters to
-    one domain. `key` is the URL without scheme; pass it to `read_cache/delete_cache`."""
+    """List cached entries. Returns, sorted by key, `[{"key", "host", "size", "complete",
+    "path"}]`, where `size` is what is actually stored (a partly-downloaded entry reports its
+    real extent, not the file's full length). `host` (e.g. "huggingface.co") filters to one
+    domain. `key` is the URL without scheme; pass it to `read_cache`/`delete_cache`."""
     import os
     root = cache_dir or _default_hub_cache()
-    await _persist_load(root)
+    store = _make_store(root)
+    await store.open()
     out = []
-    if os.path.isdir(root):
-        for dp, _dn, fns in os.walk(root):
-            for f in fns:
-                if f.endswith(".complete") or f.endswith(".part"):
-                    continue
-                ap = os.path.join(dp, f); key = os.path.relpath(ap, root).replace("\\", "/")
-                h = _cache_host(key)
-                if host is not None and h != host:
-                    continue
-                try: sz = os.path.getsize(ap)
-                except OSError: sz = 0
-                out.append({"key": key, "host": h, "size": sz,
-                            "complete": os.path.exists(ap + ".complete"), "path": ap})
+    for key in await store.keys():
+        h = _cache_host(key)
+        if host is not None and h != host:
+            continue
+        m = await store.meta(key)
+        out.append({"key": key, "host": h, "size": await store.stored(key),
+                    "complete": m["complete"], "total": m["size"],
+                    "path": os.path.join(root, _url_key(key))})
     out.sort(key=lambda e: e["key"])
     return out
 
+
 async def cache_hosts(cache_dir=None):
-    """Per-domain summary so HF vs ModelScope (etc.) are separated:
-    `[{"host", "files", "size"}]`, largest first."""
+    """Per-domain summary of the cache: `[{"host", "files", "size"}]`, so entries from
+    different hubs stay distinguishable."""
     agg = {}
     for e in await list_cache(cache_dir):
         a = agg.setdefault(e["host"], {"host": e["host"], "files": 0, "size": 0})
         a["files"] += 1; a["size"] += e["size"]
-    return sorted(agg.values(), key=lambda a: -a["size"])
+    return sorted(agg.values(), key=lambda a: a["host"])
+
 
 async def cache_size(cache_dir=None, host=None):
-    """Total bytes cached (optionally for one `host`)."""
+    """Total bytes currently held (optionally for one host)."""
     return sum(e["size"] for e in await list_cache(cache_dir, host))
 
+
 async def read_cache(key, offset=0, length=None, cache_dir=None):
-    """Read bytes from a cached entry by its `key` (a `list_cache` key or a full URL). Returns
-    None if that entry is not cached."""
-    import os
-    root = cache_dir or _default_hub_cache(); await _persist_load(root)
-    p = os.path.join(root, _url_key(key))
-    if not os.path.exists(p):
+    """Read bytes from a cached entry by its `key` (a `list_cache` key or a full URL).
+    Reads only the chunks the range touches, so this stays cheap on a multi-GB entry.
+    Returns None if nothing is cached for that key."""
+    root = cache_dir or _default_hub_cache()
+    store = _make_store(root)
+    await store.open()
+    m = await store.meta(key)
+    have = await store.have(key)
+    if not have:
         return None
-    with open(p, "rb") as f:
-        if offset: f.seek(offset)
-        return f.read() if length is None else f.read(length)
+    chunk = m["chunk"]
+    total = m["size"] if m["size"] is not None else (max(have) + 1) * chunk
+    end = total if length is None else min(offset + length, total)
+    if end <= offset:
+        return b""
+    out = bytearray(end - offset)
+    pos = 0
+    for i in range(offset // chunk, (end - 1) // chunk + 1):
+        base = i * chunk
+        b = await store.get(key, i)
+        lo = max(offset, base) - base
+        hi = min(end, base + chunk) - base
+        if b is None:                                  # hole in a partial entry
+            return None
+        out[pos:pos + (hi - lo)] = b[lo:hi]
+        pos += hi - lo
+        del b
+    return bytes(out)
+
 
 async def write_cache(key, data, cache_dir=None, complete=True):
-    """Write/replace a cache entry's bytes (pre-seed the cache). `complete=True` marks it fully
-    cached (so a reader serves it from disk). Persists to IndexedDB in the browser."""
-    import os
-    root = cache_dir or _default_hub_cache(); await _persist_load(root)
-    p = os.path.join(root, _url_key(key)); d = os.path.dirname(p)
-    if d:
-        try: os.makedirs(d, exist_ok=True)
-        except Exception: pass
-    with open(p, "wb") as f:
-        f.write(bytes(data))
-    marker = p + ".complete"
-    if complete:
-        try: open(marker, "w").close()
-        except Exception: pass
-    else:
-        try: os.remove(marker)
-        except OSError: pass
-    await _persist_flush(root)
+    """Write/replace a cache entry's bytes (pre-seed the cache). Stored chunk by chunk, so
+    seeding a large entry does not need it all resident at once on the storage side.
+    `complete=True` marks it fully cached, so a reader serves it without any network."""
+    root = cache_dir or _default_hub_cache()
+    store = _make_store(root)
+    await store.open()
+    await store.delete(key)                            # replace, never merge with older chunks
+    data = bytes(data)
+    chunk = _CHUNK_DEFAULT
+    await store.set_meta(key, size=len(data), chunk=chunk, complete=bool(complete))
+    for i in range((len(data) + chunk - 1) // chunk):
+        await store.put(key, i, data[i * chunk:(i + 1) * chunk])
+
 
 async def delete_cache(key, cache_dir=None):
-    """Delete one cached entry (its data + `.complete` + `.part`). Persists. -> True if it
-    existed. (Applies on disk; a live reader created earlier may still hold it in memory.)"""
-    import os
-    root = cache_dir or _default_hub_cache(); await _persist_load(root)
-    p = os.path.join(root, _url_key(key)); existed = os.path.exists(p)
-    for q in (p, p + ".complete", p + ".part"):
-        try: os.remove(q)
-        except OSError: pass
-    await _persist_flush(root)
-    return existed
+    """Delete one cached entry -- every chunk plus its metadata. -> True if it existed.
+    (A reader created earlier may still hold chunks it already read.)"""
+    root = cache_dir or _default_hub_cache()
+    store = _make_store(root)
+    await store.open()
+    return await store.delete(key)
+
 
 async def clear_cache(cache_dir=None, host=None):
-    """Delete all cached entries (or only one `host`/domain's). Persists. -> # data files
-    removed."""
-    import os
+    """Delete all cached entries (or only one `host`/domain's). -> number removed."""
     root = cache_dir or _default_hub_cache()
-    entries = await list_cache(cache_dir, host)          # loads persistence, host-filtered
+    store = _make_store(root)
+    await store.open()
     n = 0
-    for e in entries:
-        for q in (e["path"], e["path"] + ".complete", e["path"] + ".part"):
-            try: os.remove(q)
-            except OSError: pass
-        n += 1
-    if os.path.isdir(root):                              # prune now-empty subdirs
-        for dp, _dn, _fn in os.walk(root, topdown=False):
-            if dp != root:
-                try: os.rmdir(dp)
-                except OSError: pass
-    await _persist_flush(root)
+    for e in await list_cache(cache_dir, host):
+        if await store.delete(e["key"]):
+            n += 1
     return n
 
 
@@ -942,11 +1225,12 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
 
     `name` ("<org>/<repo>/<path>") maps to `{endpoint}/{org}/{repo}/resolve/{revision}/{path}`.
     Caching (default on) prefetches each touched file in the background and serves later reads
-    from disk; it **persists by default** (`persist=True`) — in the browser the cache dir is
-    backed by IndexedDB (IDBFS) so it survives page reloads, on the host it is a real dir.
-    `cache=False` streams with no cache, `cache_dir` picks the location, `prefetch=False`
-    disables read-ahead, `chunk_mb` is the prefetch chunk size, `persist=False` keeps an
-    in-session-only (browser MEMFS) cache. `token` is a Bearer header for gated repos.
+    from the cache; it **persists by default** — in the browser each chunk is its own
+    IndexedDB record, written as it arrives, so a reload keeps whatever had been downloaded
+    and resumes from there; on the host it is a real directory.
+    `cache=False` streams with no cache, `cache_dir` picks the namespace, `prefetch=False`
+    disables read-ahead, `chunk_mb` sets the chunk (and so the storage) granularity.
+    `token` is a Bearer header for gated repos.
     `max_parallel` is the **ceiling** on concurrent range reads; the live limit adapts to a
     hub's real capacity. An explicit rate-limit (429 or a rate-limit body) halves it; it cools
     down (30→60→120→180s, cap 3 min) only if pushed to 0 with nothing in flight, and climbs

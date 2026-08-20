@@ -24,6 +24,10 @@ from pyodide.ffi import create_proxy
 FS = _pyodide.FS
 
 # Framework cache roots to back with IndexedDB. Each becomes its own IDBFS mount.
+# IDBFS suits these: they hold configs, tokenizers and other small files. It is NOT suitable
+# for model weights -- IDBFS keeps a file's whole contents in the wasm heap and only copies
+# them to IndexedDB on syncfs, so a multi-GB file would be buffered entirely in memory. Model
+# downloads go through webio's cache instead, which stores a record per chunk.
 CACHE_ROOTS = (
     "/root/.cache/huggingface",   # HF_HOME default -> hub/, transformers/
     "/root/.cache/torch",         # torch.hub / torch download cache
