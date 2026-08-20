@@ -40,6 +40,7 @@ from ._sdk import (install_torch, load, Model, release, loaded_models, release_a
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
 from .backend import backend, has_gpu, require_gpu
+from .portable import export_model, import_model, model_groups
 from .lm_engine import TransformerLM, build_lm, SAMPLERS
 from .multimodal import MultimodalLM, register_encoder, load_encoder, list_encoders, splice_embeddings
 
@@ -69,6 +70,7 @@ from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_writ
                     write_cache, delete_cache, clear_cache)
 
 __all__ = [
+    "export_model", "import_model", "model_groups",
     "backend", "has_gpu", "require_gpu",
     # torch-compatible core
     "install_torch", "Tensor", "core",
