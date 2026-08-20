@@ -368,7 +368,11 @@ class CausalLM:
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
 
     def _gquant(self, W_out_in, bias=None):
-        """fp32 (out,in) weight -> int4 QuantizedLinear (pad to divide gs / pack)."""
+        """fp32 (out,in) weight -> a linear layer. Quantized to int`bits` by default; with
+        `self._qbits == 0` (dtype="fp16") it stays unquantized, which also makes GGUF models
+        runnable without a GPU (the int kernel is GPU-only)."""
+        if getattr(self, "_qbits", None) == 0:
+            return wt.UnquantizedLinear(W_out_in, bias)
         W = np.ascontiguousarray(W_out_in.T)                 # (in, out)
         K, N = W.shape; per = 32 // self.bits
         kmul = self.gs if self.gs % per == 0 else self.gs * per
@@ -380,7 +384,7 @@ class CausalLM:
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
     @classmethod
-    async def from_gguf(cls, url, lmax=320, bits=4):
+    async def from_gguf(cls, url, lmax=320, bits=4, quantize=True):
         """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
         they run on the same capture-accelerated engine. `url` is the served .gguf file.
 
@@ -393,6 +397,9 @@ class CausalLM:
         from . import ggufload as G
         self = cls(None); self.lmax = lmax; self._gguf = url
         self.bits = bits                                      # int4 or int8 (same kernels/optims)
+        # `quantize=False` (dtype="fp16") keeps the dequantized weights unquantized, so a GGUF
+        # runs on the numpy/CPU path too — the int kernel is GPU-only.
+        self._qbits = bits if quantize else 0
         size = 12 << 20
         while True:
             buf = await self._grng(0, size - 1)

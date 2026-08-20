@@ -69,7 +69,10 @@ class AutoModelForCausalLM:
         p = path.rstrip("/")
         if p.endswith(".gguf"):
             gb = 8 if dtype == "int8" else (4 if dtype == "int4" else bits)
-            return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=gb)
+            # dtype="fp16" runs a GGUF unquantized (works without a GPU; the int kernel is
+            # GPU-only). "auto"/int4/int8 requantize to the int engine as before.
+            return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=gb,
+                                                 quantize=(dtype != "fp16"))
         cfg = await webio.read_json(p + "/config.json")
         if "quantization_config" in cfg:                     # already-quantized AutoGPTQ (int4/int8)
             return await _llm.CausalLM.from_gptq(p, lmax=lmax)

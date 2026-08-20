@@ -20,7 +20,14 @@ U8, I8, U16, I16, U32, I32, F32V, BOOLV, STRING, ARRAY, U64, I64, F64 = range(13
 # ggml tensor types (subset we handle + names)
 GGML_NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
               8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-              13: "Q5_K", 14: "Q6_K", 15: "Q8_K"}
+              13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
+              # i-quants (importance-matrix codebook quantizations)
+              16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL",
+              21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 29: "IQ1_M"}
+
+# IQ4 non-linear codebook: 4-bit indices select from these 16 levels (ggml kvalues_iq4nl).
+_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
+                   1, 13, 25, 38, 53, 69, 89, 113], np.float32)
 
 
 class _R:
@@ -192,13 +199,41 @@ def dequant(ttype, raw, n):
                 out[:, base + l + 64] = d[:, 0] * sch[:, ii + 4] * q3
                 out[:, base + l + 96] = d[:, 0] * sch[:, ii + 6] * q4
         return out.reshape(-1)[:n]
+    if name == "IQ4_NL":                     # 32 vals / 18 bytes: f16 d + 16 packed nibbles
+        blk = n // 32
+        b = u8[:blk * 18].reshape(blk, 18)
+        d = _f16(b[:, 0:2])                  # (blk,1)
+        qs = b[:, 2:18]                      # (blk,16) two 4-bit indices per byte
+        lo = _IQ4NL[(qs & 0x0F)]             # first 16 values
+        hi = _IQ4NL[(qs >> 4)]               # next 16 values
+        return (d * np.concatenate([lo, hi], axis=1)).reshape(-1)[:n]
+    if name == "IQ4_XS":                     # 256 vals / 136 bytes
+        # block_iq4_xs: f16 d | u16 scales_h | u8 scales_l[4] | u8 qs[128]
+        # Each of the 8 sub-blocks of 32 has a 6-bit scale: low nibble from scales_l,
+        # high 2 bits from scales_h; the sub-block scale is d * (ls - 32).
+        blk = n // 256
+        b = u8[:blk * 136].reshape(blk, 136)
+        d = _f16(b[:, 0:2])                                          # (blk,1)
+        sh = (b[:, 2].astype(np.uint32) | (b[:, 3].astype(np.uint32) << 8))   # (blk,) scales_h
+        sl = b[:, 4:8]                                               # (blk,4) scales_l
+        qs = b[:, 8:136].reshape(blk, 8, 16)                         # 8 sub-blocks x 16 bytes
+        ib = np.arange(8)
+        low = (sl[:, ib // 2] >> (4 * (ib % 2))) & 0x0F              # (blk,8) low nibble
+        high = (sh[:, None] >> (2 * ib)) & 0x03                      # (blk,8) high 2 bits
+        ls = (low.astype(np.int32) | (high.astype(np.int32) << 4)) - 32
+        dl = d * ls.astype(np.float32)                               # (blk,8) sub-block scales
+        lo = _IQ4NL[(qs & 0x0F)]                                     # (blk,8,16)
+        hi = _IQ4NL[(qs >> 4)]                                       # (blk,8,16)
+        vals = np.concatenate([lo, hi], axis=2)                      # (blk,8,32)
+        return (vals * dl[:, :, None]).reshape(-1)[:n]
     raise NotImplementedError("dequant not implemented for %s" % name)
 
 
 # block byte size per type (for slicing a tensor's raw bytes)
 _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),
-          "Q4_K": (256, 144), "Q6_K": (256, 210)}
+          "Q4_K": (256, 144), "Q6_K": (256, 210),
+          "IQ4_NL": (32, 18), "IQ4_XS": (256, 136)}
 
 
 # Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the
