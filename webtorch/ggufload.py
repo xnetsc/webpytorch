@@ -199,6 +199,69 @@ def dequant(ttype, raw, n):
                 out[:, base + l + 64] = d[:, 0] * sch[:, ii + 4] * q3
                 out[:, base + l + 96] = d[:, 0] * sch[:, ii + 6] * q4
         return out.reshape(-1)[:n]
+    if name == "Q5_K":                       # 256 vals / 176 bytes
+        # f16 d | f16 dmin | scales[12] (6-bit, get_scale_min_k4) | qh[32] (5th bit) | qs[128]
+        blk = n // 256
+        b = u8[:blk * 176].reshape(blk, 176)
+        d = _f16(b[:, 0:2]); dmin = _f16(b[:, 2:4])
+        sc, m = _q4k_scales(b[:, 4:16])
+        qh = b[:, 16:48]; qs = b[:, 48:176]
+        out = np.empty((blk, 256), np.float32)
+        for g in range(4):                   # 4 groups of 64 values -> 2 sub-blocks each
+            ql = qs[:, g * 32:(g + 1) * 32]
+            i0 = 2 * g
+            u1 = np.uint8(1 << i0); u2 = np.uint8(1 << (i0 + 1))
+            lo = (ql & 0x0F).astype(np.float32) + np.where(qh & u1, 16.0, 0.0)
+            hi = (ql >> 4).astype(np.float32) + np.where(qh & u2, 16.0, 0.0)
+            out[:, i0 * 32:(i0 + 1) * 32] = d * sc[:, i0:i0+1] * lo - dmin * m[:, i0:i0+1]
+            out[:, (i0+1) * 32:(i0+2) * 32] = d * sc[:, i0+1:i0+2] * hi - dmin * m[:, i0+1:i0+2]
+        return out.reshape(-1)[:n]
+    if name == "Q3_K":                       # 256 vals / 110 bytes
+        # hmask[32] | qs[64] (2-bit) | scales[12] (6-bit signed-ish, -32) | f16 d
+        blk = n // 256
+        b = u8[:blk * 110].reshape(blk, 110)
+        hm = b[:, 0:32]; qs = b[:, 32:96]; sraw = b[:, 96:108]; d_all = _f16(b[:, 108:110])
+        a = sraw.view(np.uint32).reshape(blk, 3).astype(np.uint32)   # aux[0..2]
+        k1, k2 = np.uint32(0x03030303), np.uint32(0x0F0F0F0F)
+        tmp = a[:, 2].copy()
+        aux = np.empty((blk, 4), np.uint32)
+        aux[:, 2] = ((a[:, 0] >> 4) & k2) | (((tmp >> 4) & k1) << 4)
+        aux[:, 3] = ((a[:, 1] >> 4) & k2) | (((tmp >> 6) & k1) << 4)
+        aux[:, 0] = (a[:, 0] & k2) | (((tmp >> 0) & k1) << 4)
+        aux[:, 1] = (a[:, 1] & k2) | (((tmp >> 2) & k1) << 4)
+        sc = aux.view(np.int8).reshape(blk, 16).astype(np.float32) - 32.0
+        out = np.empty((blk, 256), np.float32); o = 0; is_ = 0
+        for nblk in range(2):                # two halves of 128 values
+            q = qs[:, nblk * 32:(nblk + 1) * 32]
+            for j in range(4):
+                shift = 2 * j
+                mbit = np.uint8(1 << (nblk * 4 + j))
+                for half in range(2):        # 16 low + 16 high values
+                    ql = q[:, half * 16:(half + 1) * 16]
+                    hmm = hm[:, half * 16:(half + 1) * 16]
+                    v = ((ql >> shift) & 3).astype(np.float32) - np.where(hmm & mbit, 0.0, 4.0)
+                    out[:, o:o + 16] = (d_all * sc[:, is_:is_ + 1]) * v
+                    o += 16; is_ += 1
+        return out.reshape(-1)[:n]
+    if name == "Q2_K":                       # 256 vals / 84 bytes
+        # scales[16] (4-bit scale + 4-bit min) | qs[64] (2-bit) | f16 d | f16 dmin
+        blk = n // 256
+        b = u8[:blk * 84].reshape(blk, 84)
+        sc8 = b[:, 0:16]; qs = b[:, 16:80]
+        d = _f16(b[:, 80:82]); dmin = _f16(b[:, 82:84])
+        out = np.empty((blk, 256), np.float32); o = 0; is_ = 0
+        for nblk in range(2):
+            q = qs[:, nblk * 32:(nblk + 1) * 32]
+            for j in range(4):
+                shift = 2 * j
+                for half in range(2):
+                    ql = q[:, half * 16:(half + 1) * 16]
+                    sc = sc8[:, is_:is_ + 1]
+                    dl = d * (sc & 0x0F).astype(np.float32)
+                    ml = dmin * (sc >> 4).astype(np.float32)
+                    out[:, o:o + 16] = dl * ((ql >> shift) & 3).astype(np.float32) - ml
+                    o += 16; is_ += 1
+        return out.reshape(-1)[:n]
     if name == "IQ4_NL":                     # 32 vals / 18 bytes: f16 d + 16 packed nibbles
         blk = n // 32
         b = u8[:blk * 18].reshape(blk, 18)
@@ -233,7 +296,8 @@ def dequant(ttype, raw, n):
 _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),
           "Q4_K": (256, 144), "Q6_K": (256, 210),
-          "IQ4_NL": (32, 18), "IQ4_XS": (256, 136)}
+          "IQ4_NL": (32, 18), "IQ4_XS": (256, 136),
+          "Q5_K": (256, 176), "Q3_K": (256, 110), "Q2_K": (256, 84)}
 
 
 # Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the
