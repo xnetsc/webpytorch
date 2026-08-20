@@ -231,12 +231,25 @@ async def _load_qwenvl(**kw):
 async def _load_causal(**kw):
     return await AutoModelForCausalLM.from_pretrained(kw["path"], **{k: kw[k] for k in ("bits", "lmax") if k in kw})
 
+async def _load_multimodal(**kw):
+    """Generic multimodal impl: ANY decoder + ANY registered media encoder.
+        pipeline("image-to-text", "auto", path=…, encoder="my-vision")
+    The decoder is loaded by config (the whole CausalLM/MoE family) and paired with the named
+    encoder through `MultimodalLM` — no model-specific code."""
+    from . import multimodal
+    lm = await AutoModelForCausalLM.from_pretrained(
+        kw["path"], **{k: kw[k] for k in ("dtype", "bits", "lmax") if k in kw})
+    enc = await multimodal.load_encoder(kw.get("encoder", "auto"),
+                                        **kw.get("encoder_kwargs", {}))
+    return multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id"))
+
 register_pipeline("text-to-speech", "cosyvoice2", _load_cosyvoice2, default=True)
 register_pipeline("text-to-speech", "vits", _load_vits)
 register_pipeline("text-to-speech", "mms-tts", _load_vits)
 register_pipeline("object-detection", "yolo", _load_yolo, default=True)
 register_pipeline("object-detection", "detr", _load_detr)
 register_pipeline("image-to-text", "qwen-vl", _load_qwenvl, default=True)
+register_pipeline("image-to-text", "auto", _load_multimodal)     # any decoder + any encoder
 register_pipeline("text-generation", "auto", _load_causal, default=True)
 
 

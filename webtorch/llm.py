@@ -533,13 +533,20 @@ class CausalLM:
         v = lay["v"](x).reshape(T, self.NKV, self.HD).permute(1, 0, 2)
         return q.permute(1, 0, 2), k.permute(1, 0, 2), v
 
-    def _prefill(self, ids):
+    def _embed_ids(self, ids, embeds=None):
+        """Input embeddings for a prompt. `embeds` (T,H) overrides the token lookup — the hook
+        multimodal models use to splice image/audio embeddings into the sequence."""
+        if embeds is not None:
+            return wt.Tensor(np.asarray(embeds, np.float32))
+        return wt.Tensor(self.embed[np.asarray(ids, np.int64)].astype(np.float32))
+
+    def _prefill(self, ids, embeds=None):
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
         c, s = self._rope_np(0, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
         m = np.triu(np.full((T, LMAX), -1e9, np.float32), 1); m[:, T:] = -1e9
         mask = wt.Tensor(m.reshape(1, T, LMAX))
-        h = wt.Tensor(self.embed[np.asarray(ids, np.int64)].astype(np.float32))
+        h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
@@ -579,11 +586,11 @@ class CausalLM:
         return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
 
     # ---- WebGL path: growing KVCache, fresh forward (no in-place capture) ----
-    def _kv_forward(self, ids, pos, cache):
+    def _kv_forward(self, ids, pos, cache, embeds=None):
         T = len(ids); H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
         c, s = self._rope_np(pos, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
-        h = wt.Tensor(self.embed[np.asarray(ids, np.int64)].astype(np.float32))
+        h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
@@ -618,17 +625,24 @@ class CausalLM:
             self._set_inputs(nxt, pos); plat.replay("decode")
             nxt = int(logits_t.numpy()[0].argmax()); pos += 1
 
-    def generate(self, prompt, max_new=48, system="You are a helpful assistant."):
+    def generate(self, prompt, max_new=48, system="You are a helpful assistant.",
+                 ids=None, embeds=None):
         """ChatML prompt -> greedy decode -> GenResult. WebGPU replays a captured
         decode step per token (~20x); WebGL uses a correct growing-cache forward.
-        For live token-by-token output use `stream(...)`."""
+        For live token-by-token output use `stream(...)`.
+
+        `ids`/`embeds` override the prompt encoding: pass prebuilt token ids and/or (T,H) input
+        embeddings to decode from a sequence assembled elsewhere. That is the generic hook used
+        for multimodality (image/audio embeddings spliced into the token embeddings) — see
+        `webtorch.MultimodalLM` — so no model-specific decode path is needed."""
         eot = self.tok.SPECIALS["<|im_end|>"]
-        ids = self.tok.encode_chat(prompt, system)
+        if ids is None:
+            ids = self.tok.encode_chat(prompt, system)
         P = len(ids)
 
         if not self._gpu:                              # WebGL fallback
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
-            t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache)
+            t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0
             gen = [g0]; nxt = g0; pos = P; steps = 0; td = time.perf_counter()
             while len(gen) < max_new:
@@ -645,7 +659,7 @@ class CausalLM:
             c.data[:] = 0.0
         for v in self.Vc:
             v.data[:] = 0.0
-        t0 = time.perf_counter(); g0 = self._prefill(ids)
+        t0 = time.perf_counter(); g0 = self._prefill(ids, embeds=embeds)
         ttft = time.perf_counter() - t0
         plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)

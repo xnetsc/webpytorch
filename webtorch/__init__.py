@@ -40,6 +40,7 @@ from ._sdk import (install_torch, AutoTokenizer, AutoModelForCausalLM, Quantizer
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
 from .lm_engine import TransformerLM, build_lm, SAMPLERS
+from .multimodal import MultimodalLM, register_encoder, load_encoder, list_encoders, splice_embeddings
 
 # The PUBLIC API is generic / task-level only (below). Concrete model implementations
 # (CosyVoice2, VITS, DETR, YOLO, Qwen-VL, …) are NOT public interfaces — reach them
@@ -74,6 +75,8 @@ __all__ = [
     "list_pipelines", "Quantizer", "OnnxModel",
     # generic decoder engine (CausalLM + MoE series)
     "TransformerLM", "build_lm", "SAMPLERS",
+    # generic multimodal: pair ANY decoder with ANY registered media encoder
+    "MultimodalLM", "register_encoder", "load_encoder", "list_encoders", "splice_embeddings",
     # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None
     "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
     # built-in / hub read callbacks you install via set_io_read (NOT auto-installed)
