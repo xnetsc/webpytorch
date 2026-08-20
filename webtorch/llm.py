@@ -634,7 +634,13 @@ class CausalLM:
             if default is not None or not required: return default
             raise NotImplementedError(
                 "GGUF arch %r is missing %r — unsupported architecture for from_gguf" % (arch, key))
-        self.H = int(m("embedding_length")); self.L = int(m("block_count"))
+        self.H = int(m("embedding_length"))
+        # `block_count` counts multi-token-prediction blocks too, but those are a separate
+        # head (their tensors carry a `nextn.` prefix), not part of the decoder stack --
+        # running one as a normal layer would silently corrupt every generation. The count
+        # is declared in the file, so this needs no per-model knowledge.
+        self.L = int(m("block_count")) - int(m("nextn_predict_layers", default=0,
+                                               required=False) or 0)
         self.NH = int(m("attention.head_count"))
         self.NKV = int(m("attention.head_count_kv", default=self.NH, required=False) or self.NH)
         self.HD = int(m("attention.key_length", default=0, required=False) or (self.H // self.NH))
