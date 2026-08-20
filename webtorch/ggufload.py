@@ -201,6 +201,13 @@ _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "Q4_K": (256, 144), "Q6_K": (256, 210)}
 
 
+# Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the
+# `dequant` implementations). Anything else — notably the IQ i-quants (IQ1/IQ2/IQ3/IQ4_XS/
+# IQ4_NL), which use importance-matrix codebooks — is rejected up-front with a clear error.
+SUPPORTED_NAMES = frozenset(_BLOCK)
+SUPPORTED_TYPES = frozenset(t for t, n in GGML_NAMES.items() if n in _BLOCK)
+
+
 def is_supported(ttype):
     return GGML_NAMES.get(ttype) in _BLOCK
 

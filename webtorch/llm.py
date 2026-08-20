@@ -119,6 +119,67 @@ class CausalLM:
         self.rope_style = "hf"          # qwen2 = HF rotate_half (both GPTQ and GGUF)
         self.gs = 128; self.bits = 4    # int4 kernel params (GGUF is requantized to this)
 
+    def _apply_cfg(self, cfg):
+        """Read an HF `config.json` into the engine's shape parameters. Purely config-driven —
+        no model-name special cases — so it covers the whole Llama-style decoder family
+        (Llama / Mistral / Qwen2 / Qwen3 / …), dense or MoE:
+          * `head_dim` is honoured when present (Qwen3 has head_dim * num_heads != hidden_size);
+            it falls back to hidden_size // num_heads for models that omit it.
+          * QK-norm (Qwen3) is detected from the weights at load time, not from the model name.
+          * MoE fields (num_experts / num_experts_per_tok / …) drive the sparse path."""
+        self.H = cfg["hidden_size"]; self.L = cfg["num_hidden_layers"]
+        self.NH = cfg["num_attention_heads"]
+        self.NKV = cfg.get("num_key_value_heads", self.NH)
+        self.HD = int(cfg.get("head_dim") or (self.H // self.NH))
+        self.VOCAB = cfg["vocab_size"]
+        self.eps = cfg.get("rms_norm_eps", 1e-6); self.theta = cfg.get("rope_theta", 10000.0)
+        # MoE (0 => dense); mirrors lm_engine.build_lm's config contract
+        self.n_experts = int(cfg.get("num_experts", cfg.get("num_local_experts", 0)) or 0)
+        self.top_k = int(cfg.get("num_experts_per_tok", 0) or 0)
+        self.norm_topk = bool(cfg.get("norm_topk_prob", True))
+        self.sparse_step = int(cfg.get("decoder_sparse_step", 1) or 1)
+        self.mlp_only = set(cfg.get("mlp_only_layers", []) or [])
+        self.has_shared_expert = bool(cfg.get("shared_expert_intermediate_size", 0))
+
+    def _is_moe_layer(self, i):
+        return (self.n_experts > 0 and i not in self.mlp_only
+                and ((i + 1) % self.sparse_step == 0))
+
+    async def _opt_norm(self, name):
+        """Load an optional norm weight (e.g. Qwen3's q_norm/k_norm); None when absent."""
+        return wt.Tensor(await self._np(name)) if name in self._idx else None
+
+    async def _build_layer(self, i, lin):
+        """Build one decoder layer generically from the served weights. `lin(prefix)` is the
+        format's linear factory (int4 for AutoGPTQ, fp16/quantized for plain HF), so this is
+        shared by every loader. Optional pieces are detected from the weights, not the model
+        name: QK-norm (`self_attn.{q,k}_norm.weight`, Qwen3) and a sparse-MoE block."""
+        p = "model.layers.%d." % i
+        lay = {"in_ln": wt.Tensor(await self._np(p + "input_layernorm.weight")),
+               "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight")),
+               "q": await lin(p + "self_attn.q_proj"), "k": await lin(p + "self_attn.k_proj"),
+               "v": await lin(p + "self_attn.v_proj"), "o": await lin(p + "self_attn.o_proj"),
+               "qn": await self._opt_norm(p + "self_attn.q_norm.weight"),
+               "kn": await self._opt_norm(p + "self_attn.k_norm.weight")}
+        if self._is_moe_layer(i):                       # sparse layer: router + experts
+            moe = {"gate": await lin(p + "mlp.gate"), "top_k": self.top_k,
+                   "norm_topk": self.norm_topk,
+                   "experts": [{"gate": await lin(p + "mlp.experts.%d.gate_proj" % e),
+                                "up": await lin(p + "mlp.experts.%d.up_proj" % e),
+                                "down": await lin(p + "mlp.experts.%d.down_proj" % e)}
+                               for e in range(self.n_experts)]}
+            if self.has_shared_expert:
+                moe["shared"] = {"gate": await lin(p + "mlp.shared_expert.gate_proj"),
+                                 "up": await lin(p + "mlp.shared_expert.up_proj"),
+                                 "down": await lin(p + "mlp.shared_expert.down_proj")}
+                moe["shared_gate"] = await lin(p + "mlp.shared_expert_gate")
+            lay["moe"] = moe
+        else:                                           # dense SwiGLU
+            lay["gate"] = await lin(p + "mlp.gate_proj")
+            lay["up"] = await lin(p + "mlp.up_proj")
+            lay["down"] = await lin(p + "mlp.down_proj")
+        return lay
+
     # ---- range helpers (all reads go through the global IO callback) ----
     async def _rng(self, fn, a, b):
         from . import webio
@@ -200,12 +261,9 @@ class CausalLM:
         self.lmax = lmax
         self._shard_hdr = {}
         cfg = await webio.read_json(self.base + "config.json")
-        self.H = cfg["hidden_size"]; self.L = cfg["num_hidden_layers"]
-        self.NH = cfg["num_attention_heads"]; self.NKV = cfg["num_key_value_heads"]
-        self.HD = self.H // self.NH; self.VOCAB = cfg["vocab_size"]
-        self.eps = cfg["rms_norm_eps"]; self.theta = cfg["rope_theta"]
+        self._apply_cfg(cfg)
         self.gs = cfg["quantization_config"]["group_size"]; self.bits = cfg["quantization_config"]["bits"]
-        tie = cfg["tie_word_embeddings"]
+        tie = cfg.get("tie_word_embeddings", False)
 
         vocab = await webio.read_json(self.base + "vocab.json")
         merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
@@ -224,16 +282,7 @@ class CausalLM:
         else:
             self.embed = await self._f16_chunked("model.embed_tokens.weight")
             self.head = self._quantize_head(self.embed)
-        self.layers = []
-        for i in range(self.L):
-            p = "model.layers.%d." % i
-            self.layers.append({
-                "in_ln": wt.Tensor(await self._np(p + "input_layernorm.weight")),
-                "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight")),
-                "q": await self._qlin(p + "self_attn.q_proj"), "k": await self._qlin(p + "self_attn.k_proj"),
-                "v": await self._qlin(p + "self_attn.v_proj"), "o": await self._qlin(p + "self_attn.o_proj"),
-                "gate": await self._qlin(p + "mlp.gate_proj"), "up": await self._qlin(p + "mlp.up_proj"),
-                "down": await self._qlin(p + "mlp.down_proj")})
+        self.layers = [await self._build_layer(i, self._qlin) for i in range(self.L)]
         self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()        # webgpu -> capture path available
@@ -270,9 +319,15 @@ class CausalLM:
 
     @classmethod
     async def from_gguf(cls, url, lmax=320, bits=4):
-        """Load a llama.cpp GGUF (qwen2 arch), dequantizing + requantizing weights
-        to int`bits` (4 or 8) so they run on the same capture-accelerated engine.
-        `url` is the served .gguf file, e.g. '/models/qwen3b-gguf/model.gguf'."""
+        """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
+        they run on the same capture-accelerated engine. `url` is the served .gguf file.
+
+        **Architecture-generic**: shape/rope/eps are read from GGUF's own `{arch}.*` metadata
+        keys (the format's convention), and optional pieces are detected from the tensors —
+        QK-norm (`attn_q_norm`/`attn_k_norm`, e.g. Qwen3) and sparse-MoE (`ffn_gate_inp` +
+        `ffn_*_exps`). So any Llama-style decoder GGUF (llama / qwen2 / qwen3 / mistral / …)
+        loads without a per-model branch. A GGUF whose weights use a quantization type this
+        SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error."""
         from . import ggufload as G
         self = cls(None); self.lmax = lmax; self._gguf = url
         self.bits = bits                                      # int4 or int8 (same kernels/optims)
@@ -286,16 +341,37 @@ class CausalLM:
                 if size > (128 << 20):
                     raise
         arch = meta.get("general.architecture")
-        if arch != "qwen2":
-            raise NotImplementedError("from_gguf supports qwen2 GGUF (got %r)" % arch)
-        self.H = meta["qwen2.embedding_length"]; self.L = meta["qwen2.block_count"]
-        self.NH = meta["qwen2.attention.head_count"]; self.NKV = meta["qwen2.attention.head_count_kv"]
-        self.HD = self.H // self.NH; self.VOCAB = len(meta["tokenizer.ggml.tokens"])
-        self.eps = meta["qwen2.attention.layer_norm_rms_epsilon"]
-        self.theta = meta["qwen2.rope.freq_base"]
+        if not arch:
+            raise ValueError("GGUF has no general.architecture")
+        A = arch + "."                                        # GGUF namespaces its keys by arch
+        def m(key, *alts, default=None, required=True):
+            for k in (key,) + alts:
+                if A + k in meta: return meta[A + k]
+            if default is not None or not required: return default
+            raise NotImplementedError(
+                "GGUF arch %r is missing %r — unsupported architecture for from_gguf" % (arch, key))
+        self.H = int(m("embedding_length")); self.L = int(m("block_count"))
+        self.NH = int(m("attention.head_count"))
+        self.NKV = int(m("attention.head_count_kv", default=self.NH, required=False) or self.NH)
+        self.HD = int(m("attention.key_length", default=0, required=False) or (self.H // self.NH))
+        self.VOCAB = len(meta["tokenizer.ggml.tokens"])
+        self.eps = float(m("attention.layer_norm_rms_epsilon", default=1e-6, required=False))
+        self.theta = float(m("rope.freq_base", default=10000.0, required=False))
+        # MoE (0 => dense), same contract as the safetensors path
+        self.n_experts = int(m("expert_count", default=0, required=False) or 0)
+        self.top_k = int(m("expert_used_count", default=0, required=False) or 0)
+        self.norm_topk = True; self.sparse_step = 1; self.mlp_only = set()
+        self.has_shared_expert = False
         self.tok = BPETokenizer({t: i for i, t in enumerate(meta["tokenizer.ggml.tokens"])},
-                                meta["tokenizer.ggml.merges"])
+                                meta.get("tokenizer.ggml.merges", []))
         self._ginfo = {t["name"]: t for t in infos}; self._gds = ds
+        bad = sorted({G.GGML_NAMES.get(t["type"], "type%d" % t["type"])
+                      for t in infos if t["type"] not in G.SUPPORTED_TYPES})
+        if bad:                                               # e.g. IQ4_XS / IQ2_M i-quants
+            raise NotImplementedError(
+                "GGUF uses quantization type(s) %s which this SDK cannot dequantize "
+                "(supported: %s). Use a supported quant (Q4_K/Q6_K/Q8_0/Q4_0/Q4_1/F16/F32)."
+                % (", ".join(bad), ", ".join(sorted(G.SUPPORTED_NAMES))))
 
         t0 = time.perf_counter()
         # token_embd -> host f16 (streamed in row-blocks so the full 1.2GB fp32
@@ -326,15 +402,33 @@ class CausalLM:
         self.layers = []
         for i in range(self.L):
             p = "blk.%d." % i
-            async def qb(nm):                                  # weight + optional bias -> QuantizedLinear
-                b = (await self._gload(p + nm + ".bias")) if (p + nm + ".bias") in self._ginfo else None
-                return self._gquant(await self._gload(p + nm + ".weight"), b)
-            self.layers.append({
-                "in_ln": wt.Tensor(await self._gload(p + "attn_norm.weight")),
-                "post_ln": wt.Tensor(await self._gload(p + "ffn_norm.weight")),
-                "q": await qb("attn_q"), "k": await qb("attn_k"), "v": await qb("attn_v"),
-                "o": await qb("attn_output"),
-                "gate": await qb("ffn_gate"), "up": await qb("ffn_up"), "down": await qb("ffn_down")})
+            async def qb(nm, _p=p):                            # weight + optional bias -> QuantizedLinear
+                b = (await self._gload(_p + nm + ".bias")) if (_p + nm + ".bias") in self._ginfo else None
+                return self._gquant(await self._gload(_p + nm + ".weight"), b)
+            async def opt_norm(nm, _p=p):                      # QK-norm (qwen3-style) if present
+                n = _p + nm + ".weight"
+                return wt.Tensor(await self._gload(n)) if n in self._ginfo else None
+            lay = {"in_ln": wt.Tensor(await self._gload(p + "attn_norm.weight")),
+                   "post_ln": wt.Tensor(await self._gload(p + "ffn_norm.weight")),
+                   "q": await qb("attn_q"), "k": await qb("attn_k"), "v": await qb("attn_v"),
+                   "o": await qb("attn_output"),
+                   "qn": await opt_norm("attn_q_norm"), "kn": await opt_norm("attn_k_norm")}
+            if (p + "ffn_gate_inp.weight") in self._ginfo:     # sparse-MoE block
+                # llama.cpp stacks experts: ffn_{gate,up,down}_exps = (n_experts, out, in)
+                gate_x = await self._gload(p + "ffn_gate_exps.weight")
+                up_x = await self._gload(p + "ffn_up_exps.weight")
+                down_x = await self._gload(p + "ffn_down_exps.weight")
+                ne = int(gate_x.shape[0])
+                lay["moe"] = {"gate": self._gquant(await self._gload(p + "ffn_gate_inp.weight")),
+                              "top_k": self.top_k or 2, "norm_topk": True,
+                              "experts": [{"gate": self._gquant(gate_x[e]),
+                                           "up": self._gquant(up_x[e]),
+                                           "down": self._gquant(down_x[e])} for e in range(ne)]}
+                del gate_x, up_x, down_x
+            else:
+                lay["gate"] = await qb("ffn_gate"); lay["up"] = await qb("ffn_up")
+                lay["down"] = await qb("ffn_down")
+            self.layers.append(lay)
         self.final_norm = wt.Tensor(await self._gload("output_norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
@@ -364,10 +458,7 @@ class CausalLM:
         if self._qbits:
             self.bits = self._qbits                        # gs keeps the default 128
         cfg = await webio.read_json(self.base + "config.json")
-        self.H = cfg["hidden_size"]; self.L = cfg["num_hidden_layers"]
-        self.NH = cfg["num_attention_heads"]; self.NKV = cfg["num_key_value_heads"]
-        self.HD = self.H // self.NH; self.VOCAB = cfg["vocab_size"]
-        self.eps = cfg["rms_norm_eps"]; self.theta = cfg["rope_theta"]
+        self._apply_cfg(cfg)
         tie = cfg.get("tie_word_embeddings", False)
 
         vocab = await webio.read_json(self.base + "vocab.json")
@@ -387,16 +478,7 @@ class CausalLM:
         self.embed = await self._f16_chunked("model.embed_tokens.weight")     # (V,H) fp16
         headW = self.embed if tie else await self._f16_chunked("lm_head.weight")
         self.head = self._quantize_head(headW) if self._qbits else [wt.UnquantizedLinear(headW)]
-        self.layers = []
-        for i in range(self.L):
-            p = "model.layers.%d." % i
-            self.layers.append({
-                "in_ln": wt.Tensor(await self._np(p + "input_layernorm.weight")),
-                "post_ln": wt.Tensor(await self._np(p + "post_attention_layernorm.weight")),
-                "q": await self._lin(p + "self_attn.q_proj"), "k": await self._lin(p + "self_attn.k_proj"),
-                "v": await self._lin(p + "self_attn.v_proj"), "o": await self._lin(p + "self_attn.o_proj"),
-                "gate": await self._lin(p + "mlp.gate_proj"), "up": await self._lin(p + "mlp.up_proj"),
-                "down": await self._lin(p + "mlp.down_proj")})
+        self.layers = [await self._build_layer(i, self._lin) for i in range(self.L)]
         self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
@@ -432,6 +514,25 @@ class CausalLM:
             self.ctl = xp.asarray(np.array([0, 1, NKV, HD, LMAX], np.int32))
 
     # ---- prefill (fresh, fills KV 0..P-1) ----
+    def _mlp(self, lay, x):
+        """Dense SwiGLU, or generic sparse-MoE (router top-k + optional shared expert) when the
+        layer carries `moe` — same layer dict shape as `lm_engine.build_lm`, so the proven
+        generic MoE path is reused instead of a second implementation."""
+        if lay.get("moe"):
+            from . import lm_engine
+            return lm_engine.moe_mlp(self, lay, x)
+        return lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+
+    def _qkv(self, lay, x, T):
+        """q,k,v projections -> (heads, T, HD). Applies Qwen3-style QK-norm (per-head RMSNorm
+        over head_dim, before rope) when `lay` carries `qn`/`kn` weights; a no-op otherwise."""
+        q = lay["q"](x).reshape(T, self.NH, self.HD)
+        k = lay["k"](x).reshape(T, self.NKV, self.HD)
+        if lay.get("qn") is not None: q = self._rms(q, lay["qn"])
+        if lay.get("kn") is not None: k = self._rms(k, lay["kn"])
+        v = lay["v"](x).reshape(T, self.NKV, self.HD).permute(1, 0, 2)
+        return q.permute(1, 0, 2), k.permute(1, 0, 2), v
+
     def _prefill(self, ids):
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
         c, s = self._rope_np(0, T)
@@ -442,16 +543,14 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q = lay["q"](x).reshape(T, NH, HD).permute(1, 0, 2)
-            k = lay["k"](x).reshape(T, NKV, HD).permute(1, 0, 2)
-            v = lay["v"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+            q, k, v = self._qkv(lay, x, T)
             q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
             wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
             wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, H))
+            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
             x = self._rms(h, lay["post_ln"])
-            h = h + lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+            h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
 
     def _set_inputs(self, token, pos):
@@ -468,17 +567,15 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD); h = self.h_in
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q = lay["q"](x).reshape(1, NH, HD).permute(1, 0, 2)
-            k = lay["k"](x).reshape(1, NKV, HD).permute(1, 0, 2)
-            v = lay["v"](x).reshape(1, NKV, HD).permute(1, 0, 2)
+            q, k, v = self._qkv(lay, x, 1)
             q = q * self.cos_b + self._rot(q) * self.sin_b
             k = k * self.cos_b + self._rot(k) * self.sin_b
             wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(1, H))
+            h = h + lay["o"](o.permute(1, 0, 2).reshape(1, NH * HD))
             x = self._rms(h, lay["post_ln"])
-            h = h + lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+            h = h + self._mlp(lay, x)
         return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
 
     # ---- WebGL path: growing KVCache, fresh forward (no in-place capture) ----
@@ -490,14 +587,12 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q = lay["q"](x).reshape(T, NH, HD).permute(1, 0, 2)
-            k = lay["k"](x).reshape(T, NKV, HD).permute(1, 0, 2)
-            v = lay["v"](x).reshape(T, NKV, HD).permute(1, 0, 2)
+            q, k, v = self._qkv(lay, x, T)
             q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
             o = cache.attn(i, q, k, v, pos, scale=sc)
-            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, H))
+            h = h + lay["o"](o.permute(1, 0, 2).reshape(T, NH * HD))
             x = self._rms(h, lay["post_ln"])
-            h = h + lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+            h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
 
     def stream(self, prompt, max_new=48, system="You are a helpful assistant."):
