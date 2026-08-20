@@ -16,6 +16,39 @@ you **must** install two global async callbacks first — `set_io_read` and `set
   (nn / optim / autograd / functional, torch 2.x surface). Idempotent.
 - `webtorch.Tensor`, `webtorch.core` → the tensor engine (also under `torch.*` after install).
 
+## Unified loader — `webtorch.load` / `Model`
+
+One entry point for every model type; the specialised APIs below remain available.
+
+- `await webtorch.load(source=None, task=None, dtype="auto", encoder=None, reuse=True, **kw) -> Model`
+  - `source`: a model dir, a hub repo id (`"org/repo"`, with a hub reader installed), a
+    `.gguf`, or a `.onnx`. Omit it and pass `task=` to build a registered pipeline.
+  - `task`: force a task (`"text-to-speech"`, `"asr"`, …); `encoder=`: a registered media
+    encoder, giving a multimodal model; `dtype`: `"auto"|"fp16"|"int4"|"int8"`.
+  - Detection is by content (extension, then the served `config.json`) — never by model name.
+- `Model.infer(...)` / `model(...)` — **the single inference call for every model type**. It
+  dispatches to whatever the impl exposes (`__call__`, then `generate`/`run`/`synth`/`detect`/
+  `transcribe`/`classify`/`encode`). `.stream(...)` streams where supported. `.kind` and
+  `.impl` stay visible and unknown attributes forward to the impl.
+
+**A model is never loaded twice.** `load()` caches by request, so loading the same source again
+returns the *same* object instead of re-downloading and rebuilding multi-GB weights, and
+concurrent `load()` calls for one model fetch it once.
+
+```python
+m  = await webtorch.load("Qwen/Qwen3-0.6B")      # first call builds it
+m2 = await webtorch.load("Qwen/Qwen3-0.6B")      # same object, zero extra reads (m2 is m)
+m.release()                                       # free the weights (or: with await load(...) as m:)
+m3 = await webtorch.load("Qwen/Qwen3-0.6B")      # released -> loads fresh
+```
+- `model.release()` frees the weights and drops it from the cache; using a released model
+  raises. `webtorch.release_all()` releases everything; `webtorch.loaded_models()` lists what
+  is held; `load(..., reuse=False)` forces a separate instance.
+
+## Generation parameters
+`generate(...)` / `stream(...)` take `temperature`, `top_p`, `top_k`, `seed`, `do_sample`.
+Greedy is the default (`temperature<=0`); with sampling, a given `seed` is reproducible.
+
 ## Causal LM (dense + MoE series)
 - `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=4, lmax=320)`
   - Runs inference at **int4, int8, or fp16** — `dtype` selects it:
@@ -123,6 +156,18 @@ print(lm("Hello", max_new=64))
 For LLMs you usually don't even need the registry — `AutoModelForCausalLM.from_pretrained(path)`
 already loads *any* CausalLM/MoE-series model by its `config`. The registry is for giving a
 model a stable task name or plugging in a non-CausalLM architecture.
+
+## GGUF quantization support
+`.gguf` files are loaded generically (architecture read from the file's own `{arch}.*`
+metadata). Dequantization is implemented for **F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K,
+Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS** — which covers the common builds (`Q4_K_M`, `Q5_K_M`,
+`Q6_K`, `Q8_0`, `IQ4_XS`) including mixed/"dynamic" files that combine several of these. The
+remaining i-quants (IQ1/IQ2/IQ3 families) are **not** supported.
+
+Both the quantization types and the architecture are **checked up front from the header**, so
+an unsupported file fails in seconds naming exactly what is missing, instead of after
+downloading gigabytes. `dtype="fp16"` runs a GGUF unquantized (the int kernel is GPU-only, so
+this is what makes GGUF work without a GPU).
 
 ## Generic ONNX  (`webtorch.OnnxModel`)
 - `await webtorch.OnnxModel.from_source(src, io=None)` — `src`: url | bytes | async

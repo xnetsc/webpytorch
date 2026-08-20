@@ -104,11 +104,29 @@ class Model:
     `.kind` says what was loaded ("causal-lm" / "onnx" / a task name), `.impl` is the underlying
     object, and any attribute not defined here is forwarded to it — so nothing is hidden."""
 
-    def __init__(self, impl, kind):
-        self.impl = impl; self.kind = kind
+    def __init__(self, impl, kind, key=None):
+        self.impl = impl; self.kind = kind; self._key = key
 
     def __getattr__(self, name):                 # forward everything else to the impl
-        return getattr(self.__dict__["impl"], name)
+        impl = self.__dict__.get("impl")
+        if impl is None:
+            raise RuntimeError("this model has been released; load it again with webtorch.load(...)")
+        return getattr(impl, name)
+
+    @property
+    def released(self):
+        return self.__dict__.get("impl") is None
+
+    def release(self):
+        """Free this model: drop its weights and remove it from the loaded-model cache, so a
+        later `load()` of the same source builds a fresh one. Idempotent."""
+        _LOADED.pop(self.__dict__.get("_key"), None)
+        self.__dict__["impl"] = None
+        return self
+
+    # so `with await webtorch.load(...) as m:` frees the weights on exit
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.release(); return False
 
     def __repr__(self):
         return "<webtorch.Model kind=%s impl=%s>" % (self.kind, type(self.impl).__name__)
@@ -155,7 +173,34 @@ class Model:
         return self.infer(*a, **kw)
 
 
-async def load(source=None, task=None, dtype="auto", encoder=None, **kw):
+# Loaded-model cache: loading a multi-GB model twice is pure waste, so `load()` returns the
+# SAME Model for the same request until it is released.
+_LOADED = {}        # key -> Model
+_LOADING = {}       # key -> asyncio.Future, so concurrent loads of one model fetch once
+
+
+def loaded_models():
+    """The models currently held by the loader cache: `{key: Model}`."""
+    return dict(_LOADED)
+
+
+def release_all():
+    """Release every cached model (frees their weights). Returns how many were released."""
+    n = 0
+    for m in list(_LOADED.values()):
+        m.release(); n += 1
+    _LOADED.clear()
+    return n
+
+
+def _load_key(source, task, dtype, encoder, kw):
+    # normalise the source so trivially different spellings ("dir" vs "dir/") do not reload
+    src = None if source is None else str(source).rstrip("/")
+    extra = tuple(sorted((k, repr(v)) for k, v in kw.items() if k != "encoder_kwargs"))
+    return (src, task, dtype, encoder, extra)
+
+
+async def load(source=None, task=None, dtype="auto", encoder=None, reuse=True, **kw):
     """**The unified loader.** Point it at anything and get a `Model` back:
 
       source: a model dir / repo id ("org/repo" with a hub reader installed), a `.gguf` file,
@@ -167,7 +212,40 @@ async def load(source=None, task=None, dtype="auto", encoder=None, **kw):
 
     Detection is by content, not by model name: `.onnx`/`.gguf` by extension, otherwise the
     served `config.json` decides (a decoder config -> the generic CausalLM/MoE/hybrid engine).
-    Every specialised API remains available and unchanged."""
+    Every specialised API remains available and unchanged.
+
+    **Loading the same model twice does not reload it.** Results are cached by request, so a
+    second `load()` of the same source returns the SAME object instead of re-downloading and
+    rebuilding multi-GB weights, and concurrent loads of one model fetch it once. Call
+    `model.release()` (or use it as a context manager, or `webtorch.release_all()`) to free the
+    weights; a later `load()` then builds it fresh. Pass `reuse=False` to force a separate
+    instance. `webtorch.loaded_models()` shows what is currently held."""
+    import asyncio
+    from . import multimodal, webio
+
+    key = _load_key(source, task, dtype, encoder, kw)
+    if reuse:
+        hit = _LOADED.get(key)
+        if hit is not None and not hit.released:
+            return hit                                     # already loaded -> reuse, no reload
+        if key in _LOADING:
+            return await asyncio.shield(_LOADING[key])     # a concurrent load is already running
+        fut = asyncio.get_event_loop().create_future()
+        _LOADING[key] = fut
+        try:
+            m = await _load_uncached(source, task, dtype, encoder, kw)
+        except BaseException as e:
+            _LOADING.pop(key, None)
+            if not fut.done(): fut.set_exception(e)
+            raise
+        m._key = key; _LOADED[key] = m
+        _LOADING.pop(key, None)
+        if not fut.done(): fut.set_result(m)
+        return m
+    return await _load_uncached(source, task, dtype, encoder, kw)
+
+
+async def _load_uncached(source, task, dtype, encoder, kw):
     from . import multimodal, webio
     if source is None:
         if task is None:
@@ -385,7 +463,7 @@ from .webio import (set_io_read, get_io_read, io_read, set_io_write, get_io_writ
 
 
 # ---- explicit exports --------------------------------------------------------
-__all__ = ["install_torch", "load", "Model", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
+__all__ = ["install_torch", "load", "Model", "loaded_models", "release_all", "AutoTokenizer", "AutoModelForCausalLM", "Quantizer", "pipeline", "register_pipeline",
            "register_task", "list_pipelines", "OnnxModel", "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
            "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
            "make_cached_reader", "http_get", "http_size", "HttpError",

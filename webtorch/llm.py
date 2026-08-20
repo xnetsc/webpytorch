@@ -434,6 +434,41 @@ class CausalLM:
         self.tok = BPETokenizer({t: i for i, t in enumerate(meta["tokenizer.ggml.tokens"])},
                                 meta.get("tokenizer.ggml.merges", []))
         self._ginfo = {t["name"]: t for t in infos}; self._gds = ds
+
+        # Preflight: report every unsupported quantization up front, from the header alone,
+        # instead of failing part-way through a multi-GB download. Mixed ("dynamic") files
+        # combine many types, so list all of them with how many tensors each covers.
+        from collections import Counter
+        bad = Counter(G.GGML_NAMES.get(t["type"], "type%d" % t["type"])
+                      for t in infos if not G.is_supported(t["type"]))
+        if bad:
+            raise NotImplementedError(
+                "this GGUF uses quantization types webtorch cannot dequantize yet: %s. "
+                "Supported: %s. Pick a build using only supported types (e.g. Q4_K_M, Q5_K_M, "
+                "Q6_K, Q8_0, IQ4_XS)." % (
+                    ", ".join("%s (%d tensors)" % (k, v) for k, v in sorted(bad.items())),
+                    ", ".join(sorted(G.SUPPORTED_NAMES))))
+
+        # Preflight the architecture too: this engine is a Llama-style decoder (per-layer
+        # attn_q/attn_k/attn_v or a fused attn_qkv, attn_norm, ffn_norm, ffn_*). Report a
+        # structural mismatch from the header rather than after downloading gigabytes.
+        names = set(self._ginfo)
+        if "blk.0.attn_norm.weight" in names:
+            missing = [t for t in ("blk.0.ffn_norm.weight",) if t not in names]
+            fused = "blk.0.attn_qkv.weight" in names
+            split = all(("blk.0.attn_%s.weight" % x) in names for x in ("q", "k", "v"))
+            ssm = sorted(n.split(".", 2)[-1] for n in names
+                         if n.startswith("blk.0.ssm") or n.startswith("blk.0.attn_gate"))
+            if missing or not (fused or split):
+                raise NotImplementedError(
+                    "this GGUF's %r architecture is not the Llama-style decoder this engine "
+                    "implements: layer 0 %s%s. Unsupported layer tensors: %s. Models with "
+                    "state-space / gated-linear-attention blocks need those operators; use a "
+                    "GGUF whose blocks are standard attention + FFN." % (
+                        arch,
+                        "lacks " + ", ".join(missing) if missing else "",
+                        "" if (fused or split) else (" and has no attn_q/k/v or attn_qkv"),
+                        ", ".join(ssm) or "n/a"))
         bad = sorted({G.GGML_NAMES.get(t["type"], "type%d" % t["type"])
                       for t in infos if t["type"] not in G.SUPPORTED_TYPES})
         if bad:                                               # e.g. IQ4_XS / IQ2_M i-quants
