@@ -390,7 +390,7 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, ch
     tr = throttle_reads(fetch, max_parallel, http_rate_limited)
     if prefetch:
         tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    cached = make_cached_reader(tr, size=size, cache_dir=cache_dir,
+    cached = _cache_through(tr, size=size, cache_dir=cache_dir,
                                 chunk_mb=chunk_mb, persist=persist)
     async def read(name, offset=0, length=None):
         if _is_url(name) or _in_browser():                   # network read -> cache it
@@ -1136,7 +1136,7 @@ class _CacheLayer:
 
 
 # ============================ generic cached-reader tool ============================
-# `make_cached_reader` wraps ANY async transport with the cache + read-ahead + adaptive
+# The HTTP transport, the throttle and the read-ahead below are the pieces a read
 # concurrency + (browser) persistence used by the hub readers. Use it when you implement your
 # own `set_io_read` callback over a custom source (S3, a signed CDN, your own server, …); the
 # built-in `hf_read` / `modelscope_read` are just clients of it (see below).
@@ -1193,7 +1193,7 @@ def http_rate_limited(exc):
     """True when `exc` from the HTTP transport means "slow down".
 
     This is the transport's own knowledge -- a 429, or a body that says so in as many words
-    -- and it is handed to `make_cached_reader` rather than assumed by it, because the cache
+    -- and it is handed to the throttle rather than assumed by it, because the cache
     has no idea what its reader speaks.
     """
     return isinstance(exc, HttpError) and _is_rate_limited(exc.status, exc.body)
@@ -1201,7 +1201,7 @@ def http_rate_limited(exc):
 
 async def http_get(url, offset=0, length=None, headers=None):
     """The built-in HTTP range transport (browser `fetch` / host `urllib`). Raises `HttpError`
-    on a non-2xx status. A ready-made `fetch` building block for `make_cached_reader`."""
+    on a non-2xx status. A ready-made `fetch` building block for a read callback."""
     rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
     data = await _fetch_once(url, rng, headers)
     _note_download(url, len(data))            # this transport IS HTTP, so it has a speed
@@ -1209,7 +1209,7 @@ async def http_get(url, offset=0, length=None, headers=None):
 
 async def http_size(url, headers=None):
     """Total byte length of an http(s) file (HEAD, else a `bytes=0-0` GET's Content-Range).
-    A ready-made `size` building block for `make_cached_reader` (drives prefetch)."""
+    A ready-made `size` building block for a read callback (drives read-ahead)."""
     return await _remote_size(url, headers)
 
 def throttle_reads(fetch, max_parallel=8, is_rate_limited=None):
@@ -1218,7 +1218,7 @@ def throttle_reads(fetch, max_parallel=8, is_rate_limited=None):
     This belongs to the transport, not to the cache: how many requests a host will take at
     once, what it does when pushed too hard, and what "slow down" even looks like are facts
     about the thing being read, and only its reader knows them. Compose it around your own
-    reader before handing that to `make_cached_reader`; the built-in HTTP tools do exactly
+    reader before caching it; the built-in HTTP readers do exactly
     that.
 
     `is_rate_limited(exc) -> bool` tells the gate which failures mean "slow down" -- for
@@ -1241,7 +1241,7 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
     background and writes them through the cache's own write interface. The cached reader
     then simply finds them and never calls the transport for those ranges again.
 
-    Returns a `fetch`-shaped callable to hand to `make_cached_reader`.
+    Returns a `fetch`-shaped callable.
     """
     import asyncio
     chunk = chunk_mb << 20
@@ -1285,10 +1285,20 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
     return ahead
 
 
-def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
+def _cache_through(fetch, size=None, key=None, cache=True, cache_dir=None,
                        chunk_mb=16, persist=True):
-    """Wrap an async transport with the cache, giving back an `io_read`-shaped callback
-    `read(name, offset=0, length=None) -> bytes` for `webtorch.set_io_read`.
+    """Cache-with-miss-fill, used by the readers below. INTERNAL.
+
+    Not part of the API. The cache has exactly two entry points -- `read_cache` and
+    `write_cache` -- and exactly two places they are used: inside a read/write callback, and
+    for managing the cache. A third public "cached reader" concept would just be a second
+    way to say the first one. What lives here is the part that is genuinely fiddly and that
+    both hub readers need: mapping a byte range onto chunks, serving a range that is partly
+    cached, learning a file's length from a short read when the host will not reveal it,
+    clamping past EOF, and assembling the answer without duplicating it in memory.
+
+    Writing your own callback? Use `read_cache` / `write_cache` directly -- see the hub
+    readers for the shape.
 
     Caching, and only caching. Bytes it already has come from storage; bytes it does not
     come from `fetch`, and are kept. It does not read ahead, does not decide how many
@@ -1298,7 +1308,7 @@ def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
 
         tr = throttle_reads(my_fetch, max_parallel=8, is_rate_limited=my_classifier)
         tr = prefetch_whole_file(tr, size=my_size, cache_dir=None)   # optional
-        webtorch.set_io_read(make_cached_reader(tr, size=my_size))
+        webtorch.set_io_read(_cache_through(tr, size=my_size))
 
     which is exactly what `hf_read` and `modelscope_read` do. The cache is also reachable on
     its own through `read_cache` / `write_cache`, which is how a transport that wants to fill
@@ -1329,7 +1339,7 @@ def make_cached_reader(fetch, size=None, key=None, cache=True, cache_dir=None,
 # browser's IndexedDB-backed cache is loaded first (and flushed after any change).
 
 def default_cache_dir():
-    """The cache directory the hub readers / `make_cached_reader` use by default
+    """The cache directory the hub readers use by default
     ($WEBTORCH_CACHE or ~/.cache/webtorch/hub)."""
     return _default_hub_cache()
 
@@ -1477,7 +1487,7 @@ async def clear_cache(cache_dir=None, host=None):
     return n
 
 
-# ---- model-hub readers: thin clients of make_cached_reader over the HTTP transport ----
+# ---- model-hub readers: ready-made read callbacks over the HTTP transport ----
 def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
     hdr = {"Authorization": "Bearer " + token} if token else None
     async def fetch(url, offset, length): return await http_get(url, offset, length, hdr)
@@ -1492,13 +1502,13 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     tr = throttle_reads(fetch, max_parallel, http_rate_limited)
     if prefetch:
         tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    return make_cached_reader(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
+    return _cache_through(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
                               chunk_mb=chunk_mb, persist=persist)
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
             cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from the
-    **Hugging Face Hub** (a client of `make_cached_reader` over the HTTP transport). Install it,
+    **Hugging Face Hub**, caching as it goes. Install it,
     then load by repo id:
 
         webtorch.set_io_read(webtorch.hf_read())        # + set_io_write(...) only if quantizing
@@ -1526,7 +1536,7 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
 def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None,
                     cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from
-    **ModelScope (魔搭)** — another client of `make_cached_reader`. Same shape and options as
+    **ModelScope (魔搭)**, caching as it goes. Same shape and options as
     `hf_read` (incl. `persist=True` → IndexedDB-backed in the browser):
 
         webtorch.set_io_read(webtorch.modelscope_read())

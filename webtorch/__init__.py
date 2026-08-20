@@ -67,7 +67,7 @@ from .webio import (set_read_progress, get_read_progress,
                     set_download_progress, get_download_progress,
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
-                    make_cached_reader, throttle_reads, prefetch_whole_file, http_get, http_size, HttpError,
+                    throttle_reads, prefetch_whole_file, http_get, http_size, HttpError,
                     default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
                     write_cache, delete_cache, clear_cache)
 
@@ -95,7 +95,7 @@ __all__ = [
     "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
     # generic cached-reader tool (cache + read-ahead + adaptive concurrency + persistence) for
     # building your own read callback; hf_read/modelscope_read are clients of it
-    "make_cached_reader", "http_get", "http_size", "HttpError",
+    "http_get", "http_size", "HttpError",
     # persistent-cache management (list/read/write/delete, separated by host/domain)
     "default_cache_dir", "list_cache", "cache_hosts", "cache_size", "read_cache",
     "write_cache", "delete_cache", "clear_cache",

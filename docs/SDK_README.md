@@ -216,7 +216,7 @@ HF `…/resolve/{revision}/{path}`, ModelScope
 `name` is fetched as-is. Reads only — install a writer separately if you quantize.
 
 **Reusable tool.** The caching, read-ahead, adaptive concurrency, and persistence are generic:
-`webtorch.make_cached_reader(fetch, size=…, key=…, …)` wraps *any* async transport with all of
+`webtorch.read_cache` / `write_cache` are the cache; a read callback uses them, and that is all of
 it, and `hf_read`/`modelscope_read` are just clients supplying a repo-id→URL mapping. Build
 your own cached reader over S3 / a signed CDN / your own server with it — using
 `webtorch.http_get`/`http_size` as the HTTP transport and raising `webtorch.HttpError(status,

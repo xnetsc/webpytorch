@@ -372,7 +372,7 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
 
 **Build your own cached reader (generic tool).** The caching, background read-ahead, adaptive
 concurrency (see `max_parallel` below), and browser persistence are **not** hub-specific — they
-live in one reusable wrapper, `webtorch.make_cached_reader`, and `hf_read`/`modelscope_read`
+live inside the ready-made readers `hf_read`/`modelscope_read`, which
 are just clients of it (each supplies only a repo-id→URL mapping). Use it to give your own
 source (S3, a signed CDN, your own server, …) the same behavior:
 
