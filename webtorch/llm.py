@@ -178,6 +178,88 @@ class GenResult:
 
 
 # ----------------------------- model ---------------------------------------
+# One range request spans several of the IO layer's 16 MB chunks so they are fetched in
+# parallel; the fp32 expansion is done in _HEAD_BLK-row sub-blocks so it stays bounded
+# whatever the read size.
+_READ_BYTES = 64 << 20
+_HEAD_BLK = 4096
+
+
+class _RowTable:
+    """A 2-D weight that is only ever read by row, exposed with ndarray-style indexing.
+
+    Embedding and lm_head tables are indexed by token id -- a handful of rows per step, or
+    one block at a time when quantizing the head. Materializing the whole thing as a dense
+    (vocab, hidden) fp16 array is ~1.5 GB on a 27B, which 32-bit WASM refuses to allocate
+    as a single object. Subclasses supply `_rows`; indexing semantics match ndarray, so a
+    scalar gives (H,), a sequence gives (n, H) and a slice gives (n, H).
+    """
+
+    def __init__(self, nrows, H):
+        self.shape = (nrows, H)
+        self.dtype = np.float16
+
+    def __len__(self):
+        return self.shape[0]
+
+    def _rows(self, idx):
+        """Dense (len(idx), H) fp16 for the given row numbers."""
+        raise NotImplementedError
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return self._rows(np.arange(*idx.indices(self.shape[0])))
+        ids = np.asarray(idx, np.int64)
+        flat = np.atleast_1d(ids).ravel()
+        # Repeated ids are common in a prompt; fetch each distinct row once.
+        uniq, inv = np.unique(flat, return_inverse=True)
+        out = self._rows(uniq)[inv]
+        return out.reshape(ids.shape + (self.shape[1],)) if ids.ndim else out[0]
+
+
+class _QuantRows(_RowTable):
+    """Rows kept in their GGUF-quantized form and dequantized on lookup."""
+
+    dtype = np.float32                                         # rows arrive as fp32
+
+    def __init__(self, buf, gtype, H, row_nbytes, dequant):
+        raw = np.frombuffer(buf, np.uint8)
+        _RowTable.__init__(self, raw.size // row_nbytes, H)
+        self.raw = raw.reshape(self.shape[0], row_nbytes)      # a view, not a copy
+        self.gtype, self._dequant = gtype, dequant
+
+    def _rows(self, idx):
+        idx = np.asarray(idx, np.int64)
+        # Each row is an independent, block-aligned run of bytes, so gathering the wanted
+        # rows and dequantizing the result in ONE call is equivalent to a call per row --
+        # and avoids paying numpy's per-call overhead once per token, which dominates
+        # everything else at prompt length (measured 3.1s vs 12ms for 320 ids).
+        sel = self.raw[idx]                                    # (n, row_nbytes), contiguous
+        n, H = idx.size, self.shape[1]
+        # `sel` is handed to the dequantizer directly (it reads through the buffer
+        # protocol) and the fp32 it returns is handed on as-is: the caller wants fp32, so
+        # a detour through fp16 would be two conversions and two copies per token.
+        return self._dequant(self.gtype, sel, n * H).reshape(n, H)
+
+
+class _ChunkRows(_RowTable):
+    """Rows held as fp16 in several bounded blocks rather than one oversized array."""
+
+    def __init__(self, chunks, rpc, nrows, H):
+        _RowTable.__init__(self, nrows, H)
+        self.chunks, self.rpc = chunks, rpc
+
+    def _rows(self, idx):
+        idx = np.asarray(idx, np.int64)
+        out = np.empty((idx.size, self.shape[1]), np.float16)
+        # One vectorized gather per source block rather than a copy per row.
+        ch = idx // self.rpc
+        for c in np.unique(ch):
+            m = ch == c
+            out[m] = self.chunks[int(c)][idx[m] - int(c) * self.rpc]
+        return out
+
+
 class CausalLM:
     """Quantized causal LM (qwen2 family) with capture-accelerated decode.
 
@@ -356,7 +438,7 @@ class CausalLM:
         shard = self._idx[name]; h, base = await self._hdr(shard)
         info = h[name]; a, z = info["data_offsets"]; V, Hh = info["shape"]; dt = info["dtype"]
         esz = 2 if dt in ("F16", "BF16") else 4; row = Hh * esz
-        out = np.empty((V, Hh), np.float16); rpc = max(1, chunk_bytes // row)
+        rpc = max(1, chunk_bytes // row); chunks = []
         for v0 in range(0, V, rpc):
             v1 = min(V, v0 + rpc)
             raw = await self._rng(shard, base + a + v0 * row, base + a + v1 * row - 1)
@@ -366,8 +448,8 @@ class CausalLM:
                 arr = np.frombuffer(raw, np.float16)
             else:
                 arr = np.frombuffer(raw, np.float32)
-            out[v0:v1] = arr.reshape(v1 - v0, Hh).astype(np.float16)
-        return out
+            chunks.append(arr.reshape(v1 - v0, Hh).astype(np.float16))
+        return _ChunkRows(chunks, rpc, V, Hh)
 
     def _quantize_head(self, WVH, blk=4096):
         V, Hh = WVH.shape; blocks = []
@@ -443,6 +525,27 @@ class CausalLM:
         off = self._gds + t["offset"]
         raw = await self._grng(off, off + nb - 1)
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
+
+    async def _gexperts(self, name):
+        """Yield each expert of a stacked MoE tensor as fp32 (out,in), one at a time.
+
+        llama.cpp packs a layer's experts into a single `ffn_*_exps` tensor. Dequantizing
+        the whole stack costs ~800 MB of fp32 on a 128-expert layer, so experts are
+        converted individually -- but the packed bytes are fetched in ONE range request,
+        because a read per expert would turn three reads per layer into hundreds. Peak
+        cost is therefore the packed tensor (tens of MB) plus a single fp32 expert.
+        Quantization blocks run along `in`, and out*in is a whole number of blocks, so
+        every per-expert offset is block-aligned.
+        """
+        from . import ggufload as G
+        t = self._ginfo[name]
+        ne, out_d, in_d = (int(d) for d in reversed(t["dims"]))
+        per = out_d * in_d
+        nb = G.tensor_nbytes(t["type"], per)                  # bytes per expert
+        off = self._gds + t["offset"]
+        raw = await self._grng(off, off + nb * ne - 1)
+        for e in range(ne):
+            yield G.dequant(t["type"], raw[e * nb:(e + 1) * nb], per).reshape(out_d, in_d)
 
     def _gquant(self, W_out_in, bias=None):
         """fp32 (out,in) weight -> a linear layer. Quantized to int`bits` by default; with
@@ -591,26 +694,43 @@ class CausalLM:
         et = self._ginfo["token_embd.weight"]
         H = int(et["dims"][0]); V = int(et["dims"][1])
         erow = G.tensor_nbytes(et["type"], H); eoff = self._gds + et["offset"]
-        self.embed = np.empty((V, H), np.float16)
+        # The table is kept PACKED and read a row at a time (see _PackedRows): it is only
+        # ever indexed by token id, and a dense (V,H) fp16 copy is ~1.5 GB on a 27B --
+        # more than 32-bit WASM will hand out for a single array.
+        ebuf = np.empty(V * erow, np.uint8)
         tied = "output.weight" not in self._ginfo
         self.head = [] if tied else None
-        for v0 in range(0, V, 4096):
-            v1 = min(V, v0 + 4096)
+        # Read in big spans, not row counts: the IO layer splits a request into 16 MB
+        # pieces and runs several at once, so one large read keeps every fetch slot busy
+        # where a 4096-row read (a few MB) leaves them idle and pays the round trip per
+        # chunk. Head quantization still walks the span in bounded sub-blocks, because it
+        # is the fp32 expansion -- not the read -- that has to stay small.
+        rpr = max(_HEAD_BLK, (_READ_BYTES // erow) // _HEAD_BLK * _HEAD_BLK)
+        for v0 in range(0, V, rpr):
+            v1 = min(V, v0 + rpr)
             raw = await self._grng(eoff + v0 * erow, eoff + v1 * erow - 1)
-            fb = G.dequant(et["type"], raw, (v1 - v0) * H).reshape(v1 - v0, H)
-            self.embed[v0:v1] = fb.astype(np.float16)
-            if tied:
-                self.head.append(self._gquant(fb))            # (blk,H) = (out,in)
-            del fb
+            ebuf[v0 * erow:v1 * erow] = np.frombuffer(raw, np.uint8)
+            if tied:                                          # (blk,H) = (out,in)
+                for b0 in range(v0, v1, _HEAD_BLK):
+                    b1 = min(v1, b0 + _HEAD_BLK)
+                    fb = G.dequant(et["type"], raw[(b0 - v0) * erow:(b1 - v0) * erow],
+                                   (b1 - b0) * H).reshape(b1 - b0, H)
+                    self.head.append(self._gquant(fb))
+                    del fb
+        self.embed = _QuantRows(memoryview(ebuf.data).cast("B"), et["type"], H, erow, G.dequant)
         if not tied:                                          # separate lm_head, also streamed
             ot = self._ginfo["output.weight"]
             orow = G.tensor_nbytes(ot["type"], H); ooff = self._gds + ot["offset"]
             self.head = []
-            for v0 in range(0, V, 4096):
-                v1 = min(V, v0 + 4096)
+            orpr = max(_HEAD_BLK, (_READ_BYTES // orow) // _HEAD_BLK * _HEAD_BLK)
+            for v0 in range(0, V, orpr):                      # large reads, small expansions
+                v1 = min(V, v0 + orpr)
                 raw = await self._grng(ooff + v0 * orow, ooff + v1 * orow - 1)
-                fb = G.dequant(ot["type"], raw, (v1 - v0) * H).reshape(v1 - v0, H)
-                self.head.append(self._gquant(fb)); del fb
+                for b0 in range(v0, v1, _HEAD_BLK):
+                    b1 = min(v1, b0 + _HEAD_BLK)
+                    fb = G.dequant(ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow],
+                                   (b1 - b0) * H).reshape(b1 - b0, H)
+                    self.head.append(self._gquant(fb)); del fb
         self.layers = []
         for i in range(self.L):
             p = "blk.%d." % i
@@ -659,17 +779,18 @@ class CausalLM:
                     "o": await qb("attn_output"),
                     "qn": await opt_norm("attn_q_norm"), "kn": await opt_norm("attn_k_norm")})
             if (p + "ffn_gate_inp.weight") in self._ginfo:     # sparse-MoE block
-                # llama.cpp stacks experts: ffn_{gate,up,down}_exps = (n_experts, out, in)
-                gate_x = await self._gload(p + "ffn_gate_exps.weight")
-                up_x = await self._gload(p + "ffn_up_exps.weight")
-                down_x = await self._gload(p + "ffn_down_exps.weight")
-                ne = int(gate_x.shape[0])
+                # llama.cpp stacks experts: ffn_{gate,up,down}_exps = (n_experts, out, in).
+                # Taken one expert at a time -- see _gload_expert; the full stack does not
+                # fit, and only the packed result is kept.
+                ne = int(self._ginfo[p + "ffn_gate_exps.weight"]["dims"][-1])
+                experts = [{} for _ in range(ne)]
+                for key, nm in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"),
+                                ("down", "ffn_down_exps")):
+                    e = 0
+                    async for W in self._gexperts(p + nm + ".weight"):
+                        experts[e][key] = self._gquant(W); e += 1
                 lay["moe"] = {"gate": self._gquant(await self._gload(p + "ffn_gate_inp.weight")),
-                              "top_k": self.top_k or 2, "norm_topk": True,
-                              "experts": [{"gate": self._gquant(gate_x[e]),
-                                           "up": self._gquant(up_x[e]),
-                                           "down": self._gquant(down_x[e])} for e in range(ne)]}
-                del gate_x, up_x, down_x
+                              "top_k": self.top_k or 2, "norm_topk": True, "experts": experts}
             else:
                 lay["gate"] = await qb("ffn_gate"); lay["up"] = await qb("ffn_up")
                 lay["down"] = await qb("ffn_down")
@@ -859,7 +980,7 @@ class CausalLM:
         multimodal models use to splice image/audio embeddings into the sequence."""
         if embeds is not None:
             return wt.Tensor(np.asarray(embeds, np.float32))
-        return wt.Tensor(self.embed[np.asarray(ids, np.int64)].astype(np.float32))
+        return wt.Tensor(np.asarray(self.embed[np.asarray(ids, np.int64)], np.float32))
 
     def _reset_linear_state(self):
         """Clear every linear-attention layer's recurrent state (start of a generation)."""
@@ -905,7 +1026,7 @@ class CausalLM:
 
     def _set_inputs(self, token, pos):
         NKV, HD, LMAX = self.NKV, self.HD, self.lmax
-        self.h_in.data.buffer.set_data(self.embed[token].astype(np.float32))
+        self.h_in.data.buffer.set_data(np.asarray(self.embed[token], np.float32))
         c, s = self._rope_np(pos)
         self.cos_b.data.buffer.set_data(c.reshape(-1)); self.sin_b.data.buffer.set_data(s.reshape(-1))
         m = np.zeros((1, 1, LMAX), np.float32); m[0, 0, pos + 1:] = -1e9
