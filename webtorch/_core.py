@@ -133,6 +133,11 @@ class Tensor:
         out._backward = _backward
         return out
 
+    def __getitem__(self, idx):
+        """Slice a tensor. Inference-only: the result is detached and materialized, since a
+        strided view is not something the GPU kernels can be handed."""
+        return Tensor(_contig(self.data[idx]))
+
     def sum(self, axis=None, keepdims=False):
         if axis is None:
             out = Tensor(self.data.sum().reshape(()), self.requires_grad, (self,), "sum")
@@ -3964,6 +3969,114 @@ def _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0, block
         out[:, c0:c1] = x @ w
         del q, z, w
     return out
+
+
+# ---- Gated DeltaNet recurrence on the GPU -----------------------------------------
+# The recurrent state S is (heads, Dk, Dv) and every decode step reads it, writes it, and
+# reads it again. Done on the host that is three passes over a few megabytes plus a round
+# trip for each of the layer's projections -- on a 27B, 48 such layers dominate a token.
+#
+# Kept on the GPU it is two dispatches, because the output can be written from the OLD
+# state. Substituting the update into the read gives
+#
+#   out = decay * (q . S_old) + delta * (q . k)
+#
+# so the (head, v) pass computes both contractions it needs from S_old, and the (head, k, v)
+# pass updates S independently. Neither has to wait for the other's result.
+_GDN_STEP_WGSL = """@group(0) @binding(0)
+var<storage,read> S: array<f32>;
+@group(0) @binding(1)
+var<storage,read> qkv: array<f32>;
+@group(0) @binding(2)
+var<storage,read_write> od: array<f32>;
+struct GD { hv: u32, dk: u32, dv: u32, rep: u32, }
+@group(0) @binding(3)
+var<storage,read> gd: GD;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let n = gd.hv * gd.dv;
+  if (i >= n) { return; }
+  let h = i / gd.dv;
+  let vi = i % gd.dv;
+  // qkv packs q | k | v | decay | beta for this token. Several value heads share one
+  // key head, so the grouping is resolved here rather than by materializing repeats.
+  let nq = (gd.hv / gd.rep) * gd.dk;
+  let qo = (h / gd.rep) * gd.dk;
+  let ko = nq + qo;
+  let vo = 2u * nq + h * gd.dv;
+  let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
+  let bta = qkv[2u * nq + gd.hv * gd.dv + gd.hv + h];
+  let sbase = h * gd.dk * gd.dv + vi;
+  var pred: f32 = 0.0;
+  var qs: f32 = 0.0;
+  var qk: f32 = 0.0;
+  for (var d: u32 = 0u; d < gd.dk; d = d + 1u) {
+    let sv = S[sbase + d * gd.dv];
+    let kd = qkv[ko + d];
+    let qd = qkv[qo + d];
+    pred = pred + kd * sv;
+    qs = qs + qd * sv;
+    qk = qk + qd * kd;
+  }
+  let delta = (qkv[vo + vi] - dcy * pred) * bta;
+  od[i] = dcy * qs + delta * qk;          // output, from the old state
+  od[n + i] = delta;                      // handed to the update pass
+}
+"""
+
+# S = S * decay + outer(k, delta), one thread per state element.
+_GDN_UPD_WGSL = """@group(0) @binding(0)
+var<storage,read_write> S: array<f32>;
+@group(0) @binding(1)
+var<storage,read> qkv: array<f32>;
+@group(0) @binding(2)
+var<storage,read> od: array<f32>;
+struct GD { hv: u32, dk: u32, dv: u32, rep: u32, }
+@group(0) @binding(3)
+var<storage,read> gd: GD;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= gd.hv * gd.dk * gd.dv) { return; }
+  let h = i / (gd.dk * gd.dv);
+  let rem = i % (gd.dk * gd.dv);
+  let d = rem / gd.dv;
+  let vi = rem % gd.dv;
+  let nq = (gd.hv / gd.rep) * gd.dk;
+  let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
+  S[i] = S[i] * dcy + qkv[nq + (h / gd.rep) * gd.dk + d] * od[gd.hv * gd.dv + h * gd.dv + vi];
+}
+"""
+
+_gdn_k = {"added": False}
+
+
+def gdn_step(S, qkv, hv, dk, dv, rep=1):
+    """One Gated-DeltaNet step, entirely on the GPU.
+
+    `S` is the (hv, dk, dv) state, updated in place; `qkv` packs q | k | v | decay | beta
+    for this token, with q and k stored per KEY head (`rep` value heads share each).
+    Returns the (hv*dv,) output."""
+    plat = _adam_kernel["platform"]
+    if not _gdn_k["added"]:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel("gdn_step", {"source": _GDN_STEP_WGSL, "bindingTypes": [ro, ro, rw, ro]})
+        plat.addKernel("gdn_upd", {"source": _GDN_UPD_WGSL, "bindingTypes": [rw, ro, ro, ro]})
+        _gdn_k["added"] = True
+    n = hv * dv
+    od = _empty((2 * n,))                       # [output | delta]
+    meta = _adam_kernel["make_meta"]((hv, dk, dv, max(1, rep)), "u4,u4,u4,u4")
+    plat.runKernel({"name": "gdn_step",
+                    "tensors": [S.buffer.buffer_id, qkv.buffer.buffer_id,
+                                od.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    tot = hv * dk * dv
+    plat.runKernel({"name": "gdn_upd",
+                    "tensors": [S.buffer.buffer_id, qkv.buffer.buffer_id,
+                                od.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (tot + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(od[:n])
 
 
 class GGMLLinear(Module):

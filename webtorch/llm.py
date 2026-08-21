@@ -1394,8 +1394,10 @@ class CausalLM:
         """Run a linear-attention layer's recurrence -> (T, H) Tensor. The per-layer state lives
         in `self.lin_state[i]`, so prefill and incremental decode share one implementation."""
         st = self.lin_state[i]
-        y = lay["linear"].forward(x.numpy() if hasattr(x, "numpy") else np.asarray(x), st)
-        return wt.Tensor(np.asarray(y, np.float32))
+        # Hand the Tensor over as-is: the layer's decode path stays on the device, and
+        # pulling it to the host here would undo that.
+        y = lay["linear"].forward(x, st)
+        return y if isinstance(y, wt.Tensor) else wt.Tensor(np.asarray(y, np.float32))
 
     def _prefill(self, ids, embeds=None):
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax

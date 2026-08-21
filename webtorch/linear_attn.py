@@ -31,11 +31,35 @@ class LinearAttentionState:
     def __init__(self, n_v_heads, k_dim, v_dim, conv_width, conv_channels):
         self.S = np.zeros((n_v_heads, k_dim, v_dim), np.float32)
         self.conv = np.zeros((conv_width - 1, conv_channels), np.float32) if conv_width > 1 else None
+        # A GPU copy exists only while the GPU path is driving. Whichever side was written
+        # last is the authoritative one, and asking for the other syncs it -- so prefill on
+        # the host and decode on the device can be mixed without either going stale.
+        self._gpu = None
 
     def reset(self):
         self.S[:] = 0.0
         if self.conv is not None:
             self.conv[:] = 0.0
+        self._gpu = None
+
+    def gpu(self):
+        """State on the device: (S, conv) as GPU arrays, uploading if the host wrote last."""
+        if self._gpu is None:
+            # S is handed straight to a kernel, so it stays a raw device array; the conv
+            # ring buffer goes through tensor ops, so it is a Tensor.
+            self._gpu = [wt.xp.asarray(self.S.reshape(-1)),
+                         None if self.conv is None else wt.Tensor(wt.xp.asarray(self.conv))]
+        return self._gpu
+
+    def host(self):
+        """State on the host, downloading if the device wrote last."""
+        if self._gpu is not None:
+            g = self._gpu
+            self.S = np.asarray(wt.cp.asnumpy(g[0]), np.float32).reshape(self.S.shape)
+            if self.conv is not None and g[1] is not None:
+                self.conv = np.asarray(g[1].numpy(), np.float32).reshape(self.conv.shape)
+            self._gpu = None
+        return self
 
 
 def causal_conv1d(x, weight, bias=None, state=None):
@@ -156,10 +180,139 @@ class LinearAttention:
             y = f(np.asarray(x, np.float32))
         return np.asarray(y.numpy() if hasattr(y, "numpy") else y, np.float32)
 
+    # ---- GPU decode path ------------------------------------------------------------
+    # Same recurrence, but nothing leaves the device. The host path costs five GPU round
+    # trips per layer for the projections alone -- measured at 4.6 ms for one that takes
+    # 1.6 ms to compute -- and a 27B has 48 of these layers per token. Only the batch-of-one
+    # step is done this way: prefill batches its projections already, and its recurrence is
+    # sequential either way.
+
+    def _t(self, name, xt):
+        f = self.w.get(name)
+        return None if f is None else f(xt)
+
+    @staticmethod
+    def _softplus_t(t):
+        # max(x,0) + log1p(exp(-|x|)) -- the stable form, in terms of ops the Tensor has
+        return t.relu() + ((-(t.abs())).exp() + 1.0).log()
+
+    @staticmethod
+    def _l2norm_t(t, heads, dim, eps):
+        r = t.reshape(heads, dim)
+        return r / ((r * r).sum(axis=-1, keepdims=True) + eps).sqrt()
+
+    def _step_gpu(self, xt, state):
+        """One token, everything on the device. `xt` is a (1, H) Tensor -> (1, H) Tensor."""
+        nq = self.hk * self.dk
+        nv = self.hv * self.dv
+        if self.w.get("qkv") is not None:
+            flat = self._t("qkv", xt).reshape(-1)
+            q, k, v = flat[:nq], flat[nq:2 * nq], flat[2 * nq:2 * nq + nv]
+        else:
+            q = self._t("q", xt).reshape(-1)[:nq]
+            k = self._t("k", xt).reshape(-1)[:nq]
+            v = self._t("v", xt).reshape(-1)[:nv]
+        g = state.gpu()
+        if self.conv_width > 1 and self.w.get("conv_w") is not None:
+            cw = self._conv_w_t()                       # (W, C) on the device
+            cur = wt.cat([q, k, v], axis=0).reshape(1, -1)
+            hist = cur if g[1] is None else wt.cat([g[1], cur], axis=0)
+            mixed = (hist * cw).sum(axis=0)
+            if self.w.get("conv_b") is not None:
+                mixed = mixed + self._conv_b_t()
+            mixed = wt.silu(mixed)
+            g[1] = wt.Tensor(wt._contig(hist.data[1:]))
+            q, k, v = mixed[:nq], mixed[nq:2 * nq], mixed[2 * nq:2 * nq + nv]
+        q = self._l2norm_t(q, self.hk, self.dk, self.eps) * (1.0 / math.sqrt(self.dk))
+        k = self._l2norm_t(k, self.hk, self.dk, self.eps)
+        b_raw = self._t("beta", xt)
+        beta = (b_raw.reshape(-1)[:self.hv].sigmoid() if b_raw is not None
+                else wt.Tensor(np.ones((self.hv,), np.float32)))
+        a_raw = self._t("alpha", xt)
+        if a_raw is not None:
+            a = a_raw.reshape(-1)
+            if self._dtb_t() is not None:
+                a = a + self._dtb_t()
+            gate = self._softplus_t(a)
+            if self._A_t() is not None:
+                gate = gate * self._A_t()
+            decay = (-((-gate).relu())).exp()            # exp(min(gate, 0)); A <= 0
+            decay = decay.reshape(-1)[:self.hv]
+        else:
+            decay = wt.Tensor(np.ones((self.hv,), np.float32))
+        packed = wt.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1),
+                         decay.reshape(-1), beta.reshape(-1)], axis=0)
+        out = wt.gdn_step(g[0], wt._contig(packed.data), self.hv, self.dk, self.dv, self.rep)
+        if self.w.get("norm") is not None:
+            gw = self._norm_t()
+            if self._norm_per_head:
+                o = out.reshape(self.hv, self.dv)
+                out = (o / ((o * o).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * gw
+            else:
+                o = out.reshape(1, -1)
+                out = (o / ((o * o).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * gw
+        y = out.reshape(1, nv)
+        gp = self._t("g", xt)
+        if gp is not None:
+            y = y * wt.silu(gp.reshape(1, -1)[:, :nv])
+        o = self.w.get("o")
+        return y if o is None else o(y)
+
+    def _cache_t(self, key, build):
+        c = self.__dict__.setdefault("_tcache", {})
+        if key not in c:
+            c[key] = build()
+        return c[key]
+
+    def _conv_w_t(self):
+        return self._cache_t("cw", lambda: wt.Tensor(
+            np.ascontiguousarray(np.asarray(self.w["conv_w"], np.float32).T)))
+
+    def _conv_b_t(self):
+        return self._cache_t("cb", lambda: wt.Tensor(
+            np.asarray(self.w["conv_b"], np.float32).reshape(-1)))
+
+    def _dtb_t(self):
+        d = self.w.get("dt_bias")
+        return None if d is None else self._cache_t(
+            "dtb", lambda: wt.Tensor(np.asarray(d, np.float32).reshape(-1)))
+
+    def _A_t(self):
+        a = self.w.get("A")
+        return None if a is None else self._cache_t(
+            "A", lambda: wt.Tensor(np.asarray(a, np.float32).reshape(-1)))
+
+    def _norm_t(self):
+        gw = np.asarray(self.w["norm"], np.float32).reshape(-1)
+        self._norm_per_head = gw.size == self.dv
+        return self._cache_t("nrm", lambda: wt.Tensor(
+            gw.reshape(1, self.dv) if gw.size == self.dv else gw.reshape(1, -1)))
+
+    # Off by default, and measured rather than assumed. Keeping the step on the device is
+    # only worth it once it is FUSED: every tensor op here costs 0.3-0.9 ms of fixed
+    # dispatch overhead in this runtime -- near enough the same for 256 elements as for
+    # 260k, so it is the call, not the data -- and the step in its unfused form is ~50 of
+    # them, which came out slower (28.2 ms) than doing the whole thing in numpy (24.8 ms).
+    # The recurrence kernels below are verified correct to 4e-7 across steps and stay here
+    # for the fused version; flipping this on without fusing makes decode slower.
+    _GDN_GPU = False
+
+    def _gpu_step_ok(self):
+        """Is every piece this layer uses available on the device?"""
+        if not self._GDN_GPU or not wt._adam_backend_ready():
+            return False
+        return all(not callable(self.w.get(n)) or hasattr(self.w.get(n), "forward")
+                   for n in ("qkv", "q", "k", "v", "beta", "alpha", "g", "o")
+                   if self.w.get(n) is not None)
+
     def forward(self, x, state):
         """x: (T, H) ndarray -> (T, H). Sequential over T (the recurrence is inherently
         sequential); prefill and single-token decode use the same code."""
-        x = np.asarray(x, np.float32)
+        if getattr(x, "shape", (0,))[0] == 1 and self._gpu_step_ok():
+            xt = x if isinstance(x, wt.Tensor) else wt.Tensor(np.asarray(x, np.float32))
+            return self._step_gpu(xt.reshape(1, -1), state)
+        state = state.host()                       # host path owns the state from here
+        x = np.asarray(x.numpy() if hasattr(x, "numpy") else x, np.float32)
         T = x.shape[0]
         nq = self.hk * self.dk; nk = nq
         if self.w.get("qkv") is not None:          # single fused [q|k|v] projection
