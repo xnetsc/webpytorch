@@ -2900,34 +2900,64 @@ fn HF(h: u32) -> f32 {
 # activations straight from global memory -- with a batch to amortize, there is enough work
 # in flight to hide that.
 _GGML_GEMM_PRE = """
-var<private> acc: array<f32, 4>;
+var<workgroup> psum: array<f32, KSGx256>;
+var<private> a0: f32;
+var<private> a1: f32;
+var<private> a2: f32;
+var<private> a3: f32;
 var<private> mb: u32;
 var<private> mn: u32;
+// Separate scalars, not array<f32,4>. A private array indexed by a loop variable is not
+// guaranteed to live in registers, and here it did not: the batched matmul cost time
+// strictly proportional to the batch (12.3 / 35.5 / 94.2 ms at M = 8 / 24 / 64) because
+// every accumulate went to memory. Widening the rows per thread made it worse, which is
+// what ruled out the decode being the expensive part. gemv was always fast for the same
+// reason in reverse -- it accumulates into one scalar.
 fn ACC(k: u32, v: f32) {
-  for (var r: u32 = 0u; r < mn; r = r + 1u) {
-    acc[r] = acc[r] + x[(mb + r) * gm.K + k] * v;
-  }
+  let b = mb * gm.K + k;
+  a0 = a0 + x[b] * v;
+  if (mn > 1u) { a1 = a1 + x[b + gm.K] * v; }
+  if (mn > 2u) { a2 = a2 + x[b + 2u * gm.K] * v; }
+  if (mn > 3u) { a3 = a3 + x[b + 3u * gm.K] * v; }
 }
 """
 
 _GGML_GEMM_MAIN = """
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(64, KSGu)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
   let n = gid.x;
-  mb = gid.y * 4u;
-  if (n >= gm.N || mb >= gm.M) { return; }
-  mn = min(4u, gm.M - mb);
-  acc = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+  let lx = lid.x;
+  let ly = lid.y;
+  mb = gid.z * 4u;
+  mn = select(0u, min(4u, gm.M - mb), mb < gm.M);
+  a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
   let base = n * gm.rowb;
   let nb = gm.K / BLKVALS;
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+  let livec = (n < gm.N && mn > 0u);
+  if (livec) {
+    for (var b: u32 = ly; b < nb; b = b + KSGu) {
 """
 
 _GGML_GEMM_TAIL = """
+    }
   }
-  for (var r: u32 = 0u; r < mn; r = r + 1u) { outp[(mb + r) * gm.N + n] = acc[r]; }
+  let pb = (ly * 64u + lx) * 4u;
+  psum[pb] = a0; psum[pb + 1u] = a1; psum[pb + 2u] = a2; psum[pb + 3u] = a3;
+  workgroupBarrier();
+  if (ly == 0u && livec) {
+    for (var r: u32 = 0u; r < mn; r = r + 1u) {
+      var tot: f32 = 0.0;
+      for (var i: u32 = 0u; i < KSGu; i = i + 1u) {
+        tot = tot + psum[(i * 64u + lx) * 4u + r];
+      }
+      outp[(mb + r) * gm.N + n] = tot;
+    }
+  }
 }
 """
+
+_GGML_KSG = 2               # split-K rows on the batched path
 
 # GEMV (decode, batch of one): the shape where the naive kernel loses. Two things fix it,
 # both of which ggml blocks happen to suit. Blocks are independent, so KS rows of threads
@@ -3581,6 +3611,7 @@ def _ggml_src(type_name, gemv):
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
     src = _GGML_BIND + helpers + pre + main + dec + tail
     for k, v in (("KSxBLK", str(_GGML_KS * vals)), ("KSx64", str(_GGML_KS * 64)),
+                 ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
                  ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
                  ("BLKVALS", "%uu" % vals)):
         src = src.replace(k, v)
@@ -3673,8 +3704,8 @@ def _ggml_run(xf, packed, type_name, K, N):
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": (N + 63) // 64,
-                                   "y": 1 if M == 1 else (M + 3) // 4, "z": 1}})
+                    "workGroups": {"x": (N + 63) // 64, "y": 1,
+                                   "z": 1 if M == 1 else (M + 3) // 4}})
     return of
 
 
