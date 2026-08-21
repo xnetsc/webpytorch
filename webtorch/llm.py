@@ -402,6 +402,7 @@ class CausalLM:
         self.base = (base.rstrip("/") + "/") if base else ""
         self.capture_ready = False
         # Sampling state, so a forward called outside generate() still works.
+        self.mtp = None             # multi-token-prediction head, when the file has one
         self._seen = []
         self._gen_start = 0
         self._con_text = ""
@@ -1091,10 +1092,90 @@ class CausalLM:
                 lay["down"] = await qb("ffn_down")
             self.layers.append(lay)
         self.final_norm = wt.Tensor(await self._gload("output_norm.weight"))
+        self.mtp = await self._gload_mtp()
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
         self._init_state()
         return self
+
+    async def _gload_mtp(self):
+        """Load a multi-token-prediction head, if the file ships one. None otherwise.
+
+        Found by tensor name rather than by architecture: a NextN/MTP block is an extra
+        decoder block past the trunk whose distinguishing tensor is `nextn.eh_proj`, and
+        DeepSeek-V3, Qwen3.5 and GLM all lay it out that way. Everything else in the block
+        is an ordinary attention layer, and the pieces it does not carry -- its own
+        embedding table, its own LM head -- fall back to the trunk's.
+        """
+        pre = next(("blk.%d." % i for i in range(self.L, self.L + 8)
+                    if ("blk.%d.nextn.eh_proj.weight" % i) in self._ginfo), None)
+        if pre is None:
+            return None
+
+        async def qb(nm):
+            b = ((await self._gload(pre + nm + ".bias"))
+                 if (pre + nm + ".bias") in self._ginfo else None)
+            return await self._gload_quant(pre + nm + ".weight", b)
+
+        async def opt_qb(nm):
+            return (await qb(nm)) if (pre + nm + ".weight") in self._ginfo else None
+
+        async def opt_t(nm):
+            n = pre + nm + ".weight"
+            return wt.Tensor(await self._gload(n)) if n in self._ginfo else None
+
+        post = next((n for n in ("ffn_norm", "post_attention_norm")
+                     if (pre + n + ".weight") in self._ginfo), None)
+        m = {"eh": await qb("nextn.eh_proj"),
+             "enorm": await opt_t("nextn.enorm"), "hnorm": await opt_t("nextn.hnorm"),
+             "in_ln": await opt_t("attn_norm"),
+             "post_ln": (await opt_t(post)) if post else None,
+             "qkv": await opt_qb("attn_qkv"),
+             "q": await opt_qb("attn_q"), "k": await opt_qb("attn_k"),
+             "v": await opt_qb("attn_v"), "o": await opt_qb("attn_output"),
+             "qn": await opt_t("attn_q_norm"), "kn": await opt_t("attn_k_norm"),
+             "gate": await opt_qb("ffn_gate"), "up": await opt_qb("ffn_up"),
+             "down": await opt_qb("ffn_down"),
+             "head_norm": await opt_t("nextn.shared_head_norm"),
+             "head": await opt_qb("nextn.shared_head_head")}
+        if m["eh"] is None or m["q"] is None or m["o"] is None:
+            return None                       # incomplete; run without it
+        return m
+
+    def mtp_logits(self, h_last, token, pos, cache):
+        """Predict the token AFTER `token`, from the trunk's last hidden state.
+
+        `h_last` is the trunk's final hidden for the position that produced `token`; the
+        head combines it with that token's embedding and runs one more decoder block. This
+        is the draft step of speculative decoding -- one layer against the trunk's many.
+        """
+        m = self.mtp
+        if m is None:
+            return None
+        e = wt.Tensor(np.asarray(self.embed[int(token)], np.float32).reshape(1, self.H))
+        pair = wt.cat([self._rms(e, m["enorm"]) if m["enorm"] is not None else e,
+                       self._rms(h_last, m["hnorm"]) if m["hnorm"] is not None else h_last],
+                      axis=-1)
+        h = m["eh"](pair)
+        lay = {"q": m["q"], "k": m["k"], "v": m["v"], "o": m["o"],
+               "qn": m["qn"], "kn": m["kn"], "gate": m["gate"], "up": m["up"],
+               "down": m["down"]}
+        x = self._rms(h, m["in_ln"]) if m["in_ln"] is not None else h
+        c, sn = self._rope_np(pos, 1)
+        cos_t, sin_t = wt.Tensor(c), wt.Tensor(sn)
+        q, k, v = self._qkv(lay, x, 1)
+        q = q * cos_t + self._rot(q) * sin_t
+        k = k * cos_t + self._rot(k) * sin_t
+        sc = 1.0 / math.sqrt(self.HD)
+        h = h + self._attn_out(lay, cache.attn(0, q, k, v, pos, scale=sc), 1)
+        if m["post_ln"] is not None:
+            x = self._rms(h, m["post_ln"])
+            h = h + self._mlp(lay, x)
+        hn = m["head_norm"] if m["head_norm"] is not None else self.final_norm
+        fin = self._rms(h, hn)
+        if m["head"] is not None:
+            return np.asarray(m["head"](fin).numpy()).reshape(-1)
+        return self._logits(wt.Tensor(wt._contig(fin.data[-1:])))
 
     # ---- fp16 (plain HF safetensors) loading: run UNquantized, or quantize on load ----
     def _mklin(self, W_out_in, bias=None):

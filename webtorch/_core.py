@@ -2920,6 +2920,16 @@ fn ACC(k: u32, v: f32) {
   if (mn > 2u) { a2 = a2 + x[b + 2u * gm.K] * v; }
   if (mn > 3u) { a3 = a3 + x[b + 3u * gm.K] * v; }
 }
+fn ACC4(k: u32, v: vec4<f32>) {
+  let b = mb * gm.K + k;
+  a0 = a0 + dot(vec4<f32>(x[b], x[b + 1u], x[b + 2u], x[b + 3u]), v);
+  if (mn > 1u) { let c = b + gm.K;
+    a1 = a1 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
+  if (mn > 2u) { let c = b + 2u * gm.K;
+    a2 = a2 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
+  if (mn > 3u) { let c = b + 3u * gm.K;
+    a3 = a3 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
+}
 """
 
 _GGML_GEMM_MAIN = """
@@ -2971,6 +2981,10 @@ var<workgroup> psum: array<f32, KSx64>;
 var<private> acc0: f32;
 var<private> xoff: u32;
 fn ACC(k: u32, v: f32) { acc0 = acc0 + xs[xoff + (k & MASKBLK)] * v; }
+fn ACC4(k: u32, v: vec4<f32>) {
+  let i = xoff + (k & MASKBLK);
+  acc0 = acc0 + dot(vec4<f32>(xs[i], xs[i + 1u], xs[i + 2u], xs[i + 3u]), v);
+}
 """
 
 _GGML_GEMV_MAIN = """
@@ -3209,6 +3223,10 @@ _GRID_FN = """
 var<storage,read> gr: array<u32>;
 fn GB(o: u32) -> u32 { return (gr[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
 fn G4(idx: u32) -> u32 { return gr[32u + idx]; }        // one 4-byte entry, one read
+fn G4V(idx: u32) -> vec4<f32> { return unpack4x8unorm(gr[32u + idx]) * 255.0; }
+fn SGN4(mask: u32, j0: u32) -> vec4<f32> {
+  return vec4<f32>(SGN(mask, j0), SGN(mask, j0 + 1u), SGN(mask, j0 + 2u), SGN(mask, j0 + 3u));
+}
 fn BY(w: u32, q: u32) -> f32 { return f32((w >> (8u * q)) & 255u); }
 fn GI8(o: u32) -> f32 { return f32(i32(GB(o) << 24u) >> 24u); }
 fn SGN(mask: u32, j: u32) -> f32 { return select(1.0, -1.0, (mask & (1u << j)) != 0u); }
@@ -3298,13 +3316,9 @@ _IQ3XXS_DEC = """
       let db = d * (0.5 + f32(a1 >> 28u)) * 0.5;
       let k0 = kb + ib * 32u;
       for (var p: u32 = 0u; p < 8u; p = p + 1u) {
-        let gw = G4(B(o + 2u + ib * 8u + p));
         let f0 = p * 4u;
-        for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-          let flat = f0 + q;
-          let sm = GB((a1 >> (7u * (flat >> 3u))) & 127u);
-          ACC(k0 + flat, db * BY(gw, q) * SGN(sm, flat & 7u));
-        }
+        let sm = GB((a1 >> (7u * (f0 >> 3u))) & 127u);
+        ACC4(k0 + f0, G4V(B(o + 2u + ib * 8u + p)) * SGN4(sm, f0 & 7u) * db);
       }
     }
 """
@@ -3323,13 +3337,11 @@ _IQ3S_DEC = """
       let qh = B(o + 66u + ib);
       let k0 = kb + ib * 32u;
       for (var p: u32 = 0u; p < 8u; p = p + 1u) {
-        let gw = G4(B(o + 2u + ib * 8u + p) | ((qh << (8u - p)) & 256u));
         let f0 = p * 4u;
         // f0 is a multiple of four, so all four values share one sign byte
         let sm = B(o + 74u + ib * 4u + (f0 >> 3u));
-        for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-          ACC(k0 + f0 + q, db * BY(gw, q) * SGN(sm, (f0 + q) & 7u));
-        }
+        ACC4(k0 + f0, G4V(B(o + 2u + ib * 8u + p) | ((qh << (8u - p)) & 256u))
+                      * SGN4(sm, f0 & 7u) * db);
       }
     }
 """
