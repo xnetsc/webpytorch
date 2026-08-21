@@ -553,6 +553,17 @@ class CausalLM:
         raw = await self._grng(off, off + nb - 1)
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
 
+    def _head_block(self, ttype, chunk, rows, H):
+        """One block of the LM head as a Linear. Native when the type allows it, which keeps
+        the head off the conversion path too -- it is (vocab, H), the largest single tensor
+        in most models, and expanding it to fp32 is what forces the block-at-a-time walk."""
+        from . import ggufload as G
+        nm = G.GGML_NAMES.get(ttype)
+        if (getattr(self, "_weights", "native") == "native"
+                and wt.ggml_native_supported(nm) and H % wt._GGML_TYPES[nm][2] == 0):
+            return wt.GGMLLinear(chunk, nm, H, rows)
+        return self._gquant(G.dequant(ttype, chunk, rows * H).reshape(rows, H))
+
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
 
@@ -849,10 +860,8 @@ class CausalLM:
             if tied:                                          # (blk,H) = (out,in)
                 for b0 in range(v0, v1, _HEAD_BLK):
                     b1 = min(v1, b0 + _HEAD_BLK)
-                    fb = G.dequant(et["type"], raw[(b0 - v0) * erow:(b1 - v0) * erow],
-                                   (b1 - b0) * H).reshape(b1 - b0, H)
-                    self.head.append(self._gquant(fb))
-                    del fb
+                    self.head.append(self._head_block(
+                        et["type"], raw[(b0 - v0) * erow:(b1 - v0) * erow], b1 - b0, H))
         self.embed = _QuantRows(memoryview(ebuf.data).cast("B"), et["type"], H, erow, G.dequant)
         if not tied:                                          # separate lm_head, also streamed
             ot = self._ginfo["output.weight"]
@@ -864,9 +873,8 @@ class CausalLM:
                 raw = await self._grng(ooff + v0 * orow, ooff + v1 * orow - 1)
                 for b0 in range(v0, v1, _HEAD_BLK):
                     b1 = min(v1, b0 + _HEAD_BLK)
-                    fb = G.dequant(ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow],
-                                   (b1 - b0) * H).reshape(b1 - b0, H)
-                    self.head.append(self._gquant(fb)); del fb
+                    self.head.append(self._head_block(
+                        ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow], b1 - b0, H))
         self.layers = []
         for i in range(self.L):
             p = "blk.%d." % i
