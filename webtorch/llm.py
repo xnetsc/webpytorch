@@ -285,6 +285,11 @@ class GenResult:
 # whatever the read size.
 _READ_BYTES = 64 << 20
 _HEAD_BLK = 4096
+# On the native path the head is never expanded to fp32, so the block size is not bounded by
+# a working set -- only by how much packed data to hold at once. 61 small matmuls cost far
+# more than a few large ones: the head is the single biggest tensor in the model and gets
+# multiplied every token.
+_HEAD_BLK_NATIVE = 65536
 
 
 def _source_bits(infos, G):
@@ -655,6 +660,14 @@ class CausalLM:
         raw = await self._grng(off, off + nb - 1)
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
 
+    def _head_blk(self, ttype, H):
+        """Rows per head block: large when nothing has to be expanded, small when it does."""
+        from . import ggufload as G
+        nm = G.GGML_NAMES.get(ttype)
+        native = (getattr(self, "_weights", "native") == "native"
+                  and wt.ggml_native_supported(nm) and H % wt._GGML_TYPES[nm][2] == 0)
+        return _HEAD_BLK_NATIVE if native else _HEAD_BLK
+
     def _head_block(self, ttype, chunk, rows, H):
         """One block of the LM head as a Linear. Native when the type allows it, which keeps
         the head off the conversion path too -- it is (vocab, H), the largest single tensor
@@ -1004,14 +1017,16 @@ class CausalLM:
         # where a 4096-row read (a few MB) leaves them idle and pays the round trip per
         # chunk. Head quantization still walks the span in bounded sub-blocks, because it
         # is the fp32 expansion -- not the read -- that has to stay small.
-        rpr = max(_HEAD_BLK, (_READ_BYTES // erow) // _HEAD_BLK * _HEAD_BLK)
+        _ehb = self._head_blk(et["type"], H)
+        rpr = max(_ehb, (_READ_BYTES // erow) // _ehb * _ehb)
         for v0 in range(0, V, rpr):
             v1 = min(V, v0 + rpr)
             raw = await self._grng(eoff + v0 * erow, eoff + v1 * erow - 1)
             ebuf[v0 * erow:v1 * erow] = np.frombuffer(raw, np.uint8)
             if tied:                                          # (blk,H) = (out,in)
-                for b0 in range(v0, v1, _HEAD_BLK):
-                    b1 = min(v1, b0 + _HEAD_BLK)
+                hb = self._head_blk(et["type"], H)
+                for b0 in range(v0, v1, hb):
+                    b1 = min(v1, b0 + hb)
                     self.head.append(self._head_block(
                         et["type"], raw[(b0 - v0) * erow:(b1 - v0) * erow], b1 - b0, H))
         self.embed = _QuantRows(memoryview(ebuf.data).cast("B"), et["type"], H, erow, G.dequant)
@@ -1019,12 +1034,14 @@ class CausalLM:
             ot = self._ginfo["output.weight"]
             orow = G.tensor_nbytes(ot["type"], H); ooff = self._gds + ot["offset"]
             self.head = []
-            orpr = max(_HEAD_BLK, (_READ_BYTES // orow) // _HEAD_BLK * _HEAD_BLK)
+            _ohb = self._head_blk(ot["type"], H)
+            orpr = max(_ohb, (_READ_BYTES // orow) // _ohb * _ohb)
             for v0 in range(0, V, orpr):                      # large reads, small expansions
                 v1 = min(V, v0 + orpr)
                 raw = await self._grng(ooff + v0 * orow, ooff + v1 * orow - 1)
-                for b0 in range(v0, v1, _HEAD_BLK):
-                    b1 = min(v1, b0 + _HEAD_BLK)
+                hb = self._head_blk(ot["type"], H)
+                for b0 in range(v0, v1, hb):
+                    b1 = min(v1, b0 + hb)
                     self.head.append(self._head_block(
                         ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow], b1 - b0, H))
         self.layers = []

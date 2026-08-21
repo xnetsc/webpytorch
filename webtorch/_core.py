@@ -2976,14 +2976,20 @@ _GGML_KSG = 2               # split-K rows on the batched path
 # 64 threads in a row want the SAME activations, so a block's worth is staged in workgroup
 # memory once instead of being re-read from global memory 64 times.
 _GGML_GEMV_PRE = """
-var<workgroup> xs: array<f32, KSxBLK>;
-var<workgroup> psum: array<f32, KSx64>;
+var<workgroup> xs: array<f32, KSxBLKxR>;
+var<workgroup> psum: array<f32, KSx64xR>;
 var<private> acc0: f32;
+ACCDECL1
 var<private> xoff: u32;
-fn ACC(k: u32, v: f32) { acc0 = acc0 + xs[xoff + (k & MASKBLK)] * v; }
+fn ACC(k: u32, v: f32) {
+  let i = xoff + (k & MASKBLK);
+  acc0 = acc0 + xs[i] * v;
+ACCBODY1
+}
 fn ACC4(k: u32, v: vec4<f32>) {
   let i = xoff + (k & MASKBLK);
   acc0 = acc0 + dot(vec4<f32>(xs[i], xs[i + 1u], xs[i + 2u], xs[i + 3u]), v);
+ACC4BODY1
 }
 """
 
@@ -2996,6 +3002,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let ly = lid.y;
   xoff = ly * BLKVALS;
   acc0 = 0.0;
+ACCINIT1
   let base = n * gm.rowb;
   let nb = gm.K / BLKVALS;
   // A fixed step count, not `b < nb` per row: every thread must reach the same barriers.
@@ -3006,6 +3013,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
       var xv: f32 = 0.0;
       if (b < nb) { xv = x[b * BLKVALS + t]; }
       xs[xoff + t] = xv;
+XLOAD1
     }
     workgroupBarrier();
     if (b < nb && n < gm.N) {
@@ -3016,11 +3024,13 @@ _GGML_GEMV_TAIL = """
     workgroupBarrier();
   }
   psum[ly * 64u + lx] = acc0;
+PSUM1
   workgroupBarrier();
   if (ly == 0u && n < gm.N) {
     var tot: f32 = 0.0;
     for (var i: u32 = 0u; i < KSu; i = i + 1u) { tot = tot + psum[i * 64u + lx]; }
     outp[n] = tot;
+OUT1
   }
 }
 """
@@ -3628,21 +3638,42 @@ def ggml_native_supported(type_name):
     return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
 
 
-def _ggml_src(type_name, gemv):
+def _ggml_src(type_name, mode):
+    """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
-    pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if gemv
+    pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
                        else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
     src = _GGML_BIND + helpers + pre + main + dec + tail
-    for k, v in (("KSxBLK", str(_GGML_KS * vals)), ("KSx64", str(_GGML_KS * 64)),
-                 ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
-                 ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
-                 ("BLKVALS", "%uu" % vals)):
+    rows = max(1, mode)
+    two = rows == 2
+    xrow = _GGML_KS * vals                      # where the second row's activations start
+    subs = [("ACCDECL1", "var<private> acc1: f32;" if two else ""),
+            ("ACCBODY1", "  acc1 = acc1 + xs[i + %du] * v;" % xrow if two else ""),
+            ("ACC4BODY1", ("  acc1 = acc1 + dot(vec4<f32>(xs[i + %du], xs[i + %du], "
+                           "xs[i + %du], xs[i + %du]), v);"
+                           % (xrow, xrow + 1, xrow + 2, xrow + 3)) if two else ""),
+            ("ACCINIT1", "  acc1 = 0.0;" if two else ""),
+            ("XLOAD1", ("      var xv1: f32 = 0.0;\n"
+                        "      if (b < nb) { xv1 = x[gm.K + b * BLKVALS + t]; }\n"
+                        "      xs[%du + xoff + t] = xv1;" % xrow) if two else ""),
+            ("PSUM1", "  psum[%du + ly * 64u + lx] = acc1;" % (_GGML_KS * 64) if two else ""),
+            ("OUT1", ("    var t1: f32 = 0.0;\n"
+                      "    for (var i: u32 = 0u; i < KSu; i = i + 1u) "
+                      "{ t1 = t1 + psum[%du + i * 64u + lx]; }\n"
+                      "    outp[gm.N + n] = t1;" % (_GGML_KS * 64)) if two else ""),
+            ("KSxBLKxR", str(_GGML_KS * vals * rows)),
+            ("KSx64xR", str(_GGML_KS * 64 * rows)),
+            ("KSxBLK", str(_GGML_KS * vals)), ("KSx64", str(_GGML_KS * 64)),
+            ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
+            ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
+            ("BLKVALS", "%uu" % vals)]
+    for k, v in subs:
         src = src.replace(k, v)
     return src
 
 
-def _ggml_selfcheck(type_name, gemv):
+def _ggml_selfcheck(type_name, mode):
     """Multiply one random block and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -3664,7 +3695,7 @@ def _ggml_selfcheck(type_name, gemv):
             break
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
-    M = 1 if gemv else 3
+    M = mode if mode else 3
     x = rng.standard_normal((M, vals)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
     got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=xp.asarray(np.frombuffer(raw, np.int32)),
@@ -3679,12 +3710,15 @@ def _ggml_selfcheck(type_name, gemv):
 
 def ggml_matmul(xf, packed, type_name, K, N):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader."""
-    gemv = int(xf.shape[0]) == 1
-    key = (type_name, gemv)
+    # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
+    # batch of two, and it only pays if the second row rides along with the first.
+    m = int(xf.shape[0])
+    mode = m if m <= 2 else 0
+    key = (type_name, mode)
     if key not in _ggml_k["added"]:
-        _ggml_add(type_name, gemv)
+        _ggml_add(type_name, mode)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
-        _ggml_selfcheck(type_name, gemv)
+        _ggml_selfcheck(type_name, mode)
     return _ggml_run(xf, packed, type_name, K, N)
 
 
@@ -3703,23 +3737,23 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, gemv):
+def _ggml_add(type_name, mode):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
-    plat.addKernel(_ggml_name(type_name, gemv),
-                   {"source": _ggml_src(type_name, gemv), "bindingTypes": binds})
+    plat.addKernel(_ggml_name(type_name, mode),
+                   {"source": _ggml_src(type_name, mode), "bindingTypes": binds})
 
 
-def _ggml_name(type_name, gemv):
-    return "ggml%s_%s" % ("v" if gemv else "", type_name.lower())
+def _ggml_name(type_name, mode):
+    return "ggml%s_%s" % (("v", "v2", "")[mode], type_name.lower())
 
 
 def _ggml_run(xf, packed, type_name, K, N):
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
     M = int(xf.shape[0])
-    name = _ggml_name(type_name, M == 1)
+    name = _ggml_name(type_name, M if M <= 2 else 0)
     plat = _adam_kernel["platform"]
     of = _empty((M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk), "u4,u4,u4,u4")
@@ -3729,7 +3763,7 @@ def _ggml_run(xf, packed, type_name, K, N):
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
                     "workGroups": {"x": (N + 63) // 64, "y": 1,
-                                   "z": 1 if M == 1 else (M + 3) // 4}})
+                                   "z": 1 if M <= 2 else (M + 3) // 4}})
     return of
 
 
