@@ -3017,12 +3017,12 @@ _GGML_KS = 4                 # split-K rows per workgroup on the decode path
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
 _KV_FN = """
 fn kv(i: u32) -> f32 {
-  var p: u32 = 0xBFAD9881u;
-  if (i >= 12u) { p = 0x71594535u; }
-  else if (i >= 8u) { p = 0x26190D01u; }
-  else if (i >= 4u) { p = 0xF6EADDCFu; }
-  let b = (p >> (8u * (i & 3u))) & 255u;
-  return f32(i32(b << 24u) >> 24u);
+  // Branchless: this is called once per decoded value, and an if-chain here showed up as
+  // the limit on IQ4_XS once its quants were being read a word at a time.
+  let lo = select(0xBFAD9881u, 0xF6EADDCFu, (i & 4u) != 0u);
+  let hi = select(0x26190D01u, 0x71594535u, (i & 4u) != 0u);
+  let p = select(lo, hi, (i & 8u) != 0u);
+  return f32(i32(((p >> (8u * (i & 3u))) & 255u) << 24u) >> 24u);
 }
 """
 
@@ -3067,12 +3067,16 @@ _IQ4XS_DEC = """
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
       let ls = ((B(o + 4u + (ib >> 1u)) >> (4u * (ib & 1u))) & 15u) | (((sh >> (2u * ib)) & 3u) << 4u);
       let dl = d * f32(i32(ls) - 32);
-      let qo = o + 8u + ib * 16u;
+      let qw = (o + 8u + ib * 16u) >> 2u;
       let k0 = kb + ib * 32u;
-      for (var j: u32 = 0u; j < 16u; j = j + 1u) {
-        let by = B(qo + j);
-        ACC(k0 + j, dl * kv(by & 15u));
-        ACC(k0 + 16u + j, dl * kv(by >> 4u));
+      for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+        let w4 = w[qw + jw];
+        for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+          let by = (w4 >> (8u * q)) & 255u;
+          let j = jw * 4u + q;
+          ACC(k0 + j, dl * kv(by & 15u));
+          ACC(k0 + 16u + j, dl * kv(by >> 4u));
+        }
       }
     }
 """
@@ -3204,6 +3208,8 @@ _GRID_FN = """
 @group(0) @binding(4)
 var<storage,read> gr: array<u32>;
 fn GB(o: u32) -> u32 { return (gr[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+fn G4(idx: u32) -> u32 { return gr[32u + idx]; }        // one 4-byte entry, one read
+fn BY(w: u32, q: u32) -> f32 { return f32((w >> (8u * q)) & 255u); }
 fn GI8(o: u32) -> f32 { return f32(i32(GB(o) << 24u) >> 24u); }
 fn SGN(mask: u32, j: u32) -> f32 { return select(1.0, -1.0, (mask & (1u << j)) != 0u); }
 """
@@ -3220,11 +3226,13 @@ _IQ2XXS_DEC = """
       let a1 = U32(ao + 4u);
       let db = d * (0.5 + f32(a1 >> 28u)) * 0.25;
       for (var l: u32 = 0u; l < 4u; l = l + 1u) {
-        let gi = 128u + B(ao + l) * 8u;
+        let gx = B(ao + l) * 2u;
+        let ga = G4(gx); let gb = G4(gx + 1u);
         let sm = GB((a1 >> (7u * l)) & 127u);
         let k0 = kb + ib * 32u + l * 8u;
-        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-          ACC(k0 + j, db * f32(GB(gi + j)) * SGN(sm, j));
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+          ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
+          ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
         }
       }
     }
@@ -3242,11 +3250,13 @@ _IQ2XS_DEC = """
         let q = U16(o + 2u + ib * 8u + l * 2u);
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
-        let gi = 128u + (q & 511u) * 8u;
+        let gx = (q & 511u) * 2u;
+        let ga = G4(gx); let gb = G4(gx + 1u);
         let sm = GB(q >> 9u);
         let k0 = kb + ib * 32u + l * 8u;
-        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-          ACC(k0 + j, db * f32(GB(gi + j)) * SGN(sm, j));
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+          ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
+          ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
         }
       }
     }
@@ -3265,11 +3275,13 @@ _IQ2S_DEC = """
       for (var l: u32 = 0u; l < 4u; l = l + 1u) {
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
-        let gi = 128u + (B(o + 2u + ib * 4u + l) | ((qh << (8u - 2u * l)) & 768u)) * 8u;
+        let gx = (B(o + 2u + ib * 4u + l) | ((qh << (8u - 2u * l)) & 768u)) * 2u;
+        let ga = G4(gx); let gb = G4(gx + 1u);
         let sm = B(o + 34u + ib * 4u + l);
         let k0 = kb + ib * 32u + l * 8u;
-        for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-          ACC(k0 + j, db * f32(GB(gi + j)) * SGN(sm, j));
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+          ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
+          ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
         }
       }
     }
@@ -3286,11 +3298,12 @@ _IQ3XXS_DEC = """
       let db = d * (0.5 + f32(a1 >> 28u)) * 0.5;
       let k0 = kb + ib * 32u;
       for (var p: u32 = 0u; p < 8u; p = p + 1u) {
-        let gi = 128u + B(o + 2u + ib * 8u + p) * 4u;
+        let gw = G4(B(o + 2u + ib * 8u + p));
+        let f0 = p * 4u;
         for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-          let flat = p * 4u + q;
+          let flat = f0 + q;
           let sm = GB((a1 >> (7u * (flat >> 3u))) & 127u);
-          ACC(k0 + flat, db * f32(GB(gi + q)) * SGN(sm, flat & 7u));
+          ACC(k0 + flat, db * BY(gw, q) * SGN(sm, flat & 7u));
         }
       }
     }
@@ -3310,11 +3323,12 @@ _IQ3S_DEC = """
       let qh = B(o + 66u + ib);
       let k0 = kb + ib * 32u;
       for (var p: u32 = 0u; p < 8u; p = p + 1u) {
-        let gi = 128u + (B(o + 2u + ib * 8u + p) | ((qh << (8u - p)) & 256u)) * 4u;
+        let gw = G4(B(o + 2u + ib * 8u + p) | ((qh << (8u - p)) & 256u));
+        let f0 = p * 4u;
+        // f0 is a multiple of four, so all four values share one sign byte
+        let sm = B(o + 74u + ib * 4u + (f0 >> 3u));
         for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-          let flat = p * 4u + q;
-          let sm = B(o + 74u + ib * 4u + (flat >> 3u));
-          ACC(k0 + flat, db * f32(GB(gi + q)) * SGN(sm, flat & 7u));
+          ACC(k0 + f0 + q, db * BY(gw, q) * SGN(sm, (f0 + q) & 7u));
         }
       }
     }
@@ -3435,12 +3449,10 @@ _F32_DEC = """
 # scale encodings those formats use. Packed into u32s for the same reason as the IQ4 table.
 _FP4_FN = """
 fn fp4(i: u32) -> f32 {
-  var p: u32 = 0x03020100u;
-  if (i >= 12u) { p = 0xF4F8FAFCu; }
-  else if (i >= 8u) { p = 0xFDFEFF00u; }
-  else if (i >= 4u) { p = 0x0C080604u; }
-  let b = (p >> (8u * (i & 3u))) & 255u;
-  return f32(i32(b << 24u) >> 24u);
+  let lo = select(0x03020100u, 0x0C080604u, (i & 4u) != 0u);
+  let hi = select(0xFDFEFF00u, 0xF4F8FAFCu, (i & 4u) != 0u);
+  let p = select(lo, hi, (i & 8u) != 0u);
+  return f32(i32(((p >> (8u * (i & 3u))) & 255u) << 24u) >> 24u);
 }
 fn e8m0h(e: u32) -> f32 {
   if (e < 2u) { return bitcast<f32>(0x00200000u << e); }
