@@ -58,6 +58,10 @@ _EOT_CANDIDATES = ("<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|end|>", "</s>
                    "<|endoftext|>", "<|end_of_text|>")
 
 
+def _tpl_raise(msg):
+    raise ValueError(msg)
+
+
 class BPETokenizer:
     """Byte-level BPE (vocab + merges), with the special tokens and chat format discovered
     from the model itself.
@@ -68,8 +72,19 @@ class BPETokenizer:
     vocabulary contains. A model using none of the known conventions still works through a
     plain `role: content` transcript."""
 
-    def __init__(self, vocab, merges, eos_ids=None, chat_format=None):
+    def __init__(self, vocab, merges, eos_ids=None, chat_format=None,
+                 chat_template=None, control=None):
         self.enc = vocab
+        # A model ships its own prompt layout. Probing the vocabulary for a known marker
+        # gets the family right but not the details -- Qwen3 opens its turn with <think>,
+        # which no amount of "this looks like ChatML" will tell you, and without it the
+        # model answers by completing the template and stopping. So when the file carries a
+        # chat template, that template is the source of truth; the probe is the fallback.
+        self.chat_template = chat_template
+        self._tpl = None
+        # Tokens BPE must never split. From the file's own token_type where it has one --
+        # anything else is guesswork about what "looks special".
+        self.control = sorted((t for t in (control or ()) if t in vocab), key=len, reverse=True)
         self.dec = {i: t for t, i in vocab.items()}
         # discover specials that this vocabulary actually defines
         self.SPECIALS = {t: vocab[t] for t in
@@ -123,8 +138,67 @@ class BPETokenizer:
     def _sp(self, name):
         return self.SPECIALS.get(name)
 
+    async def prepare_template(self):
+        """Compile the model's chat template, if it has one. Async because jinja2 is loaded
+        on demand -- it ships with Pyodide, so this is a local package load, not a download,
+        and a model without a template never pays for it. Rendering itself stays sync."""
+        if self._tpl is not None or not self.chat_template:
+            return self._tpl
+        try:
+            try:
+                import jinja2
+            except ImportError:
+                import micropip
+                await micropip.install("jinja2")
+                import jinja2
+            env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+            env.globals["raise_exception"] = _tpl_raise
+            env.policies["json.dumps_kwargs"] = {"ensure_ascii": False}
+            self._tpl = env.from_string(self.chat_template)
+        except Exception as e:                     # no jinja2, or a template we cannot parse
+            self._tpl = False
+            print("webtorch: chat template unavailable (%s); using the detected format" % e)
+        return self._tpl
+
+    def encode_special(self, text):
+        """Encode text, emitting each control token as its own id instead of BPE-ing it."""
+        if not self.control:
+            return self.encode(text)
+        parts = self.re.split("(" + "|".join(self.re.escape(t) for t in self.control) + ")", text)
+        out = []
+        for p in parts:
+            if not p:
+                continue
+            i = self.enc.get(p)
+            out.append(i) if (i is not None and p in self.control) else out.extend(self.encode(p))
+        return out
+
+    def render_chat(self, messages, add_generation_prompt=True, **kw):
+        """The model's own template applied to a message list -> token ids, or None if the
+        model has no usable template."""
+        if not self._tpl:
+            return None
+        try:
+            txt = self._tpl.render(messages=messages, add_generation_prompt=add_generation_prompt,
+                                   bos_token=self._tok_str(self.SPECIALS.get("<s>")),
+                                   eos_token=self._tok_str(self.eot), **kw)
+        except Exception as e:
+            print("webtorch: chat template failed to render (%s); using the detected format" % e)
+            self._tpl = False
+            return None
+        return self.encode_special(txt)
+
+    def _tok_str(self, i):
+        return self.dec.get(int(i), "") if i is not None and int(i) >= 0 else ""
+
     def encode_chat(self, user, system="You are a helpful assistant."):
-        """Render a chat prompt in whatever format this model's vocabulary indicates."""
+        """Render a chat prompt: the model's own template when it has one, else whatever
+        format its vocabulary indicates."""
+        msgs = ([{"role": "system", "content": system}] if system else []) + \
+               [{"role": "user", "content": user}]
+        got = self.render_chat(msgs)
+        if got is not None:
+            return got
         f = self.chat_format
         if f == "chatml":
             ims, ime = self._sp("<|im_start|>"), self._sp("<|im_end|>")
@@ -510,12 +584,7 @@ class CausalLM:
         self.gs = cfg["quantization_config"]["group_size"]; self.bits = cfg["quantization_config"]["bits"]
         tie = self.tie_embeddings
 
-        vocab = await webio.read_json(self.base + "vocab.json")
-        merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
-        _e = cfg.get("eos_token_id")
-        _eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
-        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
-                                eos_ids=_eos)
+        self.tok = await self._hf_tokenizer(cfg)
 
         imeta = await webio.read_json(self.base + "model.safetensors.index.json")
         self._idx = imeta.get("weight_map")
@@ -563,6 +632,30 @@ class CausalLM:
                 and wt.ggml_native_supported(nm) and H % wt._GGML_TYPES[nm][2] == 0):
             return wt.GGMLLinear(chunk, nm, H, rows)
         return self._gquant(G.dequant(ttype, chunk, rows * H).reshape(rows, H))
+
+    async def _hf_tokenizer(self, cfg):
+        """Tokenizer for an HF directory: vocab, merges, and the model's own chat template.
+
+        tokenizer_config.json is where a served model states its prompt layout and its
+        added tokens; reading it is what makes an unfamiliar model's turns come out right
+        instead of approximately right."""
+        from . import webio
+        vocab = await webio.read_json(self.base + "vocab.json")
+        merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
+        _e = cfg.get("eos_token_id")
+        eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
+        tc = {}
+        try:
+            tc = await webio.read_json(self.base + "tokenizer_config.json")
+        except Exception:
+            pass                                   # optional -- fall back to the format probe
+        added = tc.get("added_tokens_decoder") or {}
+        ctrl = [v.get("content") for v in added.values()
+                if isinstance(v, dict) and v.get("content")]
+        tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
+                           eos_ids=eos, chat_template=tc.get("chat_template"), control=ctrl)
+        await tok.prepare_template()
+        return tok
 
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
@@ -790,8 +883,15 @@ class CausalLM:
         self.partial_rotary = (self.rope_dim / self.HD) if self.HD else 1.0
         self.attn_output_gate = False        # set below if the weights show a gate
         _eos = [meta.get("tokenizer.ggml.eos_token_id"), meta.get("tokenizer.ggml.eot_token_id")]
-        self.tok = BPETokenizer({t: i for i, t in enumerate(meta["tokenizer.ggml.tokens"])},
-                                meta.get("tokenizer.ggml.merges", []))
+        _toks = meta["tokenizer.ggml.tokens"]
+        _tt = meta.get("tokenizer.ggml.token_type") or []
+        # GGML_TOKEN_TYPE_CONTROL / _USER_DEFINED: the file says which tokens are markers,
+        # so BPE never has to guess from what a token looks like.
+        _ctrl = [_toks[i] for i, t in enumerate(_tt) if int(t) in (3, 4)]
+        self.tok = BPETokenizer({t: i for i, t in enumerate(_toks)},
+                                meta.get("tokenizer.ggml.merges", []), eos_ids=_eos,
+                                chat_template=meta.get("tokenizer.chat_template"), control=_ctrl)
+        await self.tok.prepare_template()
         self._ginfo = {t["name"]: t for t in infos}; self._gds = ds
 
         # Preflight: report every unsupported quantization up front, from the header alone,
@@ -971,12 +1071,7 @@ class CausalLM:
         self._apply_cfg(cfg)
         tie = self.tie_embeddings
 
-        vocab = await webio.read_json(self.base + "vocab.json")
-        merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
-        _e = cfg.get("eos_token_id")
-        _eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
-        self.tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
-                                eos_ids=_eos)
+        self.tok = await self._hf_tokenizer(cfg)
 
         try:                                                   # sharded models have an index
             imeta = await webio.read_json(self.base + "model.safetensors.index.json")
