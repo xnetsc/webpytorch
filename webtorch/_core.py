@@ -4080,6 +4080,122 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+# Everything between the projections and the recurrence, in one dispatch: the causal conv,
+# its SiLU, the L2 norm on q and k, and the decay/write gates. Done with tensor ops these
+# are ~40 separate calls, and a call costs 0.3-0.9 ms here regardless of how little data it
+# touches, which is why the unfused version lost to numpy.
+#
+# One workgroup per head (plus one for the gates). Threads within it hold a head's channels,
+# so the L2 norm's sum is a workgroup reduction rather than another dispatch.
+_GDN_PRE_WGSL = """@group(0) @binding(0)
+var<storage,read> qkv: array<f32>;
+@group(0) @binding(1)
+var<storage,read> braw: array<f32>;
+@group(0) @binding(2)
+var<storage,read> araw: array<f32>;
+@group(0) @binding(3)
+var<storage,read_write> cst: array<f32>;
+@group(0) @binding(4)
+var<storage,read> konst: array<f32>;
+@group(0) @binding(5)
+var<storage,read_write> outp: array<f32>;
+struct GP { hk: u32, hv: u32, dk: u32, dv: u32, W: u32, flags: u32, }
+@group(0) @binding(6)
+var<storage,read> gp: GP;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let g = wg.x;
+  let t = lid.x;
+  let nq = gp.hk * gp.dk;
+  let nv = gp.hv * gp.dv;
+  let C = 2u * nq + nv;
+  let heads = 2u * gp.hk + gp.hv;
+  if (g >= heads) {
+    // gate workgroup: decay = exp(min(softplus(a + dt_bias) * A, 0)), beta = sigmoid(b)
+    if (t < gp.hv) {
+      let ko = gp.W * C + C;                       // conv_w, conv_b, then A, dt_bias
+      var a = araw[t];
+      if ((gp.flags & 2u) != 0u) { a = a + konst[ko + gp.hv + t]; }
+      let sp = max(a, 0.0) + log(1.0 + exp(-abs(a)));
+      var d = sp;
+      if ((gp.flags & 4u) != 0u) { d = sp * konst[ko + t]; }
+      outp[2u * nq + nv + t] = exp(min(d, 0.0));
+      var bv: f32 = 1.0;
+      if ((gp.flags & 8u) != 0u) { bv = 1.0 / (1.0 + exp(-braw[t])); }
+      outp[2u * nq + nv + gp.hv + t] = bv;
+    }
+    return;
+  }
+  // a q, k or v head: its channels are [c0, c0 + dim)
+  var c0: u32; var dim: u32; var isqk: bool;
+  if (g < 2u * gp.hk) { c0 = g * gp.dk; dim = gp.dk; isqk = true; }
+  else { c0 = 2u * nq + (g - 2u * gp.hk) * gp.dv; dim = gp.dv; isqk = false; }
+  var val: f32 = 0.0;
+  if (t < dim) {
+    let c = c0 + t;
+    let raw = qkv[c];
+    if ((gp.flags & 1u) != 0u) {                   // causal depthwise conv over W taps
+      var acc: f32 = 0.0;
+      for (var j: u32 = 0u; j + 1u < gp.W; j = j + 1u) {
+        acc = acc + cst[j * C + c] * konst[j * C + c];
+      }
+      acc = acc + raw * konst[(gp.W - 1u) * C + c];
+      if ((gp.flags & 16u) != 0u) { acc = acc + konst[gp.W * C + c]; }
+      val = acc / (1.0 + exp(-acc));               // SiLU
+      // the ring buffer holds INPUTS, so it shifts in `raw`, not the conv output
+      for (var j: u32 = 0u; j + 2u < gp.W; j = j + 1u) {
+        cst[j * C + c] = cst[(j + 1u) * C + c];
+      }
+      if (gp.W > 1u) { cst[(gp.W - 2u) * C + c] = raw; }
+    } else {
+      val = raw;
+    }
+  }
+  if (isqk) {
+    red[t] = val * val;
+    workgroupBarrier();
+    for (var s: u32 = 64u; s > 0u; s = s >> 1u) {
+      if (t < s) { red[t] = red[t] + red[t + s]; }
+      workgroupBarrier();
+    }
+    let inv = inverseSqrt(red[0] + 1e-6);
+    if (t < dim) {
+      var v = val * inv;
+      if (g < gp.hk) { v = v * inverseSqrt(f32(gp.dk)); }   // q also carries 1/sqrt(dk)
+      outp[c0 + t] = v;
+    }
+  } else if (t < dim) {
+    outp[c0 + t] = val;
+  }
+}
+"""
+
+_gdnp_k = {"added": False}
+
+
+def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
+    """Conv + SiLU + L2 norm + gates, writing the packed q|k|v|decay|beta the step wants.
+
+    `cst` (the conv ring buffer) is updated in place. `flags` bits: 1 conv, 2 dt_bias,
+    4 A, 8 beta projection, 16 conv bias."""
+    plat = _adam_kernel["platform"]
+    if not _gdnp_k["added"]:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel("gdn_pre", {"source": _GDN_PRE_WGSL,
+                                   "bindingTypes": [ro, ro, ro, rw, ro, rw, ro]})
+        _gdnp_k["added"] = True
+    meta = _adam_kernel["make_meta"]((hk, hv, dk, dv, W, flags), "u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "gdn_pre",
+                    "tensors": [qkv.buffer.buffer_id, braw.buffer.buffer_id,
+                                araw.buffer.buffer_id, cst.buffer.buffer_id,
+                                konst.buffer.buffer_id, out.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": 2 * hk + hv + 1, "y": 1, "z": 1}})
+    return out
+
+
 _gdn_k = {"added": False}
 
 
