@@ -36,7 +36,10 @@
   });
 
   async function text(u) {
-    const r = await fetch(u);
+    // Bust the HTTP cache: the package files change constantly during development, and a
+    // stale copy here means the browser is running code that no longer exists on disk --
+    // which is indistinguishable from a bug, and much harder to find.
+    const r = await fetch(u + (u.includes('?') ? '&' : '?') + 'v=' + Date.now(), {cache: 'no-store'});
     if (!r.ok) throw new Error(u + ': ' + r.status);
     return r.text();
   }
