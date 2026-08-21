@@ -2848,150 +2848,92 @@ class Adam:
 #   scales  (nG, N) f32,  nG = K/group_size
 #   dequant: w[k,n] = scales[k//gs, n] * (q[k,n] - zero[k//gs, n])
 # Quantization is PER-TENSOR (independent) -> naturally streamable.
-# Quantizing is the expensive half of loading a GGUF: measured 0.31s of the 0.53s it takes
-# to turn an 89M-value weight into packed int4, and a 27B model is 300 of those. It is also
-# embarrassingly parallel -- every output column's groups are independent -- and unlike
-# dequantizing, there is only ONE format to write a shader for rather than fourteen. So it
-# goes to the GPU: three passes over a band of the weight, no host arithmetic at all.
+# ---- native ggml weights: matmul that reads GGUF's own encodings -------------------
+# Converting a GGUF into the kernel's packed format costs most of a load -- 23 minutes for a
+# 27B -- and quantizes twice, refitting ggml's scheme onto this one and losing a little
+# accuracy for the privilege. The way out is llama.cpp's: decode inside the matmul. The
+# packed bytes go to the GPU as they are, and a shader unpacks each block on the fly.
 #
-# The weight is read in its (out, in) layout, so each thread's `group_size` values are
-# contiguous; only the packed writes stride.
-_QSCALE_WGSL = """@group(0) @binding(0)
-var<storage,read> w: array<f32>;
+# One gemv framework, one decode function per ggml type. `x` is the activation, `w` the
+# packed weight in its (out, in) layout, one thread per output row.
+_GGML_GEMV_HEAD = """@group(0) @binding(0)
+var<storage,read> x: array<f32>;
 @group(0) @binding(1)
-var<storage,read_write> scales: array<f32>;
+var<storage,read> w: array<u32>;
 @group(0) @binding(2)
-var<storage,read_write> zeros: array<f32>;
-struct QM { N: u32, Kp: u32, gs: u32, nG: u32, qmax: u32, }
+var<storage,read_write> outp: array<f32>;
+struct GM { N: u32, K: u32, blocks: u32, words: u32, }
 @group(0) @binding(3)
-var<storage,read> qm: QM;
+var<storage,read> gm: GM;
+"""
+
+# IQ4_XS: 256 values per 136-byte block -- d (f16) | scales_h (u16) | scales_l[4] | qs[128].
+# Eight 32-value sub-blocks, each with a 6-bit scale split across scales_l/scales_h; the
+# values themselves are indices into a 16-entry codebook.
+_IQ4XS_WGSL = _GGML_GEMV_HEAD + """
+const KV = array<f32, 16>(-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+                            1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= qm.nG * qm.N) { return; }
-  let g = i / qm.N;
-  let n = i - g * qm.N;
-  let base = n * qm.Kp + g * qm.gs;
-  var lo: f32 = w[base];
-  var hi: f32 = lo;
-  for (var j: u32 = 1u; j < qm.gs; j = j + 1u) {
-    let v = w[base + j];
-    lo = min(lo, v); hi = max(hi, v);
+  let n = gid.x;
+  if (n >= gm.N) { return; }
+  let row = n * gm.words;                       // u32 offset of this output row
+  var acc: f32 = 0.0;
+  for (var b: u32 = 0u; b < gm.blocks; b = b + 1u) {
+    let o = row + b * 34u;                      // 136 bytes = 34 u32 per block
+    let w0 = w[o];
+    let d = unpack2x16float(w0).x;              // low half is the f16 scale
+    let sh = w0 >> 16u;                         // high half is scales_h
+    let sl = w[o + 1u];
+    let kb = b * 256u;
+    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+      let lo4 = (sl >> (8u * (ib / 2u) + 4u * (ib % 2u))) & 15u;
+      let hi2 = (sh >> (2u * ib)) & 3u;
+      let dl = d * (f32(i32(lo4 | (hi2 << 4u)) - 32));
+      let qb = o + 2u + ib * 4u;                // 16 bytes of qs per sub-block
+      for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+        let byte = (w[qb + j / 4u] >> (8u * (j % 4u))) & 255u;
+        let k0 = kb + ib * 32u + j;
+        acc = acc + x[k0] * dl * KV[byte & 15u];
+        acc = acc + x[k0 + 16u] * dl * KV[byte >> 4u];
+      }
+    }
   }
-  var sc = (hi - lo) / f32(qm.qmax);
-  if (sc == 0.0) { sc = 1e-8; }
-  let zp = clamp(round(-lo / sc), 0.0, f32(qm.qmax));
-  scales[g * qm.N + n] = sc;
-  zeros[g * qm.N + n] = zp;
+  outp[n] = acc;
 }
 """
 
-_QPACK_WGSL = """@group(0) @binding(0)
-var<storage,read> w: array<f32>;
-@group(0) @binding(1)
-var<storage,read> scales: array<f32>;
-@group(0) @binding(2)
-var<storage,read> zeros: array<f32>;
-@group(0) @binding(3)
-var<storage,read_write> qweight: array<u32>;
-struct QM { N: u32, Kp: u32, gs: u32, nG: u32, qmax: u32, bits: u32, per: u32, }
-@group(0) @binding(4)
-var<storage,read> qm: QM;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  let rows = qm.Kp / qm.per;
-  if (i >= rows * qm.N) { return; }
-  let kb = i / qm.N;
-  let n = i - kb * qm.N;
-  var acc: u32 = 0u;
-  for (var j: u32 = 0u; j < qm.per; j = j + 1u) {
-    let k = kb * qm.per + j;
-    let g = k / qm.gs;
-    let sc = scales[g * qm.N + n];
-    let zp = zeros[g * qm.N + n];
-    let q = clamp(round(w[n * qm.Kp + k] / sc) + zp, 0.0, f32(qm.qmax));
-    acc = acc | (u32(q) << (j * qm.bits));
-  }
-  qweight[kb * qm.N + n] = acc;
-}
-"""
-
-_QZPACK_WGSL = """@group(0) @binding(0)
-var<storage,read> zeros: array<f32>;
-@group(0) @binding(1)
-var<storage,read_write> qzeros: array<u32>;
-struct QM { N: u32, nG: u32, bits: u32, per: u32, }
-@group(0) @binding(2)
-var<storage,read> qm: QM;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  let cols = qm.N / qm.per;
-  if (i >= qm.nG * cols) { return; }
-  let g = i / cols;
-  let nb = i - g * cols;
-  var acc: u32 = 0u;
-  for (var j: u32 = 0u; j < qm.per; j = j + 1u) {
-    acc = acc | (u32(zeros[g * qm.N + nb * qm.per + j]) << (j * qm.bits));
-  }
-  qzeros[g * cols + nb] = acc;
-}
-"""
-_q_k = {"added": False}
-_GPU_QUANT = True      # A/B switch for quantizing on the GPU
+_GGML_KERNELS = {"IQ4_XS": ("ggml_iq4xs", _IQ4XS_WGSL, 136)}
+_ggml_k = {"added": set()}
+_NATIVE_GGUF = True     # default on; `weights=` on the loader overrides
 
 
-def gptq_quantize_gpu(W_out_in, group_size=128, bits=4):
-    """Quantize a band on the GPU. Returns (qweight, qzeros, scales) or None if unavailable.
+def ggml_native_supported(type_name):
+    """Can this ggml type be multiplied without conversion?"""
+    return bool(_NATIVE_GGUF) and type_name in _GGML_KERNELS
 
-    `W_out_in` is (out, in) and must already be padded to the packing multiples. Shapes and
-    values match `_gptq_quantize(..., from_out_in=True)` exactly.
-    """
-    if not (_GPU_QUANT and _adam_backend_ready()):
+
+def ggml_gemv(x, packed, type_name, N, K):
+    """out = packed(N,K) @ x(K,), decoding ggml blocks inside the shader. None if unsupported."""
+    if not (_adam_backend_ready() and type_name in _GGML_KERNELS):
         return None
-    N, Kp = (int(v) for v in W_out_in.shape)
-    per = 32 // bits
-    qmax = (1 << bits) - 1
-    if Kp % group_size or Kp % per or N % per:
-        return None
-    nG = Kp // group_size
+    name, src, blk_bytes = _GGML_KERNELS[type_name]
     plat = _adam_kernel["platform"]
-    if not _q_k["added"]:
-        ro, rw = "read-only-storage", "storage"
-        plat.addKernel("q_scale", {"source": _QSCALE_WGSL, "bindingTypes": [ro, rw, rw, ro]})
-        plat.addKernel("q_pack", {"source": _QPACK_WGSL, "bindingTypes": [ro, ro, ro, rw, ro]})
-        plat.addKernel("q_zpack", {"source": _QZPACK_WGSL, "bindingTypes": [ro, rw, ro]})
-        _q_k["added"] = True
-    wg = xp.asarray(np.ascontiguousarray(W_out_in, dtype=np.float32))
-    sc = _empty((nG * N,))
-    zr = _empty((nG * N,))
-    m1 = _adam_kernel["make_meta"]((N, Kp, group_size, nG, qmax), "u4,u4,u4,u4,u4")
-    plat.runKernel({"name": "q_scale",
-                    "tensors": [wg.buffer.buffer_id, sc.buffer.buffer_id,
-                                zr.buffer.buffer_id, m1.buffer_id],
-                    "workGroups": {"x": (nG * N + 63) // 64, "y": 1, "z": 1}})
-    qw = _empty(((Kp // per) * N,))
-    m2 = _adam_kernel["make_meta"]((N, Kp, group_size, nG, qmax, bits, per),
-                                   "u4,u4,u4,u4,u4,u4,u4")
-    plat.runKernel({"name": "q_pack",
-                    "tensors": [wg.buffer.buffer_id, sc.buffer.buffer_id, zr.buffer.buffer_id,
-                                qw.buffer.buffer_id, m2.buffer_id],
-                    "workGroups": {"x": ((Kp // per) * N + 63) // 64, "y": 1, "z": 1}})
-    qz = _empty((nG * (N // per),))
-    m3 = _adam_kernel["make_meta"]((N, nG, bits, per), "u4,u4,u4,u4")
-    plat.runKernel({"name": "q_zpack",
-                    "tensors": [zr.buffer.buffer_id, qz.buffer.buffer_id, m3.buffer_id],
-                    "workGroups": {"x": (nG * (N // per) + 63) // 64, "y": 1, "z": 1}})
-    to_np = lambda a: np.asarray(a.get() if hasattr(a, "get") else a)
-    # The packed outputs are integers written through an f32-typed buffer, so they come back
-    # reinterpreted, not converted: astype() here would read the bit pattern as a float and
-    # produce garbage -- which is exactly what it did, while scales, being genuinely f32,
-    # came out correct and made the mismatch look like a rounding difference.
-    as_i32 = lambda a: to_np(a).astype(np.float32).view(np.int32)
-    return (as_i32(qw).reshape(Kp // per, N),
-            as_i32(qz).reshape(nG, N // per),
-            to_np(sc).astype(np.float32).reshape(nG, N))
+    if name not in _ggml_k["added"]:
+        plat.addKernel(name, {"source": src,
+                              "bindingTypes": ["read-only-storage", "read-only-storage",
+                                               "storage", "read-only-storage"]})
+        _ggml_k["added"].add(name)
+    blocks = K // 256
+    words = blocks * (blk_bytes // 4)
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    of = _empty((N,))
+    meta = _adam_kernel["make_meta"]((N, K, blocks, words), "u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+                    "tensors": [xd.buffer.buffer_id, packed.buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (N + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(of)
 
 
 def _gptq_quantize(W, group_size=32, bits=4, from_out_in=False, block=2048):
