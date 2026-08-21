@@ -1283,7 +1283,13 @@ class CausalLM:
         self._set_sampling(temperature, top_p, top_k, seed, do_sample)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
-        if not self._gpu:                              # WebGL fallback
+        # A recurrent (linear-attention) layer advances state on the host each step, so a
+        # decode step is not a fixed GPU command sequence and cannot be captured. Hybrid
+        # architectures -- attention every few layers, a recurrent mixer in between -- take
+        # the same growing-cache forward as WebGL: slower per token than replay, but it is
+        # what makes them run at all. `_decode_fwd` assumes every layer has q/k/v.
+        recurrent = any(self._is_linear_layer(i) for i in range(len(self.layers)))
+        if not self._gpu or recurrent:                 # WebGL fallback, or a hybrid stack
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0

@@ -522,6 +522,7 @@ async def _remote_size(url, headers):
 # rewritten. Which chunks exist IS the coverage map, so resuming needs no extra bookkeeping.
 
 _CHUNK_DEFAULT = 16 << 20
+_idb_warned = []            # warn once, not once per chunk
 
 
 def _merge(spans, lo, hi):
@@ -794,8 +795,22 @@ class _IdbStore(_Store):
         return out
 
     async def get(self, key, i):
+        """One chunk, or None if it is not there -- or cannot be read right now.
+
+        A read can fail on a value the store definitely holds: Chrome raises "Failed to
+        read large IndexedDB value" when it cannot materialize one under memory pressure,
+        which is exactly the situation loading a large model creates. That is a cache miss,
+        not a load failure -- the caller's reader fetches the range instead -- so it must
+        not propagate. Raising here failed a 27B load outright with the file fully cached.
+        """
         await self.open()
-        v = await _idb_req(self._store(self.CHUNKS, "readonly").get(self._ck(key, i)))
+        try:
+            v = await _idb_req(self._store(self.CHUNKS, "readonly").get(self._ck(key, i)))
+        except Exception as e:
+            if not _idb_warned:
+                _idb_warned.append(1)
+                print("webtorch: IndexedDB read failed (%s); treating as a cache miss" % e)
+            return None
         if v is None:
             return None
         return bytes(v.to_py()) if hasattr(v, "to_py") else bytes(v)

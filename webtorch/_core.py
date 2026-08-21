@@ -2862,7 +2862,7 @@ class Adam:
 # decode differs per type, so a new format is a fragment, not a kernel. ACC and the
 # accumulator live in `private` storage because a WGSL function cannot take a pointer to a
 # local array.
-_GGML_PRE = """@group(0) @binding(0)
+_GGML_BIND = """@group(0) @binding(0)
 var<storage,read> x: array<f32>;
 @group(0) @binding(1)
 var<storage,read> w: array<u32>;
@@ -2871,11 +2871,8 @@ var<storage,read_write> outp: array<f32>;
 struct GM { M: u32, N: u32, K: u32, rowb: u32, }
 @group(0) @binding(3)
 var<storage,read> gm: GM;
-var<private> acc: array<f32, 4>;
-var<private> mb: u32;
-var<private> mn: u32;
 // Byte addressing, not word: most ggml blocks are not a multiple of four bytes (Q8_0 is 34,
-// Q3_K and IQ3_S 110, IQ2_XXS 66), so a u32 index would drift out of alignment after the
+// Q3_K and IQ3_S 110, MXFP4 17), so a u32 index would drift out of alignment after the
 // first block. These mirror the reference dequantizer's own byte offsets exactly.
 fn B(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
 fn I8(o: u32) -> f32 { return f32(i32(B(o) << 24u) >> 24u); }
@@ -2892,6 +2889,15 @@ fn HF(h: u32) -> f32 {
   if ((h & 32768u) != 0u) { return -v; }
   return v;
 }
+"""
+
+# GEMM (prefill): one thread owns an output column and four rows of the batch, and reads
+# activations straight from global memory -- with a batch to amortize, there is enough work
+# in flight to hide that.
+_GGML_GEMM_PRE = """
+var<private> acc: array<f32, 4>;
+var<private> mb: u32;
+var<private> mn: u32;
 fn ACC(k: u32, v: f32) {
   for (var r: u32 = 0u; r < mn; r = r + 1u) {
     acc[r] = acc[r] + x[(mb + r) * gm.K + k] * v;
@@ -2899,7 +2905,7 @@ fn ACC(k: u32, v: f32) {
 }
 """
 
-_GGML_MAIN = """
+_GGML_GEMM_MAIN = """
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
@@ -2909,12 +2915,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   acc = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
   let base = n * gm.rowb;
   let nb = gm.K / BLKVALS;
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
 """
 
-_GGML_TAIL = """
+_GGML_GEMM_TAIL = """
+  }
   for (var r: u32 = 0u; r < mn; r = r + 1u) { outp[(mb + r) * gm.N + n] = acc[r]; }
 }
 """
+
+# GEMV (decode, batch of one): the shape where the naive kernel loses. Two things fix it,
+# both of which ggml blocks happen to suit. Blocks are independent, so KS rows of threads
+# can each take every KS-th block and the partial sums are added at the end -- KS times the
+# parallelism on a matmul that is otherwise one long serial walk per output column. And all
+# 64 threads in a row want the SAME activations, so a block's worth is staged in workgroup
+# memory once instead of being re-read from global memory 64 times.
+_GGML_GEMV_PRE = """
+var<workgroup> xs: array<f32, KSxBLK>;
+var<workgroup> psum: array<f32, KSx64>;
+var<private> acc0: f32;
+var<private> xoff: u32;
+fn ACC(k: u32, v: f32) { acc0 = acc0 + xs[xoff + (k & MASKBLK)] * v; }
+"""
+
+_GGML_GEMV_MAIN = """
+@compute @workgroup_size(64, KSu)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let n = gid.x;
+  let lx = lid.x;
+  let ly = lid.y;
+  xoff = ly * BLKVALS;
+  acc0 = 0.0;
+  let base = n * gm.rowb;
+  let nb = gm.K / BLKVALS;
+  // A fixed step count, not `b < nb` per row: every thread must reach the same barriers.
+  let steps = (nb + KSu - 1u) / KSu;
+  for (var st: u32 = 0u; st < steps; st = st + 1u) {
+    let b = st * KSu + ly;
+    for (var t: u32 = lx; t < BLKVALS; t = t + 64u) {
+      var xv: f32 = 0.0;
+      if (b < nb) { xv = x[b * BLKVALS + t]; }
+      xs[xoff + t] = xv;
+    }
+    workgroupBarrier();
+    if (b < nb && n < gm.N) {
+"""
+
+_GGML_GEMV_TAIL = """
+    }
+    workgroupBarrier();
+  }
+  psum[ly * 64u + lx] = acc0;
+  workgroupBarrier();
+  if (ly == 0u && n < gm.N) {
+    var tot: f32 = 0.0;
+    for (var i: u32 = 0u; i < KSu; i = i + 1u) { tot = tot + psum[i * 64u + lx]; }
+    outp[n] = tot;
+  }
+}
+"""
+
+_GGML_KS = 4                 # split-K rows per workgroup on the decode path
 
 # The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
@@ -2941,17 +3003,14 @@ fn k4sc(so: u32, j: u32) -> vec2<f32> {
 
 # Q8_0: 32 values / 34 bytes -- f16 d + int8[32].
 _Q8_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 34u;
     let d = F16(o);
     let kb = b * 32u;
     for (var l: u32 = 0u; l < 32u; l = l + 1u) { ACC(kb + l, d * I8(o + 2u + l)); }
-  }
 """
 
 # IQ4_NL: 32 values / 18 bytes -- f16 d + 16 bytes of paired codebook indices.
 _IQ4NL_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 18u;
     let d = F16(o);
     let kb = b * 32u;
@@ -2960,14 +3019,12 @@ _IQ4NL_DEC = """
       ACC(kb + j, d * kv(by & 15u));
       ACC(kb + 16u + j, d * kv(by >> 4u));
     }
-  }
 """
 
 # IQ4_XS: 256 values / 136 bytes -- f16 d | u16 scales_h | u8 scales_l[4] | u8 qs[128].
 # Eight 32-value sub-blocks, each with a 6-bit scale split across scales_l and scales_h; low
 # nibbles fill a sub-block's first 16 slots, high nibbles the next 16.
 _IQ4XS_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 136u;
     let d = F16(o);
     let sh = U16(o + 2u);
@@ -2983,12 +3040,10 @@ _IQ4XS_DEC = """
         ACC(k0 + 16u + j, dl * kv(by >> 4u));
       }
     }
-  }
 """
 
 # Q4_K: 256 values / 144 bytes -- f16 d | f16 dmin | scales[12] | qs[128].
 _Q4K_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 144u;
     let d = F16(o); let dmin = F16(o + 2u);
     let so = o + 4u; let qo = o + 16u;
@@ -3004,13 +3059,11 @@ _Q4K_DEC = """
         ACC(kb + (i0 + 1u) * 32u + l, d2 * f32(q >> 4u) - m2);
       }
     }
-  }
 """
 
 # Q5_K: 256 values / 176 bytes -- f16 d | f16 dmin | scales[12] | qh[32] | qs[128].
 # qh carries each value's fifth bit, one bit per sub-block index.
 _Q5K_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 176u;
     let d = F16(o); let dmin = F16(o + 2u);
     let so = o + 4u; let ho = o + 16u; let qo = o + 48u;
@@ -3029,12 +3082,10 @@ _Q5K_DEC = """
         ACC(kb + (i0 + 1u) * 32u + l, d2 * hi - m2);
       }
     }
-  }
 """
 
 # Q6_K: 256 values / 210 bytes -- ql[128] | qh[64] | int8 scales[16] | f16 d.
 _Q6K_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 210u;
     let d = F16(o + 208u);
     let kb = b * 256u;
@@ -3052,14 +3103,12 @@ _Q6K_DEC = """
         ACC(k0 + l + 96u, d * I8(so + ii + 6u) * (f32((c >> 4u)  | (((h >> 6u) & 3u) << 4u)) - 32.0));
       }
     }
-  }
 """
 
 # Q3_K: 256 values / 110 bytes -- hmask[32] | qs[64] | scales[12] | f16 d.
 # The sixteen 6-bit scales are split across three u32s and reassembled four at a time;
 # hmask supplies a per-value bit that shifts the 2-bit quant from [-4,-1] to [0,3].
 _Q3K_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 110u;
     let d = F16(o + 108u);
     let a0 = U32(o + 96u); let a1 = U32(o + 100u); let a2 = U32(o + 104u);
@@ -3088,12 +3137,10 @@ _Q3K_DEC = """
         }
       }
     }
-  }
 """
 
 # Q2_K: 256 values / 84 bytes -- scales[16] (4-bit scale + 4-bit min) | qs[64] | f16 d | f16 dmin.
 _Q2K_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 84u;
     let d = F16(o + 80u); let dmin = F16(o + 82u);
     let kb = b * 256u;
@@ -3112,7 +3159,6 @@ _Q2K_DEC = """
         }
       }
     }
-  }
 """
 
 # The i-quants store INDICES into ggml's codebook grids rather than values, so the shader
@@ -3131,7 +3177,6 @@ fn SGN(mask: u32, j: u32) -> f32 { return select(1.0, -1.0, (mask & (1u << j)) !
 # four grid indices in its low four bytes; the high u32 carries four 7-bit sign codes and,
 # in its top nibble, the sub-block scale.
 _IQ2XXS_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 66u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3148,13 +3193,11 @@ _IQ2XXS_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ2_XS: 256 values / 74 bytes -- f16 d | u16 qs[32] | u8 scales[8]. Each u16 is a 9-bit
 # grid index plus a 7-bit sign code; the two nibbles of a scale byte cover l=0,1 and l=2,3.
 _IQ2XS_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 74u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3172,14 +3215,12 @@ _IQ2XS_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ2_S: 256 values / 82 bytes -- f16 d | qs[32] | signs[32] | qh[8] | scales[8]. The grid
 # index is 8 bits from qs plus 2 from qh, and the sign byte is used directly as a mask
 # rather than as an index into ksigns.
 _IQ2S_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 82u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3197,13 +3238,11 @@ _IQ2S_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ3_XXS: 256 values / 98 bytes -- f16 d | qs[64] | u32 aux[8]. Eight grid indices per
 # sub-block, four bytes each, so the 32 decoded values regroup into four sign-groups of 8.
 _IQ3XXS_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 98u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3220,14 +3259,12 @@ _IQ3XXS_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ3_S: 256 values / 110 bytes -- f16 d | qs[64] | qh[8] | signs[32] | scales[4]. qh adds a
 # ninth bit to each grid index (shift 8-p for both even and odd slots), and like IQ2_S the
 # sign byte is a mask, not a ksigns index.
 _IQ3S_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 110u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3246,14 +3283,12 @@ _IQ3S_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ1_S: 256 values / 50 bytes -- f16 d | qs[32] | u16 qh[8]. qh carries the sub-block scale,
 # a shared +/-0.125 offset, and three extra bits for each of the four grid indices. The grid
 # entries are signed bytes here, unlike the IQ2/IQ3 grids.
 _IQ1S_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 50u;
     let d = F16(o);
     let kb = b * 256u;
@@ -3269,7 +3304,6 @@ _IQ1S_DEC = """
         }
       }
     }
-  }
 """
 
 # IQ1_M: 256 values / 56 bytes -- qs[32] | qh[16] | u16 scales[4]. There is no d field: the
@@ -3277,7 +3311,6 @@ _IQ1S_DEC = """
 # 3-bit half-scales, and each pair of grid indices takes its extra bits and sign offset from
 # one qh byte.
 _IQ1M_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 56u;
     let s0 = U16(o + 48u); let s1 = U16(o + 50u);
     let s2 = U16(o + 52u); let s3 = U16(o + 54u);
@@ -3301,12 +3334,10 @@ _IQ1M_DEC = """
         }
       }
     }
-  }
 """
 
 # Q4_0: 32 values / 18 bytes -- f16 d + 16 nibble pairs, quants centred on 8.
 _Q4_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 18u;
     let d = F16(o);
     let kb = b * 32u;
@@ -3315,12 +3346,10 @@ _Q4_0_DEC = """
       ACC(kb + j, d * (f32(q & 15u) - 8.0));
       ACC(kb + 16u + j, d * (f32(q >> 4u) - 8.0));
     }
-  }
 """
 
 # Q4_1: 32 values / 20 bytes -- f16 d, f16 min, 16 nibble pairs.
 _Q4_1_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 20u;
     let d = F16(o); let mn = F16(o + 2u);
     let kb = b * 32u;
@@ -3329,12 +3358,10 @@ _Q4_1_DEC = """
       ACC(kb + j, d * f32(q & 15u) + mn);
       ACC(kb + 16u + j, d * f32(q >> 4u) + mn);
     }
-  }
 """
 
 # Q5_0: 32 values / 22 bytes -- f16 d, u32 qh holding each value's fifth bit, 16 nibble pairs.
 _Q5_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 22u;
     let d = F16(o);
     let qh = U32(o + 2u);
@@ -3344,12 +3371,10 @@ _Q5_0_DEC = """
       ACC(kb + j, d * (f32((q & 15u) | (((qh >> j) << 4u) & 16u)) - 16.0));
       ACC(kb + 16u + j, d * (f32((q >> 4u) | ((qh >> (j + 12u)) & 16u)) - 16.0));
     }
-  }
 """
 
 # Q5_1: 32 values / 24 bytes -- f16 d, f16 min, u32 qh, 16 nibble pairs.
 _Q5_1_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 24u;
     let d = F16(o); let mn = F16(o + 2u);
     let qh = U32(o + 4u);
@@ -3359,17 +3384,16 @@ _Q5_1_DEC = """
       ACC(kb + j, d * f32((q & 15u) | (((qh >> j) << 4u) & 16u)) + mn);
       ACC(kb + 16u + j, d * f32((q >> 4u) | ((qh >> (j + 12u)) & 16u)) + mn);
     }
-  }
 """
 
 # F16 / F32: not quantized at all, but going through the same kernel keeps an unquantized
 # tensor on the no-conversion path instead of sending it back through the fp32 expansion.
 _F16_DEC = """
-  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, F16(base + k * 2u)); }
+    ACC(b, F16(base + b * 2u));
 """
 
 _F32_DEC = """
-  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, bitcast<f32>(U32(base + k * 4u))); }
+    ACC(b, bitcast<f32>(U32(base + b * 4u)));
 """
 
 # E2M1 values (doubled) -- ggml's kvalues_fp4, shared by MXFP4 and NVFP4 -- plus the two
@@ -3406,13 +3430,12 @@ fn pow3(n: u32) -> u32 {
 
 # BF16: the top 16 bits of an fp32, so widening is a shift.
 _BF16_DEC = """
-  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, bitcast<f32>(U16(base + k * 2u) << 16u)); }
+    ACC(b, bitcast<f32>(U16(base + b * 2u) << 16u));
 """
 
 # TQ1_0: 256 values / 54 bytes -- qs[48] | qh[4] | f16 d. Ternary, five values packed per
 # byte: multiply the byte by a power of three (mod 256) and the top of byte*3 is the trit.
 _TQ1_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 54u;
     let d = F16(o + 52u);
     let kb = b * 256u;
@@ -3437,13 +3460,11 @@ _TQ1_0_DEC = """
       }
       k = k + 4u;
     }
-  }
 """
 
 # TQ2_0: 256 values / 66 bytes -- qs[64] | f16 d. Two bits per value, one bit-plane at a
 # time across each 32-byte group.
 _TQ2_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 66u;
     let d = F16(o + 64u);
     let kb = b * 256u;
@@ -3457,12 +3478,10 @@ _TQ2_0_DEC = """
         k = k + 32u;
       }
     }
-  }
 """
 
 # MXFP4: 32 values / 17 bytes -- one E8M0 exponent byte then 16 nibble pairs.
 _MXFP4_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 17u;
     let d = e8m0h(B(o));
     let kb = b * 32u;
@@ -3471,13 +3490,11 @@ _MXFP4_DEC = """
       ACC(kb + j, fp4(q & 15u) * d);
       ACC(kb + 16u + j, fp4(q >> 4u) * d);
     }
-  }
 """
 
 # NVFP4: 64 values / 36 bytes -- four UE4M3 scales, one per 16-value sub-block, then 32
 # nibble pairs.
 _NVFP4_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 36u;
     let kb = b * 64u;
     for (var s: u32 = 0u; s < 4u; s = s + 1u) {
@@ -3489,31 +3506,26 @@ _NVFP4_DEC = """
         ACC(k0 + 8u + j, fp4(q >> 4u) * d);
       }
     }
-  }
 """
 
 # Q1_0: 128 values / 18 bytes -- f16 d and one bit per value, +d or -d.
 _Q1_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 18u;
     let d = F16(o);
     let kb = b * 128u;
     for (var j: u32 = 0u; j < 128u; j = j + 1u) {
       ACC(kb + j, select(-d, d, ((B(o + 2u + (j >> 3u)) >> (j & 7u)) & 1u) != 0u));
     }
-  }
 """
 
 # Q2_0: 64 values / 18 bytes -- f16 d and two bits per value, 00=-1 01=0 10=+1 11=+2.
 _Q2_0_DEC = """
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
     let o = base + b * 18u;
     let d = F16(o);
     let kb = b * 64u;
     for (var j: u32 = 0u; j < 64u; j = j + 1u) {
       ACC(kb + j, (f32((B(o + 2u + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u) - 1.0) * d);
     }
-  }
 """
 
 # name -> (decode fragment, helper functions, values per block, bytes per block, codebook)
@@ -3557,14 +3569,20 @@ def ggml_native_supported(type_name):
     return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
 
 
-def _ggml_src(type_name):
+def _ggml_src(type_name, gemv):
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if gemv
+                       else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
-    return (_GGML_PRE + helpers + _GGML_MAIN.replace("BLKVALS", "%uu" % vals)
-            + dec + _GGML_TAIL)
+    src = _GGML_BIND + helpers + pre + main + dec + tail
+    for k, v in (("KSxBLK", str(_GGML_KS * vals)), ("KSx64", str(_GGML_KS * 64)),
+                 ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
+                 ("BLKVALS", "%uu" % vals)):
+        src = src.replace(k, v)
+    return src
 
 
-def _ggml_selfcheck(type_name):
+def _ggml_selfcheck(type_name, gemv):
     """Multiply one random block and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -3586,23 +3604,27 @@ def _ggml_selfcheck(type_name):
             break
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
-    x = rng.standard_normal((1, vals)).astype(np.float32)
+    M = 1 if gemv else 3
+    x = rng.standard_normal((M, vals)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
     got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=xp.asarray(np.frombuffer(raw, np.int32)),
-                                          type_name=type_name, K=vals, N=2))).reshape(1, 2)
+                                          type_name=type_name, K=vals, N=2))).reshape(M, 2)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
-        raise RuntimeError("native ggml kernel for %s is wrong (rel err %.3g) -- check the "
-                           "console for a WGSL compile error" % (type_name, err))
+        raise RuntimeError("native ggml %s kernel for %s is wrong (rel err %.3g) -- check "
+                           "the console for a WGSL compile error"
+                           % ("gemv" if gemv else "gemm", type_name, err))
 
 
 def ggml_matmul(xf, packed, type_name, K, N):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader."""
-    if type_name not in _ggml_k["added"]:
-        _ggml_add(type_name)
-        _ggml_k["added"].add(type_name)     # set before the check: it calls back in here
-        _ggml_selfcheck(type_name)
+    gemv = int(xf.shape[0]) == 1
+    key = (type_name, gemv)
+    if key not in _ggml_k["added"]:
+        _ggml_add(type_name, gemv)
+        _ggml_k["added"].add(key)           # set before the check: it calls back in here
+        _ggml_selfcheck(type_name, gemv)
     return _ggml_run(xf, packed, type_name, K, N)
 
 
@@ -3621,19 +3643,23 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name):
+def _ggml_add(type_name, gemv):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
-    plat.addKernel("ggml_" + type_name.lower(),
-                   {"source": _ggml_src(type_name), "bindingTypes": binds})
+    plat.addKernel(_ggml_name(type_name, gemv),
+                   {"source": _ggml_src(type_name, gemv), "bindingTypes": binds})
+
+
+def _ggml_name(type_name, gemv):
+    return "ggml%s_%s" % ("v" if gemv else "", type_name.lower())
 
 
 def _ggml_run(xf, packed, type_name, K, N):
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
     M = int(xf.shape[0])
-    name = "ggml_" + type_name.lower()
+    name = _ggml_name(type_name, M == 1)
     plat = _adam_kernel["platform"]
     of = _empty((M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk), "u4,u4,u4,u4")
@@ -3642,7 +3668,8 @@ def _ggml_run(xf, packed, type_name, K, N):
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": (N + 63) // 64, "y": (M + 3) // 4, "z": 1}})
+                    "workGroups": {"x": (N + 63) // 64,
+                                   "y": 1 if M == 1 else (M + 3) // 4, "z": 1}})
     return of
 
 
