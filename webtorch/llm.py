@@ -611,7 +611,14 @@ class CausalLM:
                 W = np.zeros((0, K), np.float32)
             if live < r1 - r0 or Kp != K:                      # pad to the packing multiple
                 W = np.pad(W, ((0, (r1 - r0) - live), (0, Kp - K)))
-            qw, qz, sc, _, _ = wt._gptq_quantize(W, self.gs, self.bits, from_out_in=True)
+            # Quantizing is the expensive half and every column is independent, so it goes
+            # to the GPU when there is one; the host path stays as the fallback and as the
+            # reference the GPU one is checked against.
+            got = wt.gptq_quantize_gpu(W, self.gs, self.bits)
+            if got is None:
+                qw, qz, sc, _, _ = wt._gptq_quantize(W, self.gs, self.bits, from_out_in=True)
+            else:
+                qw, qz, sc = got
             del W
             qws.append(qw); qzs.append(qz); scs.append(sc)
         qw = np.concatenate(qws, axis=1); del qws

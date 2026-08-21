@@ -2848,6 +2848,152 @@ class Adam:
 #   scales  (nG, N) f32,  nG = K/group_size
 #   dequant: w[k,n] = scales[k//gs, n] * (q[k,n] - zero[k//gs, n])
 # Quantization is PER-TENSOR (independent) -> naturally streamable.
+# Quantizing is the expensive half of loading a GGUF: measured 0.31s of the 0.53s it takes
+# to turn an 89M-value weight into packed int4, and a 27B model is 300 of those. It is also
+# embarrassingly parallel -- every output column's groups are independent -- and unlike
+# dequantizing, there is only ONE format to write a shader for rather than fourteen. So it
+# goes to the GPU: three passes over a band of the weight, no host arithmetic at all.
+#
+# The weight is read in its (out, in) layout, so each thread's `group_size` values are
+# contiguous; only the packed writes stride.
+_QSCALE_WGSL = """@group(0) @binding(0)
+var<storage,read> w: array<f32>;
+@group(0) @binding(1)
+var<storage,read_write> scales: array<f32>;
+@group(0) @binding(2)
+var<storage,read_write> zeros: array<f32>;
+struct QM { N: u32, Kp: u32, gs: u32, nG: u32, qmax: u32, }
+@group(0) @binding(3)
+var<storage,read> qm: QM;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= qm.nG * qm.N) { return; }
+  let g = i / qm.N;
+  let n = i - g * qm.N;
+  let base = n * qm.Kp + g * qm.gs;
+  var lo: f32 = w[base];
+  var hi: f32 = lo;
+  for (var j: u32 = 1u; j < qm.gs; j = j + 1u) {
+    let v = w[base + j];
+    lo = min(lo, v); hi = max(hi, v);
+  }
+  var sc = (hi - lo) / f32(qm.qmax);
+  if (sc == 0.0) { sc = 1e-8; }
+  let zp = clamp(round(-lo / sc), 0.0, f32(qm.qmax));
+  scales[g * qm.N + n] = sc;
+  zeros[g * qm.N + n] = zp;
+}
+"""
+
+_QPACK_WGSL = """@group(0) @binding(0)
+var<storage,read> w: array<f32>;
+@group(0) @binding(1)
+var<storage,read> scales: array<f32>;
+@group(0) @binding(2)
+var<storage,read> zeros: array<f32>;
+@group(0) @binding(3)
+var<storage,read_write> qweight: array<u32>;
+struct QM { N: u32, Kp: u32, gs: u32, nG: u32, qmax: u32, bits: u32, per: u32, }
+@group(0) @binding(4)
+var<storage,read> qm: QM;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let rows = qm.Kp / qm.per;
+  if (i >= rows * qm.N) { return; }
+  let kb = i / qm.N;
+  let n = i - kb * qm.N;
+  var acc: u32 = 0u;
+  for (var j: u32 = 0u; j < qm.per; j = j + 1u) {
+    let k = kb * qm.per + j;
+    let g = k / qm.gs;
+    let sc = scales[g * qm.N + n];
+    let zp = zeros[g * qm.N + n];
+    let q = clamp(round(w[n * qm.Kp + k] / sc) + zp, 0.0, f32(qm.qmax));
+    acc = acc | (u32(q) << (j * qm.bits));
+  }
+  qweight[kb * qm.N + n] = acc;
+}
+"""
+
+_QZPACK_WGSL = """@group(0) @binding(0)
+var<storage,read> zeros: array<f32>;
+@group(0) @binding(1)
+var<storage,read_write> qzeros: array<u32>;
+struct QM { N: u32, nG: u32, bits: u32, per: u32, }
+@group(0) @binding(2)
+var<storage,read> qm: QM;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let cols = qm.N / qm.per;
+  if (i >= qm.nG * cols) { return; }
+  let g = i / cols;
+  let nb = i - g * cols;
+  var acc: u32 = 0u;
+  for (var j: u32 = 0u; j < qm.per; j = j + 1u) {
+    acc = acc | (u32(zeros[g * qm.N + nb * qm.per + j]) << (j * qm.bits));
+  }
+  qzeros[g * cols + nb] = acc;
+}
+"""
+_q_k = {"added": False}
+_GPU_QUANT = True      # A/B switch for quantizing on the GPU
+
+
+def gptq_quantize_gpu(W_out_in, group_size=128, bits=4):
+    """Quantize a band on the GPU. Returns (qweight, qzeros, scales) or None if unavailable.
+
+    `W_out_in` is (out, in) and must already be padded to the packing multiples. Shapes and
+    values match `_gptq_quantize(..., from_out_in=True)` exactly.
+    """
+    if not (_GPU_QUANT and _adam_backend_ready()):
+        return None
+    N, Kp = (int(v) for v in W_out_in.shape)
+    per = 32 // bits
+    qmax = (1 << bits) - 1
+    if Kp % group_size or Kp % per or N % per:
+        return None
+    nG = Kp // group_size
+    plat = _adam_kernel["platform"]
+    if not _q_k["added"]:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel("q_scale", {"source": _QSCALE_WGSL, "bindingTypes": [ro, rw, rw, ro]})
+        plat.addKernel("q_pack", {"source": _QPACK_WGSL, "bindingTypes": [ro, ro, ro, rw, ro]})
+        plat.addKernel("q_zpack", {"source": _QZPACK_WGSL, "bindingTypes": [ro, rw, ro]})
+        _q_k["added"] = True
+    wg = xp.asarray(np.ascontiguousarray(W_out_in, dtype=np.float32))
+    sc = _empty((nG * N,))
+    zr = _empty((nG * N,))
+    m1 = _adam_kernel["make_meta"]((N, Kp, group_size, nG, qmax), "u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "q_scale",
+                    "tensors": [wg.buffer.buffer_id, sc.buffer.buffer_id,
+                                zr.buffer.buffer_id, m1.buffer_id],
+                    "workGroups": {"x": (nG * N + 63) // 64, "y": 1, "z": 1}})
+    qw = _empty(((Kp // per) * N,))
+    m2 = _adam_kernel["make_meta"]((N, Kp, group_size, nG, qmax, bits, per),
+                                   "u4,u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "q_pack",
+                    "tensors": [wg.buffer.buffer_id, sc.buffer.buffer_id, zr.buffer.buffer_id,
+                                qw.buffer.buffer_id, m2.buffer_id],
+                    "workGroups": {"x": ((Kp // per) * N + 63) // 64, "y": 1, "z": 1}})
+    qz = _empty((nG * (N // per),))
+    m3 = _adam_kernel["make_meta"]((N, nG, bits, per), "u4,u4,u4,u4")
+    plat.runKernel({"name": "q_zpack",
+                    "tensors": [zr.buffer.buffer_id, qz.buffer.buffer_id, m3.buffer_id],
+                    "workGroups": {"x": (nG * (N // per) + 63) // 64, "y": 1, "z": 1}})
+    to_np = lambda a: np.asarray(a.get() if hasattr(a, "get") else a)
+    # The packed outputs are integers written through an f32-typed buffer, so they come back
+    # reinterpreted, not converted: astype() here would read the bit pattern as a float and
+    # produce garbage -- which is exactly what it did, while scales, being genuinely f32,
+    # came out correct and made the mismatch look like a rounding difference.
+    as_i32 = lambda a: to_np(a).astype(np.float32).view(np.int32)
+    return (as_i32(qw).reshape(Kp // per, N),
+            as_i32(qz).reshape(nG, N // per),
+            to_np(sc).astype(np.float32).reshape(nG, N))
+
+
 def _gptq_quantize(W, group_size=32, bits=4, from_out_in=False, block=2048):
     """Quantize a weight to packed int`bits` with per-group scales and zero points.
 
