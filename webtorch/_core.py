@@ -3304,8 +3304,233 @@ _IQ1M_DEC = """
   }
 """
 
+# Q4_0: 32 values / 18 bytes -- f16 d + 16 nibble pairs, quants centred on 8.
+_Q4_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 2u + j);
+      ACC(kb + j, d * (f32(q & 15u) - 8.0));
+      ACC(kb + 16u + j, d * (f32(q >> 4u) - 8.0));
+    }
+  }
+"""
+
+# Q4_1: 32 values / 20 bytes -- f16 d, f16 min, 16 nibble pairs.
+_Q4_1_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 20u;
+    let d = F16(o); let mn = F16(o + 2u);
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 4u + j);
+      ACC(kb + j, d * f32(q & 15u) + mn);
+      ACC(kb + 16u + j, d * f32(q >> 4u) + mn);
+    }
+  }
+"""
+
+# Q5_0: 32 values / 22 bytes -- f16 d, u32 qh holding each value's fifth bit, 16 nibble pairs.
+_Q5_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 22u;
+    let d = F16(o);
+    let qh = U32(o + 2u);
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 6u + j);
+      ACC(kb + j, d * (f32((q & 15u) | (((qh >> j) << 4u) & 16u)) - 16.0));
+      ACC(kb + 16u + j, d * (f32((q >> 4u) | ((qh >> (j + 12u)) & 16u)) - 16.0));
+    }
+  }
+"""
+
+# Q5_1: 32 values / 24 bytes -- f16 d, f16 min, u32 qh, 16 nibble pairs.
+_Q5_1_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 24u;
+    let d = F16(o); let mn = F16(o + 2u);
+    let qh = U32(o + 4u);
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 8u + j);
+      ACC(kb + j, d * f32((q & 15u) | (((qh >> j) << 4u) & 16u)) + mn);
+      ACC(kb + 16u + j, d * f32((q >> 4u) | ((qh >> (j + 12u)) & 16u)) + mn);
+    }
+  }
+"""
+
+# F16 / F32: not quantized at all, but going through the same kernel keeps an unquantized
+# tensor on the no-conversion path instead of sending it back through the fp32 expansion.
+_F16_DEC = """
+  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, F16(base + k * 2u)); }
+"""
+
+_F32_DEC = """
+  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, bitcast<f32>(U32(base + k * 4u))); }
+"""
+
+# E2M1 values (doubled) -- ggml's kvalues_fp4, shared by MXFP4 and NVFP4 -- plus the two
+# scale encodings those formats use. Packed into u32s for the same reason as the IQ4 table.
+_FP4_FN = """
+fn fp4(i: u32) -> f32 {
+  var p: u32 = 0x03020100u;
+  if (i >= 12u) { p = 0xF4F8FAFCu; }
+  else if (i >= 8u) { p = 0xFDFEFF00u; }
+  else if (i >= 4u) { p = 0x0C080604u; }
+  let b = (p >> (8u * (i & 3u))) & 255u;
+  return f32(i32(b << 24u) >> 24u);
+}
+fn e8m0h(e: u32) -> f32 {
+  if (e < 2u) { return bitcast<f32>(0x00200000u << e); }
+  return bitcast<f32>((e - 1u) << 23u);
+}
+fn ue4m3(v: u32) -> f32 {
+  if (v == 0u || v == 127u) { return 0.0; }
+  let e = (v >> 3u) & 15u;
+  let m = f32(v & 7u);
+  if (e == 0u) { return m * exp2(-9.0) * 0.5; }
+  return (1.0 + m * 0.125) * exp2(f32(i32(e) - 7)) * 0.5;
+}
+"""
+
+_POW3_FN = """
+fn pow3(n: u32) -> u32 {
+  var p: u32 = 1u;
+  for (var i: u32 = 0u; i < n; i = i + 1u) { p = p * 3u; }
+  return p;
+}
+"""
+
+# BF16: the top 16 bits of an fp32, so widening is a shift.
+_BF16_DEC = """
+  for (var k: u32 = 0u; k < gm.K; k = k + 1u) { ACC(k, bitcast<f32>(U16(base + k * 2u) << 16u)); }
+"""
+
+# TQ1_0: 256 values / 54 bytes -- qs[48] | qh[4] | f16 d. Ternary, five values packed per
+# byte: multiply the byte by a power of three (mod 256) and the top of byte*3 is the trit.
+_TQ1_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 54u;
+    let d = F16(o + 52u);
+    let kb = b * 256u;
+    var k: u32 = 0u;
+    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+      let jo = g * 32u;
+      let cnt = select(32u, 16u, g == 1u);
+      for (var p: u32 = 0u; p < 5u; p = p + 1u) {
+        let p3 = pow3(p);
+        for (var m: u32 = 0u; m < cnt; m = m + 1u) {
+          let q = (B(o + jo + m) * p3) & 255u;
+          ACC(kb + k + m, (f32((q * 3u) >> 8u) - 1.0) * d);
+        }
+        k = k + cnt;
+      }
+    }
+    for (var p: u32 = 0u; p < 4u; p = p + 1u) {      // the four qh bytes, four values each
+      let p3 = pow3(p);
+      for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+        let q = (B(o + 48u + j) * p3) & 255u;
+        ACC(kb + k + j, (f32((q * 3u) >> 8u) - 1.0) * d);
+      }
+      k = k + 4u;
+    }
+  }
+"""
+
+# TQ2_0: 256 values / 66 bytes -- qs[64] | f16 d. Two bits per value, one bit-plane at a
+# time across each 32-byte group.
+_TQ2_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 66u;
+    let d = F16(o + 64u);
+    let kb = b * 256u;
+    var k: u32 = 0u;
+    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+      let jo = g * 32u;
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        for (var m: u32 = 0u; m < 32u; m = m + 1u) {
+          ACC(kb + k + m, (f32((B(o + jo + m) >> (l * 2u)) & 3u) - 1.0) * d);
+        }
+        k = k + 32u;
+      }
+    }
+  }
+"""
+
+# MXFP4: 32 values / 17 bytes -- one E8M0 exponent byte then 16 nibble pairs.
+_MXFP4_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 17u;
+    let d = e8m0h(B(o));
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 1u + j);
+      ACC(kb + j, fp4(q & 15u) * d);
+      ACC(kb + 16u + j, fp4(q >> 4u) * d);
+    }
+  }
+"""
+
+# NVFP4: 64 values / 36 bytes -- four UE4M3 scales, one per 16-value sub-block, then 32
+# nibble pairs.
+_NVFP4_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 36u;
+    let kb = b * 64u;
+    for (var s: u32 = 0u; s < 4u; s = s + 1u) {
+      let d = ue4m3(B(o + s));
+      let k0 = kb + s * 16u;
+      for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+        let q = B(o + 4u + s * 8u + j);
+        ACC(k0 + j, fp4(q & 15u) * d);
+        ACC(k0 + 8u + j, fp4(q >> 4u) * d);
+      }
+    }
+  }
+"""
+
+# Q1_0: 128 values / 18 bytes -- f16 d and one bit per value, +d or -d.
+_Q1_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 128u;
+    for (var j: u32 = 0u; j < 128u; j = j + 1u) {
+      ACC(kb + j, select(-d, d, ((B(o + 2u + (j >> 3u)) >> (j & 7u)) & 1u) != 0u));
+    }
+  }
+"""
+
+# Q2_0: 64 values / 18 bytes -- f16 d and two bits per value, 00=-1 01=0 10=+1 11=+2.
+_Q2_0_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 64u;
+    for (var j: u32 = 0u; j < 64u; j = j + 1u) {
+      ACC(kb + j, (f32((B(o + 2u + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u) - 1.0) * d);
+    }
+  }
+"""
+
 # name -> (decode fragment, helper functions, values per block, bytes per block, codebook)
 _GGML_TYPES = {
+    "F32":     (_F32_DEC,     "",                   1,   4, None),
+    "F16":     (_F16_DEC,     "",                   1,   2, None),
+    "BF16":    (_BF16_DEC,    "",                   1,   2, None),
+    "TQ1_0":   (_TQ1_0_DEC,   _POW3_FN,           256,  54, None),
+    "TQ2_0":   (_TQ2_0_DEC,   "",                 256,  66, None),
+    "MXFP4":   (_MXFP4_DEC,   _FP4_FN,             32,  17, None),
+    "NVFP4":   (_NVFP4_DEC,   _FP4_FN,             64,  36, None),
+    "Q1_0":    (_Q1_0_DEC,    "",                 128,  18, None),
+    "Q2_0":    (_Q2_0_DEC,    "",                  64,  18, None),
+    "Q4_0":    (_Q4_0_DEC,    "",                  32,  18, None),
+    "Q4_1":    (_Q4_1_DEC,    "",                  32,  20, None),
+    "Q5_0":    (_Q5_0_DEC,    "",                  32,  22, None),
+    "Q5_1":    (_Q5_1_DEC,    "",                  32,  24, None),
     "Q8_0":    (_Q8_0_DEC,    "",                  32,  34, None),
     "IQ4_NL":  (_IQ4NL_DEC,   _KV_FN,              32,  18, None),
     "IQ4_XS":  (_IQ4XS_DEC,   _KV_FN,             256, 136, None),
@@ -3362,6 +3587,7 @@ def _ggml_selfcheck(type_name):
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
     x = rng.standard_normal((1, vals)).astype(np.float32)
+    raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
     got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=xp.asarray(np.frombuffer(raw, np.int32)),
                                           type_name=type_name, K=vals, N=2))).reshape(1, 2)
     want = x @ ref.T
@@ -3711,6 +3937,33 @@ def _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0, block
         out[:, c0:c1] = x @ w
         del q, z, w
     return out
+
+
+class GGMLLinear(Module):
+    """Inference-only Linear whose weight stays in the encoding the GGUF shipped it in.
+
+    Nothing is dequantized or requantized at load: the file's bytes go to the GPU as they
+    are and `ggml_matmul` unpacks each block while it multiplies. That removes the whole
+    conversion pass -- the bulk of a load -- and the second rounding it imposed."""
+
+    def __init__(self, raw, type_name, K, N, bias=None):
+        b = np.frombuffer(raw, np.uint8)
+        pad = (-b.size) % 4
+        if pad:
+            b = np.concatenate([b, np.zeros(pad, np.uint8)])
+        self.packed = xp.asarray(b.view(np.int32))
+        self.type_name = type_name
+        self.Kt = int(K); self.Nt = int(N)
+        self.bias = None if bias is None else xp.asarray(np.asarray(bias, np.float32))
+
+    def forward(self, x):
+        xd = x.data
+        lead = xd.shape[:-1]
+        of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed,
+                         self.type_name, self.Kt, self.Nt)
+        if self.bias is not None:
+            of = of + self.bias
+        return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
 
 
 class QuantizedLinear(Module):

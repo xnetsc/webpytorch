@@ -554,15 +554,17 @@ class CausalLM:
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
 
     async def _gexperts(self, name):
-        """Yield each expert of a stacked MoE tensor as fp32 (out,in), one at a time.
+        """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
 
-        llama.cpp packs a layer's experts into a single `ffn_*_exps` tensor. Dequantizing
-        the whole stack costs ~800 MB of fp32 on a 128-expert layer, so experts are
-        converted individually -- but the packed bytes are fetched in ONE range request,
-        because a read per expert would turn three reads per layer into hundreds. Peak
-        cost is therefore the packed tensor (tens of MB) plus a single fp32 expert.
-        Quantization blocks run along `in`, and out*in is a whole number of blocks, so
-        every per-expert offset is block-aligned.
+        llama.cpp packs a layer's experts into a single `ffn_*_exps` tensor. The packed
+        bytes are fetched in ONE range request -- a read per expert would turn three reads
+        per layer into hundreds -- and then split, which is exact: quantization blocks run
+        along `in` and out*in is a whole number of blocks, so every per-expert offset is
+        block-aligned.
+
+        On the native path each expert's slice goes straight to the GPU in its own encoding.
+        Otherwise it is dequantized and requantized one expert at a time, because the whole
+        stack as fp32 is ~800 MB on a 128-expert layer; peak stays at one expert.
         """
         from . import ggufload as G
         t = self._ginfo[name]
@@ -571,8 +573,39 @@ class CausalLM:
         nb = G.tensor_nbytes(t["type"], per)                  # bytes per expert
         off = self._gds + t["offset"]
         raw = await self._grng(off, off + nb * ne - 1)
+        nm = G.GGML_NAMES.get(t["type"])
+        native = (getattr(self, "_weights", "native") == "native"
+                  and wt.ggml_native_supported(nm)
+                  and in_d % wt._GGML_TYPES[nm][2] == 0)
         for e in range(ne):
-            yield G.dequant(t["type"], raw[e * nb:(e + 1) * nb], per).reshape(out_d, in_d)
+            chunk = raw[e * nb:(e + 1) * nb]
+            if native:
+                yield wt.GGMLLinear(chunk, nm, in_d, out_d)
+            else:
+                yield self._gquant(G.dequant(t["type"], chunk, per).reshape(out_d, in_d))
+
+    async def _gload_native(self, name, bias=None):
+        """Upload a GGUF weight unchanged, for a kernel that decodes it while multiplying.
+
+        No dequantize, no requantize, no fp32 intermediate: the packed tensor is a few tens
+        of MB where its fp32 expansion would be hundreds, so it goes up in one piece.
+        Returns None when the tensor is not something the native kernels handle -- a type
+        without a decode fragment, a non-2D tensor, or a K that is not block-aligned -- and
+        the caller falls back to converting it."""
+        from . import ggufload as G
+        t = self._ginfo[name]
+        dims = [int(d) for d in reversed(t["dims"])]
+        if len(dims) != 2:
+            return None
+        nm = G.GGML_NAMES.get(t["type"])
+        if not wt.ggml_native_supported(nm):
+            return None
+        N, K = dims
+        if K % wt._GGML_TYPES[nm][2]:
+            return None
+        row = G.tensor_nbytes(t["type"], K)
+        off = self._gds + t["offset"]
+        return wt.GGMLLinear(await self._grng(off, off + N * row - 1), nm, K, N, bias)
 
     async def _gload_quant(self, name, bias=None):
         """Read a GGUF weight and quantize it without ever holding it whole.
@@ -585,6 +618,10 @@ class CausalLM:
         quantize, keep only the packed result. Peak is one band, whatever the tensor's size.
         """
         from . import ggufload as G
+        if getattr(self, "_weights", "native") == "native":
+            got = await self._gload_native(name, bias)
+            if got is not None:
+                return got
         if getattr(self, "_qbits", None) == 0:                # fp16 path wants it whole
             return self._gquant(await self._gload(name), bias)
         t = self._ginfo[name]
@@ -641,7 +678,7 @@ class CausalLM:
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
     @classmethod
-    async def from_gguf(cls, url, lmax=320, bits=None, quantize=True):
+    async def from_gguf(cls, url, lmax=320, bits=None, quantize=True, weights="native"):
         """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
         they run on the same capture-accelerated engine. `url` is the served .gguf file.
 
@@ -674,6 +711,14 @@ class CausalLM:
         # `quantize=False` (dtype="fp16") keeps the dequantized weights unquantized, so a GGUF
         # runs on the numpy/CPU path too — the int kernel is GPU-only.
         self._qbits = self.bits if quantize else 0
+        # "native" multiplies straight out of the file's own encoding; "requant" converts
+        # every weight to the int4/int8 kernel format first, which is what this did before
+        # the native kernels existed. Native is the default: it skips the conversion (the
+        # bulk of a load) and the second rounding that came with it. Types without a native
+        # decode fall back to conversion per tensor either way.
+        if weights not in ("native", "requant"):
+            raise ValueError("weights must be 'native' or 'requant', got %r" % (weights,))
+        self._weights = weights
         arch = meta.get("general.architecture")
         if not arch:
             raise ValueError("GGUF has no general.architecture")
@@ -878,9 +923,9 @@ class CausalLM:
                 for key, nm in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"),
                                 ("down", "ffn_down_exps")):
                     e = 0
-                    async for W in self._gexperts(p + nm + ".weight"):
-                        experts[e][key] = self._gquant(W); e += 1
-                lay["moe"] = {"gate": self._gquant(await self._gload(p + "ffn_gate_inp.weight")),
+                    async for lin in self._gexperts(p + nm + ".weight"):
+                        experts[e][key] = lin; e += 1
+                lay["moe"] = {"gate": await self._gload_quant(p + "ffn_gate_inp.weight"),
                               "top_k": self.top_k or 2, "norm_topk": True, "experts": experts}
             else:
                 lay["gate"] = await qb("ffn_gate"); lay["up"] = await qb("ffn_up")

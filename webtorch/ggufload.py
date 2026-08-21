@@ -23,12 +23,35 @@ GGML_NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
               13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
               # i-quants (importance-matrix codebook quantizations)
               16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL",
-              21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 29: "IQ1_M"}
+              21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 29: "IQ1_M", 30: "BF16",
+              # ternary, microscaling-float and sub-2-bit types
+              34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0", 42: "Q2_0"}
 GGML_IDS = {v: k for k, v in GGML_NAMES.items()}
 
 # IQ4 non-linear codebook: 4-bit indices select from these 16 levels (ggml kvalues_iq4nl).
 _IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
                    1, 13, 25, 38, 53, 69, 89, 113], np.float32)
+
+
+# E2M1 values, doubled -- ggml's kvalues_fp4, shared by MXFP4 and NVFP4.
+_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.float32)
+
+
+def _e8m0_half(e):
+    """MXFP4's shared exponent: 0.5 * 2^(e-127), with denormal patterns below 2."""
+    e = np.asarray(e, np.uint32)
+    bits = np.where(e < 2, np.uint32(0x00200000) << e, (np.maximum(e, 1) - 1) << 23)
+    return bits.astype(np.uint32).view(np.float32)
+
+
+def _ue4m3(x):
+    """NVFP4's per-sub-block scale: unsigned 4-bit exponent (bias 7), 3-bit mantissa, halved."""
+    x = np.asarray(x, np.uint32)
+    exp = (x >> 3) & 0xF
+    man = (x & 7).astype(np.float32)
+    raw = np.where(exp == 0, man * 2.0 ** -9,
+                   (1.0 + man / 8.0) * 2.0 ** (exp.astype(np.float32) - 7))
+    return np.where((x == 0) | (x == 0x7F), 0.0, raw * 0.5).astype(np.float32)
 
 
 class _R:
@@ -290,6 +313,72 @@ def dequant(ttype, raw, n):
         hi = _IQ4NL[(qs >> 4)]                                       # (blk,8,16)
         vals = np.concatenate([lo, hi], axis=2)                      # (blk,8,32)
         return (vals * dl[:, :, None]).reshape(-1)[:n]
+    if name == "BF16":                       # top 16 bits of an fp32
+        return (np.frombuffer(raw, np.uint16)[:n].astype(np.uint32) << 16).view(np.float32)
+    if name == "TQ1_0":                      # 256 vals / 54 bytes: qs[48] | qh[4] | f16 d
+        # Ternary, five values to a byte: each is recovered by multiplying the byte by a
+        # power of three (mod 256) and taking the top of byte*3.
+        blk = n // 256
+        b = u8[:blk * 54].reshape(blk, 54)
+        d = _f16(b[:, 52:54])
+        out = np.empty((blk, 256), np.float32); o = 0
+        for j, cnt in ((0, 32), (32, 16)):
+            seg = b[:, j:j + cnt].astype(np.uint16)
+            for p in range(5):
+                q = (seg * (3 ** p)) & 0xFF
+                out[:, o:o + cnt] = ((q * 3) >> 8).astype(np.float32) - 1.0
+                o += cnt
+        qh = b[:, 48:52].astype(np.uint16)
+        for p in range(4):
+            q = (qh * (3 ** p)) & 0xFF
+            out[:, o:o + 4] = ((q * 3) >> 8).astype(np.float32) - 1.0
+            o += 4
+        return (out * d).reshape(-1)[:n]
+    if name == "TQ2_0":                      # 256 vals / 66 bytes: qs[64] | f16 d
+        blk = n // 256
+        b = u8[:blk * 66].reshape(blk, 66)
+        d = _f16(b[:, 64:66])
+        out = np.empty((blk, 256), np.float32); o = 0
+        for j in (0, 32):
+            seg = b[:, j:j + 32]
+            for l in range(4):               # one bit-plane at a time, 32 values each
+                out[:, o:o + 32] = ((seg >> (2 * l)) & 3).astype(np.float32) - 1.0
+                o += 32
+        return (out * d).reshape(-1)[:n]
+    if name == "MXFP4":                      # 32 vals / 17 bytes: E8M0 e | qs[16]
+        blk = n // 32
+        b = u8[:blk * 17].reshape(blk, 17)
+        d = _e8m0_half(b[:, 0])[:, None]
+        qs = b[:, 1:17]
+        out = np.empty((blk, 32), np.float32)
+        out[:, :16] = _FP4[qs & 0x0F]
+        out[:, 16:] = _FP4[qs >> 4]
+        return (out * d).reshape(-1)[:n]
+    if name == "NVFP4":                      # 64 vals / 36 bytes: UE4M3 d[4] | qs[32]
+        blk = n // 64
+        b = u8[:blk * 36].reshape(blk, 36)
+        ds = _ue4m3(b[:, 0:4])               # one scale per 16-value sub-block
+        out = np.empty((blk, 4, 16), np.float32)
+        for s in range(4):
+            q = b[:, 4 + s * 8:4 + (s + 1) * 8]
+            out[:, s, :8] = _FP4[q & 0x0F]
+            out[:, s, 8:] = _FP4[q >> 4]
+        return (out * ds[:, :, None]).reshape(-1)[:n]
+    if name == "Q1_0":                       # 128 vals / 18 bytes: f16 d | one bit each
+        blk = n // 128
+        b = u8[:blk * 18].reshape(blk, 18)
+        d = _f16(b[:, 0:2])
+        bits = np.unpackbits(b[:, 2:18], axis=1, bitorder="little")
+        return np.where(bits != 0, d, -d).reshape(-1)[:n]
+    if name == "Q2_0":                       # 64 vals / 18 bytes: f16 d | 2 bits each
+        blk = n // 64
+        b = u8[:blk * 18].reshape(blk, 18)
+        d = _f16(b[:, 0:2])
+        qs = b[:, 2:18]
+        out = np.empty((blk, 16, 4), np.float32)
+        for l in range(4):
+            out[:, :, l] = ((qs >> (2 * l)) & 3).astype(np.float32)
+        return ((out.reshape(blk, 64) - 1.0) * d).reshape(-1)[:n]
     if name in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"):
         return _dequant_iq(name, u8, n)
     raise NotImplementedError("dequant not implemented for %s" % name)
@@ -424,7 +513,9 @@ _BLOCK = {"F32": (1, 4), "F16": (1, 2), "Q8_0": (32, 34), "Q4_0": (32, 18),
           "Q5_K": (256, 176), "Q3_K": (256, 110), "Q2_K": (256, 84),
           "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ2_S": (256, 82),
           "IQ3_XXS": (256, 98), "IQ3_S": (256, 110),
-          "IQ1_S": (256, 50), "IQ1_M": (256, 56)}
+          "IQ1_S": (256, 50), "IQ1_M": (256, 56),
+          "BF16": (1, 2), "TQ1_0": (256, 54), "TQ2_0": (256, 66),
+          "MXFP4": (32, 17), "NVFP4": (64, 36), "Q1_0": (128, 18), "Q2_0": (64, 18)}
 
 
 # Quantization types this loader can dequantize (derived from _BLOCK, which mirrors the

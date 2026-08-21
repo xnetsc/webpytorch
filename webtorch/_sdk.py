@@ -65,7 +65,7 @@ class AutoModelForCausalLM:
         requantize to that width. (An AutoGPTQ dir always loads at its own stored bits.)
     """
     @staticmethod
-    async def from_pretrained(path, dtype="auto", bits=None, lmax=320):
+    async def from_pretrained(path, dtype="auto", bits=None, lmax=320, weights="native"):
         from . import llm as _llm, webio
         p = path.rstrip("/")
         if p.endswith(".gguf"):
@@ -75,12 +75,17 @@ class AutoModelForCausalLM:
             # dtype="fp16" runs a GGUF unquantized (works without a GPU; the int kernel is
             # GPU-only). "auto"/int4/int8 requantize to the int engine as before.
             return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=gb,
-                                                 quantize=(dtype != "fp16"))
+                                                 quantize=(dtype != "fp16"), weights=weights)
         cfg = await webio.read_json(p + "/config.json")
         if "quantization_config" in cfg:                     # already-quantized AutoGPTQ (int4/int8)
             return await _llm.CausalLM.from_gptq(p, lmax=lmax)
         q = {"int4": 4, "int8": 8}.get(dtype)                # plain fp16/bf16 HF dir
         return await _llm.CausalLM.from_fp16(p, lmax=lmax, quantize=q)   # q=None → run fp16
+
+
+# Options every LLM entry point forwards to AutoModelForCausalLM. Kept in one place so a
+# new loader option reaches load(), pipeline() and the multimodal path without three edits.
+_LLM_OPTS = ("dtype", "bits", "lmax", "weights")
 
 
 # ---- ONE unified entry point for every model type ---------------------------
@@ -264,7 +269,7 @@ async def _load_uncached(source, task, dtype, encoder, kw):
     if task is not None:                                   # explicit task -> registry
         return Model(await pipeline(task, kw.pop("model", "auto"), path=src, **kw), task)
     lm = await AutoModelForCausalLM.from_pretrained(
-        src, dtype=dtype, **{k: kw[k] for k in ("bits", "lmax") if k in kw})
+        src, dtype=dtype, **{k: kw[k] for k in _LLM_OPTS if k in kw and k != "dtype"})
     if encoder is not None:                                # decoder + media encoder
         enc = await multimodal.load_encoder(encoder, **kw.get("encoder_kwargs", {}))
         return Model(multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id")),
@@ -442,7 +447,8 @@ async def _load_qwenvl(**kw):
     from . import vl
     return await vl.QwenVL.from_pretrained(kw.get("path", "/models/qwen2.5-vl-3b"))
 async def _load_causal(**kw):
-    return await AutoModelForCausalLM.from_pretrained(kw["path"], **{k: kw[k] for k in ("bits", "lmax") if k in kw})
+    return await AutoModelForCausalLM.from_pretrained(
+        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw})
 
 async def _load_multimodal(**kw):
     """Generic multimodal impl: ANY decoder + ANY registered media encoder.
@@ -451,7 +457,7 @@ async def _load_multimodal(**kw):
     encoder through `MultimodalLM` — no model-specific code."""
     from . import multimodal
     lm = await AutoModelForCausalLM.from_pretrained(
-        kw["path"], **{k: kw[k] for k in ("dtype", "bits", "lmax") if k in kw})
+        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw})
     enc = await multimodal.load_encoder(kw.get("encoder", "auto"),
                                         **kw.get("encoder_kwargs", {}))
     return multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id"))
