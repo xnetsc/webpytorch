@@ -191,20 +191,36 @@ class BPETokenizer:
     def _tok_str(self, i):
         return self.dec.get(int(i), "") if i is not None and int(i) >= 0 else ""
 
-    def encode_chat(self, user, system="You are a helpful assistant."):
+    def encode_chat(self, user=None, system="You are a helpful assistant.", messages=None,
+                    tools=None, **tpl_kw):
         """Render a chat prompt: the model's own template when it has one, else whatever
-        format its vocabulary indicates."""
-        msgs = ([{"role": "system", "content": system}] if system else []) + \
-               [{"role": "user", "content": user}]
-        got = self.render_chat(msgs)
+        format its vocabulary indicates.
+
+        `messages` is a full conversation ([{role, content}, ...]); `user`/`system` are the
+        one-turn shorthand for it. `tools` and any other keyword are handed to the template
+        unchanged, which is what makes tool calling, thinking toggles and the rest generic:
+        a model that documents them in its template gets them, and one that does not
+        ignores them. Nothing here knows what any particular model calls its options."""
+        msgs = messages if messages is not None else (
+            ([{"role": "system", "content": system}] if system else [])
+            + ([{"role": "user", "content": user}] if user is not None else []))
+        got = self.render_chat(msgs, tools=tools, **tpl_kw)
         if got is not None:
             return got
+        # No template: fall back to the layout the vocabulary implies. Tools cannot be
+        # expressed without one, so say so rather than dropping them silently.
+        if tools:
+            raise ValueError("this model ships no chat template, so tool definitions cannot "
+                             "be rendered; pass them inside a message instead")
         f = self.chat_format
+        sys_txt = next((m["content"] for m in msgs if m["role"] == "system"), "")
+        turns = [m for m in msgs if m["role"] != "system"]
         if f == "chatml":
             ims, ime = self._sp("<|im_start|>"), self._sp("<|im_end|>")
             seq = []
-            for role, content in (("system", system), ("user", user)):
-                seq += [ims] + self.encode(role + "\n" + content) + [ime] + self.encode("\n")
+            for m in msgs:
+                seq += ([ims] + self.encode(m["role"] + "\n" + m["content"]) + [ime]
+                        + self.encode("\n"))
             return seq + [ims] + self.encode("assistant\n")
         if f == "llama3":
             sh, eh = self._sp("<|start_header_id|>"), self._sp("<|end_header_id|>")
@@ -212,23 +228,35 @@ class BPETokenizer:
             seq = []
             bos = self._sp("<|begin_of_text|>")
             if bos is not None: seq.append(bos)
-            for role, content in (("system", system), ("user", user)):
-                seq += [sh] + self.encode(role) + [eh] + self.encode("\n\n" + content) + [eot]
+            for m in msgs:
+                seq += ([sh] + self.encode(m["role"]) + [eh]
+                        + self.encode("\n\n" + m["content"]) + [eot])
             return seq + [sh] + self.encode("assistant") + [eh] + self.encode("\n\n")
         if f == "gemma":
             sot, eot = self._sp("<start_of_turn>"), self._sp("<end_of_turn>")
-            # Gemma has no system role: fold it into the first user turn
-            body = (system + "\n\n" + user) if system else user
-            return ([sot] + self.encode("user\n" + body) + [eot] + self.encode("\n")
-                    + [sot] + self.encode("model\n"))
+            seq = []
+            for i, m in enumerate(turns):     # Gemma has no system role: fold it into turn 1
+                body = m["content"]
+                if i == 0 and sys_txt:
+                    body = sys_txt + "\n\n" + body
+                role = "model" if m["role"] == "assistant" else "user"
+                seq += [sot] + self.encode(role + "\n" + body) + [eot] + self.encode("\n")
+            return seq + [sot] + self.encode("model\n")
         if f == "mistral":
             bos = self._sp("<s>")
             seq = [bos] if bos is not None else []
-            body = (system + "\n\n" + user) if system else user
-            return seq + self.encode("[INST] " + body + " [/INST]")
-        # plain transcript — works for a base model or an unknown convention
-        pre = (system + "\n\n") if system else ""
-        return self.encode(pre + "User: " + user + "\nAssistant:")
+            for i, m in enumerate(turns):
+                body = m["content"]
+                if i == 0 and sys_txt:
+                    body = sys_txt + "\n\n" + body
+                seq += (self.encode("[INST] " + body + " [/INST]") if m["role"] != "assistant"
+                        else self.encode(body))
+            return seq
+        # plain transcript -- works for a base model or an unknown convention
+        pre = (sys_txt + "\n\n") if sys_txt else ""
+        body = "".join("%s: %s\n" % ("User" if m["role"] != "assistant" else "Assistant",
+                                      m["content"]) for m in turns)
+        return self.encode(pre + body + "Assistant:")
 
     def decode(self, ids):
         buf = bytearray()
@@ -655,7 +683,26 @@ class CausalLM:
         tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
                            eos_ids=eos, chat_template=tc.get("chat_template"), control=ctrl)
         await tok.prepare_template()
+        await self._load_gen_defaults()
         return tok
+
+    async def _load_gen_defaults(self):
+        """Sampling settings the model ships with (generation_config.json).
+
+        A model states what it should be sampled at -- Qwen3 asks for temperature 0.6 /
+        top_p 0.95 / top_k 20 -- and ignoring that makes it look worse than it is. These
+        are defaults: anything passed to generate() still wins. Read by name, so a field
+        the sampler does not implement is simply not picked up."""
+        from . import webio
+        try:
+            gc = await webio.read_json(self.base + "generation_config.json")
+        except Exception:
+            return                                  # optional file
+        keys = ("temperature", "top_p", "top_k", "do_sample", "repetition_penalty", "min_p",
+                "max_new_tokens", "max_length", "min_new_tokens")
+        got = {k: gc[k] for k in keys if gc.get(k) is not None}
+        if got:
+            self.gen_defaults = dict(getattr(self, "gen_defaults", {}) or {}, **got)
 
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
@@ -1147,32 +1194,125 @@ class CausalLM:
         return self._pick(self._logits(hlast))
 
     def _pick(self, logits):
-        """Turn logits into a token id using the current sampling parameters. Greedy when
-        `temperature <= 0` (or no sampling params were given), otherwise temperature +
-        top-k/top-p nucleus sampling. Parameters come from `generate(...)` / `load(...)`."""
-        sp = getattr(self, "_sampling", None)
-        if not sp or not sp.get("do_sample"):
-            return int(np.asarray(logits).argmax())
+        """Turn logits into a token id using the current sampling parameters.
+
+        Greedy when `temperature <= 0` (or no sampling params were given), otherwise
+        temperature + top-k/top-p/min-p sampling, with an optional repetition penalty and
+        an optional output constraint. Parameters come from `generate(...)`, from the
+        model's own generation_config.json, or from `load(...)`."""
+        sp = getattr(self, "_sampling", None) or {}
+        lg = np.asarray(logits, np.float32)
+        rp = float(sp.get("repetition_penalty", 1.0) or 1.0)
+        if rp != 1.0 and self._seen:
+            idx = np.unique(np.asarray(self._seen, np.int64))
+            idx = idx[(idx >= 0) & (idx < lg.size)]
+            v = lg[idx]
+            lg = lg.copy()
+            lg[idx] = np.where(v > 0, v / rp, v * rp)   # the usual asymmetric form
+        mn = int(sp.get("min_new_tokens", 0) or 0)
+        if mn and len(self._seen) - self._gen_start < mn and self.tok.eos_ids:
+            eos = np.asarray(self.tok.eos_ids, np.int64)
+            eos = eos[(eos >= 0) & (eos < lg.size)]
+            lg = lg.copy()
+            lg[eos] = -np.inf                           # not allowed to stop yet
+        con = sp.get("constraint")
+        tok = (self._pick_constrained(lg, con, sp) if con is not None
+               else (self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())))
+        self._seen.append(tok)
+        if con is not None:
+            self._con_text += self.tok.decode([tok])
+        return tok
+
+    def _sample(self, lg, sp):
         from . import lm_engine
+        mp = float(sp.get("min_p", 0.0) or 0.0)
+        if mp > 0:                              # keep only what is within min_p of the top
+            m = lg.max()
+            keep = lg >= m + math.log(max(mp, 1e-9))
+            lg = np.where(keep, lg, -np.inf)
         return int(lm_engine.sample_nucleus(
-            np.asarray(logits, np.float32) / max(float(sp.get("temperature", 1.0)), 1e-5),
-            top_p=float(sp.get("top_p", 1.0)), top_k=int(sp.get("top_k", 0) or 10 ** 9),
-            rng=sp.get("rng")))
+            lg / max(float(sp.get("temperature", 1.0) or 1.0), 1e-5),
+            top_p=float(sp.get("top_p", 1.0) or 1.0),
+            top_k=int(sp.get("top_k", 0) or 10 ** 9), rng=sp.get("rng")))
+
+    def _pick_constrained(self, lg, con, sp):
+        """Sample from just the candidates the constraint accepts.
+
+        Only the most likely handful are checked. Scoring a 250k-token vocabulary through a
+        constraint would cost more than the model step that produced the logits, and gains
+        nothing: what matters is which tokens are allowed, not the exact ordering of ones
+        the model was never going to pick. If none of them fit, fall back to the plain pick
+        rather than stalling -- a constraint the model cannot satisfy should not hang."""
+        k = min(int(sp.get("constraint_candidates", 64) or 64), int(lg.size) - 1)
+        order = np.argpartition(-lg, k)[:k]
+        order = order[np.argsort(-lg[order])]
+        allowed = [int(t) for t in order
+                   if con.allows(self._con_text, self.tok.decode([int(t)]))]
+        if not allowed:
+            return int(lg.argmax())
+        if not sp.get("do_sample"):
+            return allowed[0]
+        sub = np.full_like(lg, -np.inf)
+        sub[np.asarray(allowed, np.int64)] = lg[np.asarray(allowed, np.int64)]
+        return self._sample(sub, sp)
+
+    def _plan_length(self, ids, max_new, max_length, truncate):
+        """Reconcile the requested lengths with what this model can actually hold.
+
+        `lmax` -- the KV cache the model was loaded with -- is a hard ceiling on prompt plus
+        generation, and running past it silently corrupts the cache. A prompt that does not
+        fit is either truncated from the front (a chat history wants its most recent turns)
+        or refused, and `max_new` is clipped to whatever room is left."""
+        lmax = int(self.lmax)
+        d = getattr(self, "gen_defaults", {}) or {}
+        mx = int(max_new if max_new is not None else d.get("max_new_tokens", 48) or 48)
+        if max_length is None:
+            max_length = d.get("max_length")
+        if max_length:
+            mx = min(mx, int(max_length) - len(ids))
+        ids = list(ids)
+        if len(ids) >= lmax:
+            if not truncate:
+                raise ValueError(
+                    "prompt is %d tokens but this model was loaded with a %d-token context; "
+                    "load it with a larger lmax, shorten the prompt, or pass truncate=True"
+                    % (len(ids), lmax))
+            keep = max(1, lmax - max(1, min(mx, lmax // 4)))
+            ids = ids[-keep:]
+        return ids, max(1, min(mx, lmax - len(ids)))
+
+    def _stop_now(self):
+        """True when an output constraint says the text is complete."""
+        con = (getattr(self, "_sampling", None) or {}).get("constraint")
+        return bool(con is not None and con.finished(self._con_text))
 
     def _set_sampling(self, temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
-                      **_ignored):
-        """Install generation parameters. Defaults set at load time are kept; anything passed to
-        generate() overrides them for that call."""
+                      repetition_penalty=None, min_p=None, constraint=None,
+                      min_new_tokens=None, prompt_ids=None, **_ignored):
+        """Install generation parameters. Defaults from the model's generation_config.json (or
+        from load()) are kept; anything passed to generate() overrides them for that call."""
+        from . import constrain
         base = dict(getattr(self, "gen_defaults", {}) or {})
-        for k, v in (("temperature", temperature), ("top_p", top_p),
-                     ("top_k", top_k), ("seed", seed), ("do_sample", do_sample)):
+        for k, v in (("temperature", temperature), ("top_p", top_p), ("top_k", top_k),
+                     ("seed", seed), ("do_sample", do_sample), ("min_p", min_p),
+                     ("repetition_penalty", repetition_penalty),
+                     ("min_new_tokens", min_new_tokens)):
             if v is not None:
                 base[k] = v
         if base.get("do_sample") is None:
             base["do_sample"] = float(base.get("temperature", 0) or 0) > 0
         if base.get("seed") is not None:
             base["rng"] = np.random.default_rng(int(base["seed"]))
+        con = constrain.build(constraint if constraint is not None else base.get("constraint"))
+        if con is not None:
+            con.reset()
+        base["constraint"] = con
         self._sampling = base
+        # Repetition penalty counts the prompt too, as it does elsewhere; the constraint
+        # sees only what this generation produced.
+        self._seen = list(prompt_ids or [])
+        self._gen_start = len(self._seen)
+        self._con_text = ""
         return base
 
     def _init_state(self):
@@ -1329,19 +1469,26 @@ class CausalLM:
             h = h + self._mlp(lay, x)
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
 
-    def stream(self, prompt, max_new=48, system="You are a helpful assistant.",
-               temperature=None, top_p=None, top_k=None, seed=None, do_sample=None, **_kw):
+    def stream(self, prompt=None, max_new=None, system="You are a helpful assistant.",
+               messages=None, tools=None, ids=None, temperature=None, top_p=None,
+               top_k=None, seed=None, do_sample=None, repetition_penalty=None, min_p=None,
+               constraint=None, max_length=None, min_new_tokens=None, truncate=True,
+               **chat_kw):
         """Streaming decode: yield each new token's text as it is produced (render live,
         bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
-        Takes the same generation parameters as `generate` (temperature/top_p/top_k/seed)."""
+        Takes the same parameters as `generate`."""
         eot = self.tok.eot
-        self._set_sampling(temperature, top_p, top_k, seed, do_sample)
         self._reset_linear_state()
-        ids = self.tok.encode_chat(prompt, system); P = len(ids)
+        if ids is None:
+            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools, **chat_kw)
+        ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
+        P = len(ids)
+        self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
+                           min_p, constraint, min_new_tokens, prompt_ids=ids)
         if not self._gpu:
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             nxt = self._kv_forward(ids, 0, cache); pos = P; n = 0
-            while n < max_new and nxt != eot:
+            while n < max_new and nxt != eot and not self._stop_now():
                 yield self.tok.decode([nxt]); n += 1
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1
             return
@@ -1351,7 +1498,7 @@ class CausalLM:
         self._set_inputs(g0, P)
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
         self.capture_ready = True; nxt = g0; pos = P; n = 0
-        while n < max_new and nxt != eot:
+        while n < max_new and nxt != eot and not self._stop_now():
             yield self.tok.decode([nxt]); n += 1
             self._set_inputs(nxt, pos); plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
@@ -1367,23 +1514,36 @@ class CausalLM:
         if self.__dict__.get("_released"):
             raise RuntimeError("this model has been released; load it again to use it")
 
-    def generate(self, prompt, max_new=48, system="You are a helpful assistant.",
-                 ids=None, embeds=None, temperature=None, top_p=None, top_k=None, seed=None,
-                 do_sample=None, **_kw):
-        """ChatML prompt -> greedy decode -> GenResult. WebGPU replays a captured
-        decode step per token (~20x); WebGL uses a correct growing-cache forward.
-        For live token-by-token output use `stream(...)`.
+    def generate(self, prompt=None, max_new=None, system="You are a helpful assistant.",
+                 messages=None, tools=None, ids=None, embeds=None,
+                 temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
+                 repetition_penalty=None, min_p=None, constraint=None,
+                 max_length=None, min_new_tokens=None, truncate=True, **chat_kw):
+        """Chat prompt -> decode -> GenResult. WebGPU replays a captured decode step per
+        token (~20x); WebGL uses a correct growing-cache forward. For live token-by-token
+        output use `stream(...)`.
 
-        `ids`/`embeds` override the prompt encoding: pass prebuilt token ids and/or (T,H) input
-        embeddings to decode from a sequence assembled elsewhere. That is the generic hook used
-        for multimodality (image/audio embeddings spliced into the token embeddings) — see
-        `webtorch.MultimodalLM` — so no model-specific decode path is needed."""
+        `messages` is a full conversation instead of the `prompt`/`system` shorthand.
+
+        Any other keyword goes to the model's chat template unchanged -- `tools=[...]`,
+        `enable_thinking=False`, `reasoning_effort="low"`, whatever that model documents.
+        This is why those work without the SDK knowing a thing about them: the template
+        ships with the model and is the only place that knows what its options are called.
+        A model whose template ignores a keyword simply ignores it.
+
+        `ids`/`embeds` override the prompt encoding: pass prebuilt token ids and/or (T,H)
+        input embeddings to decode from a sequence assembled elsewhere. That is the generic
+        hook used for multimodality (image/audio embeddings spliced into the token
+        embeddings) -- see `webtorch.MultimodalLM` -- so no model-specific decode path is
+        needed."""
         self._check_live()
         eot = self.tok.eot
         if ids is None:
-            ids = self.tok.encode_chat(prompt, system)
+            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools, **chat_kw)
+        ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
-        self._set_sampling(temperature, top_p, top_k, seed, do_sample)
+        self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
+                           min_p, constraint, min_new_tokens, prompt_ids=ids)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
         # A recurrent (linear-attention) layer advances state on the host each step, so a
@@ -1397,7 +1557,7 @@ class CausalLM:
             t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0
             gen = [g0]; nxt = g0; pos = P; steps = 0; td = time.perf_counter()
-            while len(gen) < max_new:
+            while len(gen) < max_new and not self._stop_now():
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1; steps += 1
                 if nxt == eot:
                     break
@@ -1419,7 +1579,7 @@ class CausalLM:
         logits_t = self._decode_fwd(); logits_t.numpy()
         plat.endCapture(); self.capture_ready = True
         gen = [g0]; nxt = g0; pos = P; steps = 0; td = time.perf_counter()
-        while len(gen) < max_new:
+        while len(gen) < max_new and not self._stop_now():
             self._set_inputs(nxt, pos)
             plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1

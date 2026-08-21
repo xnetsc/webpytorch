@@ -5,6 +5,7 @@
   "_sdk.py",
   "audiofe.py",
   "backend.py",
+  "constrain.py",
   "cosyvoice.py",
   "detection.py",
   "ggufload.py",
