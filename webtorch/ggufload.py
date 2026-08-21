@@ -24,6 +24,7 @@ GGML_NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
               # i-quants (importance-matrix codebook quantizations)
               16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL",
               21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 29: "IQ1_M"}
+GGML_IDS = {v: k for k, v in GGML_NAMES.items()}
 
 # IQ4 non-linear codebook: 4-bit indices select from these 16 levels (ggml kvalues_iq4nl).
 _IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,

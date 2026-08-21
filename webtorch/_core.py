@@ -2848,92 +2848,170 @@ class Adam:
 #   scales  (nG, N) f32,  nG = K/group_size
 #   dequant: w[k,n] = scales[k//gs, n] * (q[k,n] - zero[k//gs, n])
 # Quantization is PER-TENSOR (independent) -> naturally streamable.
-# ---- native ggml weights: matmul that reads GGUF's own encodings -------------------
-# Converting a GGUF into the kernel's packed format costs most of a load -- 23 minutes for a
-# 27B -- and quantizes twice, refitting ggml's scheme onto this one and losing a little
-# accuracy for the privilege. The way out is llama.cpp's: decode inside the matmul. The
-# packed bytes go to the GPU as they are, and a shader unpacks each block on the fly.
+# ---- native ggml weights: matmul that reads GGUF's own encodings --------------------
+# Converting a GGUF into the kernel's packed format is what makes a load slow: on a 27B it
+# is 23 minutes, of which reading the 12.2 GB is 13 seconds and uploading it 19. All the
+# rest is the host dequantizing ggml blocks to fp32 and requantizing them -- work that also
+# quantizes twice, refitting ggml's scheme onto this one and losing a little accuracy.
 #
-# One gemv framework, one decode function per ggml type. `x` is the activation, `w` the
-# packed weight in its (out, in) layout, one thread per output row.
-_GGML_GEMV_HEAD = """@group(0) @binding(0)
+# So do what llama.cpp does and decode inside the matmul. The packed bytes go to the GPU
+# exactly as they sit in the file, and a shader unpacks each block on the fly.
+#
+# One framework serves every ggml type: a thread owns one output column `n` and four rows of
+# the batch, walks that weight row's blocks, and hands each decoded value to ACC(). Only the
+# decode differs per type, so a new format is a fragment, not a kernel. ACC and the
+# accumulator live in `private` storage because a WGSL function cannot take a pointer to a
+# local array.
+_GGML_PRE = """@group(0) @binding(0)
 var<storage,read> x: array<f32>;
 @group(0) @binding(1)
 var<storage,read> w: array<u32>;
 @group(0) @binding(2)
 var<storage,read_write> outp: array<f32>;
-struct GM { N: u32, K: u32, blocks: u32, words: u32, }
+struct GM { M: u32, N: u32, K: u32, words: u32, }
 @group(0) @binding(3)
 var<storage,read> gm: GM;
-"""
-
-# IQ4_XS: 256 values per 136-byte block -- d (f16) | scales_h (u16) | scales_l[4] | qs[128].
-# Eight 32-value sub-blocks, each with a 6-bit scale split across scales_l/scales_h; the
-# values themselves are indices into a 16-entry codebook.
-_IQ4XS_WGSL = _GGML_GEMV_HEAD + """
-const KV = array<f32, 16>(-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
-                            1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x;
-  if (n >= gm.N) { return; }
-  let row = n * gm.words;                       // u32 offset of this output row
-  var acc: f32 = 0.0;
-  for (var b: u32 = 0u; b < gm.blocks; b = b + 1u) {
-    let o = row + b * 34u;                      // 136 bytes = 34 u32 per block
-    let w0 = w[o];
-    let d = unpack2x16float(w0).x;              // low half is the f16 scale
-    let sh = w0 >> 16u;                         // high half is scales_h
-    let sl = w[o + 1u];
-    let kb = b * 256u;
-    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
-      let lo4 = (sl >> (8u * (ib / 2u) + 4u * (ib % 2u))) & 15u;
-      let hi2 = (sh >> (2u * ib)) & 3u;
-      let dl = d * (f32(i32(lo4 | (hi2 << 4u)) - 32));
-      let qb = o + 2u + ib * 4u;                // 16 bytes of qs per sub-block
-      for (var j: u32 = 0u; j < 16u; j = j + 1u) {
-        let byte = (w[qb + j / 4u] >> (8u * (j % 4u))) & 255u;
-        let k0 = kb + ib * 32u + j;
-        acc = acc + x[k0] * dl * KV[byte & 15u];
-        acc = acc + x[k0 + 16u] * dl * KV[byte >> 4u];
-      }
-    }
+var<private> acc: array<f32, 4>;
+var<private> mb: u32;
+var<private> mn: u32;
+fn ACC(k: u32, v: f32) {
+  for (var r: u32 = 0u; r < mn; r = r + 1u) {
+    acc[r] = acc[r] + x[(mb + r) * gm.K + k] * v;
   }
-  outp[n] = acc;
 }
 """
 
-_GGML_KERNELS = {"IQ4_XS": ("ggml_iq4xs", _IQ4XS_WGSL, 136)}
+_GGML_MAIN = """
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  mb = gid.y * 4u;
+  if (n >= gm.N || mb >= gm.M) { return; }
+  mn = min(4u, gm.M - mb);
+  acc = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+  let row = n * gm.words;
+  let nb = gm.K / BLKVALS;
+"""
+
+_GGML_TAIL = """
+  for (var r: u32 = 0u; r < mn; r = r + 1u) { outp[(mb + r) * gm.N + n] = acc[r]; }
+}
+"""
+
+# The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
+# uniformly implemented, so the sixteen signed bytes are carried packed in four u32s and
+# sign-extended on read -- no array indexing at all.
+_KV_FN = """
+fn kv(i: u32) -> f32 {
+  var p: u32 = 0xBFAD9881u;
+  if (i >= 12u) { p = 0x71594535u; }
+  else if (i >= 8u) { p = 0x26190D01u; }
+  else if (i >= 4u) { p = 0xF6EADDCFu; }
+  let b = (p >> (8u * (i & 3u))) & 255u;
+  return f32(i32(b << 24u) >> 24u);
+}
+"""
+
+# IQ4_XS: 256 values per 136-byte block -- d (f16) | scales_h (u16) | scales_l[4] | qs[128].
+# Eight 32-value sub-blocks, each with a 6-bit scale split across scales_l and scales_h; the
+# quants are 4-bit indices into the codebook, low nibbles filling the sub-block's first 16
+# slots and high nibbles the next 16.
+_IQ4XS_DEC = """
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    let o = row + b * 34u;
+    let w0 = w[o];
+    let d = unpack2x16float(w0).x;
+    let sh = w0 >> 16u;
+    let sl = w[o + 1u];
+    let kb = b * 256u;
+    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+      let ls = ((sl >> (8u * (ib / 2u) + 4u * (ib % 2u))) & 15u) | (((sh >> (2u * ib)) & 3u) << 4u);
+      let dl = d * f32(i32(ls) - 32);
+      let qb = o + 2u + ib * 4u;
+      let k0 = kb + ib * 32u;
+      for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+        let byte = (w[qb + (j >> 2u)] >> (8u * (j & 3u))) & 255u;
+        ACC(k0 + j, dl * kv(byte & 15u));
+        ACC(k0 + 16u + j, dl * kv(byte >> 4u));
+      }
+    }
+  }
+"""
+
+# name -> (decode fragment, extra helpers, values per block, bytes per block)
+_GGML_TYPES = {
+    "IQ4_XS": (_IQ4XS_DEC, _KV_FN, 256, 136),
+}
 _ggml_k = {"added": set()}
-_NATIVE_GGUF = True     # default on; `weights=` on the loader overrides
+_NATIVE_GGUF = True          # default on; the loader's `weights=` overrides
 
 
 def ggml_native_supported(type_name):
-    """Can this ggml type be multiplied without conversion?"""
-    return bool(_NATIVE_GGUF) and type_name in _GGML_KERNELS
+    """Can this ggml type be multiplied straight out of the file, with no conversion?"""
+    return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
 
 
-def ggml_gemv(x, packed, type_name, N, K):
-    """out = packed(N,K) @ x(K,), decoding ggml blocks inside the shader. None if unsupported."""
-    if not (_adam_backend_ready() and type_name in _GGML_KERNELS):
-        return None
-    name, src, blk_bytes = _GGML_KERNELS[type_name]
+def _ggml_src(type_name):
+    dec, helpers, vals, _ = _GGML_TYPES[type_name]
+    # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
+    return (_GGML_PRE + helpers + _GGML_MAIN.replace("BLKVALS", "%uu" % vals)
+            + dec + _GGML_TAIL)
+
+
+def _ggml_selfcheck(type_name):
+    """Multiply one random block and compare against the reference dequantizer.
+
+    A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
+    exception -- which reads exactly like a working kernel on an all-zero weight, and has
+    twice sent me chasing a numerical bug that was a syntax error. One block per type, once
+    per session, turns both failure modes into something that raises."""
+    from . import ggufload as G
+    _, _, vals, blk = _GGML_TYPES[type_name]
+    rng = np.random.default_rng(0)
+    a = rng.integers(0, 256, (2, blk), dtype=np.uint8)
+    a[:, 0:2] = np.float16([0.01, -0.02]).view(np.uint8).reshape(2, 2)   # keep d finite
+    raw = a.tobytes()
+    ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, 2 * vals), np.float32).reshape(2, vals)
+    x = rng.standard_normal((1, vals)).astype(np.float32)
+    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=xp.asarray(np.frombuffer(raw, np.int32)),
+                                          type_name=type_name, K=vals, N=2))).reshape(1, 2)
+    want = x @ ref.T
+    err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
+    if not (err < 1e-4):
+        raise RuntimeError("native ggml kernel for %s is wrong (rel err %.3g) -- check the "
+                           "console for a WGSL compile error" % (type_name, err))
+
+
+def ggml_matmul(xf, packed, type_name, K, N):
+    """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader."""
+    if type_name not in _ggml_k["added"]:
+        _ggml_add(type_name)
+        _ggml_k["added"].add(type_name)     # set before the check: it calls back in here
+        _ggml_selfcheck(type_name)
+    return _ggml_run(xf, packed, type_name, K, N)
+
+
+def _ggml_add(type_name):
     plat = _adam_kernel["platform"]
-    if name not in _ggml_k["added"]:
-        plat.addKernel(name, {"source": src,
-                              "bindingTypes": ["read-only-storage", "read-only-storage",
-                                               "storage", "read-only-storage"]})
-        _ggml_k["added"].add(name)
-    blocks = K // 256
-    words = blocks * (blk_bytes // 4)
-    xd = _contig(x.data if isinstance(x, Tensor) else x)
-    of = _empty((N,))
-    meta = _adam_kernel["make_meta"]((N, K, blocks, words), "u4,u4,u4,u4")
+    plat.addKernel("ggml_" + type_name.lower(),
+                   {"source": _ggml_src(type_name),
+                    "bindingTypes": ["read-only-storage", "read-only-storage",
+                                     "storage", "read-only-storage"]})
+
+
+def _ggml_run(xf, packed, type_name, K, N):
+    _, _, vals, blk = _GGML_TYPES[type_name]
+    M = int(xf.shape[0])
+    name = "ggml_" + type_name.lower()
+    plat = _adam_kernel["platform"]
+    of = _empty((M, N))
+    words = (K // vals) * (blk // 4)
+    meta = _adam_kernel["make_meta"]((M, N, K, words), "u4,u4,u4,u4")
     plat.runKernel({"name": name,
-                    "tensors": [xd.buffer.buffer_id, packed.buffer.buffer_id,
+                    "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
                                 of.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": (N + 63) // 64, "y": 1, "z": 1}})
-    return Tensor(of)
+                    "workGroups": {"x": (N + 63) // 64, "y": (M + 3) // 4, "z": 1}})
+    return of
 
 
 def _gptq_quantize(W, group_size=32, bits=4, from_out_in=False, block=2048):
