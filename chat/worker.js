@@ -1,6 +1,8 @@
 /* Chat worker: boots Pyodide + the webtorch package, loads models from ModelScope with
    progress, generates, and exposes the SDK's cache-management calls. */
-importScripts('../lib/pyodide/pyodide.js');
+// Pyodide from a CDN unless told otherwise, so this page works on a plain static host.
+const PYODIDE_URL = self.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+importScripts(PYODIDE_URL + 'pyodide.js');
 importScripts('../dist/wgpy-worker.js');
 importScripts('../webtorch/js/webtorch-worker.js');
 
@@ -13,7 +15,7 @@ async function boot() {
   if (ready) return;
   // The SDK brings up the backend, Pyodide and the package in the order they require.
   const r = await webtorch.initWorker({
-    baseURL: '../', stdout: log, stderr: log,
+    baseURL: '../', pyodideIndexURL: PYODIDE_URL, stdout: log, stderr: log,
     onStatus: (t) => send({ type: 'status', text: t }),
   });
   pyodide = r.pyodide;

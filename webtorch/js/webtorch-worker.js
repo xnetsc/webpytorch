@@ -12,6 +12,9 @@
 (function (root) {
   const wt = root.webtorch || (root.webtorch = {});
 
+  // Where Pyodide itself comes from. Overridable before initWorker for an offline copy.
+  wt.PYODIDE_URL = wt.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+
   // The package's own inventory, read from a manifest generated with it, so adding a
   // module never needs an edit here. The inline list is the fallback for a tree served
   // without the manifest, and is only ever a floor.
@@ -55,7 +58,9 @@
   wt.initWorker = async function (opts) {
     opts = opts || {};
     const base = opts.baseURL || '../';
-    const idx = opts.pyodideIndexURL || (base + 'lib/pyodide/');
+    // A CDN by default: the full Pyodide distribution is ~900 MB, which no static host
+    // wants to carry. Point `pyodideIndexURL` at a local copy to run without a network.
+    const idx = opts.pyodideIndexURL || wt.PYODIDE_URL;
     const say = opts.onStatus || function () {};
 
     // Wait for the main thread's choice; it has the device, this context does not.

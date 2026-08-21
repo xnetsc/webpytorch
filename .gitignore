@@ -15,8 +15,9 @@ lib/
 
 # JS/TS build output
 node_modules/
-dist/
 build/
+# dist/ IS tracked: 212 KB of loader + backend wheels that the page cannot start without,
+# and a static host has nothing to build with.
 *.egg-info/
 
 # Python

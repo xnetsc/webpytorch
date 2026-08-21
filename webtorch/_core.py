@@ -4323,6 +4323,11 @@ def ggml_transpose(src, n, rowb):
     plat.runKernel({"name": "ggml_tr",
                     "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id],
                     "workGroups": {"x": gx, "y": gy, "z": 1}})
+    # The dispatch is queued, not done. The caller drops the source right after this, and
+    # freeing a buffer a pending command still reads leaves the destination zeroed -- which
+    # showed up as a loaded model of all-zero weights while the same tensor transposed on
+    # its own was fine, because using it immediately forced the queue to drain.
+    cp.asnumpy(dst[:1])
     return dst
 
 

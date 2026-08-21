@@ -523,6 +523,9 @@ async def _remote_size(url, headers):
 
 _CHUNK_DEFAULT = 16 << 20
 _idb_warned = []            # warn once, not once per chunk
+# Below this, too little time has passed to quote a rate; report none rather than a number
+# that is an artefact of dividing by nearly zero.
+_RATE_MIN_S = 0.05
 
 
 def _merge(spans, lo, hi):
@@ -930,12 +933,13 @@ def _report(key, done, total):
         a = 0.4                               # recent enough to feel live, steady enough to read
         st["rate"] = a * ((done - st["done"]) / dt) + (1 - a) * st["rate"]
         st["t"] = now; st["done"] = done
-    el = max(now - st["t0"], 1e-6)
+    el = now - st["t0"]
+    # Until the window has produced a figure, the average since the first read is the honest
+    # answer -- but only once enough time has passed to divide by. Clamping the elapsed time
+    # to a microsecond instead reported 12583 GB/s on the first callback.
+    rate = st["rate"] or ((done / el) if el >= _RATE_MIN_S else 0.0)
     try:
-        # Until the window has produced a figure, the average since the first read is the
-        # honest answer -- better than reporting zero while bytes are plainly moving.
-        cb({"key": key, "done": done, "total": total, "elapsed": now - st["t0"],
-            "rate": st["rate"] or (done / el)})
+        cb({"key": key, "done": done, "total": total, "elapsed": el, "rate": rate})
     except Exception:
         pass                                  # a broken meter must not break a load
 
@@ -1390,9 +1394,10 @@ def _note_download(url, n):
         a = 0.4
         _dl["rate"] = a * ((_dl["n"] - _dl["last"]) / dt) + (1 - a) * _dl["rate"]
         _dl["t"] = now; _dl["last"] = _dl["n"]
-    el = max(now - (_dl["t0"] or now), 1e-6)
+    el = now - (_dl["t0"] or now)
+    rate = _dl["rate"] or ((_dl["n"] / el) if el >= _RATE_MIN_S else 0.0)
     try:
-        cb({"url": url, "bytes": _dl["n"], "rate": _dl["rate"] or (_dl["n"] / el)})
+        cb({"url": url, "bytes": _dl["n"], "rate": rate})
     except Exception:
         pass
 
@@ -1702,21 +1707,30 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
         # 0-16 and then 16-32 leaves one span rather than two, and a file that ends up complete
         # is a single span.
         first, last = offset // chunk, (offset + len(data) - 1) // chunk
+        # `covered` records what is actually STORED, so a chunk the store refused -- it is
+        # full -- must not be claimed. Recording it anyway marks a partial file complete and
+        # makes reads ask for bytes that are not there.
+        done = offset
         for i in range(first, last + 1):
             base = i * chunk
             lo, hi = max(offset, base), min(offset + len(data), base + chunk)
             piece = data[lo - offset:hi - offset]
             if lo == base and (hi - lo == chunk or
                                (meta["size"] is not None and hi >= meta["size"])):
-                await store.put(key, i, piece)             # a whole chunk, or the file's tail
+                if await store.put(key, i, piece) is False:  # a whole chunk, or the file's tail
+                    break
+                done = hi
                 continue
             cur = await store.get(key, i)
             buf = bytearray(cur if cur is not None else b"")
             if len(buf) < hi - base:                       # grow to hold this span
                 buf.extend(b"\x00" * (hi - base - len(buf)))
             buf[lo - base:hi - base] = piece
-            await store.put(key, i, bytes(buf))
-        await store.set_meta(key, covered=_merge(meta["covered"], offset, offset + len(data)))
+            if await store.put(key, i, bytes(buf)) is False:
+                break
+            done = hi
+        if done > offset:
+            await store.set_meta(key, covered=_merge(meta["covered"], offset, done))
         meta = await store.meta(key)
 
         if complete is not None:
