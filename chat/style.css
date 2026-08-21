@@ -73,3 +73,6 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
 #composer.locked{opacity:.55}
 #composer.locked #input{cursor:not-allowed}
+
+/* A cache entry that is not fully downloaded: usable for resuming, not for export. */
+.item .k.partial { color: var(--warn, #b26b00); }

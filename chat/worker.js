@@ -39,16 +39,23 @@ async function loadModel(repo, file) {
   // Progress comes from the SDK's own read hook, which counts bytes SERVED. A model
   // already cached does no network at all, so counting fetches would leave that load
   // looking frozen -- this reports either way, and needs no knowledge of SDK internals.
-  self.__prog = (key, done, total) => {
+  // Two different things from two different owners: how far the LOAD has got comes from
+  // the SDK, and the download speed comes from the HTTP reader we installed -- the SDK has
+  // no transport and cannot know one.
+  self.__dlRate = 0;
+  self.__prog = (done, total, rate) => {
     const now = Date.now();
     if (now - (self.__progT || 0) < 250 && done !== total) return;
     self.__progT = now;
-    send({ type: 'progress', bytes: done, total: total || 0 });
+    send({ type: 'progress', bytes: done, total: total || 0,
+           rate, dlRate: self.__dlRate });
   };
+  self.__dl = (rate) => { self.__dlRate = rate; };
   await pyodide.runPythonAsync(`
 import js, webtorch
 src = _src
-webtorch.set_read_progress(lambda k, d, t: js.self.__prog(k, d, t if t else 0))
+webtorch.set_read_progress(lambda i: js.self.__prog(i["done"], i["total"] or 0, i["rate"]))
+webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
@@ -56,6 +63,7 @@ try:
     _MODEL["m"] = m; _MODEL["id"] = src
 finally:
     webtorch.set_read_progress(None)
+    webtorch.set_download_progress(None)
 `);
   send({ type: 'status', text: `ready: ${src}` });
   send({ type: 'loaded', id: src });
@@ -85,7 +93,8 @@ groups = await webtorch.model_groups()
 json.dumps({"items":[{"key":e["key"],"host":e["host"],"size":e["size"],
                       "complete":bool(e["complete"])} for e in items],
             "groups":[{"name":g["name"],"label":g["label"],"keys":g["keys"],
-                       "size":g["size"],"files":g["files"]} for g in groups],
+                       "size":g["size"],"total":g["total"],"files":g["files"],
+                       "complete":bool(g["complete"]),"partial":g["partial"]} for g in groups],
             "hosts":hosts, "total": await webtorch.cache_size()})
 `);
   return JSON.parse(out);
@@ -95,6 +104,37 @@ json.dumps({"items":[{"key":e["key"],"host":e["host"],"size":e["size"],
 // but a FileSystemFileHandle and a File can, so the page picks the file (which needs a user
 // gesture) and all the streaming happens here: the SDK hands over one chunk at a time and
 // each goes straight to disk. A 12 GB model is never a Blob and never a wasm allocation.
+// 配额满时告诉页面，由它去要一个目录；SDK 不弹窗，页面才有用户手势。
+async function armStorageWatch() {
+  await boot();
+  self.__full = (key) => send({ type: 'storageFull', key });
+  await pyodide.runPythonAsync(`
+import js, webtorch
+webtorch.set_storage_full(lambda i: js.self.__full(i["key"]))
+`);
+}
+
+// 把已经存在 IndexedDB 里的搬到用户选的目录，搬一条删一条，之后改用该目录。
+async function migrateToDirectory(dir) {
+  await boot();
+  pyodide.globals.set('_dir', dir);
+  self.__mig = (n, key) => send({ type: 'migrate', bytes: n, key });
+  return await pyodide.runPythonAsync(`
+import js, webtorch
+await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
+`);
+}
+
+// 导入 = 登记本地文件/文件夹，就地读，不复制、不入 IndexedDB。
+async function importModel(handle) {
+  await boot();
+  pyodide.globals.set('_h', handle);
+  return await pyodide.runPythonAsync(`
+import json, webtorch
+json.dumps(await webtorch.import_model(_h))
+`);
+}
+
 async function exportModel(keys, handle) {
   await boot();
   const w = await handle.createWritable();
@@ -161,11 +201,14 @@ onmessage = async (e) => {
     if (cmd === 'boot') await boot();
     else if (cmd === 'load') await loadModel(args.repo, args.file);
     else if (cmd === 'generate') res = await generate(args.prompt, args);
+    else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'cacheList') res = await cacheList();
     else if (cmd === 'cacheDelete') await cacheDelete(args.key);
     else if (cmd === 'cacheClear') await cacheClear();
     else if (cmd === 'exportModel') res = await exportModel(args.keys, args.handle);
-    else if (cmd === 'importModel') res = await importModel(args.file, args.key);
+    else if (cmd === 'importModel') res = await importModel(args.handle);
+    else if (cmd === 'migrate') res = await migrateToDirectory(args.dir);
+    else if (cmd === 'armStorage') await armStorageWatch();
     else if (cmd === 'release') await releaseModel();
     send({ type: 'result', id, res });
   } catch (err) {

@@ -382,20 +382,58 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, ch
     set_io_write(default_io_write)
     if not cache:
         set_io_read(default_io_read); return
-    async def fetch(name, offset, length):                   # the network transport (browser fetch / host urllib)
-        return await http_get(name, offset, length)
+    cdir = cache_dir or _default_hub_cache()
+    known, served = {}, {}
+
     async def size(name):
         try: return await http_size(name)
         except Exception: return None
-    tr = throttle_reads(fetch, max_parallel, http_rate_limited)
+
+    async def raw(name, offset, length):                     # browser fetch / host urllib
+        return await http_get(name, offset, length)
+
+    get = throttle_reads(raw, max_parallel, http_rate_limited)
     if prefetch:
-        tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    cached = _cached_read(tr, size=size, cache_dir=cache_dir,
-                                chunk_mb=chunk_mb)
+        get = prefetch_whole_file(get, size=size, cache_dir=cdir, chunk_mb=chunk_mb)
+
     async def read(name, offset=0, length=None):
-        if _is_url(name) or _in_browser():                   # network read -> cache it
-            return await cached(name, offset, length)
-        return await default_io_read(name, offset, length)   # local host file -> read directly
+        if not (_is_url(name) or _in_browser()):
+            return await default_io_read(name, offset, length)   # a local file: read it
+        h = _local_files.get(str(name).rsplit("/", 1)[-1])
+        if h is not None:                                    # a file the person pointed at
+            data = await _read_local_file(h, offset, length)
+            served[name] = served.get(name, 0) + len(data)
+            _report(name, served[name], None)
+            return data
+        # Ask the cache; if it has not got them, that is this callback's problem to solve.
+        hit = await read_cache(name, offset, length, cdir)
+        if hit is not None and (length is None or len(hit) >= length):
+            served[name] = served.get(name, 0) + len(hit)
+            _report(name, served[name], known.get(name))
+            return hit
+        got = len(hit) if hit else 0
+        if await await_inflight(name, offset + got, chunk_mb << 20):
+            again = await read_cache(name, offset, length, cdir)
+            if again is not None and (length is None or len(again) >= length):
+                served[name] = served.get(name, 0) + len(again)
+                _report(name, served[name], known.get(name))
+                return again
+            hit = again if again is not None else hit
+            got = len(hit) if hit else 0
+        if name not in known:
+            known[name] = await size(name)
+        total = known.get(name)
+        want = None if length is None else length - got
+        data = await get(name, offset + got, want)
+        if total is None and want is not None and len(data) < want:
+            total = offset + got + len(data)
+            known[name] = total
+        await write_cache(name, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
+        out = (hit or b"") + data
+        served[name] = served.get(name, 0) + len(out)
+        _report(name, served[name], total)
+        return out
+
     set_io_read(read)
 
 
@@ -786,6 +824,7 @@ class _IdbStore(_Store):
         except Exception as e:
             if _is_quota_error(e):
                 self.full = True               # stop trying; reads keep working, writes stream
+                _note_full(key)
                 return False
             raise
         finally:
@@ -886,7 +925,270 @@ def _report(key, done, total):
         pass                                  # a broken meter must not break a load
 
 
+class _FsaStore(_Store):
+    """A directory the person picked, through the File System Access API.
+
+    The origin storage quota is a browser policy, not a property of the machine: the same
+    page is given 4.46 GB in one browser and 11.5 GB in another while the disk has 382 GB
+    free, and `persist()` is refused in both. A model larger than whatever that number
+    happens to be simply cannot be kept -- which is why this exists. A directory handed
+    over by the person carries no quota at all, so what fits is what fits on the disk.
+
+    It is also a better fit than a chunk store: a real file takes writes at an offset, so
+    the bytes go where they belong and the file IS the model -- openable by anything else,
+    and exportable by copying it. Only the span bookkeeping lives beside it, in a sidecar.
+    """
+
+    def __init__(self, root, handle):
+        self.root = root
+        self.dir = handle                     # FileSystemDirectoryHandle, from the page
+        self._h = {}
+
+    async def open(self):
+        pass
+
+    def _name(self, key):
+        return _url_key(key).replace("/", "_")
+
+    async def _file(self, key, create=True):
+        from pyodide.ffi import to_js
+        from js import Object
+        n = self._name(key)
+        h = self._h.get(n)
+        if h is None:
+            fh = await self.dir.getFileHandle(n, to_js({"create": create},
+                                                       dict_converter=Object.fromEntries))
+            h = self._h[n] = await fh.createSyncAccessHandle()
+        return h
+
+    async def _meta_file(self, key, data=None):
+        import json
+        from pyodide.ffi import to_js
+        from js import Object, Uint8Array
+        n = self._name(key) + ".meta"
+        fh = await self.dir.getFileHandle(n, to_js({"create": True},
+                                                   dict_converter=Object.fromEntries))
+        if data is None:
+            f = await fh.getFile()
+            txt = await f.text()
+            try: return json.loads(txt) if txt else {}
+            except Exception: return {}
+        w = await fh.createWritable()
+        await w.write(json.dumps(data))
+        await w.close()
+        return data
+
+    async def meta(self, key):
+        d = await self._meta_file(key)
+        return {"size": d.get("size"), "chunk": d.get("chunk"),
+                "complete": bool(d.get("complete", False)),
+                "covered": [list(x) for x in (d.get("covered") or [])]}
+
+    async def set_meta(self, key, **kw):
+        d = await self._meta_file(key)
+        for k, v in kw.items():
+            if v is not None or k == "size":
+                d[k] = v
+        await self._meta_file(key, d)
+
+    async def have(self, key):
+        m = await self.meta(key)
+        ch = m["chunk"] or _CHUNK_DEFAULT
+        return {i for a, b in m["covered"] for i in range(a // ch, (b - 1) // ch + 1)}
+
+    async def get(self, key, i):
+        from js import Uint8Array
+        m = await self.meta(key)
+        ch = m["chunk"] or _CHUNK_DEFAULT
+        h = await self._file(key)
+        size = h.getSize()
+        off = i * ch
+        if off >= size:
+            return None
+        n = min(ch, size - off)
+        buf = Uint8Array.new(n)
+        got = h.read(buf, _at(off))
+        return bytes(buf.to_py()[:got])
+
+    async def put(self, key, i, data):
+        from js import Uint8Array
+        m = await self.meta(key)
+        ch = m["chunk"] or _CHUNK_DEFAULT
+        h = await self._file(key)
+        buf = Uint8Array.new(len(data))
+        buf.assign(data)
+        h.write(buf, _at(i * ch))
+        h.flush()
+        return True                           # no quota to run out of
+
+    async def delete(self, key):
+        n = self._name(key)
+        h = self._h.pop(n, None)
+        if h is not None:
+            try: h.close()
+            except Exception: pass
+        existed = False
+        for nm in (n, n + ".meta"):
+            try:
+                await self.dir.removeEntry(nm); existed = True
+            except Exception:
+                pass
+        return existed
+
+    async def keys(self):
+        out = []
+        it = self.dir.values()
+        while True:
+            r = await it.next()
+            if r.done:
+                break
+            nm = r.value.name
+            if not nm.endswith(".meta"):
+                out.append(nm)
+        return sorted(out)
+
+    async def stored(self, key):
+        try:
+            h = await self._file(key, create=False)
+            return int(h.getSize())
+        except Exception:
+            return 0
+
+
+def _at(offset):
+    """`{at: offset}` for a sync access handle, as a JS object."""
+    from pyodide.ffi import to_js
+    from js import Object
+    return to_js({"at": offset}, dict_converter=Object.fromEntries)
+
+
 _stores = {}
+_dir_handle = {"h": None}
+_local_files = {}          # basename -> FileSystemFileHandle, read in place
+
+
+def use_model_file(handle, name=None):
+    """Read a model straight out of a local file the person picked. Nothing is copied.
+
+    Importing a model should not mean duplicating it: a 12 GB file copied into origin
+    storage is slow and would not fit anyway. This registers the handle instead, and reads
+    come from it at the offsets they ask for -- no download, no quota, no second copy.
+
+    Matching is by file name, because a model's key ends in the same name the file has
+    ("…/resolve/master/model.gguf" against "model.gguf"), so a file picked from disk
+    satisfies the very id the loader was going to fetch. Pass `name` to override.
+    """
+    _local_files[name or handle.name] = handle
+    return name or handle.name
+
+
+def local_files():
+    """Names currently satisfied from local files, in registration order."""
+    return list(_local_files)
+
+
+def forget_model_file(name):
+    """Stop reading `name` from a local file."""
+    return _local_files.pop(name, None) is not None
+
+
+async def _read_local_file(handle, offset, length):
+    """A byte range of a picked file, read where it lies."""
+    f = await handle.getFile()
+    total = int(f.size)
+    end = total if length is None else min(offset + length, total)
+    if end <= offset:
+        return b""
+    blob = f.slice(offset, end)
+    buf = await blob.arrayBuffer()
+    from js import Uint8Array
+    return bytes(Uint8Array.new(buf).to_py())
+_full_cb = {"cb": None, "fired": False}
+
+
+def set_storage_full(cb):
+    """Install `cb(info)`, called once when origin storage runs out. `None` clears it.
+
+        key    the entry being written when it hit the wall
+        quota  what the browser said the origin may use, if it said
+
+    Origin storage is capped by browser policy -- the same page is given a few GB in one
+    browser and a few more in another, while the disk has hundreds free -- so a large model
+    can run out of room through no fault of the machine. That is not an error to raise: the
+    load continues by streaming. It is a moment to offer the person a directory, which has
+    no such cap. See `use_directory` and `migrate_cache`.
+    """
+    _full_cb["cb"] = cb
+    _full_cb["fired"] = False
+
+
+def _note_full(key):
+    if _full_cb["cb"] is None or _full_cb["fired"]:
+        return
+    _full_cb["fired"] = True
+    try:
+        _full_cb["cb"]({"key": key, "quota": None})
+    except Exception:
+        pass
+
+
+def use_directory(handle):
+    """Keep cached models in a directory the person picked, instead of origin storage.
+
+    The browser's storage quota is a policy, not a limit of the machine -- the same page is
+    given 4.46 GB in one browser and 11.5 GB in another while the disk has hundreds of GB
+    free, and `persist()` is refused in both. A model bigger than that number cannot be
+    kept at all. A directory carries no quota, so what fits is what fits on the disk, and
+    what lands there is the file itself: openable by other tools, and copied rather than
+    exported.
+
+    `handle` is a `FileSystemDirectoryHandle` from `showDirectoryPicker()`, which needs a
+    gesture, so the page asks for it and passes it in. `None` goes back to origin storage.
+    """
+    _dir_handle["h"] = handle
+    _stores.clear()
+
+
+async def migrate_cache(handle, cache_dir=None, on_progress=None, keep=False):
+    """Move what is already cached into a directory, then keep using that directory.
+
+    Entry by entry, chunk by chunk, and each entry is deleted from origin storage as soon
+    as it is safely written -- which is the point: when the quota is already full, freeing
+    as you go is the only way there is room to continue. Memory holds one chunk, never a
+    model. `keep=True` copies instead of moving, for when origin storage is not the problem.
+
+    Returns the bytes moved. Afterwards reads come from the directory, which has no quota.
+    """
+    root = cache_dir or _default_hub_cache()
+    src = _make_store(root)
+    await src.open()
+    dst = _FsaStore(root, handle)
+    await dst.open()
+    moved = 0
+    for key in await src.keys():
+        m = await src.meta(key)
+        chunk = m["chunk"] or _CHUNK_DEFAULT
+        await dst.set_meta(key, size=m["size"], chunk=chunk,
+                           covered=m["covered"], complete=m["complete"])
+        for a, b in m["covered"]:
+            i = a // chunk
+            while i * chunk < b:
+                blk = await src.get(key, i)
+                if blk is not None:
+                    await dst.put(key, i, blk)
+                    moved += len(blk)
+                    if on_progress is not None:
+                        on_progress(moved, key)
+                del blk
+                i += 1
+        if not keep:
+            await src.delete(key)              # freed now, so the next entry has room
+    use_directory(handle)
+    return moved
+
+
+def get_directory():
+    return _dir_handle["h"]
 
 
 def _make_store(root):
@@ -897,7 +1199,13 @@ def _make_store(root):
     """
     st = _stores.get(root)
     if st is None:
-        st = _stores[root] = _IdbStore(root) if _in_browser() else _DiskStore(root)
+        if _dir_handle["h"] is not None:
+            st = _FsaStore(root, _dir_handle["h"])
+        elif _in_browser():
+            st = _IdbStore(root)
+        else:
+            st = _DiskStore(root)
+        _stores[root] = st
     return st
 
 
@@ -1116,6 +1424,44 @@ def throttle_reads(fetch, max_parallel=8, is_rate_limited=None):
     return gated
 
 
+# Which chunks a background read-ahead has in flight right now. A foreground read that
+# wants one of them should wait for it and then take it from the cache, rather than asking
+# for the same bytes a second time; a chunk nobody is fetching it takes itself, at once.
+_inflight = {}
+
+
+def _mark_inflight(key, i):
+    import asyncio
+    fut = asyncio.get_running_loop().create_future()
+    _inflight[(key, i)] = fut
+    return fut
+
+
+def _clear_inflight(key, i, fut, exc=None):
+    _inflight.pop((key, i), None)
+    if not fut.done():
+        if exc is not None:
+            fut.set_exception(exc)
+            fut.exception()                   # marked as retrieved; waiters see it too
+        else:
+            fut.set_result(None)
+
+
+async def await_inflight(key, offset, chunk):
+    """If a read-ahead is already fetching the chunk at `offset`, wait for it. -> did we wait.
+
+    Whatever went wrong for the read-ahead is raised here rather than swallowed. Asking for
+    the same bytes again after they just failed has no reason to go differently, so the
+    caller is told what happened instead of quietly retrying and failing a second time.
+    """
+    import asyncio
+    fut = _inflight.get((key, offset // chunk))
+    if fut is None:
+        return False
+    await asyncio.shield(fut)                 # raises what the read-ahead hit
+    return True
+
+
 def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None):
     """Wrap a transport so that touching a file starts filling the cache with the rest of it.
 
@@ -1150,13 +1496,21 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
                         off = reach
                         continue
                 n = chunk if total is None else min(chunk, total - off)
-                b = await fetch(k, off, n)
-                if not b:
-                    break
-                await write_cache(k, b, cache_dir, offset=off,
-                                  total=total if total is not None
-                                  else (off + len(b) if len(b) < n else None),
-                                  chunk_mb=chunk_mb)
+                fut = _mark_inflight(k, off // chunk)     # so a reader waits instead of refetching
+                try:
+                    b = await fetch(k, off, n)
+                    if not b:
+                        _clear_inflight(k, off // chunk, fut)
+                        break
+                    await write_cache(k, b, cache_dir, offset=off,
+                                      total=total if total is not None
+                                      else (off + len(b) if len(b) < n else None),
+                                      chunk_mb=chunk_mb)
+                except Exception as e:
+                    # Hand it to whoever is waiting on this chunk, then stop reading ahead.
+                    _clear_inflight(k, off // chunk, fut, e)
+                    raise
+                _clear_inflight(k, off // chunk, fut)
                 off += len(b)
                 if len(b) < n:
                     break                                # short read == end of file
@@ -1171,51 +1525,6 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
         return await fetch(k, offset, length)
 
     return ahead
-
-
-def _cached_read(fetch, size=None, key=None, cache=True, cache_dir=None, chunk_mb=16):
-    """Compose a read callback: serve from the cache, and on a miss read and keep the rest.
-
-    INTERNAL -- this is just the two public cache calls put together, and it is what the
-    hub readers below are made of. Writing your own callback is the same six lines; see
-    `read_cache` / `write_cache`.
-    """
-    keyfn = key or (lambda n: n)
-    cdir = (cache_dir or _default_hub_cache()) if cache else None
-    known = {}
-    served = {}
-
-    async def read(name, offset=0, length=None):
-        k = keyfn(name)
-        if cdir is None:
-            data = await fetch(k, offset, length)      # caching off -> straight through
-            served[k] = served.get(k, 0) + len(data)
-            _report(k, served[k], None)
-            return data
-        hit = await read_cache(k, offset, length, cdir)
-        if hit is not None and (length is None or len(hit) >= length):
-            served[k] = served.get(k, 0) + len(hit)    # cached bytes are still loaded bytes
-            _report(k, served[k], known.get(k))
-            return hit
-        got = len(hit) if hit else 0
-        if k not in known and size is not None:
-            try: known[k] = await size(k)
-            except Exception: known[k] = None
-        total = known.get(k)
-        want = None if length is None else length - got
-        data = await fetch(k, offset + got, want)
-        # A short answer means the file ends here -- often the only way to learn its length,
-        # since a cross-origin host need not expose Content-Length.
-        if total is None and want is not None and len(data) < want:
-            total = offset + got + len(data)
-            known[k] = total
-        await write_cache(k, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
-        out = (hit or b"") + data
-        served[k] = served.get(k, 0) + len(out)
-        _report(k, served[k], total)
-        return out
-
-    return read
 
 
 # ============================ cache management ============================
@@ -1317,6 +1626,21 @@ async def read_cache(key, offset=0, length=None, cache_dir=None):
     return bytes(out[:pos]) if pos else None
 
 
+_write_locks = {}
+
+
+def _write_lock(key):
+    """One lock per entry: a write is read-modify-write over the span list, and the
+    foreground read and the background read-ahead are both writing the same file. Without
+    this they interleave, each having read the spans before the other's write, and the
+    second one back overwrites the first one's record of what it just stored."""
+    import asyncio
+    lk = _write_locks.get(key)
+    if lk is None:
+        lk = _write_locks[key] = asyncio.Lock()
+    return lk
+
+
 async def write_cache(key, data, cache_dir=None, offset=None, complete=None, total=None,
                       chunk_mb=None):
     """Put bytes into the cache. A later `read_cache` (or a reader built on it) finds them.
@@ -1333,55 +1657,56 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
     when the full length is known, so progress and completeness can be reported. `complete`
     sets the "whole file is here" flag; leaving it None sets it once every chunk is present.
     """
-    root = cache_dir or _default_hub_cache()
-    store = _make_store(root)
-    await store.open()
-    data = bytes(data)
+    async with _write_lock(key):
+        root = cache_dir or _default_hub_cache()
+        store = _make_store(root)
+        await store.open()
+        data = bytes(data)
 
-    if offset is None:                                 # replace the entry outright
-        await store.delete(key)
-        chunk = (chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT
-        await store.set_meta(key, size=len(data), chunk=chunk, covered=[[0, len(data)]],
-                             complete=True if complete is None else bool(complete))
-        for i in range((len(data) + chunk - 1) // chunk):
-            await store.put(key, i, data[i * chunk:(i + 1) * chunk])
-        return
+        if offset is None:                                 # replace the entry outright
+            await store.delete(key)
+            chunk = (chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT
+            await store.set_meta(key, size=len(data), chunk=chunk, covered=[[0, len(data)]],
+                                 complete=True if complete is None else bool(complete))
+            for i in range((len(data) + chunk - 1) // chunk):
+                await store.put(key, i, data[i * chunk:(i + 1) * chunk])
+            return
 
-    meta = await store.meta(key)
-    chunk = meta["chunk"] or ((chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT)
-    if meta["chunk"] is None or (meta["size"] is None and total is not None):
-        await store.set_meta(key, size=None if total is None else int(total), chunk=chunk)
         meta = await store.meta(key)
-    # Any offset, any length. How the bytes are chunked underneath is this function's
-    # business, not the caller's -- a transport writes the range it happened to read.
-    # Storage is chunked at a fixed size, but a chunk need not be full and may have holes
-    # in it; which bytes are actually present is kept as a merged span list, so writing
-    # 0-16 and then 16-32 leaves one span rather than two, and a file that ends up complete
-    # is a single span.
-    first, last = offset // chunk, (offset + len(data) - 1) // chunk
-    for i in range(first, last + 1):
-        base = i * chunk
-        lo, hi = max(offset, base), min(offset + len(data), base + chunk)
-        piece = data[lo - offset:hi - offset]
-        if lo == base and (hi - lo == chunk or
-                           (meta["size"] is not None and hi >= meta["size"])):
-            await store.put(key, i, piece)             # a whole chunk, or the file's tail
-            continue
-        cur = await store.get(key, i)
-        buf = bytearray(cur if cur is not None else b"")
-        if len(buf) < hi - base:                       # grow to hold this span
-            buf.extend(b"\x00" * (hi - base - len(buf)))
-        buf[lo - base:hi - base] = piece
-        await store.put(key, i, bytes(buf))
-    await store.set_meta(key, covered=_merge(meta["covered"], offset, offset + len(data)))
-    meta = await store.meta(key)
+        chunk = meta["chunk"] or ((chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT)
+        if meta["chunk"] is None or (meta["size"] is None and total is not None):
+            await store.set_meta(key, size=None if total is None else int(total), chunk=chunk)
+            meta = await store.meta(key)
+        # Any offset, any length. How the bytes are chunked underneath is this function's
+        # business, not the caller's -- a transport writes the range it happened to read.
+        # Storage is chunked at a fixed size, but a chunk need not be full and may have holes
+        # in it; which bytes are actually present is kept as a merged span list, so writing
+        # 0-16 and then 16-32 leaves one span rather than two, and a file that ends up complete
+        # is a single span.
+        first, last = offset // chunk, (offset + len(data) - 1) // chunk
+        for i in range(first, last + 1):
+            base = i * chunk
+            lo, hi = max(offset, base), min(offset + len(data), base + chunk)
+            piece = data[lo - offset:hi - offset]
+            if lo == base and (hi - lo == chunk or
+                               (meta["size"] is not None and hi >= meta["size"])):
+                await store.put(key, i, piece)             # a whole chunk, or the file's tail
+                continue
+            cur = await store.get(key, i)
+            buf = bytearray(cur if cur is not None else b"")
+            if len(buf) < hi - base:                       # grow to hold this span
+                buf.extend(b"\x00" * (hi - base - len(buf)))
+            buf[lo - base:hi - base] = piece
+            await store.put(key, i, bytes(buf))
+        await store.set_meta(key, covered=_merge(meta["covered"], offset, offset + len(data)))
+        meta = await store.meta(key)
 
-    if complete is not None:
-        await store.set_meta(key, complete=bool(complete))
-    elif meta["size"] is not None:
-        cov = meta["covered"]
-        if len(cov) == 1 and cov[0][0] <= 0 and cov[0][1] >= meta["size"]:
-            await store.set_meta(key, complete=True)   # one span covering it all
+        if complete is not None:
+            await store.set_meta(key, complete=bool(complete))
+        elif meta["size"] is not None:
+            cov = meta["covered"]
+            if len(cov) == 1 and cov[0][0] <= 0 and cov[0][1] >= meta["size"]:
+                await store.set_meta(key, complete=True)   # one span covering it all
 
 
 async def delete_cache(key, cache_dir=None):
@@ -1407,21 +1732,88 @@ async def clear_cache(cache_dir=None, host=None):
 
 # ---- model-hub readers: ready-made read callbacks over the HTTP transport ----
 def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
+    """The read callback behind `hf_read` / `modelscope_read`.
+
+    It asks the cache first, and when the cache says it does not have the bytes, it deals
+    with that itself -- which is the whole arrangement. `read_cache` answers one question,
+    "do I have this", and takes no transport because it has no idea what one would be. What
+    to do about a miss is knowledge this function has and the cache does not: that these
+    bytes live behind HTTP, that the host rate-limits, that reading ahead is worth it.
+    """
     hdr = {"Authorization": "Bearer " + token} if token else None
-    async def fetch(url, offset, length): return await http_get(url, offset, length, hdr)
-    async def size(url): return await http_size(url, hdr)
-    def key(name):
+    cdir = (cache_dir or _default_hub_cache()) if cache else None
+    known, served = {}, {}
+
+    async def size(url):
+        return await http_size(url, hdr)
+
+    async def raw(url, offset, length):
+        return await http_get(url, offset, length, hdr)
+
+    # Concurrency and rate-limit handling are properties of HTTP, so they wrap the transport
+    # here rather than living in the cache; read-ahead likewise, filling the cache in the
+    # background so later reads find the bytes already there.
+    get = throttle_reads(raw, max_parallel, http_rate_limited)
+    if prefetch and cache:
+        get = prefetch_whole_file(get, size=size, cache_dir=cdir, chunk_mb=chunk_mb)
+
+    def to_key(name):
         return name if name.startswith(("http://", "https://")) else to_url(*_split_repo(name))
-    # Composed the way the layers actually stack: the HTTP transport carries its own
-    # concurrency and rate-limit handling, and the cache is wrapped around the result.
-    # Stacked the way the responsibilities actually sit: the HTTP transport carries its own
-    # concurrency and rate-limit handling, optionally reads ahead into the cache, and the
-    # cache is wrapped around the result and only ever asks for what it does not have.
-    tr = throttle_reads(fetch, max_parallel, http_rate_limited)
-    if prefetch:
-        tr = prefetch_whole_file(tr, size=size, cache_dir=cache_dir, chunk_mb=chunk_mb)
-    return _cached_read(tr, size=size, key=key, cache=cache, cache_dir=cache_dir,
-                              chunk_mb=chunk_mb)
+
+    async def read(name, offset=0, length=None):
+        url = to_key(name)
+        # A file the person pointed at IS the model: read it where it lies, before anything
+        # else. No download, no copy, no quota.
+        h = _local_files.get(url.rsplit("/", 1)[-1])
+        if h is not None:
+            data = await _read_local_file(h, offset, length)
+            served[url] = served.get(url, 0) + len(data)
+            _report(url, served[url], None)
+            return data
+        if cdir is None:                               # caching off: straight to HTTP
+            data = await get(url, offset, length)
+            served[url] = served.get(url, 0) + len(data)
+            _report(url, served[url], None)
+            return data
+
+        hit = await read_cache(url, offset, length, cdir)
+        if hit is not None and (length is None or len(hit) >= length):
+            served[url] = served.get(url, 0) + len(hit)  # cached bytes are loaded bytes too
+            _report(url, served[url], known.get(url))
+            return hit
+
+        # A miss, or a short answer that ran into a gap. If the read-ahead is already
+        # fetching exactly this chunk, wait for it and take it from the cache -- asking for
+        # the same bytes again would just download them twice. A chunk nobody is fetching we
+        # take ourselves, right now, rather than waiting for the read-ahead to reach it.
+        got = len(hit) if hit else 0
+        if await await_inflight(url, offset + got, chunk_mb << 20):
+            again = await read_cache(url, offset, length, cdir)
+            if again is not None and (length is None or len(again) >= length):
+                served[url] = served.get(url, 0) + len(again)
+                _report(url, served[url], known.get(url))
+                return again
+            hit = again if again is not None else hit
+            got = len(hit) if hit else 0
+        if url not in known:
+            try: known[url] = await size(url)
+            except Exception: known[url] = None
+        total = known.get(url)
+        want = None if length is None else length - got
+        data = await get(url, offset + got, want)
+        # A short answer means the file ends here -- often the only way to learn its length,
+        # since a cross-origin host need not expose Content-Length.
+        if total is None and want is not None and len(data) < want:
+            total = offset + got + len(data)
+            known[url] = total
+        await write_cache(url, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
+        out = (hit or b"") + data
+        served[url] = served.get(url, 0) + len(out)
+        _report(url, served[url], total)
+        return out
+
+    return read
+
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
             cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True):

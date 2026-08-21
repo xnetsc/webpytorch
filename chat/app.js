@@ -130,9 +130,14 @@ worker.onmessage = (e) => {
     $('#modelStatus').textContent = m.text;
     $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
   }
-  else if (m.type === 'progress') { if (m.total) expected = m.total; showProgress(m.bytes); }
+  else if (m.type === 'progress') { if (m.total) expected = m.total;
+    showProgress(m.bytes, m.rate, m.dlRate); }
   else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'log') { console.log('[py]', m.text); }
+  else if (m.type === 'storageFull') { offerDirectory(m.key); }
+  else if (m.type === 'migrate') {
+    $('#progressText').textContent = 'moving to disk · ' + fmt(m.bytes);
+  }
   else if (m.type === 'backend') {
     ENV.backend = m.name;
     // A CPU fallback is the difference between seconds and minutes per reply, so it is
@@ -160,9 +165,14 @@ function syncButtons() {
 }
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
 let expected = 0;
-function showProgress(bytes) {
-  // "read", not "downloaded": the same meter covers a load served entirely from cache.
-  $('#progressText').textContent = 'read ' + fmt(bytes) + (expected ? ' of ' + fmt(expected) : '');
+function showProgress(bytes, rate, dlRate) {
+  // "loaded", not "downloaded": the same meter covers a load served entirely from cache.
+  // The download figure is shown only while bytes are actually coming over the wire --
+  // it comes from the HTTP reader, and a cached load has none.
+  const parts = ['loaded ' + fmt(bytes) + (expected ? ' of ' + fmt(expected) : '')];
+  if (rate) parts.push(fmt(rate) + '/s');
+  if (dlRate) parts.push('↓ ' + fmt(dlRate) + '/s');
+  $('#progressText').textContent = parts.join(' · ');
   if (expected) setBar(bytes / expected); else setBar(((bytes / 5e8) % 1));
 }
 
@@ -256,9 +266,18 @@ async function refreshCache() {
       const d = document.createElement('div'); d.className = 'item';
       const k = document.createElement('span'); k.className = 'k';
       k.title = g.keys.join('\n');
-      k.textContent = g.label + ' · ' + fmt(g.size) + (g.files > 1 ? ' · ' + g.files + ' files' : '');
+      // An incomplete model says so, and says how far it got -- otherwise a half-downloaded
+      // entry is indistinguishable from a usable one.
+      const partial = !g.complete;
+      k.textContent = g.label + ' · ' + fmt(g.size)
+        + (g.files > 1 ? ' · ' + g.files + ' files' : '')
+        + (partial ? ' · ⚠ incomplete' + (g.total ? ' (' + Math.floor(100 * g.size / g.total)
+                                                    + '% of ' + fmt(g.total) + ')' : '') : '');
+      if (partial) k.classList.add('partial');
       const ex = document.createElement('button'); ex.textContent = 'export';
-      ex.title = g.files > 1 ? 'Save as a .zip' : 'Save the file itself';
+      ex.disabled = partial;
+      ex.title = partial ? 'Finish downloading before exporting'
+                         : (g.files > 1 ? 'Save as a .zip' : 'Save the file itself');
       ex.onclick = () => exportModel(g);
       const del = document.createElement('button'); del.textContent = 'delete';
       del.onclick = async () => {
@@ -292,26 +311,44 @@ async function exportModel(g) {
   setBar(0); $('#progressText').textContent = '';
 }
 
-$('#importModel').onclick = () => $('#importFileModel').click();
-$('#importFileModel').onchange = async (e) => {
-  const f = e.target.files[0]; e.target.value = '';
-  if (!f) return;
-  // A .zip carries its own file names; a bare file does not, so it needs the cache key it
-  // should be restored under -- which is what the loader will look for.
-  let key = '';
-  if (!/\.zip$/i.test(f.name)) {
-    key = prompt('Restore under which model id?\n(e.g. unsloth/Qwen3-0.6B-GGUF/' + f.name + ')', '');
-    if (!key) return;
-    key = 'modelscope.cn/models/' + key.replace(/^\/+/, '').replace(
-      /^([^/]+\/[^/]+)\//, '$1/resolve/master/');
+// Browser storage is capped by policy, not by the disk -- a few GB here while hundreds are
+// free. When a model runs past it the load keeps going by streaming, and this offers the one
+// way out: a directory, which has no cap. Needs a gesture, so it has to happen in the page.
+let offering = false;
+async function offerDirectory(key) {
+  if (offering || !window.showDirectoryPicker) return;
+  offering = true;
+  const name = String(key).split('/').pop();
+  if (!confirm('Browser storage is full, so ' + name + ' cannot be kept.\n\n'
+             + 'Choose a folder to keep models in instead? What is already stored moves '
+             + 'there and is freed here; a folder has no size limit.')) {
+    offering = false; note('Continuing without caching this model.'); return;
   }
-  note('Importing ' + f.name + ' …');
   try {
-    const keys = JSON.parse(await call('importModel', { file: f, key }));
-    note('Imported ' + keys.length + ' file(s). Load it from Settings without downloading.');
+    const dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+    note('Moving cached models to the folder…');
+    await call('migrate', { dir });
+    note('Done. Models are kept in that folder from now on.');
     refreshCache();
-  } catch (err) { note('Import failed: ' + err.message); }
+  } catch (e) { note('Not moved: ' + e.message); }
+  offering = false;
+}
+
+// Import points at a model on disk and reads it there -- nothing is copied, so a 12 GB file
+// costs nothing and is not subject to the quota at all.
+$('#importModel').onclick = async () => {
+  const dirMode = confirm('Import a folder (multi-file model)?\n\nOK = folder,  Cancel = single file');
+  try {
+    let handle;
+    if (dirMode) handle = await window.showDirectoryPicker({ mode: 'read' });
+    else handle = (await window.showOpenFilePicker({ multiple: false }))[0];
+    const names = JSON.parse(await call('importModel', { handle }));
+    note('Reading from disk: ' + names.join(', ') + '. Load it as usual — no download.');
+    refreshCache();
+  } catch (e) { if (e.name !== 'AbortError') note('Import failed: ' + e.message); }
 };
+const _unusedImportInput = () => $('#importFileModel').click();
+
 
 $('#refreshCache').onclick = refreshCache;
 $('#clearCache').onclick = async () => { if (confirm('Delete every cached model file?')) { await call('cacheClear'); refreshCache(); } };
@@ -494,5 +531,7 @@ $('#importFile').onchange = async (e) => {
 loadConvs(); if (!convs.length) newConv(); else curId = convs[0].id;
 renderConvs(); render(); syncButtons();
 detectEnv().then(() => { fillPresets(); wireGpuMem(); });
+// Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
+call('armStorage', {}).catch(() => {});
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
 call('boot').then(refreshCache).catch(e => $('#modelStatus').textContent = 'runtime failed: ' + e.message);

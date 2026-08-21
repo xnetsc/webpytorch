@@ -17,7 +17,10 @@ Shape of the output follows the model:
   * several files (config + tokenizer + shards) are written as one ZIP, stored uncompressed
     because quantized weights do not compress and the copy would cost time for nothing.
 
-`import_model` accepts either, telling them apart by content rather than by file name.
+`import_model` is the other direction and does not mirror it: it registers a file or a
+directory and reads the model where it lies. Copying a multi-gigabyte model into origin
+storage would be slow and would not fit under the browser's quota, and there is no reason
+to hold it twice.
 """
 
 import binascii
@@ -198,100 +201,29 @@ async def export_model(keys, write, cache_dir=None, on_progress=None):
     return written[0]
 
 
-async def _fill_entry(key, read, size, cache_dir=None, chunk_mb=16, on_progress=None):
-    """Fill one cache entry from `read(offset, length) -> bytes`, a span at a time."""
-    chunk = chunk_mb << 20
-    await webio.delete_cache(key, cache_dir)       # replace, never merge with older bytes
-    done = 0
-    while done < size:
-        n = min(chunk, size - done)
-        b = await read(done, n)
-        if not b:
-            raise ValueError("import ended early: %d of %d bytes for %r" % (done, size, key))
-        # Through write_cache, which is what records the bytes as present; putting chunks
-        # into the store directly leaves them invisible to every reader.
-        await webio.write_cache(key, bytes(b), cache_dir, offset=done, total=size,
-                                chunk_mb=chunk_mb)
-        done += len(b)
-        if on_progress is not None:
-            on_progress(done)
-        del b
-    return done
+async def import_model(handle):
+    """Point at a model on disk. Nothing is copied.
 
+    Importing should not mean duplicating: a 12 GB file copied into origin storage is slow
+    and would not fit under the browser's quota anyway. So a file handle is registered and
+    read where it lies, and a directory handle registers every file in it -- which is what
+    a multi-file model is. Neither touches origin storage; both are read at the offsets the
+    loader asks for.
 
-async def import_model(read, size, key=None, cache_dir=None, on_progress=None):
-    """Put an exported model back into the cache, so loading it needs no network.
-
-    `read(offset, length) -> bytes` supplies the exported bytes -- a plain file or a ZIP
-    written by `export_model`; the two are told apart by the archive signature, not by any
-    file name. A plain file needs `key` (the cache key to store it under, e.g.
-    "modelscope.cn/models/org/repo/resolve/master/model.gguf"); a ZIP carries its own
-    names, and `key` is then the prefix they are stored under.
-
-    Returns the list of keys written.
+    `handle` is a `FileSystemFileHandle` or `FileSystemDirectoryHandle` from
+    `showOpenFilePicker()` / `showDirectoryPicker()`. Returns the names now satisfied
+    locally; loading any id ending in one of them reaches neither network nor cache.
     """
-    head = bytes(await read(0, 4))
-    if head[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
-        if not key:
-            raise ValueError("a plain file needs `key`, the cache key to store it under")
-        await _fill_entry(key, read, size, cache_dir, on_progress=on_progress)
-        return [key]
-
-    # ZIP: walk local headers. Entries written by export_model are stored (never deflated)
-    # and carry their sizes in a data descriptor, so the central directory is read first --
-    # it is the only place the sizes are known before the data.
-    names = await _zip_central(read, size)
-    out = []
-    for name, csize, offset in names:
-        nlen, elen = struct.unpack("<HH", bytes(await read(offset + 26, 4)))
-        start = offset + 30 + nlen + elen
-        full = ("%s/%s" % (key.rstrip("/"), name)) if key else name
-
-        async def sub(o, n, _s=start):
-            return await read(_s + o, n)
-
-        await _fill_entry(full, sub, csize, cache_dir, on_progress=on_progress)
-        out.append(full)
-    return out
-
-
-async def _zip_central(read, size):
-    """-> [(name, size, local_header_offset)] from a ZIP's central directory."""
-    tail_n = min(size, 66000)
-    tail = bytes(await read(size - tail_n, tail_n))
-    p = tail.rfind(b"PK\x05\x06")
-    if p < 0:
-        raise ValueError("not a ZIP: no end-of-central-directory record")
-    n, cd_size, cd_off = struct.unpack("<HII", tail[p + 10:p + 20])
-    z = tail.rfind(b"PK\x06\x06")
-    if z >= 0:                               # ZIP64: the real values live here
-        n, _n2, cd_size, cd_off = struct.unpack("<QQQQ", tail[z + 24:z + 56])
-    cd = bytes(await read(cd_off, cd_size))
-    out = []
-    q = 0
-    while q + 46 <= len(cd) and cd[q:q + 4] == b"PK\x01\x02":
-        csize, usize = struct.unpack("<II", cd[q + 20:q + 28])
-        nlen, elen, clen = struct.unpack("<HHH", cd[q + 28:q + 34])
-        off = struct.unpack("<I", cd[q + 42:q + 46])[0]
-        name = cd[q + 46:q + 46 + nlen].decode("utf-8", "replace")
-        extra = cd[q + 46 + nlen:q + 46 + nlen + elen]
-        if 0xFFFFFFFF in (csize, off):       # pull the 64-bit values out of the extra field
-            e = 0
-            while e + 4 <= len(extra):
-                hid, hsz = struct.unpack("<HH", extra[e:e + 4])
-                if hid == 0x0001:
-                    vals = struct.unpack("<%dQ" % (hsz // 8), extra[e + 4:e + 4 + (hsz // 8) * 8])
-                    it = iter(vals)
-                    if usize == 0xFFFFFFFF:
-                        usize = next(it, usize)
-                    if csize == 0xFFFFFFFF:
-                        csize = next(it, csize)
-                    if off == 0xFFFFFFFF:
-                        off = next(it, off)
-                    break
-                e += 4 + hsz
-        out.append((name, csize, off))
-        q += 46 + nlen + elen + clen
-    if not out:
-        raise ValueError("ZIP has no entries")
-    return out
+    added = []
+    if getattr(handle, "kind", "file") == "directory":
+        it = handle.values()
+        while True:
+            r = await it.next()
+            if r.done:
+                break
+            e = r.value
+            if getattr(e, "kind", "") == "file" and not str(e.name).endswith(".meta"):
+                added.append(webio.use_model_file(e))
+    else:
+        added.append(webio.use_model_file(handle))
+    return added
