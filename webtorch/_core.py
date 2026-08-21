@@ -2879,7 +2879,9 @@ var<storage,read> gm: GM;
 // Byte addressing, not word: most ggml blocks are not a multiple of four bytes (Q8_0 is 34,
 // Q3_K and IQ3_S 110, MXFP4 17), so a u32 index would drift out of alignment after the
 // first block. These mirror the reference dequantizer's own byte offsets exactly.
-fn B(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+var<private> nrow: u32;
+fn W(wo: u32) -> u32 { return w[wo * gm.N + nrow]; }
+fn B(o: u32) -> u32 { return (W(o >> 2u) >> ((o & 3u) * 8u)) & 255u; }
 fn I8(o: u32) -> f32 { return f32(i32(B(o) << 24u) >> 24u); }
 fn U16(o: u32) -> u32 { return B(o) | (B(o + 1u) << 8u); }
 fn U32(o: u32) -> u32 { return U16(o) | (U16(o + 2u) << 16u); }
@@ -2941,8 +2943,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let ly = lid.y;
   mb = gid.z * 4u;
   mn = select(0u, min(4u, gm.M - mb), mb < gm.M);
+  nrow = n;
   a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
-  let base = n * gm.rowb;
+  let base = 0u;
   let nb = gm.K / BLKVALS;
   let livec = (n < gm.N && mn > 0u);
   if (livec) {
@@ -3001,9 +3004,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let lx = lid.x;
   let ly = lid.y;
   xoff = ly * BLKVALS;
+  nrow = n;
   acc0 = 0.0;
 ACCINIT1
-  let base = n * gm.rowb;
+  let base = 0u;
   let nb = gm.K / BLKVALS;
   // A fixed step count, not `b < nb` per row: every thread must reach the same barriers.
   let steps = (nb + KSu - 1u) / KSu;
@@ -3091,10 +3095,10 @@ _IQ4XS_DEC = """
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
       let ls = ((B(o + 4u + (ib >> 1u)) >> (4u * (ib & 1u))) & 15u) | (((sh >> (2u * ib)) & 3u) << 4u);
       let dl = d * f32(i32(ls) - 32);
-      let qw = (o + 8u + ib * 16u) >> 2u;
+      let qwb = o + 8u + ib * 16u;
       let k0 = kb + ib * 32u;
       for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
-        let w4 = w[qw + jw];
+        let w4 = W((qwb >> 2u) + jw);
         for (var q: u32 = 0u; q < 4u; q = q + 1u) {
           let by = (w4 >> (8u * q)) & 255u;
           let j = jw * 4u + q;
@@ -3698,7 +3702,8 @@ def _ggml_selfcheck(type_name, mode):
     M = mode if mode else 3
     x = rng.standard_normal((M, vals)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
-    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=xp.asarray(np.frombuffer(raw, np.int32)),
+    pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, blk)
+    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk,
                                           type_name=type_name, K=vals, N=2))).reshape(M, 2)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
@@ -3709,7 +3714,10 @@ def _ggml_selfcheck(type_name, mode):
 
 
 def ggml_matmul(xf, packed, type_name, K, N):
-    """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader."""
+    """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
+
+    `packed` must be in the transposed (word, row) layout that `ggml_transpose` produces --
+    GGMLLinear does that once at upload."""
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
     m = int(xf.shape[0])
@@ -4257,6 +4265,67 @@ def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
     return out
 
 
+# Weights are stored one row after another, so in a matmul the threads of a workgroup --
+# each owning an output row -- read addresses a whole row apart. Measured with the decode
+# happening: 59 GB/s in that layout against 90+ for the same traffic read contiguously.
+# Transposing to (word, row) at upload makes neighbouring threads read neighbouring words.
+# Rows are padded to a word boundary first, since a block size is not always a multiple of
+# four and a row would otherwise start mid-word.
+_TRANSPOSE_WGSL = """@group(0) @binding(0)
+var<storage,read> src: array<u32>;
+@group(0) @binding(1)
+var<storage,read_write> dst: array<u32>;
+struct TM { n: u32, words: u32, rowb: u32, total: u32, gx: u32, pad: u32, }
+@group(0) @binding(2)
+var<storage,read> tm: TM;
+fn sb(o: u32) -> u32 { return (src[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  // Two-dimensional: a big head needs ~900k workgroups and a dimension caps at 65535.
+  let i = gid.y * tm.gx * 64u + gid.x;
+  if (i >= tm.total) { return; }
+  let wo = i / tm.n;
+  let row = i - wo * tm.n;
+  let b = row * tm.rowb + wo * 4u;          // byte offset of this word within the row
+  var v: u32 = 0u;
+  if (b + 3u < (row + 1u) * tm.rowb) {
+    v = sb(b) | (sb(b + 1u) << 8u) | (sb(b + 2u) << 16u) | (sb(b + 3u) << 24u);
+  } else {
+    var k: u32 = 0u;                        // tail of the row: whatever bytes remain
+    loop {
+      if (k >= 4u || b + k >= (row + 1u) * tm.rowb) { break; }
+      v = v | (sb(b + k) << (8u * k));
+      k = k + 1u;
+    }
+  }
+  dst[i] = v;
+}
+"""
+
+_tr_k = {"added": False}
+
+
+def ggml_transpose(src, n, rowb):
+    """(n, rowb bytes) -> (words, n) u32, so a matmul's threads read adjacent words."""
+    words = (rowb + 3) // 4
+    plat = _adam_kernel["platform"]
+    if not _tr_k["added"]:
+        plat.addKernel("ggml_tr", {"source": _TRANSPOSE_WGSL,
+                                   "bindingTypes": ["read-only-storage", "storage",
+                                                    "read-only-storage"]})
+        _tr_k["added"] = True
+    total = words * n
+    dst = _empty((total,))
+    groups = (total + 63) // 64
+    gx = min(groups, 32768)                     # a dispatch dimension caps at 65535
+    gy = (groups + gx - 1) // gx
+    meta = _adam_kernel["make_meta"]((n, words, rowb, total, gx, 0), "u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "ggml_tr",
+                    "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": gx, "y": gy, "z": 1}})
+    return dst
+
+
 _gdn_k = {"added": False}
 
 
@@ -4299,7 +4368,12 @@ class GGMLLinear(Module):
         pad = (-b.size) % 4
         if pad:
             b = np.concatenate([b, np.zeros(pad, np.uint8)])
-        self.packed = xp.asarray(b.view(np.int32))
+        up = xp.asarray(b.view(np.int32))
+        # Transposed on the way in, once, so every later matmul reads it coalesced. Done on
+        # the device: the host copy is already the largest thing in flight during a load.
+        vals, blk = _GGML_TYPES[type_name][2], _GGML_TYPES[type_name][3]
+        self.packed = ggml_transpose(up, int(N), (int(K) // vals) * blk)
+        del up
         self.type_name = type_name
         self.Kt = int(K); self.Nt = int(N)
         self.bias = None if bias is None else xp.asarray(np.asarray(bias, np.float32))
