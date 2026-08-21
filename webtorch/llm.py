@@ -574,6 +574,52 @@ class CausalLM:
         for e in range(ne):
             yield G.dequant(t["type"], raw[e * nb:(e + 1) * nb], per).reshape(out_d, in_d)
 
+    async def _gload_quant(self, name, bias=None):
+        """Read a GGUF weight and quantize it without ever holding it whole.
+
+        A 27B feed-forward weight is 89M values: 356 MB as fp32, and the i-quant
+        dequantizers build an intermediate of the same size again, which a 32-bit heap will
+        not give. Nothing needs the whole thing -- each output column is quantized
+        independently, and GGUF blocks run along the input dimension, so a band of output
+        rows is both self-contained and block-aligned. This walks those bands: read, expand,
+        quantize, keep only the packed result. Peak is one band, whatever the tensor's size.
+        """
+        from . import ggufload as G
+        if getattr(self, "_qbits", None) == 0:                # fp16 path wants it whole
+            return self._gquant(await self._gload(name), bias)
+        t = self._ginfo[name]
+        dims = [int(d) for d in reversed(t["dims"])]
+        if len(dims) != 2:
+            return self._gquant(await self._gload(name), bias)
+        N, K = dims                                            # (out, in)
+        per = 32 // self.bits
+        kmul = self.gs if self.gs % per == 0 else self.gs * per
+        Kp = K + (-K) % kmul
+        Np = N + (-N) % per
+        row = G.tensor_nbytes(t["type"], K)                    # bytes per output row
+        off = self._gds + t["offset"]
+        band = max(per, (_READ_BYTES // max(K * 4, 1)) // per * per) or per
+        qws, qzs, scs = [], [], []
+        for r0 in range(0, Np, band):
+            r1 = min(Np, r0 + band)
+            live = max(0, min(N, r1) - r0)                     # real rows in this band
+            if live:
+                raw = await self._grng(off + r0 * row, off + (r0 + live) * row - 1)
+                W = G.dequant(t["type"], raw, live * K).reshape(live, K)
+                del raw
+            else:
+                W = np.zeros((0, K), np.float32)
+            if live < r1 - r0 or Kp != K:                      # pad to the packing multiple
+                W = np.pad(W, ((0, (r1 - r0) - live), (0, Kp - K)))
+            qw, qz, sc, _, _ = wt._gptq_quantize(W, self.gs, self.bits, from_out_in=True)
+            del W
+            qws.append(qw); qzs.append(qz); scs.append(sc)
+        qw = np.concatenate(qws, axis=1); del qws
+        qz = np.concatenate(qzs, axis=1); del qzs
+        sc = np.concatenate(scs, axis=1); del scs
+        b = np.zeros((N,), np.float32) if bias is None else np.asarray(bias, np.float32)
+        return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
+
     def _gquant(self, W_out_in, bias=None):
         """fp32 (out,in) weight -> a linear layer. Quantized to int`bits` by default; with
         `self._qbits == 0` (dtype="fp16") it stays unquantized, which also makes GGUF models
@@ -781,7 +827,7 @@ class CausalLM:
             p = "blk.%d." % i
             async def qb(nm, _p=p):                            # weight + optional bias -> QuantizedLinear
                 b = (await self._gload(_p + nm + ".bias")) if (_p + nm + ".bias") in self._ginfo else None
-                return self._gquant(await self._gload(_p + nm + ".weight"), b)
+                return await self._gload_quant(_p + nm + ".weight", b)
             async def opt_norm(nm, _p=p):                      # QK-norm (qwen3-style) if present
                 n = _p + nm + ".weight"
                 return wt.Tensor(await self._gload(n)) if n in self._ginfo else None
