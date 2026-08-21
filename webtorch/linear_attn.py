@@ -370,8 +370,12 @@ class LinearAttention:
         decay = np.broadcast_to(decay.reshape(T, -1)[:, :self.hv], (T, self.hv))
         beta = np.broadcast_to(np.asarray(beta, np.float32).reshape(T, -1)[:, :self.hv], (T, self.hv))
 
-        qh = np.repeat(q, self.rep, axis=1) if self.rep > 1 else q      # group k/q heads to v heads
-        kh = np.repeat(k, self.rep, axis=1) if self.rep > 1 else k
+        # Value head v takes key head `v % n_k_heads` -- ggml's gated_delta_net indexes
+        # iq1 = iv1 % neq1, so the key heads CYCLE across the value heads rather than each
+        # covering a contiguous block. np.repeat gives the block mapping and is wrong here:
+        # it pairs every query with the wrong key for all but the first of each group.
+        qh = np.tile(q, (1, self.rep, 1)) if self.rep > 1 else q
+        kh = np.tile(k, (1, self.rep, 1)) if self.rep > 1 else k
         out = np.empty((T, self.hv, self.dv), np.float32)
         S = state.S
         for t in range(T):                                    # inherently sequential recurrence

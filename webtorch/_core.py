@@ -4030,10 +4030,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= n) { return; }
   let h = i / gd.dv;
   let vi = i % gd.dv;
-  // qkv packs q | k | v | decay | beta for this token. Several value heads share one
-  // key head, so the grouping is resolved here rather than by materializing repeats.
-  let nq = (gd.hv / gd.rep) * gd.dk;
-  let qo = (h / gd.rep) * gd.dk;
+  // qkv packs q | k | v | decay | beta for this token. q and k are stored per KEY head and
+  // the key heads CYCLE across the value heads (ggml: iq1 = iv1 % n_q_heads), so this is a
+  // modulo, not a divide -- the block mapping pairs each query with the wrong key.
+  let hk = gd.hv / gd.rep;
+  let nq = hk * gd.dk;
+  let qo = (h % hk) * gd.dk;
   let ko = nq + qo;
   let vo = 2u * nq + h * gd.dv;
   let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
@@ -4074,9 +4076,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rem = i % (gd.dk * gd.dv);
   let d = rem / gd.dv;
   let vi = rem % gd.dv;
-  let nq = (gd.hv / gd.rep) * gd.dk;
+  let hk = gd.hv / gd.rep;
+  let nq = hk * gd.dk;
   let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
-  S[i] = S[i] * dcy + qkv[nq + (h / gd.rep) * gd.dk + d] * od[gd.hv * gd.dv + h * gd.dv + vi];
+  S[i] = S[i] * dcy + qkv[nq + (h % hk) * gd.dk + d] * od[gd.hv * gd.dv + h * gd.dv + vi];
 }
 """
 

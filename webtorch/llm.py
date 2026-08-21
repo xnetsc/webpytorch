@@ -401,6 +401,10 @@ class CausalLM:
     def __init__(self, base):
         self.base = (base.rstrip("/") + "/") if base else ""
         self.capture_ready = False
+        # Sampling state, so a forward called outside generate() still works.
+        self._seen = []
+        self._gen_start = 0
+        self._con_text = ""
         self.rope_style = "hf"          # qwen2 = HF rotate_half (both GPTQ and GGUF)
         self.gs = 128; self.bits = 4    # int4 kernel params (GGUF is requantized to this)
 
@@ -1436,17 +1440,23 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD); h = self.h_in
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
-            q, k, v = self._qkv(lay, x, 1)
-            q = self._rope1(q); k = self._rope1(k)
-            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-            # One dispatch for the single decode position; falls back for anything the
-            # fused kernel does not cover.
-            o = (wt.gqa_decode(q, self.Kc[i], self.Vc[i], self.mask_b, sc) if wt._GQA_FUSED
-                 else None)
-            if o is None:
-                o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
-            h = h + self._attn_out(lay, o, 1)
+            if self._is_linear_layer(i):
+                # A recurrent mixer is capturable once its step runs on the device: the
+                # commands are the same every token, and the state it reads and writes in
+                # place is a buffer like any other.
+                h = h + self._linear_mixer(i, lay, x, 1)
+            else:
+                q, k, v = self._qkv(lay, x, 1)
+                q = self._rope1(q); k = self._rope1(k)
+                wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                # One dispatch for the single decode position; falls back for anything the
+                # fused kernel does not cover.
+                o = (wt.gqa_decode(q, self.Kc[i], self.Vc[i], self.mask_b, sc) if wt._GQA_FUSED
+                     else None)
+                if o is None:
+                    o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
+                h = h + self._attn_out(lay, o, 1)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
         return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
@@ -1548,13 +1558,14 @@ class CausalLM:
                            min_p, constraint, min_new_tokens, prompt_ids=ids)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
-        # A recurrent (linear-attention) layer advances state on the host each step, so a
-        # decode step is not a fixed GPU command sequence and cannot be captured. Hybrid
-        # architectures -- attention every few layers, a recurrent mixer in between -- take
-        # the same growing-cache forward as WebGL: slower per token than replay, but it is
-        # what makes them run at all. `_decode_fwd` assumes every layer has q/k/v.
-        recurrent = any(self._is_linear_layer(i) for i in range(len(self.layers)))
-        if not self._gpu or recurrent:                 # WebGL fallback, or a hybrid stack
+        # A decode step can only be captured if it is the same sequence of GPU commands every
+        # token. That rules out a recurrent mixer whose state advances on the HOST -- but not
+        # one whose step runs on the device, where the state is just a buffer being read and
+        # written in place. So hybrids are captured when every recurrent layer can do that,
+        # and fall back to the growing-cache forward when one cannot.
+        rec = [i for i in range(len(self.layers)) if self._is_linear_layer(i)]
+        on_gpu = all(self.layers[i]["linear"]._gpu_step_ok() for i in rec)
+        if not self._gpu or (rec and not on_gpu):      # WebGL fallback, or a host-side mixer
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0
@@ -1580,14 +1591,20 @@ class CausalLM:
         plat.beginCapture("decode")
         logits_t = self._decode_fwd(); logits_t.numpy()
         plat.endCapture(); self.capture_ready = True
-        gen = [g0]; nxt = g0; pos = P; steps = 0; td = time.perf_counter()
-        while len(gen) < max_new and not self._stop_now():
+        # The capture ran the step for real, so its logits belong to this position. Replaying
+        # it with the same inputs would be harmless for attention -- the KV write is
+        # idempotent -- but would advance a recurrent state a second time, so consume the
+        # captured result and start replaying from the next position.
+        td = time.perf_counter()
+        gen = [g0]; steps = 1
+        nxt = self._pick(logits_t.numpy()[0]); pos = P + 1
+        while nxt != eot and len(gen) < max_new:
+            gen.append(nxt)
+            if len(gen) >= max_new or self._stop_now():
+                break
             self._set_inputs(nxt, pos)
             plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
-            if nxt == eot:
-                break
-            gen.append(nxt)
         dec = time.perf_counter() - td
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                          round(ttft, 3), round(steps / max(dec, 1e-9), 2))
