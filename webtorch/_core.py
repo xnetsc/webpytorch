@@ -4278,6 +4278,8 @@ var<storage,read_write> dst: array<u32>;
 struct TM { n: u32, words: u32, rowb: u32, total: u32, gx: u32, pad: u32, }
 @group(0) @binding(2)
 var<storage,read> tm: TM;
+@group(0) @binding(3)
+var<storage,read_write> flag: array<f32>;
 fn sb(o: u32) -> u32 { return (src[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -4299,6 +4301,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   dst[i] = v;
+  if (i == 0u) { flag[0] = 1.0; }        // four bytes to read back, instead of the tensor
 }
 """
 
@@ -4312,7 +4315,7 @@ def ggml_transpose(src, n, rowb):
     if not _tr_k["added"]:
         plat.addKernel("ggml_tr", {"source": _TRANSPOSE_WGSL,
                                    "bindingTypes": ["read-only-storage", "storage",
-                                                    "read-only-storage"]})
+                                                    "read-only-storage", "storage"]})
         _tr_k["added"] = True
     total = words * n
     dst = _empty((total,))
@@ -4320,14 +4323,20 @@ def ggml_transpose(src, n, rowb):
     gx = min(groups, 32768)                     # a dispatch dimension caps at 65535
     gy = (groups + gx - 1) // gx
     meta = _adam_kernel["make_meta"]((n, words, rowb, total, gx, 0), "u4,u4,u4,u4,u4,u4")
+    flag = _empty((1,))
     plat.runKernel({"name": "ggml_tr",
-                    "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id],
+                    "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id,
+                                flag.buffer.buffer_id],
                     "workGroups": {"x": gx, "y": gy, "z": 1}})
     # The dispatch is queued, not done. The caller drops the source right after this, and
     # freeing a buffer a pending command still reads leaves the destination zeroed -- which
     # showed up as a loaded model of all-zero weights while the same tensor transposed on
     # its own was fine, because using it immediately forced the queue to drain.
-    cp.asnumpy(dst[:1])
+    #
+    # Read the flag, not the tensor: a read-back is sized to the whole buffer, and asking
+    # for a 210 MB head block back exceeds what the backend will stage ("buffer size
+    # insufficient"). Four bytes drain the queue just as well.
+    cp.asnumpy(flag)
     return dst
 
 

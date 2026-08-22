@@ -48,7 +48,6 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .msg.user .who{background:var(--user)} .msg.bot .who{background:var(--accent)}
 .msg .body{white-space:pre-wrap;word-wrap:break-word;padding-top:4px;min-width:0}
 .msg .body img{max-width:270px;border-radius:8px;display:block;margin:6px 0}
-.think{color:var(--mut);font-style:italic;border-left:2px solid var(--line);padding-left:9px;margin:4px 0}
 #attachments{max-width:760px;margin:0 auto;width:100%;padding:0 16px;display:flex;
              gap:8px;flex-wrap:wrap}
 .chip{background:var(--code);border:1px solid var(--line);border-radius:14px;padding:3px 10px;font-size:12px}
@@ -64,12 +63,46 @@ button:disabled{opacity:.5;cursor:not-allowed}
 
 /* settings dialog */
 #settingsDlg{border:1px solid var(--line);border-radius:14px;background:var(--panel);
-             color:var(--fg);width:430px;max-width:92vw;padding:18px}
+             color:var(--fg);width:470px;max-width:92vw;padding:18px}
 #settingsDlg::backdrop{background:rgba(0,0,0,.45)}
 .dlg-head{display:flex;align-items:center;justify-content:space-between}
 .dlg-head h2{margin:0;font-size:17px}
 .dlg-head button{margin:0;border:none;background:none;font-size:16px}
 #composer .tools button{font-size:15px;padding:6px 8px}
+
+/* tabs: one settings page per concern instead of one long scroll */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:10px 0 14px}
+.tabs button{margin:0;padding:7px 13px;border:none;border-bottom:2px solid transparent;
+             border-radius:0;background:none;color:var(--mut);font-weight:600}
+.tabs button:hover{color:var(--fg)}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+.tab-panel h3{margin:16px 0 8px;font-size:12px;text-transform:uppercase;
+              letter-spacing:.06em;color:var(--mut)}
+.tab-panel h3:first-child{margin-top:0}
+
+/* labelled inputs: label above, full width, no side-by-side crowding */
+.field{display:block;margin-top:10px}
+.field>span{display:block;font-size:12px;color:var(--mut);margin-bottom:4px}
+.field input{width:100%}
+.field .inline{display:flex;gap:6px}
+.field .inline input{flex:1}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+.btns button{margin-top:10px}
+button.ghost{border:none;background:none;color:var(--accent);padding:7px 6px}
+.check{display:flex;gap:8px;align-items:flex-start;margin-top:14px;cursor:pointer}
+.check input{margin-top:3px;accent-color:var(--accent)}
+
+/* thinking block: folded by default, expandable — the reasoning is there, not lost */
+details.think{margin:2px 0 8px;color:var(--mut);font-size:13px}
+details.think summary{cursor:pointer;font-style:normal;color:var(--mut);user-select:none;
+                      list-style:none;display:flex;align-items:center;gap:6px}
+details.think summary::-webkit-details-marker{display:none}
+details.think summary::before{content:"▸";font-size:10px;transition:transform .15s}
+details.think[open] summary::before{transform:rotate(90deg)}
+details.think pre{white-space:pre-wrap;word-wrap:break-word;font:inherit;font-style:italic;
+                  border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
+details.think.live summary{color:var(--accent)}
 
 #composer.locked{opacity:.55}
 #composer.locked #input{cursor:not-allowed}

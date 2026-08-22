@@ -63,11 +63,43 @@ class AutoModelForCausalLM:
       - "fp16": force unquantized fp16 execution (plain HF dir).
       - "int4"/"int8": for a plain fp16 HF dir, quantize every linear on load; for GGUF,
         requantize to that width. (An AutoGPTQ dir always loads at its own stored bits.)
+
+    `lmax` is the context length (prompt + reply) the model is loaded with. `None` (default)
+    runs at the size the model itself declares, capped only if its KV cache would not fit the
+    memory budget; an explicit number overrides it. `load()`, `pipeline()` and the
+    `CausalLM.from_gguf/from_gptq/from_fp16` loaders all take this same option.
     """
     @staticmethod
-    async def from_pretrained(path, dtype="auto", bits=None, lmax=320, weights="native"):
+    async def from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native"):
+        import asyncio
+        p = str(path).rstrip("/")
+        key = _impl_cache_key(p, dtype, bits, lmax, weights)
+        e = _IMPL_CACHE.get(key)
+        if e is not None and not e["impl"].__dict__.get("_released"):
+            e["refs"] += 1
+            return e["impl"]               # the weights were loaded once; hand out the copy
+        if key in _IMPL_LOADING:
+            impl = await asyncio.shield(_IMPL_LOADING[key])
+            e = _IMPL_CACHE.get(key)
+            if e is not None and e["impl"] is impl:
+                e["refs"] += 1
+            return impl
+        fut = asyncio.get_event_loop().create_future()
+        _IMPL_LOADING[key] = fut
+        try:
+            impl = await AutoModelForCausalLM._load_raw(p, dtype, bits, lmax, weights)
+        except BaseException as exc:
+            _IMPL_LOADING.pop(key, None)
+            if not fut.done(): fut.set_exception(exc)
+            raise
+        _IMPL_CACHE[key] = {"impl": impl, "refs": 1}
+        _IMPL_LOADING.pop(key, None)
+        if not fut.done(): fut.set_result(impl)
+        return impl
+
+    @staticmethod
+    async def _load_raw(p, dtype, bits, lmax, weights):
         from . import llm as _llm, webio
-        p = path.rstrip("/")
         if p.endswith(".gguf"):
             # "auto" means the same here as for an AutoGPTQ dir: keep the stored
             # precision (bits=None lets the loader read it off the file).
@@ -86,6 +118,19 @@ class AutoModelForCausalLM:
 # Options every LLM entry point forwards to AutoModelForCausalLM. Kept in one place so a
 # new loader option reaches load(), pipeline() and the multimodal path without three edits.
 _LLM_OPTS = ("dtype", "bits", "lmax", "weights")
+
+# Weight-level dedup: `load()`, `pipeline()` and a direct `AutoModelForCausalLM.from_pretrained`
+# may all ask for the SAME model, and a multi-GB load must happen once. The `load()` cache
+# below (_LOADED) only sees its own handles; this one covers the weights themselves, keyed
+# by everything that changes them (source, precision, context). Each handle handed out
+# refcounts the entry; the LAST release frees it, so two entry points can share one copy
+# without one release destroying the other's model.
+_IMPL_CACHE = {}     # key -> {"impl": model, "refs": int}
+_IMPL_LOADING = {}   # key -> asyncio.Future, so concurrent loads of one model run once
+
+
+def _impl_cache_key(path, dtype, bits, lmax, weights):
+    return (str(path).rstrip("/"), dtype, bits, lmax, weights)
 
 
 # ---- ONE unified entry point for every model type ---------------------------
@@ -201,6 +246,13 @@ def release_all():
     for m in list(_LOADED.values()):
         m.release(); n += 1          # Model.release frees the impl's weights too
     _LOADED.clear()
+    # Weight handles held through other doors (pipeline objects, direct from_pretrained):
+    # release_all means everything goes, so force-free whatever the refcount still covers.
+    for e in list(_IMPL_CACHE.values()):
+        impl = e["impl"]
+        if not impl.__dict__.get("_released"):
+            _drop_heavy(impl); n += 1
+    _IMPL_CACHE.clear()
     return n
 
 
@@ -220,6 +272,10 @@ async def load(source=None, task=None, dtype="auto", encoder=None, reuse=True, *
               selects the pipeline's model name.
       dtype:  "auto" | "fp16" | "int4" | "int8" (LLMs).
       encoder: name of a registered media encoder -> a multimodal model.
+
+    LLM options forwarded to the loader (same names as `AutoModelForCausalLM.from_pretrained`
+    and `pipeline`): `lmax=` context length (None = the size the model declares), `bits=`,
+    `weights=`.
 
     Detection is by content, not by model name: `.onnx`/`.gguf` by extension, otherwise the
     served `config.json` decides (a decoder config -> the generic CausalLM/MoE/hybrid engine).
@@ -337,9 +393,12 @@ class _ImageToText(_TaskBase):
         return self._impl.generate(prompt, image=image, **kw)
 
 class _TextGeneration(_TaskBase):
+    """`pipe(prompt, …)` -> GenResult; `pipe.stream(prompt, …)` yields token text. Takes the
+    SAME parameters as `CausalLM.generate`/`stream` — `prompt` may be omitted in favour of
+    `messages=[…]`, and every sampling/length/thinking option is forwarded unchanged."""
     def __init__(self, impl): self._impl = impl
-    def __call__(self, prompt, **kw): return self._impl.generate(prompt, **kw)
-    def stream(self, prompt, **kw): return self._impl.stream(prompt, **kw)
+    def __call__(self, prompt=None, **kw): return self._impl.generate(prompt, **kw)
+    def stream(self, prompt=None, **kw): return self._impl.stream(prompt, **kw)
 
 class _SpeechToText(_TaskBase):
     """`pipe(audio)` -> text. Audio is a waveform (ndarray/list) or whatever the impl accepts;
@@ -513,9 +572,9 @@ _HEAVY = ("layers", "embed", "head", "final_norm", "Kc", "Vc", "h_in", "cos_b", 
           "_shard_hdr", "conv_state", "rec_state", "_state", "impl", "_impl", "lm", "encoder")
 
 
-def _free(obj, _seen=None):
-    """Drop an object's heavy attributes (recursively through wrappers), so the GPU/host
-    buffers they hold become collectable. Returns True if anything was freed."""
+def _drop_heavy(obj, _seen=None):
+    """Null out an object's heavy attributes (recursively through wrappers), so the GPU/host
+    buffers they hold become collectable. Returns True if anything was dropped."""
     if obj is None:
         return False
     _seen = _seen if _seen is not None else set()
@@ -523,16 +582,6 @@ def _free(obj, _seen=None):
         return False
     _seen.add(id(obj))
     freed = False
-    own = getattr(obj, "release", None)          # respect a model's own release hook
-    if callable(own) and getattr(own, "__self__", None) is obj and not getattr(obj, "_releasing", False):
-        try:
-            obj._releasing = True
-            own(); freed = True
-        except Exception:
-            pass
-        finally:
-            obj._releasing = False
-        return freed
     for name in _HEAVY:
         if name in getattr(obj, "__dict__", {}):
             inner = obj.__dict__[name]
@@ -543,6 +592,43 @@ def _free(obj, _seen=None):
     if freed:
         obj.__dict__["_released"] = True     # so using it afterwards gives a clear error
     return freed
+
+
+def _free(obj, _seen=None):
+    """Drop an object's heavy attributes, respecting its own `release()` hook when it has
+    one (a shared model's hook does the refcounting — see `_impl_release`)."""
+    if obj is None:
+        return False
+    own = getattr(obj, "release", None)          # respect a model's own release hook
+    if callable(own) and getattr(own, "__self__", None) is obj and not getattr(obj, "_releasing", False):
+        try:
+            obj._releasing = True
+            own(); return True
+        except Exception:
+            return False
+        finally:
+            obj._releasing = False
+    return _drop_heavy(obj, _seen)
+
+
+def _impl_release(impl):
+    """Release ONE handle of a model that several entry points may share.
+
+    `load()`, `pipeline()` and `from_pretrained` hand out handles of the SAME weights (see
+    _IMPL_CACHE); dropping one handle must not free a model another handle is still using.
+    The weights drop only when the last handle does. Idempotency lives one level up — a
+    Model blanks its impl on release, a pipeline wrapper blanks its _impl — so one release
+    per handle arrives here exactly once."""
+    if impl is None:
+        return False
+    for key, e in list(_IMPL_CACHE.items()):
+        if e["impl"] is impl:
+            e["refs"] -= 1
+            if e["refs"] > 0:
+                return False                     # another handle still holds it
+            _IMPL_CACHE.pop(key, None)
+            break
+    return _drop_heavy(impl)                     # last handle: actually drop the weights
 
 
 def release(model):

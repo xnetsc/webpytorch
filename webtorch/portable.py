@@ -201,7 +201,7 @@ async def export_model(keys, write, cache_dir=None, on_progress=None):
     return written[0]
 
 
-async def import_model(handle):
+async def import_model(handle, name=None):
     """Point at a model on disk. Nothing is copied.
 
     Importing should not mean duplicating: a 12 GB file copied into origin storage is slow
@@ -211,11 +211,17 @@ async def import_model(handle):
     loader asks for.
 
     `handle` is a `FileSystemFileHandle` or `FileSystemDirectoryHandle` from
-    `showOpenFilePicker()` / `showDirectoryPicker()`. Returns the names now satisfied
-    locally; loading any id ending in one of them reaches neither network nor cache.
+    `showOpenFilePicker()` / `showDirectoryPicker()`. `name` overrides the identity the
+    files are registered under: for a single file the caller passes a content fingerprint
+    (so the SAME file always maps to the SAME id, whichever way it was picked, and two
+    different files that merely share a name never collide); for a directory it is the
+    directory's own name, and every file in it is registered as "<dir>/<file>" so two
+    directories that both contain a config.json stay distinct. Returns the names now
+    satisfied locally; loading any of them reaches neither network nor cache.
     """
     added = []
     if getattr(handle, "kind", "file") == "directory":
+        base = name or getattr(handle, "name", None)
         it = handle.values()
         while True:
             r = await it.next()
@@ -223,7 +229,7 @@ async def import_model(handle):
                 break
             e = r.value
             if getattr(e, "kind", "") == "file" and not str(e.name).endswith(".meta"):
-                added.append(webio.use_model_file(e))
+                added.append(webio.use_model_file(e, ("%s/%s" % (base, e.name)) if base else None))
     else:
-        added.append(webio.use_model_file(handle))
+        added.append(webio.use_model_file(handle, name))
     return added
