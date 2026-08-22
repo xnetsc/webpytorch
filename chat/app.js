@@ -14,6 +14,9 @@ let convs = [];
 let curId = null;
 let attachments = [];
 let modelLoaded = false;
+// Does the loaded model see images? Decides whether camera / image attachments are offered —
+// a text-only model can do nothing with pixels, so the controls say so instead of failing.
+let modelImage = false;
 // The reply currently being streamed, if any: which message it is and the DOM pieces being
 // updated in place (see fillBody). Only one at a time — the worker decodes one token at a
 // time anyway.
@@ -143,7 +146,8 @@ worker.onmessage = (e) => {
   }
   else if (m.type === 'progress') { if (m.total) expected = m.total;
     showProgress(m.bytes, m.rate, m.dlRate); }
-  else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
+  else if (m.type === 'loaded') { modelLoaded = true; modelImage = !!m.image;
+    setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'chunk') {
     // One decoded token. Append it to the message being streamed and update that message's
     // DOM in place — no full re-render per token, and the thinking box keeps whatever state
@@ -153,7 +157,21 @@ worker.onmessage = (e) => {
     const reply = conv && conv.messages[streaming.idx];
     if (!reply) { streaming = null; return; }
     reply.content += m.text;
-    if (streaming.live && streaming.live.ans.isConnected) {
+    const live = streaming.live;
+    if (live) {
+      stopDots(live);                                       // the wait is over
+      live.tokens += 1;
+      const now = performance.now();
+      if (!live.t0) live.t0 = now;
+      // decode speed = tokens after the first, over the time since the first; updated at
+      // most twice a second so the number stays readable
+      if (live.rate && live.tokens >= 2 && (live.tokens === 2 || now - live.rateT > 500)) {
+        live.rateT = now; live.rate.hidden = false;
+        const sps = (live.tokens - 1) / ((now - live.t0) / 1000);
+        live.rate.textContent = live.tokens + ' tokens · ' + sps.toFixed(1) + ' tok/s';
+      }
+    }
+    if (live && live.ans.isConnected) {
       fillBody(streaming.body, reply.content, streaming.live);
       const el = $('#messages'); el.scrollTop = el.scrollHeight;
     }
@@ -184,6 +202,13 @@ function syncButtons() {
   ['#input', '#send', '#toolFile', '#toolCam', '#toolUrl', '#newChat'].forEach(sel => {
     const el = $(sel); if (el) el.disabled = off;
   });
+  // Image sources go away with a model that cannot see: the file picker stays (text files
+  // still make sense), the camera does not.
+  $('#toolCam').disabled = off || !modelImage;
+  $('#toolCam').title = modelImage ? 'Capture from camera'
+    : 'This model cannot see images';
+  $('#toolFile').title = modelImage ? 'Attach a file'
+    : 'Attach a text file (this model cannot see images)';
   $('#input').placeholder = off ? 'Load a model in ⚙ Settings to start chatting'
                                 : 'Send a message…';
   $('#composer').classList.toggle('locked', off);
@@ -287,7 +312,7 @@ $('#loadBtn').onclick = async () => {
   finally { syncButtons(); }
 };
 $('#releaseBtn').onclick = async () => {
-  await call('release'); modelLoaded = false; setBar(0);
+  await call('release'); modelLoaded = false; modelImage = false; setBar(0);
   $('#progressText').textContent = ''; syncButtons();
   note('Model released. Its files stay cached, so loading it again is fast.');
 };
@@ -502,6 +527,10 @@ $('#toolFile').onclick = () => $('#fileInput').click();
 $('#fileInput').onchange = async (e) => {
   const f = e.target.files[0]; if (!f) return;
   if (f.type.startsWith('image/')) {
+    if (!modelImage) {
+      note('This model cannot see images — load a vision model to attach pictures.');
+      e.target.value = ''; return;
+    }
     const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(f); });
     addAttachment({ kind: 'image', name: f.name, dataUrl });
   } else {
@@ -514,10 +543,21 @@ $('#toolUrl').onclick = async () => {
   const url = prompt('Fetch a URL and add its text to the message:');
   if (!url) return;
   try {
-    const r = await fetch(url); const t = await r.text();
-    const text = t.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ')
-                  .replace(/\s+/g, ' ').trim().slice(0, 20000);
-    addAttachment({ kind: 'url', name: url, text });
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const t = await r.text();
+    // Read the page as a document and keep only what a reader would: the title plus the
+    // visible text. Scripts, styles and site chrome are dropped, and the raw HTML never
+    // reaches the conversation — the bubble shows a chip, the model gets plain text.
+    const doc = new DOMParser().parseFromString(t, 'text/html');
+    doc.querySelectorAll('script,style,noscript,template,svg,iframe,nav,footer,header,form,aside')
+       .forEach(n => n.remove());
+    const title = ((doc.querySelector('title') || {}).textContent || '').trim();
+    let text = (doc.body || doc.documentElement).textContent.replace(/\s+/g, ' ').trim();
+    if (title) text = title + '\n\n' + text;
+    if (!text) throw new Error('no readable text on that page');
+    addAttachment({ kind: 'url', name: url, text: text.slice(0, 20000) });
+    note('Added the page text (' + fmt(text.length) + ') — it goes to the model, not into the bubble.');
   } catch (e) { alert('Fetch failed (the site may block cross-origin requests): ' + e.message); }
 };
 $('#toolCam').onclick = async () => {
@@ -599,6 +639,13 @@ function messageNode(m, live) {
     if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
     else { const p = document.createElement('div'); p.className = 'hint'; p.textContent = a.kind + ': ' + a.name; b.appendChild(p); }
   });
+  // finished replies keep their final decode stats as a quiet footer (the same line that
+  // shows live counts while streaming); user messages and failed replies have none
+  if (m.role === 'assistant' && m.stats && m.stats.tok_s != null) {
+    const f = document.createElement('div'); f.className = 'tokrate';
+    f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1) + ' tok/s';
+    b.appendChild(f);
+  }
   return d;
 }
 
@@ -649,6 +696,22 @@ function fillBody(b, txt, live) {
   }
   b.appendChild(document.createTextNode(rest));
 }
+// The waiting dots: prefill can take seconds before the first token exists, and an empty
+// bubble reads as a frozen page. They live in the reply body from submit until the first
+// chunk lands (or the reply ends in error), pulsing · → ·· → ···.
+function startDots(live, body) {
+  const dots = document.createElement('span');
+  dots.className = 'dots'; dots.textContent = '·';
+  live.dots = dots;
+  live.dotsTimer = setInterval(() => {
+    dots.textContent = dots.textContent.length >= 3 ? '·' : dots.textContent + '·';
+  }, 450);
+  body.appendChild(dots);
+}
+function stopDots(live) {
+  if (!live || !live.dots) return;
+  clearInterval(live.dotsTimer); live.dots.remove(); live.dots = null;
+}
 function note(t) { $('#hintbar').textContent = t || ''; }
 function promptFor(m) {
   let p = '';
@@ -691,8 +754,12 @@ $('#composer').onsubmit = async (e) => {
   det.append(sum, pre);
   det.ontoggle = () => { if (streaming) streaming.live.touched = true; };
   const live = { det, sum, pre, ans: document.createTextNode(''),
-                 touched: false, collapsed: false };
+                 touched: false, collapsed: false, tokens: 0, t0: 0, rateT: 0 };
+  startDots(live, body);                              // until the first token lands
   body.appendChild(live.ans);
+  const rate = document.createElement('div');
+  rate.className = 'tokrate'; rate.hidden = true;
+  body.appendChild(rate); live.rate = rate;
   streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
 
   try {
@@ -703,9 +770,10 @@ $('#composer').onsubmit = async (e) => {
                      + ' in ⚙ Settings, or leave it empty for no limit]';
     }
     if (!reply.content.trim()) reply.content = '(empty reply)';
+    reply.stats = r || null;                    // final n / tok_s for the footer line
   } catch (err) {
     reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
-  }
+  } finally { stopDots(live); }
   streaming = null;
   conv.updated = Date.now(); saveConvs(); render();
 };

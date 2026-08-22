@@ -104,6 +104,12 @@ details.think pre{white-space:pre-wrap;word-wrap:break-word;font:inherit;font-st
                   border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
 details.think.live summary{color:var(--accent)}
 
+/* waiting for the first token: a pulsing · → ·· → ··· so a long prefill reads as working,
+   not frozen; and the live/final decode speed under the reply text */
+.msg .body .dots{color:var(--mut);letter-spacing:2px;animation:blink 1.2s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:.35}50%{opacity:1}}
+.tokrate{margin-top:6px;font-size:11px;color:var(--mut)}
+
 #composer.locked{opacity:.55}
 #composer.locked #input{cursor:not-allowed}
 
