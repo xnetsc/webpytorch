@@ -68,9 +68,12 @@ try:
 finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
+_KIND = getattr(_MODEL["m"], "kind", "")
 `);
+  // The page uses the model kind to offer (or hide) image inputs before the user tries one.
+  const kind = await pyodide.runPythonAsync('_KIND');
   send({ type: 'status', text: `ready: ${src}` });
-  send({ type: 'loaded', id: src });
+  send({ type: 'loaded', id: src, image: kind === 'multimodal' });
 }
 
 async function generate(prompt, opts) {

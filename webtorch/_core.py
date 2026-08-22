@@ -723,8 +723,9 @@ def nll_loss(log_probs, targets):
 
 # ---- conv2d (im2col + matmul) --------------------------------------------
 def _zeros(shape):
-    # GPU-native allocation (no CPU->GPU upload). cp.zeros defaults to float64 and
-    # cp.float32 doesn't exist in the shim, so pass numpy's np.float32.
+    # WARNING: host-backed in this WgPy build (construct.zeros -> np.zeros -> staging
+    # upload), so it costs RAM twice over. Fine for small buffers; for anything seq²-sized
+    # (attention scores) use _empty + a kernel that fully overwrites the output.
     return xp.zeros(shape, np.float32)
 
 
@@ -1646,7 +1647,10 @@ def _fused_softmax(xd):
         _softmax_kernel["added"] = True
     width = int(xd.shape[-1])
     rows = int(xd.size) // width
-    s = _zeros(xd.shape)
+    # GPU-native: the attention score matrix is seq²-sized, and _zeros would allocate it on
+    # the HOST first then stage it up — that staging copy is what OOMs long prompts. The
+    # kernel below writes every output element, so an uninitialized buffer is exact.
+    s = _empty(xd.shape)
     meta = _adam_kernel["make_meta"]((rows, width), "u4,u4")
     plat.runKernel({
         "name": "fused_softmax",
