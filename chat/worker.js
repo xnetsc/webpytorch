@@ -33,11 +33,12 @@ _MODEL = {"m": None, "id": None}
   send({ type: 'ready' });
 }
 
-async function loadModel(repo, file) {
+async function loadModel(repo, file, lmax) {
   await boot();
   const src = file ? `${repo}/${file}` : repo;
   send({ type: 'status', text: `loading ${src} …` });
   pyodide.globals.set('_src', src);
+  pyodide.globals.set('_lmax', lmax || 0);
   // Progress comes from the SDK's own read hook, which counts bytes SERVED. A model
   // already cached does no network at all, so counting fetches would leave that load
   // looking frozen -- this reports either way, and needs no knowledge of SDK internals.
@@ -56,12 +57,13 @@ async function loadModel(repo, file) {
   await pyodide.runPythonAsync(`
 import js, webtorch
 src = _src
+lmax = int(_lmax)
 webtorch.set_read_progress(lambda i: js.self.__prog(i["done"], i["total"] or 0, i["rate"]))
 webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
-    m = await webtorch.load(src)
+    m = await webtorch.load(src, **({"lmax": lmax} if lmax else {}))
     _MODEL["m"] = m; _MODEL["id"] = src
 finally:
     webtorch.set_read_progress(None)
@@ -73,16 +75,32 @@ finally:
 
 async function generate(prompt, opts) {
   if (!ready || !pyodide) throw new Error('no runtime');
-  pyodide.globals.set('_prompt', prompt);
-  pyodide.globals.set('_maxnew', (opts && opts.max_new) || 256);
-  const out = await pyodide.runPythonAsync(`
+  pyodide.globals.set('_prompt', prompt || '');
+  pyodide.globals.set('_opts', JSON.stringify(opts || {}));
+  // Streaming is the default here: each token is pushed to the page the moment it is
+  // decoded, so the reply is readable while it is still being written. The SDK's
+  // `stream=True` does the decode; this layer only ferries token -> message.
+  self.__chunk = (t) => send({ type: 'chunk', text: t });
+  try {
+    const out = await pyodide.runPythonAsync(`
+import json, js
 m = _MODEL["m"]
 if m is None:
     raise RuntimeError("no model loaded — pick one and press Load model")
-r = m.generate(_prompt, max_new=int(_maxnew))
-getattr(r, "text", str(r))
+_o = json.loads(_opts)
+_n = int(_o.get("max_new") or 0)          # 0 = no budget: run until the model stops itself
+_think = bool(_o.get("enable_thinking"))
+_msgs = _o.get("messages") or None        # full conversation; falls back to the one prompt
+_kw = dict(max_new=_n or None, stream=True, enable_thinking=_think)
+_gen = m.generate(messages=_msgs, **_kw) if _msgs else m.generate(_prompt, **_kw)
+for _t in _gen:
+    js.self.__chunk(_t)
+_s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
+json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
+            "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s")})
 `);
-  return out;
+    return JSON.parse(out);
+  } finally { self.__chunk = null; }
 }
 
 async function cacheList() {
@@ -128,12 +146,14 @@ await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
 }
 
 // 导入 = 登记本地文件/文件夹，就地读，不复制、不入 IndexedDB。
-async function importModel(handle) {
+// name = 页面算好的身份：单文件传内容指纹（同一文件永远是同一 id），目录传目录名。
+async function importModel(handle, name) {
   await boot();
   pyodide.globals.set('_h', handle);
+  pyodide.globals.set('_n', name || '');
   return await pyodide.runPythonAsync(`
 import json, webtorch
-json.dumps(await webtorch.import_model(_h))
+json.dumps(await webtorch.import_model(_h, _n or None))
 `);
 }
 
@@ -163,21 +183,6 @@ await webtorch.export_model(list(_keys), _w)
   return done;
 }
 
-async function importModel(file, key) {
-  await boot();
-  self.__src = async (off, n) =>
-    new Uint8Array(await file.slice(off, off + n).arrayBuffer());
-  try {
-    pyodide.globals.set('_sz', file.size);
-    pyodide.globals.set('_key', key || '');
-    return await pyodide.runPythonAsync(`
-import js, json, webtorch
-async def _r(off, n):
-    return bytes((await js.self.__src(off, n)).to_py())
-json.dumps(await webtorch.import_model(_r, int(_sz), key=(_key or None)))
-`);
-  } finally { self.__src = null; }
-}
 async function cacheDelete(key) {
   await boot(); pyodide.globals.set('_k', key);
   await pyodide.runPythonAsync(`import webtorch; await webtorch.delete_cache(_k)`);
@@ -201,14 +206,14 @@ onmessage = async (e) => {
   try {
     let res = null;
     if (cmd === 'boot') await boot();
-    else if (cmd === 'load') await loadModel(args.repo, args.file);
+    else if (cmd === 'load') await loadModel(args.repo, args.file, args.lmax);
     else if (cmd === 'generate') res = await generate(args.prompt, args);
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'cacheList') res = await cacheList();
     else if (cmd === 'cacheDelete') await cacheDelete(args.key);
     else if (cmd === 'cacheClear') await cacheClear();
     else if (cmd === 'exportModel') res = await exportModel(args.keys, args.handle);
-    else if (cmd === 'importModel') res = await importModel(args.handle);
+    else if (cmd === 'importModel') res = await importModel(args.handle, args.name);
     else if (cmd === 'migrate') res = await migrateToDirectory(args.dir);
     else if (cmd === 'armStorage') await armStorageWatch();
     else if (cmd === 'release') await releaseModel();

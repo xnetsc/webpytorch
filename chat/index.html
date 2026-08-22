@@ -40,27 +40,39 @@
 <dialog id="settingsDlg">
   <div class="dlg-head"><h2>Settings</h2><button id="closeSettings">✕</button></div>
 
-  <section class="panel">
-    <h3>Model</h3>
+  <nav class="tabs" id="tabs">
+    <button data-tab="model" class="on">Model</button>
+    <button data-tab="gen">Generation</button>
+    <button data-tab="store">Storage</button>
+  </nav>
+
+  <section class="tab-panel" id="tab-model">
     <div id="envInfo" class="hint">detecting environment…</div>
-    <select id="preset"></select>
+    <div class="row"><select id="preset"></select></div>
     <div id="customBox" hidden>
-      <div class="row">
-        <input id="modelId" placeholder="org/repo/file.gguf  — or org/repo for a HF-format dir" />
-      </div>
+      <input id="modelId" placeholder="org/repo/file.gguf  — or org/repo for a HF-format dir" />
     </div>
-    <p class="hint">Pick “custom” to load any other ModelScope model. Downloads come from ModelScope.</p>
-    <div class="row">
-      <label for="gpuMem" class="hint">GPU memory</label>
-      <input id="gpuMem" type="number" min="1" step="1" placeholder="auto" />
-      <span class="hint">GB</span>
-      <button id="gpuMemClear" class="ghost">auto</button>
+    <p class="hint">Pick “custom” to load any other ModelScope model, or one of the
+      “on this device” entries to load a model file/folder straight from disk — nothing is
+      copied or cached.</p>
+
+    <div class="grid2">
+      <label class="field"><span>GPU memory (GB)</span>
+        <span class="inline"><input id="gpuMem" type="number" min="1" step="1" placeholder="auto">
+        <button id="gpuMemClear" class="ghost">auto</button></span>
+      </label>
+      <label class="field"><span>Context length (tokens)</span>
+        <input id="lmax" type="number" min="512" max="131072" step="512" placeholder="auto" />
+      </label>
     </div>
-    <p class="hint">The browser never reports how much memory a GPU has, so the figure above
-      is estimated from system RAM — right for unified memory (Apple silicon, phones,
-      integrated GPUs), too high for a discrete GPU whose VRAM is smaller. Set it to your
-      card’s VRAM if you have one.</p>
-    <div class="row">
+    <p class="hint">GPU memory is estimated from system RAM — right for unified memory
+      (Apple silicon, phones, integrated GPUs), too high for a discrete GPU whose VRAM is
+      smaller. Set it to your card’s VRAM if you have one.
+      Context length is everything the model holds at once, conversation plus reply.
+      Left empty it follows the size the model itself declares, trimmed if its KV cache
+      would not fit; applies the next time a model loads.</p>
+
+    <div class="row btns">
       <button id="loadBtn" class="primary">Load model</button>
       <button id="releaseBtn">Release</button>
     </div>
@@ -69,20 +81,34 @@
     <div id="progressText" class="hint"></div>
   </section>
 
-  <section class="panel">
-    <h3>Cached models</h3>
-    <div class="row">
-      <button id="refreshCache">Refresh</button>
-      <button id="clearCache" class="danger">Clear all</button>
-      <button id="importModel">Import model…</button>
-      <input type="file" id="importFileModel" accept=".zip,.gguf,.bin,.safetensors" hidden />
-    </div>
-    <div id="cacheList" class="cache"></div>
+  <section class="tab-panel" id="tab-gen" hidden>
+    <label class="field"><span>Max reply length (tokens)</span>
+      <input id="maxNew" type="number" min="64" max="16384" step="64" placeholder="auto" />
+    </label>
+    <p class="hint">Left empty, a reply may run as long as the model allows — up to the
+      rest of the context length; the model still stops itself when it is done. A number
+      sets a hard stop instead. A model told to think spends part of any budget on the
+      thinking, so a low limit can end the answer before it starts; a reply cut short by
+      the limit says so.</p>
+    <label class="check"><input type="checkbox" id="thinking" />
+      <span>Let the model write out its thinking before answering</span></label>
+    <p class="hint">Off by default: the model answers directly. On: the reasoning is
+      written first and shown folded away — slower, and it shares the reply budget above.
+      Only models whose chat template knows the option do anything with it.</p>
   </section>
 
-  <section class="panel">
+  <section class="tab-panel" id="tab-store" hidden>
+    <h3>Cached models</h3>
+    <div class="row btns">
+      <button id="refreshCache">Refresh</button>
+      <button id="clearCache" class="danger">Clear all</button>
+    </div>
+    <p class="hint">Models downloaded from ModelScope are kept here. Models loaded from
+      this device are read where they lie — they never enter the cache.</p>
+    <div id="cacheList" class="cache"></div>
+
     <h3>Conversations</h3>
-    <div class="row">
+    <div class="row btns">
       <button id="exportBtn">Export (.zip)</button>
       <button id="importBtn">Import (.zip)</button>
       <input type="file" id="importFile" accept=".zip" hidden />

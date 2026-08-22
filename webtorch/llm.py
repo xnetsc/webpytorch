@@ -286,10 +286,11 @@ class GenResult:
 _READ_BYTES = 64 << 20
 _HEAD_BLK = 4096
 # On the native path the head is never expanded to fp32, so the block size is not bounded by
-# a working set -- only by how much packed data to hold at once. 61 small matmuls cost far
-# more than a few large ones: the head is the single biggest tensor in the model and gets
-# multiplied every token.
-_HEAD_BLK_NATIVE = 65536
+# a working set. 61 small matmuls cost far more than a few large ones -- the head is the
+# biggest tensor in the model and is multiplied every token -- but a block is one GPU buffer,
+# so budget it in BYTES rather than rows: the same row count is 115 MB for one quantization
+# and 230 MB for another, and the large end runs into what the backend will stage.
+_HEAD_BYTES_NATIVE = 128 << 20
 
 
 def _source_bits(infos, G):
@@ -611,7 +612,7 @@ class CausalLM:
         return blocks
 
     @classmethod
-    async def from_gptq(cls, base, lmax=320):
+    async def from_gptq(cls, base, lmax=None):
         """Stream + build from a served AutoGPTQ int4 dir (e.g. '/models/qwen7b-gptq')."""
         from . import webio
         self = cls(base)
@@ -619,6 +620,7 @@ class CausalLM:
         self._shard_hdr = {}
         cfg = await webio.read_json(self.base + "config.json")
         self._apply_cfg(cfg)
+        self.lmax = self._auto_lmax(lmax, cfg.get("max_position_embeddings"))
         self.gs = cfg["quantization_config"]["group_size"]; self.bits = cfg["quantization_config"]["bits"]
         tie = self.tie_embeddings
 
@@ -661,12 +663,16 @@ class CausalLM:
         return G.dequant(t["type"], raw, n).reshape(tuple(reversed(t["dims"])))
 
     def _head_blk(self, ttype, H):
-        """Rows per head block: large when nothing has to be expanded, small when it does."""
+        """Rows per head block: a byte budget when nothing is expanded, a row count when it is."""
         from . import ggufload as G
         nm = G.GGML_NAMES.get(ttype)
         native = (getattr(self, "_weights", "native") == "native"
                   and wt.ggml_native_supported(nm) and H % wt._GGML_TYPES[nm][2] == 0)
-        return _HEAD_BLK_NATIVE if native else _HEAD_BLK
+        if not native:
+            return _HEAD_BLK
+        row = G.tensor_nbytes(ttype, H)
+        rows = max(1, _HEAD_BYTES_NATIVE // max(row, 1) // _HEAD_BLK) * _HEAD_BLK
+        return rows
 
     def _head_block(self, ttype, chunk, rows, H):
         """One block of the LM head as a Linear. Native when the type allows it, which keeps
@@ -847,9 +853,13 @@ class CausalLM:
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
     @classmethod
-    async def from_gguf(cls, url, lmax=320, bits=None, quantize=True, weights="native"):
+    async def from_gguf(cls, url, lmax=None, bits=None, quantize=True, weights="native"):
         """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
         they run on the same capture-accelerated engine. `url` is the served .gguf file.
+
+        `lmax=None` runs at the context length the file itself declares (`{arch}.context_length`),
+        trimmed only if the KV cache for it would exceed the memory budget; pass a number to
+        force a specific size.
 
         `bits=None` (the default) takes the width from the file itself, so an 8-bit GGUF
         runs at int8 instead of being quietly reduced to int4. Note that the conversion
@@ -932,6 +942,9 @@ class CausalLM:
         else:
             self.layer_types = ["full_attention"] * self.L
         self.is_hybrid = any(t != "full_attention" for t in self.layer_types)
+        # The size the model itself declares (`{arch}.context_length`), capped only by the
+        # KV-cache memory budget; an explicit `lmax` wins over both.
+        self.lmax = self._auto_lmax(lmax, m("context_length", default=None, required=False))
         d_state = int(m("ssm.state_size", default=0, required=False) or 0)
         d_inner = int(m("ssm.inner_size", default=0, required=False) or 0)
         n_group = int(m("ssm.group_count", default=0, required=False) or 0)
@@ -1206,7 +1219,7 @@ class CausalLM:
         return self._mklin(await self._np(prefix + ".weight"), b)
 
     @classmethod
-    async def from_fp16(cls, base, lmax=320, quantize=None):
+    async def from_fp16(cls, base, lmax=None, quantize=None):
         """Load a plain fp16/bf16 HF safetensors dir (no `quantization_config`). Runs the
         model UNquantized by default (fp16 weights, fp32 compute); pass `quantize=4` or `8`
         to instead quantize every linear to int on load (same served fp16 model → int
@@ -1218,6 +1231,7 @@ class CausalLM:
             self.bits = self._qbits                        # gs keeps the default 128
         cfg = await webio.read_json(self.base + "config.json")
         self._apply_cfg(cfg)
+        self.lmax = self._auto_lmax(lmax, cfg.get("max_position_embeddings"))
         tie = self.tie_embeddings
 
         self.tok = await self._hf_tokenizer(cfg)
@@ -1358,16 +1372,47 @@ class CausalLM:
         sub[np.asarray(allowed, np.int64)] = lg[np.asarray(allowed, np.int64)]
         return self._sample(sub, sp)
 
+    # The KV cache is the only memory that grows with context: fp32, K and V, NKV × HD per
+    # token per full-attention layer (recurrent layers keep a fixed-size state instead). A
+    # context nobody asked for must not eat memory nobody budgeted, so an undeclared size
+    # is trimmed to this; an explicit `lmax` always wins.
+    _KV_BUDGET = 2 << 30
+
+    def _auto_lmax(self, requested, declared):
+        """The context size to load with: an explicit request, else what the model declares,
+        capped by the KV memory budget."""
+        if requested:
+            return int(requested)
+        n_full = sum(1 for t in getattr(self, "layer_types", []) if t == "full_attention")
+        n_full = n_full or self.L
+        per_tok = 2 * n_full * self.NKV * self.HD * 4
+        cap = max(512, self._KV_BUDGET // per_tok)
+        want = int(declared) if declared else 2048
+        got = max(512, min(want, cap))
+        if got < want:
+            print("webtorch: context %d -> %d tokens (KV cache budget %.1f GB)"
+                  % (want, got, self._KV_BUDGET / 2 ** 30))
+        return got
+
     def _plan_length(self, ids, max_new, max_length, truncate):
         """Reconcile the requested lengths with what this model can actually hold.
 
         `lmax` -- the KV cache the model was loaded with -- is a hard ceiling on prompt plus
         generation, and running past it silently corrupts the cache. A prompt that does not
         fit is either truncated from the front (a chat history wants its most recent turns)
-        or refused, and `max_new` is clipped to whatever room is left."""
+        or refused, and `max_new` is clipped to whatever room is left.
+
+        No `max_new` at all means "as much as the model allows": its own generation_config
+        when it ships one, otherwise the rest of the context — the model still stops itself
+        at its end token; the number only bounds it."""
         lmax = int(self.lmax)
         d = getattr(self, "gen_defaults", {}) or {}
-        mx = int(max_new if max_new is not None else d.get("max_new_tokens", 48) or 48)
+        if max_new is not None:
+            mx = int(max_new)
+        elif d.get("max_new_tokens"):
+            mx = int(d["max_new_tokens"])
+        else:
+            mx = max(1, lmax - len(ids))
         if max_length is None:
             max_length = d.get("max_length")
         if max_length:
@@ -1422,9 +1467,18 @@ class CausalLM:
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
+        # Only full-attention layers hold a context-length K/V cache; a recurrent layer
+        # carries its fixed-size state instead, so allocating a cache for it would be pure
+        # waste — on a stack that is mostly linear that is most of the KV memory.
+        self._kv_i = []; n = 0
+        for i in range(L):
+            if self._is_linear_layer(i):
+                self._kv_i.append(-1)
+            else:
+                self._kv_i.append(n); n += 1
         if self._gpu:                                  # capture path: fixed scatter cache + persistent inputs
-            self.Kc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(L)]
-            self.Vc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(L)]
+            self.Kc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(n)]
+            self.Vc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(n)]
             self.h_in = wt.Tensor(np.zeros((1, H), np.float32))
             self.cos_b = wt.Tensor(np.zeros((1, HD), np.float32))
             self.sin_b = wt.Tensor(np.zeros((1, HD), np.float32))
@@ -1516,9 +1570,10 @@ class CausalLM:
             else:                                              # softmax attention layer
                 q, k, v = self._qkv(lay, x, T)
                 q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
-                wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
-                wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
-                o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
+                K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
+                wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
+                wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
+                o = wt.gqa_attention(q, K, V, mask, scale=sc)
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
@@ -1546,14 +1601,15 @@ class CausalLM:
             else:
                 q, k, v = self._qkv(lay, x, 1)
                 q = self._rope1(q); k = self._rope1(k)
-                wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-                wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
+                wt.kv_write(K.data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                wt.kv_write(V.data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
                 # One dispatch for the single decode position; falls back for anything the
                 # fused kernel does not cover.
-                o = (wt.gqa_decode(q, self.Kc[i], self.Vc[i], self.mask_b, sc) if wt._GQA_FUSED
+                o = (wt.gqa_decode(q, K, V, self.mask_b, sc) if wt._GQA_FUSED
                      else None)
                 if o is None:
-                    o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
+                    o = wt.gqa_attention(q, K, V, self.mask_b, scale=sc)
                 h = h + self._attn_out(lay, o, 1)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
@@ -1583,41 +1639,74 @@ class CausalLM:
                messages=None, tools=None, ids=None, temperature=None, top_p=None,
                top_k=None, seed=None, do_sample=None, repetition_penalty=None, min_p=None,
                constraint=None, max_length=None, min_new_tokens=None, truncate=True,
-               **chat_kw):
+               enable_thinking=False, **chat_kw):
         """Streaming decode: yield each new token's text as it is produced (render live,
         bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
-        Takes the same parameters as `generate`."""
+        Takes the same parameters as `generate`.
+
+        When the stream ends, `self.last_stream` holds `{n, truncated, ttft_s, tok_s}` —
+        `truncated` says the length limit, not the model, ended the reply."""
+        self._check_live()
         eot = self.tok.eot
         self._reset_linear_state()
         if ids is None:
-            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools, **chat_kw)
+            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools,
+                                       enable_thinking=enable_thinking, **chat_kw)
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
                            min_p, constraint, min_new_tokens, prompt_ids=ids)
-        if not self._gpu:
+        t0 = time.perf_counter()
+
+        def _stats(n, truncated, steps, td):
+            dec = time.perf_counter() - td
+            self.last_stream = {"n": n, "truncated": bool(truncated),
+                                "ttft_s": round(getattr(self, "_stream_ttft", dec), 3),
+                                "tok_s": round(steps / max(dec, 1e-9), 2)}
+            return self.last_stream
+
+        # Same capture condition as `generate`: a decode step is capturable only when every
+        # recurrent layer can run its step on the device; otherwise grow a cache instead.
+        rec = [i for i in range(len(self.layers)) if self._is_linear_layer(i)]
+        on_gpu = all(self.layers[i]["linear"]._gpu_step_ok() for i in rec)
+        if not self._gpu or (rec and not on_gpu):
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
-            nxt = self._kv_forward(ids, 0, cache); pos = P; n = 0
-            while n < max_new and nxt != eot and not self._stop_now():
-                yield self.tok.decode([nxt]); n += 1
+            nxt = self._kv_forward(ids, 0, cache)
+            self._stream_ttft = time.perf_counter() - t0
+            pos = P; n = 0; steps = 0
+            td = time.perf_counter()
+            while n < max_new and nxt != eot:
+                yield self.tok.decode([nxt]); n += 1; steps += 1
+                if self._stop_now():
+                    break                       # just-yielded text satisfies the constraint
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1
+            _stats(n, n >= max_new and nxt != eot, steps, td)
             return
         for c in self.Kc: c.data[:] = 0.0
         for v in self.Vc: v.data[:] = 0.0
-        g0 = self._prefill(ids); plat = wt._adam_kernel["platform"]
+        g0 = self._prefill(ids); self._stream_ttft = time.perf_counter() - t0
+        plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
-        self.capture_ready = True; nxt = g0; pos = P; n = 0
-        while n < max_new and nxt != eot and not self._stop_now():
-            yield self.tok.decode([nxt]); n += 1
+        self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
+        td = time.perf_counter()
+        while n < max_new and nxt != eot:
+            yield self.tok.decode([nxt]); n += 1; steps += 1
+            if self._stop_now():
+                break                           # just-yielded text satisfies the constraint
             self._set_inputs(nxt, pos); plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
+        _stats(n, n >= max_new and nxt != eot, steps, td)
 
     def release(self):
         """Free this model's weights (layers, embeddings, head, KV cache). The object must not
-        be used afterwards; load it again to use it. See `webtorch.release`."""
+        be used afterwards; load it again to use it. See `webtorch.release`.
+
+        Several entry points can share one loaded model (`load()`, `pipeline()`,
+        `from_pretrained` dedup on the weights); this releases ONE handle, and the weights
+        drop only when the last handle does."""
         from . import _sdk
-        _sdk._free(self)
+        _sdk._impl_release(self)
         return self
 
     def _check_live(self):
@@ -1628,18 +1717,26 @@ class CausalLM:
                  messages=None, tools=None, ids=None, embeds=None,
                  temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
                  repetition_penalty=None, min_p=None, constraint=None,
-                 max_length=None, min_new_tokens=None, truncate=True, **chat_kw):
+                 max_length=None, min_new_tokens=None, truncate=True,
+                 stream=False, enable_thinking=False, **chat_kw):
         """Chat prompt -> decode -> GenResult. WebGPU replays a captured decode step per
-        token (~20x); WebGL uses a correct growing-cache forward. For live token-by-token
-        output use `stream(...)`.
+        token (~20x); WebGL uses a correct growing-cache forward.
+
+        `stream=True` yields each token's text as it is produced instead of returning one
+        GenResult at the end (same parameters either way; `stream(...)` is a shorthand for
+        it). Render live, keep the reply visible while it is being written.
+
+        `enable_thinking=False` by default: a model whose chat template knows the option
+        answers directly instead of writing out its reasoning first; pass True to get the
+        reasoning too. A template that does not know the option ignores it.
 
         `messages` is a full conversation instead of the `prompt`/`system` shorthand.
 
         Any other keyword goes to the model's chat template unchanged -- `tools=[...]`,
-        `enable_thinking=False`, `reasoning_effort="low"`, whatever that model documents.
-        This is why those work without the SDK knowing a thing about them: the template
-        ships with the model and is the only place that knows what its options are called.
-        A model whose template ignores a keyword simply ignores it.
+        `reasoning_effort="low"`, whatever that model documents. This is why those work
+        without the SDK knowing a thing about them: the template ships with the model and
+        is the only place that knows what its options are called. A model whose template
+        ignores a keyword simply ignores it.
 
         `ids`/`embeds` override the prompt encoding: pass prebuilt token ids and/or (T,H)
         input embeddings to decode from a sequence assembled elsewhere. That is the generic
@@ -1647,9 +1744,21 @@ class CausalLM:
         embeddings) -- see `webtorch.MultimodalLM` -- so no model-specific decode path is
         needed."""
         self._check_live()
+        if stream:
+            if embeds is not None:
+                raise ValueError("stream=True does not take embeds= — prefill embeddings "
+                                 "need the batch path")
+            return self.stream(prompt, max_new=max_new, system=system, messages=messages,
+                               tools=tools, ids=ids, temperature=temperature, top_p=top_p,
+                               top_k=top_k, seed=seed, do_sample=do_sample,
+                               repetition_penalty=repetition_penalty, min_p=min_p,
+                               constraint=constraint, max_length=max_length,
+                               min_new_tokens=min_new_tokens, truncate=truncate,
+                               enable_thinking=enable_thinking, **chat_kw)
         eot = self.tok.eot
         if ids is None:
-            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools, **chat_kw)
+            ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools,
+                                       enable_thinking=enable_thinking, **chat_kw)
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,

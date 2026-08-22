@@ -399,7 +399,11 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
     async def read(name, offset=0, length=None):
         if not (_is_url(name) or _in_browser()):
             return await default_io_read(name, offset, length)   # a local file: read it
-        h = _local_files.get(str(name).rsplit("/", 1)[-1])
+        n = str(name)
+        # Full name first, then basename: a file imported under its own identity
+        # ("1a2b….gguf", "mydir/config.json") matches exactly, and a bare "model.gguf"
+        # still matches the plain-basename registration.
+        h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:                                    # a file the person pointed at
             data = await _read_local_file(h, offset, length)
             served[name] = served.get(name, 0) + len(data)
@@ -1793,15 +1797,28 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         return name if name.startswith(("http://", "https://")) else to_url(*_split_repo(name))
 
     async def read(name, offset=0, length=None):
-        url = to_key(name)
-        # A file the person pointed at IS the model: read it where it lies, before anything
-        # else. No download, no copy, no quota.
-        h = _local_files.get(url.rsplit("/", 1)[-1])
+        # A file the person pointed at IS the model: read it where it lies, before
+        # anything else. No download, no copy, no quota. Check BEFORE to_key so a
+        # plain basename like "model.gguf" matches even when the hub reader would
+        # turn it into a URL whose trailing-slash tail is empty.
+        n = str(name)
+        # Full name first, then basename (see the other lookup): directory-registered files
+        # ("mydir/config.json") match exactly, plain basenames still work.
+        h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:
             data = await _read_local_file(h, offset, length)
-            served[url] = served.get(url, 0) + len(data)
-            _report(url, served[url], None)
+            served[name] = served.get(name, 0) + len(data)
+            _report(name, served[name], None)
             return data
+        # A same-origin path ("/models/…", "./x.gguf") is a location, not a repo id: fetch it
+        # where it is served and do NOT copy it into the hub cache — it is already local, so
+        # caching it would burn quota for nothing. Only repo ids and full URLs map to the hub.
+        if str(name).startswith(("/", "./")):
+            data = await http_get(name, offset, length)
+            served[name] = served.get(name, 0) + len(data)
+            _report(name, served[name], None)
+            return data
+        url = to_key(name)
         if cdir is None:                               # caching off: straight to HTTP
             data = await get(url, offset, length)
             served[url] = served.get(url, 0) + len(data)

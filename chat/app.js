@@ -14,6 +14,10 @@ let convs = [];
 let curId = null;
 let attachments = [];
 let modelLoaded = false;
+// The reply currently being streamed, if any: which message it is and the DOM pieces being
+// updated in place (see fillBody). Only one at a time — the worker decodes one token at a
+// time anyway.
+let streaming = null;
 
 function loadConvs() {
   try { convs = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch (e) { convs = []; }
@@ -140,6 +144,20 @@ worker.onmessage = (e) => {
   else if (m.type === 'progress') { if (m.total) expected = m.total;
     showProgress(m.bytes, m.rate, m.dlRate); }
   else if (m.type === 'loaded') { modelLoaded = true; setBar(1); syncButtons(); refreshCache(); }
+  else if (m.type === 'chunk') {
+    // One decoded token. Append it to the message being streamed and update that message's
+    // DOM in place — no full re-render per token, and the thinking box keeps whatever state
+    // the person left it in.
+    if (!streaming) return;
+    const conv = convs.find(c => c.id === streaming.convId);
+    const reply = conv && conv.messages[streaming.idx];
+    if (!reply) { streaming = null; return; }
+    reply.content += m.text;
+    if (streaming.live && streaming.live.ans.isConnected) {
+      fillBody(streaming.body, reply.content, streaming.live);
+      const el = $('#messages'); el.scrollTop = el.scrollHeight;
+    }
+  }
   else if (m.type === 'log') { console.log('[py]', m.text); }
   else if (m.type === 'storageFull') { offerDirectory(m.key); }
   else if (m.type === 'migrate') {
@@ -204,8 +222,13 @@ function fillPresets() {
   const DEFAULT = PRESETS[0];                       // Qwen3.8-27B 3-bit
   const models = PRESETS.slice(0, -1);
 
+  // The "from this device" entries are actions, not selectable models: choosing one opens
+  // a picker, and cancelling restores whatever was selected before.
+  let lastGood = null;
   sel.onchange = () => {
     const p = PRESETS[sel.value];
+    if (!p) { localPick(sel.value, () => { sel.value = lastGood; }); return; }
+    lastGood = sel.value;
     // one box, shown only for a model that is not in the list
     $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : '';
     $('#customBox').hidden = !!p.repo;
@@ -229,7 +252,18 @@ function fillPresets() {
     sel.appendChild(o);
   });
 
-  sel.value = PRESETS.indexOf(best); sel.onchange();
+  // Loading a model from THIS device is the same decision as picking one to download, so
+  // it lives in the same dropdown: a single .gguf file, or a whole model folder (GGUF
+  // file(s), or an HF-format dir: config.json + *.safetensors, incl. GPTQ).
+  [['local-file', 'Load a GGUF file from this device…'],
+   ['local-dir',  'Load a model folder from this device (GGUF or HF safetensors)…'],
+  ].forEach(([value, label]) => {
+    const o = document.createElement('option');
+    o.value = value; o.textContent = label;
+    sel.appendChild(o);
+  });
+
+  sel.value = PRESETS.indexOf(best); lastGood = sel.value; sel.onchange();
   // Said once, about the machine — not repeated on every row it happens to apply to.
   const cacheNote = ENV.quotaGB && best.gb > ENV.quotaGB
     ? ' Note: the cache quota is smaller than this model, so part of it re-downloads each session'
@@ -248,7 +282,7 @@ $('#loadBtn').onclick = async () => {
   $('#loadBtn').disabled = true; setBar(0); expected = 0;
   const chosen = PRESETS[$('#preset').value];
   if (chosen && chosen.gb) expected = chosen.gb * 1e9;
-  try { await call('load', { repo, file }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
+  try { await call('load', { repo, file, lmax: lmaxValue() }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) { $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message); }
   finally { syncButtons(); }
 };
@@ -341,21 +375,113 @@ async function offerDirectory(key) {
   offering = false;
 }
 
-// Import points at a model on disk and reads it there -- nothing is copied, so a 12 GB file
-// costs nothing and is not subject to the quota at all.
-$('#importModel').onclick = async () => {
-  const dirMode = confirm('Import a folder (multi-file model)?\n\nOK = folder,  Cancel = single file');
-  try {
-    let handle;
-    if (dirMode) handle = await window.showDirectoryPicker({ mode: 'read' });
-    else handle = (await window.showOpenFilePicker({ multiple: false }))[0];
-    const names = JSON.parse(await call('importModel', { handle }));
-    note('Reading from disk: ' + names.join(', ') + '. Load it as usual — no download.');
-    refreshCache();
-  } catch (e) { if (e.name !== 'AbortError') note('Import failed: ' + e.message); }
-};
-const _unusedImportInput = () => $('#importFileModel').click();
+// Local models are picked from the SAME model dropdown as downloaded ones (see
+// fillPresets). Nothing is copied -- the files are read where they lie, no quota, no limit.
+//
+// Identity = the content for a single file, the folder for a folder model:
+//   * a file is registered under a fingerprint of its size + first MB (SHA-256). The SAME
+//     file then always maps to the SAME id, whichever door loads it -- so load(), pipeline()
+//     and from_pretrained share ONE copy instead of loading it twice -- and two different
+//     files that merely share a name ("model.gguf" is common) can never collide. A full-file
+//     hash would mean reading all 13 GB before the load could even start; the fingerprint
+//     decides "same model or not" just as well.
+//   * a folder is registered under its own name, every file as "<dir>/<file>", so the
+//     folder itself IS the model id and same-named files in different folders stay apart.
+async function localFileId(handle) {
+  const file = await handle.getFile();
+  const head = await file.slice(0, 1 << 20).arrayBuffer();
+  const sized = new Uint8Array(head.byteLength + 8);
+  new DataView(sized.buffer).setBigUint64(0, BigInt(file.size));
+  sized.set(new Uint8Array(head), 8);
+  const digest = await crypto.subtle.digest('SHA-256', sized);
+  const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+  const ext = (handle.name.match(/\.[a-z0-9]+$/i) || ['.gguf'])[0];
+  return 'local-' + hex.slice(0, 20) + ext;
+}
 
+// Runs one of the "from this device" dropdown entries: open the picker, register the model
+// under its identity, start the load. The dropdown restores its previous pick on cancel.
+async function localPick(which, onCancel) {
+  const dir = which === 'local-dir';
+  try {
+    const handle = dir
+      ? await window.showDirectoryPicker({ mode: 'read' })
+      : (await window.showOpenFilePicker({
+          multiple: false,
+          types: [{ description: 'GGUF model', accept: { 'application/octet-stream': ['.gguf'] } }],
+        }))[0];
+    const name = dir ? handle.name : await localFileId(handle);
+    const names = JSON.parse(await call('importModel', { handle, name }));
+    if (!names.length) {
+      note('No model files found in that ' + (dir ? 'folder' : 'file') + '.');
+      onCancel(); return;
+    }
+    // A folder that ships an HF-format model loads BY THE FOLDER (config.json names the
+    // rest), so its id is the folder; a GGUF loads by the file itself.
+    let id = names[0];
+    if (dir) {
+      const gguf = names.find(n => n.endsWith('.gguf'));
+      id = names.some(n => n.endsWith('/config.json') || n === 'config.json')
+         ? handle.name : (gguf || names[0]);
+    }
+    note('Reading ' + names.length + ' file' + (names.length > 1 ? 's' : '')
+         + ' straight from disk' + (dir ? ' (folder ' + handle.name + ')' : '')
+         + ' — no download, no cache copy.');
+    refreshCache();
+    $('#preset').value = String(PRESETS.length - 1);   // "custom"
+    $('#preset').onchange();
+    $('#modelId').value = id;
+    $('#loadBtn').click();
+  } catch (e) {
+    if (e.name !== 'AbortError') note('Import failed: ' + e.message);
+    onCancel();
+  }
+}
+
+
+
+// Remember the reply budget, the context budget and the thinking toggle the way the GPU
+// override is remembered — these are the page's view of the SDK's generate/load parameters.
+// Empty means "auto": run at the size the model itself declares.
+const MAXNEW_KEY = 'webtorch.maxNew';
+const LMAX_KEY = 'webtorch.lmax';
+const THINK_KEY = 'webtorch.thinking';
+function maxNewValue() { const v = parseInt($('#maxNew').value, 10); return v > 0 ? Math.max(64, v) : 0; }
+function lmaxValue() { const v = parseInt($('#lmax').value, 10); return v >= 512 ? v : 0; }
+function thinkingOn() { return !!$('#thinking').checked; }
+(() => {
+  $('#maxNew').value = localStorage.getItem(MAXNEW_KEY) || '';
+  $('#lmax').value = localStorage.getItem(LMAX_KEY) || '';
+  $('#thinking').checked = localStorage.getItem(THINK_KEY) === '1';
+  $('#maxNew').onchange = () => {
+    const v = maxNewValue();
+    $('#maxNew').value = v ? String(v) : '';
+    localStorage.setItem(MAXNEW_KEY, $('#maxNew').value);
+  };
+  $('#lmax').onchange = () => {
+    const v = lmaxValue();
+    $('#lmax').value = v ? String(v) : '';
+    localStorage.setItem(LMAX_KEY, $('#lmax').value);
+    note('Context length applies the next time a model loads.');
+  };
+  $('#thinking').onchange = () =>
+    localStorage.setItem(THINK_KEY, $('#thinking').checked ? '1' : '0');
+})();
+
+// Settings come in one page per concern instead of one long scroll; the open tab is
+// remembered.
+const TAB_KEY = 'webtorch.settingsTab';
+(() => {
+  const show = (name) => {
+    document.querySelectorAll('#tabs button').forEach(b =>
+      b.classList.toggle('on', b.dataset.tab === name));
+    document.querySelectorAll('.tab-panel').forEach(p => p.hidden = p.id !== 'tab-' + name);
+    localStorage.setItem(TAB_KEY, name);
+    if (name === 'store') refreshCache();
+  };
+  document.querySelectorAll('#tabs button').forEach(b => { b.onclick = () => show(b.dataset.tab); });
+  show(localStorage.getItem(TAB_KEY) || 'model');
+})();
 
 $('#refreshCache').onclick = refreshCache;
 $('#clearCache').onclick = async () => { if (confirm('Delete every cached model file?')) { await call('cacheClear'); refreshCache(); } };
@@ -453,24 +579,75 @@ function render() {
       'Pick a model in ⚙ Settings, load it, and start chatting.</div></div>';
     return;
   }
-  messages.forEach(m => {
-    const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
-    const w = document.createElement('div'); w.className = 'who'; w.textContent = m.role === 'user' ? 'You' : 'AI';
-    const b = document.createElement('div'); b.className = 'body';
-    let txt = m.content;
-    const think = /<think>([\s\S]*?)<\/think>/.exec(txt);
-    if (think) {
-      const t = document.createElement('div'); t.className = 'think'; t.textContent = think[1].trim();
-      b.appendChild(t); txt = txt.replace(think[0], '').trim();
-    }
-    b.appendChild(document.createTextNode(txt));
-    (m.attachments || []).forEach(a => {
-      if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
-      else { const p = document.createElement('div'); p.className = 'hint'; p.textContent = a.kind + ': ' + a.name; b.appendChild(p); }
-    });
-    d.append(w, b); el.appendChild(d);
-  });
+  messages.forEach(m => el.appendChild(messageNode(m)));
   el.scrollTop = el.scrollHeight;
+}
+
+// One message as DOM. The body is either rendered fresh (finished message) or driven
+// incrementally by `live` while a reply is being streamed.
+function messageNode(m, live) {
+  const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
+  const w = document.createElement('div'); w.className = 'who'; w.textContent = m.role === 'user' ? 'You' : 'AI';
+  const b = document.createElement('div'); b.className = 'body';
+  d.append(w, b);
+  if (m.role === 'user') {
+    b.textContent = m.content;
+  } else {
+    fillBody(b, m.content, live);
+  }
+  (m.attachments || []).forEach(a => {
+    if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
+    else { const p = document.createElement('div'); p.className = 'hint'; p.textContent = a.kind + ': ' + a.name; b.appendChild(p); }
+  });
+  return d;
+}
+
+// A reply may begin with reasoning the model wrote out ("<think>…</think>"). Render it folded
+// away — present, expandable, but never mixed into the answer. Also recover replies saved
+// by older builds that kept only part of the template text (a dangling "</think>" with no
+// opener): everything before the closer WAS the thinking, so put the opener back.
+function splitThink(txt) {
+  txt = typeof txt === 'string' ? txt : '';
+  if (!txt.includes('<think>') && txt.includes('</think>')) txt = '<think>' + txt;
+  const close = txt.indexOf('</think>');
+  if (txt.startsWith('<think>') && close >= 7)
+    return { think: txt.slice(7, close).trim(), rest: txt.slice(close + 8).replace(/^\s+/, ''), open: false };
+  if (txt.startsWith('<think>'))
+    return { think: txt.slice(7).trim(), rest: '', open: true };     // still thinking
+  return { think: null, rest: txt, open: false };
+}
+
+// Fill a message body from raw reply text, incrementally when `live` is given: the same
+// detail/text nodes are updated in place, so a person who opened the thinking box while the
+// reply streams keeps it open — the DOM is never rebuilt under their cursor.
+// `live` shape: {det, sum, pre, ans, touched, collapsed}
+function fillBody(b, txt, live) {
+  const { think, rest, open } = splitThink(txt);
+  if (live && live.det) {                                            // in-place update
+    if (think !== null && !live.det.parentNode) {
+      b.prepend(live.det);                                           // thinking appeared mid-stream
+      live.det.open = true;
+    }
+    if (live.det.parentNode) {
+      live.pre.textContent = think === null ? '' : think;
+      live.det.classList.toggle('live', rest === '');
+      live.sum.textContent = rest === '' ? 'Thinking…' : 'Thought before answering';
+      if (rest !== '' && !live.collapsed && !live.touched) {
+        live.det.open = false; live.collapsed = true;                // auto-fold once the answer starts
+      }
+    }
+    live.ans.data = rest;
+    return;
+  }
+  if (think !== null) {
+    const det = document.createElement('details'); det.className = 'think';
+    const sum = document.createElement('summary');
+    sum.textContent = open ? 'Thinking…' : 'Thought before answering';
+    const pre = document.createElement('pre'); pre.textContent = think;
+    det.append(sum, pre); b.appendChild(det);
+    det.open = open;                                                 // mid-think: watch it; done: folded
+  }
+  b.appendChild(document.createTextNode(rest));
 }
 function note(t) { $('#hintbar').textContent = t || ''; }
 function promptFor(m) {
@@ -486,16 +663,50 @@ $('#composer').onsubmit = async (e) => {
   const text = $('#input').value.trim();
   if (!text && !attachments.length) return;
   if (!modelLoaded) return note('Load a model first (left panel).');
+  if (streaming) return note('Wait for the current reply to finish.');
   const conv = ensureConv();
   const msg = { role: 'user', content: text, attachments };
   conv.messages.push(msg); attachments = []; renderAttachments();
   if (conv.messages.length === 1) conv.title = titleFrom(text);
   $('#input').value = ''; render(); renderConvs();
-  conv.messages.push({ role: 'assistant', content: '…' }); render();
+
+  // The whole conversation goes to the model, not just the last line — that is what makes
+  // it a chat. Assistant turns go back WITHOUT their thinking: the reasoning was this
+  // model's scratch work for its last answer, not context for the next one.
+  const msgs = conv.messages.slice(0, -1).map(m => ({
+    role: m.role, content: m.role === 'user' ? promptFor(m) : splitThink(m.content).rest,
+  })).filter(m => m.content);
+  msgs.push({ role: 'user', content: promptFor(msg) });
+
+  const reply = { role: 'assistant', content: '' };
+  conv.messages.push(reply);
+  // Add the reply bubble directly (not a full render) and wire its live pieces.
+  const el = $('#messages');
+  const node = messageNode(reply, true);
+  el.appendChild(node); el.scrollTop = el.scrollHeight;
+  const body = node.querySelector('.body');
+  const det = document.createElement('details'); det.className = 'think';
+  const sum = document.createElement('summary'); sum.textContent = 'Thinking…';
+  const pre = document.createElement('pre');
+  det.append(sum, pre);
+  det.ontoggle = () => { if (streaming) streaming.live.touched = true; };
+  const live = { det, sum, pre, ans: document.createTextNode(''),
+                 touched: false, collapsed: false };
+  body.appendChild(live.ans);
+  streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
+
   try {
-    const out = await call('generate', { prompt: promptFor(msg), max_new: 256 });
-    conv.messages[conv.messages.length - 1].content = out;
-  } catch (err) { conv.messages[conv.messages.length - 1].content = 'Error: ' + err.message; }
+    const r = await call('generate', { messages: msgs, max_new: maxNewValue(),
+                                       enable_thinking: thinkingOn() });
+    if (r && r.truncated) {
+      reply.content += '\n\n[stopped at ' + r.n + ' tokens — raise “Max reply length”'
+                     + ' in ⚙ Settings, or leave it empty for no limit]';
+    }
+    if (!reply.content.trim()) reply.content = '(empty reply)';
+  } catch (err) {
+    reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
+  }
+  streaming = null;
   conv.updated = Date.now(); saveConvs(); render();
 };
 $('#input').addEventListener('keydown', e => {
