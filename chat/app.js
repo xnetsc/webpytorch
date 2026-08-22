@@ -183,6 +183,10 @@ worker.onmessage = (e) => {
   }
   else if (m.type === 'backend') {
     ENV.backend = m.name;
+    // The runtime is up: settings can open. Everything in there talks to the worker, so
+    // before this point opening it only offered ways to fail — the button stays locked
+    // until the backend line (webgpu/cpu) exists.
+    $('#openSettings').disabled = false;
     // A CPU fallback is the difference between seconds and minutes per reply, so it is
     // stated rather than left for the user to infer from the wait.
     $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
@@ -820,4 +824,7 @@ detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 // Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
 call('armStorage', {}).catch(() => {});
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
-call('boot').then(refreshCache).catch(e => $('#modelStatus').textContent = 'runtime failed: ' + e.message);
+call('boot').then(refreshCache).catch(e => {
+  $('#modelStatus').textContent = 'runtime failed: ' + e.message;
+  $('#openSettings').disabled = false;        // a dead runtime must not lock the UI shut
+});
