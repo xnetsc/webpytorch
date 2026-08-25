@@ -211,10 +211,10 @@ worker.onmessage = (e) => {
   }
   else if (m.type === 'backend') {
     ENV.backend = m.name;
-    // The runtime is up: settings can open. Everything in there talks to the worker, so
-    // before this point opening it only offered ways to fail — the button stays locked
-    // until the backend line (webgpu/cpu) exists.
+    // The runtime is up: this is the point everything else was waiting for.
+    envReady = true;
     $('#openSettings').disabled = false;
+    syncButtons();
     // A CPU fallback is the difference between seconds and minutes per reply, so it is
     // stated rather than left for the user to infer from the wait.
     $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
@@ -225,12 +225,26 @@ worker.onmessage = (e) => {
 function setBar(f) { $('#bar').style.width = Math.min(100, f * 100) + '%'; }
 // A model stays resident until it is released, so loading is blocked while one is held —
 // otherwise a second multi-GB model would be pulled in on top of the first.
+// Nothing works before the runtime has reported which backend it got. Until then every
+// control is inert -- not just the ones that talk to the worker. Loading a model in that
+// window is the costly mistake: cross-origin isolation may still be arriving (on a host that
+// cannot send the headers, a service worker supplies them and only controls the NEXT load),
+// and a model loaded before it lands runs on the CPU for its whole life -- minutes per reply
+// instead of seconds, with nothing on screen to explain why.
+let envReady = false;
+
 function syncButtons() {
-  $('#loadBtn').disabled = modelLoaded;
-  $('#releaseBtn').disabled = !modelLoaded;
-  $('#loadBtn').title = modelLoaded ? 'Release the current model first' : '';
+  const boot = !envReady;
+  $('#loadBtn').disabled = boot || modelLoaded;
+  $('#releaseBtn').disabled = boot || !modelLoaded;
+  $('#loadBtn').title = boot ? 'Waiting for the compute backend…'
+    : modelLoaded ? 'Release the current model first' : '';
+  ['#preset', '#modelId', '#lmax', '#gpuMem', '#gpuMemClear',
+   '#refreshCache', '#clearCache', '#exportBtn', '#importBtn'].forEach(sel => {
+    const el = $(sel); if (el) el.disabled = boot;
+  });
   // Nothing in the conversation area is usable until a model is actually ready to answer.
-  const off = !modelLoaded;
+  const off = boot || !modelLoaded;
   ['#input', '#send', '#toolFile', '#toolCam', '#toolUrl', '#newChat'].forEach(sel => {
     const el = $(sel); if (el) el.disabled = off;
   });
@@ -241,8 +255,8 @@ function syncButtons() {
     : 'This model cannot see images';
   $('#toolFile').title = modelImage ? 'Attach a file'
     : 'Attach a text file (this model cannot see images)';
-  $('#input').placeholder = off ? 'Load a model in ⚙ Settings to start chatting'
-                                : 'Send a message…';
+  $('#input').placeholder = boot ? 'Starting the compute runtime…'
+    : off ? 'Load a model in ⚙ Settings to start chatting' : 'Send a message…';
   $('#composer').classList.toggle('locked', off);
 }
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }

@@ -35,13 +35,24 @@ if (typeof window === 'undefined') {
     var src = document.currentScript.src;
 
     if (window.crossOriginIsolated) {
-      // Already isolated -- the server sends the headers itself. Stand down, and stand down
-      // for good: a worker registered earlier (from a server that did NOT send them) keeps
-      // proxying, and its `credentialless` overrides the server's stricter `require-corp`,
-      // which BREAKS the isolation it was added to provide. Seen for real: the page fell
-      // back to the CPU on a server whose headers were correct.
-      if (navigator.serviceWorker) {
-        navigator.serviceWorker.getRegistrations().then(function (regs) {
+      // Isolated -- but by whom? That is the whole question, and getting it wrong breaks the
+      // page either way.
+      //
+      // If THIS worker is the one supplying the headers, unregistering it un-isolates the
+      // next load, which registers it again, which isolates the load after that: the page
+      // alternates between GPU and CPU on every refresh. (Seen on GitHub Pages, which cannot
+      // send the headers, so the worker is the only thing providing them.)
+      //
+      // If the SERVER supplies them, a worker left over from somewhere that did not keeps
+      // proxying, and its `credentialless` overrides the server's stricter `require-corp` --
+      // breaking the isolation it was added to provide. (Seen for real: a fall back to the
+      // CPU on a server whose headers were correct.)
+      //
+      // So stand down only when the isolation is not ours to hold.
+      var sw = navigator.serviceWorker;
+      var ctrl = sw && sw.controller;
+      if (sw && !(ctrl && ctrl.scriptURL === src)) {
+        sw.getRegistrations().then(function (regs) {
           regs.forEach(function (r) {
             if (r.active && r.active.scriptURL === src) r.unregister();
           });
