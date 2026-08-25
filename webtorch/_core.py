@@ -3184,14 +3184,24 @@ _IQ4XS_DEC = """
       let dl = d * f32(i32(ls) - 32);
       let qwb = o + 8u + ib * 16u;
       let k0 = kb + ib * 32u;
+      // The four quants in a word land on four CONSECUTIVE activations, so each half of the
+      // byte pair is one dot product rather than four scalar accumulates -- same arithmetic,
+      // a quarter of the workgroup-memory reads.
+      //
+      // Worth 1.5x when the weight is already in cache, and NOTHING in a real decode step:
+      // 64 layers of distinct weights stream past, the ALU hides entirely behind memory
+      // latency, and an MLP-only capture measured 113.7ms before and 113.2ms after. Kept
+      // because it is strictly less work and may matter where the working set does fit,
+      // but do not expect it to move a large model.
       for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
         let w4 = W((qwb >> 2u) + jw);
-        for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-          let by = (w4 >> (8u * q)) & 255u;
-          let j = jw * 4u + q;
-          ACC(k0 + j, dl * kv(by & 15u));
-          ACC(k0 + 16u + j, dl * kv(by >> 4u));
-        }
+        let j = jw * 4u;
+        let c0 = w4 & 255u; let c1 = (w4 >> 8u) & 255u;
+        let c2 = (w4 >> 16u) & 255u; let c3 = (w4 >> 24u) & 255u;
+        ACC4(k0 + j, vec4<f32>(dl * kv(c0 & 15u), dl * kv(c1 & 15u),
+                               dl * kv(c2 & 15u), dl * kv(c3 & 15u)));
+        ACC4(k0 + 16u + j, vec4<f32>(dl * kv(c0 >> 4u), dl * kv(c1 >> 4u),
+                                     dl * kv(c2 >> 4u), dl * kv(c3 >> 4u)));
       }
     }
 """
@@ -3437,12 +3447,19 @@ _IQ3S_DEC = """
       let db = d * (1.0 + 2.0 * f32(nib));
       let qh = B(o + 66u + ib);
       let k0 = kb + ib * 32u;
-      for (var p: u32 = 0u; p < 8u; p = p + 1u) {
-        let f0 = p * 4u;
-        // f0 is a multiple of four, so all four values share one sign byte
-        let sm = B(o + 74u + ib * 4u + (f0 >> 3u));
-        ACC4(k0 + f0, G4V(B(o + 2u + ib * 8u + p) | ((qh << (8u - p)) & 256u))
-                      * SGN4(sm, f0 & 7u) * db);
+      // Two consecutive p share one sign byte (f0 is a multiple of four, and f0 >> 3 is
+      // p >> 1), so read it once for the pair instead of once per value. Same caveat as
+      // IQ4_XS above: 1.5x on a cached weight, no change in a real step.
+      let sb = o + 74u + ib * 4u;
+      let qb = o + 2u + ib * 8u;
+      for (var pg: u32 = 0u; pg < 4u; pg = pg + 1u) {
+        let sm = B(sb + pg);
+        let p0 = pg * 2u;
+        let p1 = p0 + 1u;
+        ACC4(k0 + p0 * 4u, G4V(B(qb + p0) | ((qh << (8u - p0)) & 256u))
+                           * SGN4(sm, 0u) * db);
+        ACC4(k0 + p1 * 4u, G4V(B(qb + p1) | ((qh << (8u - p1)) & 256u))
+                           * SGN4(sm, 4u) * db);
       }
     }
 """
