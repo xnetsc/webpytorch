@@ -221,6 +221,24 @@ class StopConstraint(Constraint):
         return any(s in text for s in self.stops)
 
 
+class AllOf(Constraint):
+    """Every part must allow a piece, and any part may end the generation. Lets `stop=`
+    compose with a structural constraint instead of one silently replacing the other."""
+
+    def __init__(self, parts):
+        self.parts = [p for p in parts if p is not None]
+
+    def reset(self):
+        for p in self.parts:
+            p.reset()
+
+    def allows(self, text, piece):
+        return all(p.allows(text, piece) for p in self.parts)
+
+    def finished(self, text):
+        return any(p.finished(text) for p in self.parts)
+
+
 _BUILTIN = {"json": JsonConstraint}
 
 

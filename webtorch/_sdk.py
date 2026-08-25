@@ -70,20 +70,27 @@ class AutoModelForCausalLM:
     `CausalLM.from_gguf/from_gptq/from_fp16` loaders all take this same option.
     """
     @staticmethod
-    async def from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native"):
+    async def from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native",
+                              **kw):
+        """`kw` takes the same generation options as `load()`/`pipeline()` — temperature,
+        top_p, top_k, min_p, do_sample, seed, repetition_penalty, presence_penalty,
+        frequency_penalty, max_new_tokens, min_new_tokens, max_length, stop, constraint,
+        enable_thinking — and installs them as this model's defaults."""
         import asyncio
+        from .webio import cancel as _cancel_stop
+        _cancel_stop(False)      # a stop meant for an earlier load must not hit this one
         p = str(path).rstrip("/")
         key = _impl_cache_key(p, dtype, bits, lmax, weights)
         e = _IMPL_CACHE.get(key)
         if e is not None and not e["impl"].__dict__.get("_released"):
             e["refs"] += 1
-            return e["impl"]               # the weights were loaded once; hand out the copy
+            return _apply_gen_defaults(e["impl"], kw)  # the weights were loaded once; hand out the copy
         if key in _IMPL_LOADING:
             impl = await asyncio.shield(_IMPL_LOADING[key])
             e = _IMPL_CACHE.get(key)
             if e is not None and e["impl"] is impl:
                 e["refs"] += 1
-            return impl
+            return _apply_gen_defaults(impl, kw)
         fut = asyncio.get_event_loop().create_future()
         _IMPL_LOADING[key] = fut
         try:
@@ -95,7 +102,7 @@ class AutoModelForCausalLM:
         _IMPL_CACHE[key] = {"impl": impl, "refs": 1}
         _IMPL_LOADING.pop(key, None)
         if not fut.done(): fut.set_result(impl)
-        return impl
+        return _apply_gen_defaults(impl, kw)
 
     @staticmethod
     async def _load_raw(p, dtype, bits, lmax, weights):
@@ -118,6 +125,27 @@ class AutoModelForCausalLM:
 # Options every LLM entry point forwards to AutoModelForCausalLM. Kept in one place so a
 # new loader option reaches load(), pipeline() and the multimodal path without three edits.
 _LLM_OPTS = ("dtype", "bits", "lmax", "weights")
+# Generation options are not load options -- they do not change how weights are built -- but
+# every mainstream API lets you set them once at load/pipeline time and have them hold for
+# every later call. Collected here and installed as the model's defaults, below whatever a
+# generate()/stream() call passes and above the model's own generation_config.json.
+_GEN_OPTS = ("temperature", "top_p", "top_k", "min_p", "do_sample", "seed",
+             "repetition_penalty", "presence_penalty", "frequency_penalty",
+             "max_new_tokens", "max_length", "min_new_tokens", "stop", "constraint",
+             "enable_thinking")
+
+
+def _apply_gen_defaults(impl, kw):
+    """Install load-time generation options on a model (or on the decoder a wrapper holds)."""
+    got = {k: kw[k] for k in _GEN_OPTS if kw.get(k) is not None}
+    if not got:
+        return impl
+    tgt = impl
+    for attr in ("lm", "_impl", "model"):                  # wrappers keep the decoder inside
+        if not hasattr(tgt, "gen_defaults") and hasattr(tgt, attr):
+            tgt = getattr(tgt, attr)
+    tgt.gen_defaults = dict(getattr(tgt, "gen_defaults", {}) or {}, **got)
+    return impl
 
 # Weight-level dedup: `load()`, `pipeline()` and a direct `AutoModelForCausalLM.from_pretrained`
 # may all ask for the SAME model, and a multi-GB load must happen once. The `load()` cache
@@ -274,8 +302,13 @@ async def load(source=None, task=None, dtype="auto", encoder=None, reuse=True, *
       encoder: name of a registered media encoder -> a multimodal model.
 
     LLM options forwarded to the loader (same names as `AutoModelForCausalLM.from_pretrained`
-    and `pipeline`): `lmax=` context length (None = the size the model declares), `bits=`,
-    `weights=`.
+    and `pipeline`): `lmax=` context length (None = a size that stays responsive, capped by
+    KV memory), `bits=`, `weights=`.
+
+    Generation options may also be set here and become that model's defaults for every later
+    call: `temperature`, `top_p`, `top_k`, `min_p`, `do_sample`, `seed`, `repetition_penalty`,
+    `presence_penalty`, `frequency_penalty`, `max_new_tokens`, `min_new_tokens`, `max_length`,
+    `stop`, `constraint`, `enable_thinking`. A `generate(...)`/`stream(...)` call still wins.
 
     Detection is by content, not by model name: `.onnx`/`.gguf` by extension, otherwise the
     served `config.json` decides (a decoder config -> the generic CausalLM/MoE/hybrid engine).
@@ -326,6 +359,7 @@ async def _load_uncached(source, task, dtype, encoder, kw):
         return Model(await pipeline(task, kw.pop("model", "auto"), path=src, **kw), task)
     lm = await AutoModelForCausalLM.from_pretrained(
         src, dtype=dtype, **{k: kw[k] for k in _LLM_OPTS if k in kw and k != "dtype"})
+    lm = _apply_gen_defaults(lm, kw)
     if encoder is not None:                                # decoder + media encoder
         enc = await multimodal.load_encoder(encoder, **kw.get("encoder_kwargs", {}))
         return Model(multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id")),
@@ -506,8 +540,8 @@ async def _load_qwenvl(**kw):
     from . import vl
     return await vl.QwenVL.from_pretrained(kw.get("path", "/models/qwen2.5-vl-3b"))
 async def _load_causal(**kw):
-    return await AutoModelForCausalLM.from_pretrained(
-        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw})
+    return _apply_gen_defaults(await AutoModelForCausalLM.from_pretrained(
+        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw}), kw)
 
 async def _load_multimodal(**kw):
     """Generic multimodal impl: ANY decoder + ANY registered media encoder.
@@ -515,8 +549,8 @@ async def _load_multimodal(**kw):
     The decoder is loaded by config (the whole CausalLM/MoE family) and paired with the named
     encoder through `MultimodalLM` — no model-specific code."""
     from . import multimodal
-    lm = await AutoModelForCausalLM.from_pretrained(
-        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw})
+    lm = _apply_gen_defaults(await AutoModelForCausalLM.from_pretrained(
+        kw["path"], **{k: kw[k] for k in _LLM_OPTS if k in kw}), kw)
     enc = await multimodal.load_encoder(kw.get("encoder", "auto"),
                                         **kw.get("encoder_kwargs", {}))
     return multimodal.MultimodalLM(lm, enc, placeholder_id=kw.get("placeholder_id"))
@@ -567,7 +601,7 @@ __all__ = ["install_torch", "load", "Model", "release", "loaded_models", "releas
 # object, an `OnnxModel`, or a `MultimodalLM`.
 
 # Attributes that hold the bulk of a model's memory (weights, caches, tensor buffers).
-_HEAVY = ("layers", "embed", "head", "final_norm", "Kc", "Vc", "h_in", "cos_b", "sin_b",
+_HEAVY = ("layers", "embed", "head", "final_norm", "mtp", "Kc", "Vc", "h_in", "cos_b", "sin_b",
           "mask_b", "ctl", "vision", "graph", "nodes", "initializers", "_ginfo", "_idx",
           "_shard_hdr", "conv_state", "rec_state", "_state", "impl", "_impl", "lm", "encoder")
 
