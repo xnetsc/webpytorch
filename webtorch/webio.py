@@ -48,12 +48,40 @@ def resolve_tensor_reader(src, io=None):
 _ST_DT = {"F32": np.float32, "F16": np.float16, "I32": np.int32, "I64": np.int64,
           "I8": np.int8, "U8": np.uint8, "I16": np.int16}
 
-def _st_decode(raw, dt, shape):
+# BF16 is the top half of a float32, so widening it goes through a uint32 array, a shifted
+# copy, and a float32 view -- several times the source in temporaries, all live at once. A
+# 64MB tensor peaks over 300MB that way, which 32-bit WASM refuses outright; it is what
+# stopped a 3B safetensors model from loading on a machine with room to spare for it.
+# Converting in bounded slices makes the peak independent of the tensor's size.
+_CONV_SLICE = 1 << 22                                  # elements per step (~32MB of peak)
+
+
+def bf16_to_f32(raw):
+    """BF16 bytes -> float32, without a large intermediate."""
+    src = np.frombuffer(raw, np.uint16)
+    out = np.empty(src.size, np.float32)
+    for i in range(0, src.size, _CONV_SLICE):
+        j = min(src.size, i + _CONV_SLICE)
+        out[i:j] = (src[i:j].astype(np.uint32) << 16).view(np.float32)
+    return out
+
+
+def to_f32(raw, dt):
+    """Raw safetensors bytes of dtype `dt` -> a flat float32 array, bounded peak."""
     if dt == "BF16":
-        arr = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
-    else:
-        arr = np.frombuffer(raw, _ST_DT.get(dt, np.float32))
-    return arr.reshape(shape).astype(np.float32)
+        return bf16_to_f32(raw)
+    src = np.frombuffer(raw, _ST_DT.get(dt, np.float32))
+    if src.dtype == np.float32:
+        return src
+    out = np.empty(src.size, np.float32)
+    for i in range(0, src.size, _CONV_SLICE):
+        j = min(src.size, i + _CONV_SLICE)
+        out[i:j] = src[i:j].astype(np.float32)
+    return out
+
+
+def _st_decode(raw, dt, shape):
+    return to_f32(raw, dt).reshape(shape)
 
 
 def _st_ranged_reader(path, io=None):

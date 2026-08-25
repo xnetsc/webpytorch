@@ -321,7 +321,14 @@ def dequant(ttype, raw, n):
         vals = np.concatenate([lo, hi], axis=2)                      # (blk,8,32)
         return (vals * dl[:, :, None]).reshape(-1)[:n]
     if name == "BF16":                       # top 16 bits of an fp32
-        return (np.frombuffer(raw, np.uint16)[:n].astype(np.uint32) << 16).view(np.float32)
+        # Bounded slices: widening BF16 costs several times its own size in live temporaries,
+        # and a head block is large enough for that to matter under 32-bit WASM.
+        src = np.frombuffer(raw, np.uint16)[:n]
+        out = np.empty(src.size, np.float32)
+        for i in range(0, src.size, 1 << 22):
+            j = min(src.size, i + (1 << 22))
+            out[i:j] = (src[i:j].astype(np.uint32) << 16).view(np.float32)
+        return out
     if name == "TQ1_0":                      # 256 vals / 54 bytes: qs[48] | qh[4] | f16 d
         # Ternary, five values to a byte: each is recovered by multiplying the byte by a
         # power of three (mod 256) and taking the top of byte*3.

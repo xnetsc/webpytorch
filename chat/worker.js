@@ -148,7 +148,12 @@ if _lst:
     _media = _media[0] if len(_media) == 1 else _media
 
 if _media is not None:
-    if not hasattr(m, "encoder") and not hasattr(getattr(m, "impl", m), "encoder"):
+    # The model itself says whether it can see, through the same "kind" the page uses to
+    # offer the controls -- not through whichever attribute a particular implementation
+    # happens to keep its encoder in.
+    _im = getattr(m, "impl", m)
+    if (getattr(m, "kind", "") != "multimodal"
+            and not hasattr(_im, "encoder") and not hasattr(_im, "vision")):
         raise RuntimeError("this model cannot see images — load a vision model to send one")
     _kw.pop("stream", None); _kw.pop("channels", None)
     _r = m.generate(_prompt, media=_media, **_kw)

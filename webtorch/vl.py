@@ -75,16 +75,47 @@ def _smart_resize(h, w, factor, min_pixels, max_pixels):
     return hb, wb
 
 
-def preprocess_image(pil_img, patch=14, merge=2, temporal_patch=2,
+def _resize_rgb(a, Hn, Wn):
+    """Bilinear resize of an (H,W,3) float array. Used when the image arrives as pixels
+    rather than as a PIL object -- a browser has already decoded it by then, and requiring
+    PIL would mean shipping an image library to re-do work the page has done."""
+    H0, W0 = a.shape[:2]
+    if (H0, W0) == (Hn, Wn):
+        return a
+    yi = (np.arange(Hn, dtype=np.float32) + 0.5) * (H0 / Hn) - 0.5
+    xi = (np.arange(Wn, dtype=np.float32) + 0.5) * (W0 / Wn) - 0.5
+    y0 = np.clip(np.floor(yi), 0, H0 - 1).astype(np.int64); y1 = np.clip(y0 + 1, 0, H0 - 1)
+    x0 = np.clip(np.floor(xi), 0, W0 - 1).astype(np.int64); x1 = np.clip(x0 + 1, 0, W0 - 1)
+    wy = np.clip(yi - y0, 0, 1)[:, None, None]; wx = np.clip(xi - x0, 0, 1)[None, :, None]
+    top = a[y0][:, x0] * (1 - wx) + a[y0][:, x1] * wx
+    bot = a[y1][:, x0] * (1 - wx) + a[y1][:, x1] * wx
+    return top * (1 - wy) + bot * wy
+
+
+def preprocess_image(img_in, patch=14, merge=2, temporal_patch=2,
                      min_pixels=4 * 28 * 28, max_pixels=1280 * 28 * 28):
-    """PIL RGB image -> (pixel_values (seq,1176) f32, grid_thw (1,3) int)."""
-    from PIL import Image
-    img = pil_img.convert("RGB")
-    factor = patch * merge
-    W0, H0 = img.size
-    Hn, Wn = _smart_resize(H0, W0, factor, min_pixels, max_pixels)
-    img = img.resize((Wn, Hn), Image.BICUBIC)
-    a = np.asarray(img, np.float32) / 255.0                  # (H,W,3)
+    """RGB image -> (pixel_values (seq,1176) f32, grid_thw (1,3) int).
+
+    Takes a PIL image or an (H,W,3) uint8/float array, so a caller that already has decoded
+    pixels -- which is every browser caller -- does not need PIL at all."""
+    if hasattr(img_in, "convert"):                            # PIL
+        from PIL import Image
+        img = img_in.convert("RGB")
+        W0, H0 = img.size
+        factor = patch * merge
+        Hn, Wn = _smart_resize(H0, W0, factor, min_pixels, max_pixels)
+        a = np.asarray(img.resize((Wn, Hn), Image.BICUBIC), np.float32) / 255.0
+    else:
+        arr = np.asarray(img_in)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[:, :, None], 3, axis=2)
+        arr = arr[:, :, :3].astype(np.float32)
+        if arr.max() > 1.5:
+            arr = arr / 255.0
+        H0, W0 = arr.shape[:2]
+        factor = patch * merge
+        Hn, Wn = _smart_resize(H0, W0, factor, min_pixels, max_pixels)
+        a = _resize_rgb(arr, Hn, Wn)
     a = (a - IMAGE_MEAN) / IMAGE_STD
     a = a.transpose(2, 0, 1)                                 # (3,H,W)
     a = a[None]                                              # (1,3,H,W) single frame
@@ -269,23 +300,16 @@ class VLCausalLM(CausalLM):
         out = model.generate("Describe this image.", image=pil_image)
     """
     async def _embed_stream(self, name, chunk=64 << 20):
-        """Stream a (V,H) BF16/F16 embed to host f16 in row-blocks."""
-        shard = self._idx[name]; h, base = await self._hdr(shard)
-        info = h[name]; a, _ = info["data_offsets"]; V, Hh = info["shape"]
-        bf = info["dtype"] == "BF16"; row = Hh * 2
-        out = np.empty((V, Hh), np.float16); rpc = max(1, chunk // row)
-        for v0 in range(0, V, rpc):
-            v1 = min(V, v0 + rpc)
-            raw = await self._rng(shard, base + a + v0 * row, base + a + v1 * row - 1)
-            if bf:
-                f = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
-                out[v0:v1] = f.reshape(v1 - v0, Hh).astype(np.float16)
-            else:
-                out[v0:v1] = np.frombuffer(raw, np.float16).reshape(v1 - v0, Hh)
-        return out
+        """Stream a (V,H) BF16/F16 embed to host f16 in row-blocks.
+
+        Blocks are kept separate rather than assembled into one array: a 152k x 2048 fp16
+        table is 594MB as a single object, which 32-bit WASM refuses however much memory the
+        machine has. `_ChunkRows` indexes across the blocks and reads like an ndarray, which
+        is what the engine wants from an embedding table anyway."""
+        return await self._f16_chunked(name, chunk_bytes=chunk)
 
     @classmethod
-    async def from_qwen2_5_vl(cls, base, lmax=1024, bits=4):
+    async def from_qwen2_5_vl(cls, base, lmax=None, bits=4):
         self = cls(base); self.lmax = lmax; self.bits = bits; self.gs = 128
         self._shard_hdr = {}
         from . import webio
@@ -297,6 +321,10 @@ class VLCausalLM(CausalLM):
         self.eps = tc["rms_norm_eps"]
         self.theta = tc.get("rope_theta") or tc["rope_scaling"].get("rope_theta", 1000000.0)
         self.mrope = tc["rope_scaling"]["mrope_section"]
+        # An image costs hundreds of prompt tokens, so a fixed small context is the difference
+        # between working and refusing. Take it from the model, capped by KV memory, exactly
+        # as the text path does.
+        self.lmax = self._auto_lmax(lmax, tc.get("max_position_embeddings"))
         self.merge = vc["spatial_merge_size"]
         self.IMG_TOK = cfg["image_token_id"]; self.VSTART = cfg["vision_start_token_id"]
         self.VEND = cfg["vision_end_token_id"]
@@ -306,9 +334,12 @@ class VLCausalLM(CausalLM):
                     fullatt_block_indexes=vc["fullatt_block_indexes"],
                     out_hidden_size=vc["out_hidden_size"], in_channels=vc.get("in_channels", 3))
 
-        tj = await webio.read_json(self.base + "tokenizer.json")
-        self.tok = BPETokenizer(tj["model"]["vocab"], tj["model"]["merges"])
-        self.tok.SPECIALS = dict(BPETokenizer.SPECIALS)
+        # Build the tokenizer the same way every other HF model does. Reading tokenizer.json's
+        # `model.vocab` directly misses `added_tokens`, which is where a Qwen model keeps
+        # <|im_end|> and the rest -- without them the end-of-turn id was wrong (the probe
+        # matched <s>/</s>, which this family does not use) and generation never stopped
+        # where it should. The shared path also picks up the chat template and eos ids.
+        self.tok = await self._hf_tokenizer(cfg)
         self.tok.SPECIALS.update({"<|vision_start|>": self.VSTART, "<|vision_end|>": self.VEND,
                                   "<|image_pad|>": self.IMG_TOK})
         for t, i in self.tok.SPECIALS.items():
@@ -407,18 +438,41 @@ class VLCausalLM(CausalLM):
         self.mask_b.data.buffer.set_data(m)
         self.ctl.buffer.set_data(np.array([kv_pos, 1, NKV, HD, LMAX], np.int32))
 
+    kind = "multimodal"
+
     def generate(self, prompt, image=None, max_new=64, system="You are a helpful assistant.",
-                 max_pixels=384 * 28 * 28):
+                 max_pixels=384 * 28 * 28, media=None, **kw):
+        # `media=` is what the generic multimodal surface calls it (MultimodalLM.generate),
+        # and a caller should not have to know which of the two it is holding.
+        if image is None:
+            image = media
+        if isinstance(image, (list, tuple)):
+            image = image[0] if image else None
         # max_pixels caps the image resolution: vision full-attention is O(seq^2)
         # (seq = pixels/patch^2), so large images blow the WASM heap. 384*28*28 ->
         # ~1536 patches, a ~150MB score matrix. Raise it if you have headroom.
         if image is None:
-            return super().generate(prompt, max_new, system)
-        eot = self.tok.SPECIALS["<|im_end|>"]
+            return super().generate(prompt, max_new=max_new, system=system, **kw)
+        eot = self.tok.eot
+        # Same sampling surface as every other model: temperature, penalties, stop strings and
+        # constraints all come through `_pick`. This path used to take the argmax outright, so
+        # every one of those parameters was silently ignored once an image was attached.
         pv, grid = preprocess_image(image, max_pixels=max_pixels)
         img_embeds = self.vision.forward(pv, grid).numpy()      # (n_img, H)
         n_img = img_embeds.shape[0]
         ids = self._encode_vl(prompt, n_img, system); P = len(ids)
+        # `max_new=None` means "as much as the model allows", the same as everywhere else --
+        # the page sends None when the user sets no limit. A prompt that does not fit is a
+        # hard error here rather than something to trim from the front: trimming would cut
+        # the image placeholder tokens, which must stay in step with the image embeddings.
+        if P >= self.lmax:
+            raise ValueError("prompt plus image needs %d tokens but the context is %d — "
+                             "load with a larger lmax, or send a smaller image" % (P, self.lmax))
+        if max_new is None:
+            d = getattr(self, "gen_defaults", {}) or {}
+            max_new = int(d.get("max_new_tokens") or 0) or (self.lmax - P)
+        max_new = max(1, min(int(max_new), self.lmax - P))
+        self._set_sampling(prompt_ids=ids, **kw)
         pos3, next_pos = self._rope_index(ids, grid)
         cos, sin = self._mrope_cos_sin(pos3)                    # (P,HD)
         # embed tokens, splice image embeds at IMG_TOK positions
@@ -441,10 +495,12 @@ class VLCausalLM(CausalLM):
         gen = [g0]; nxt = g0; kvp = P; rp = next_pos; steps = 0; td = time.perf_counter()
         while len(gen) < max_new:
             self._set_inputs_vl(nxt, kvp, rp); plat.replay("vldecode")
-            nxt = int(lt.numpy()[0].argmax()); kvp += 1; rp += 1; steps += 1
+            nxt = self._pick(lt.numpy()[0]); kvp += 1; rp += 1; steps += 1
             if nxt == eot:
                 break
             gen.append(nxt)
+            if self._stop_now():
+                break
         dec = time.perf_counter() - td
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                          round(ttft, 3), round(steps / max(dec, 1e-9), 2))

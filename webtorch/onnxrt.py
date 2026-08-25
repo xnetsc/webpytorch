@@ -98,7 +98,8 @@ def _parse_tensor(buf):                # TensorProto -> (name, np.ndarray)
     if 9 in g:                                             # raw_data
         raw = bytes(g[9][0])
         if dt == 16:                                       # bfloat16 -> float32
-            arr = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
+            from . import webio
+            arr = webio.bf16_to_f32(raw)
         else:
             arr = np.frombuffer(raw, _DT.get(dt, np.float32))
     elif dt in (1, 16) and 4 in g:  arr = np.array(_pf32(g[4]), np.float32)

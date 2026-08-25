@@ -387,6 +387,34 @@ def _source_bits(infos, G):
     return 8 if bpw > 4.5 else 4
 
 
+# Widening a BF16 buffer costs several times its own size in temporaries: it is the top
+# half of a float32, so it goes through a uint32 array, a shifted copy of that, and a float32
+# view before it lands as fp16. On a 64MB read that is over 300MB of peaks, and 32-bit WASM
+# refuses to allocate it -- which is what stopped a 3B safetensors model from loading at all,
+# on a machine with plenty of room for the model itself. Converting in bounded slices keeps
+# the peak fixed no matter how large a block the caller reads.
+_F16_SLICE = 1 << 22                                   # elements per conversion step
+
+
+def _bytes_to_f16(raw, dt):
+    """Raw safetensors bytes of dtype `dt` -> a flat float16 array."""
+    if dt == "F16":
+        return np.frombuffer(raw, np.float16).copy()
+    if dt == "BF16":
+        src = np.frombuffer(raw, np.uint16)
+        out = np.empty(src.size, np.float16)
+        for i in range(0, src.size, _F16_SLICE):
+            j = min(src.size, i + _F16_SLICE)
+            out[i:j] = (src[i:j].astype(np.uint32) << 16).view(np.float32).astype(np.float16)
+        return out
+    src = np.frombuffer(raw, np.float32)
+    out = np.empty(src.size, np.float16)
+    for i in range(0, src.size, _F16_SLICE):
+        j = min(src.size, i + _F16_SLICE)
+        out[i:j] = src[i:j].astype(np.float16)
+    return out
+
+
 class _RowTable:
     """A 2-D weight that is only ever read by row, exposed with ndarray-style indexing.
 
@@ -623,14 +651,8 @@ class CausalLM:
         info = h[name]; a, z = info["data_offsets"]
         raw = await self._rng(shard, base + a, base + z - 1)
         dt = info["dtype"]
-        if dt == "BF16":
-            arr = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
-        elif dt == "F16":
-            arr = np.frombuffer(raw, np.float16).astype(np.float32)
-        elif dt == "I32":
-            arr = np.frombuffer(raw, np.int32)
-        else:
-            arr = np.frombuffer(raw, np.float32)
+        from . import webio
+        arr = (np.frombuffer(raw, np.int32) if dt == "I32" else webio.to_f32(raw, dt))
         return arr.reshape(info["shape"])
 
     async def _qlin(self, prefix):
@@ -649,14 +671,22 @@ class CausalLM:
         for v0 in range(0, V, rpc):
             v1 = min(V, v0 + rpc)
             raw = await self._rng(shard, base + a + v0 * row, base + a + v1 * row - 1)
-            if dt == "BF16":
-                arr = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
-            elif dt == "F16":
-                arr = np.frombuffer(raw, np.float16)
-            else:
-                arr = np.frombuffer(raw, np.float32)
-            chunks.append(arr.reshape(v1 - v0, Hh).astype(np.float16))
+            chunks.append(_bytes_to_f16(raw, dt).reshape(v1 - v0, Hh))
         return _ChunkRows(chunks, rpc, V, Hh)
+
+    def _fp16_head(self, WVH, blk=_HEAD_BLK):
+        """The output head as a list of row-blocks, one Linear each.
+
+        `UnquantizedLinear` transposes its weight into a single dense fp32 buffer, so handing
+        it the whole head means (H, V) floats at once -- 1.16GB on a 152k vocabulary, which
+        32-bit WASM will not allocate however much memory the machine has. The engine already
+        treats `self.head` as a list and concatenates the pieces, which is how the quantized
+        and GGUF paths have always loaded it; this makes the fp16 path agree."""
+        V = int(WVH.shape[0]); out = []
+        for v0 in range(0, V, blk):
+            v1 = min(V, v0 + blk)
+            out.append(wt.UnquantizedLinear(np.asarray(WVH[v0:v1], np.float16)))
+        return out
 
     def _quantize_head(self, WVH, blk=4096):
         V, Hh = WVH.shape; blocks = []
@@ -759,6 +789,34 @@ class CausalLM:
             return wt.GGMLLinear(chunk, nm, H, rows)
         return self._gquant(G.dequant(ttype, chunk, rows * H).reshape(rows, H))
 
+    async def _tok_files(self):
+        """(vocab, merges, added) from whichever tokenizer layout the model ships.
+
+        Two are in circulation and a model may have either: the GPT-2 pair (vocab.json +
+        merges.txt) and the single tokenizer.json that HF's `tokenizers` writes. Which one a
+        model has says nothing about the model, so requiring one of them rules out families
+        arbitrarily. tokenizer.json also keeps the special tokens in `added_tokens`, OUTSIDE
+        the vocabulary proper -- miss those and the end-of-turn id is wrong, which is not a
+        crash but a model that never stops where it should."""
+        from . import webio
+        try:
+            vocab = await webio.read_json(self.base + "vocab.json")
+            lines = (await webio.read_text(self.base + "merges.txt")).split("\n")
+            return vocab, [m for m in lines[1:] if m and not m.startswith("#")], []
+        except Exception:
+            pass
+        tj = await webio.read_json(self.base + "tokenizer.json")
+        mdl = tj.get("model") or {}
+        vocab = dict(mdl.get("vocab") or {})
+        added = []
+        for a in (tj.get("added_tokens") or []):
+            if isinstance(a, dict) and a.get("content") is not None and a.get("id") is not None:
+                vocab[a["content"]] = int(a["id"]); added.append(a["content"])
+        # merges are ["a b", ...] in newer files and [["a", "b"], ...] in older ones
+        merges = [" ".join(m) if isinstance(m, (list, tuple)) else m
+                  for m in (mdl.get("merges") or [])]
+        return vocab, merges, added
+
     async def _hf_tokenizer(self, cfg):
         """Tokenizer for an HF directory: vocab, merges, and the model's own chat template.
 
@@ -766,8 +824,7 @@ class CausalLM:
         added tokens; reading it is what makes an unfamiliar model's turns come out right
         instead of approximately right."""
         from . import webio
-        vocab = await webio.read_json(self.base + "vocab.json")
-        merges = (await webio.read_text(self.base + "merges.txt")).split("\n")
+        vocab, merges, extra = await self._tok_files()
         _e = cfg.get("eos_token_id")
         eos = _e if isinstance(_e, list) else ([_e] if _e is not None else [])
         tc = {}
@@ -775,11 +832,23 @@ class CausalLM:
             tc = await webio.read_json(self.base + "tokenizer_config.json")
         except Exception:
             pass                                   # optional -- fall back to the format probe
+        # vocab.json holds only the trained vocabulary: the special tokens live outside it,
+        # in tokenizer_config.json's `added_tokens_decoder` (or tokenizer.json's
+        # `added_tokens`). Fold them back in, because anything that looks a marker up by name
+        # -- end-of-turn, the chat markers, a vision placeholder -- searches the vocabulary,
+        # and without them the lookup either fails or silently matches the wrong token.
         added = tc.get("added_tokens_decoder") or {}
-        ctrl = [v.get("content") for v in added.values()
-                if isinstance(v, dict) and v.get("content")]
-        tok = BPETokenizer(vocab, [m for m in merges[1:] if m and not m.startswith("#")],
-                           eos_ids=eos, chat_template=tc.get("chat_template"), control=ctrl)
+        ctrl = []
+        for tid, v in added.items():
+            if isinstance(v, dict) and v.get("content"):
+                ctrl.append(v["content"])
+                try:
+                    vocab.setdefault(v["content"], int(tid))
+                except (TypeError, ValueError):
+                    pass
+        ctrl = ctrl or extra
+        tok = BPETokenizer(vocab, merges, eos_ids=eos,
+                           chat_template=tc.get("chat_template"), control=ctrl)
         await tok.prepare_template()
         await self._load_gen_defaults()
         return tok
@@ -1339,7 +1408,8 @@ class CausalLM:
         t0 = time.perf_counter()
         self.embed = await self._f16_chunked("model.embed_tokens.weight")     # (V,H) fp16
         headW = self.embed if tie else await self._f16_chunked("lm_head.weight")
-        self.head = self._quantize_head(headW) if self._qbits else [wt.UnquantizedLinear(headW)]
+        self.head = (self._quantize_head(headW) if self._qbits
+                     else self._fp16_head(headW))
         self.layers = [await self._build_layer(i, self._lin) for i in range(self.L)]
         self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
@@ -1590,8 +1660,14 @@ class CausalLM:
                      ("min_new_tokens", min_new_tokens)):
             if v is not None:
                 base[k] = v
-        if base.get("do_sample") is None:
-            base["do_sample"] = float(base.get("temperature", 0) or 0) > 0
+        # temperature 0 is greedy, and says so louder than any default: a model whose
+        # generation_config ships `do_sample: true` would otherwise keep sampling through it,
+        # and the reply would not reproduce even though the caller asked for the deterministic
+        # one. Every mainstream API reads a zero temperature this way.
+        if float(base.get("temperature", 0) or 0) <= 0:
+            base["do_sample"] = False
+        elif base.get("do_sample") is None:
+            base["do_sample"] = True
         if base.get("seed") is not None:
             base["rng"] = np.random.default_rng(int(base["seed"]))
         stops = stop if stop is not None else base.get("stop")

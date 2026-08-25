@@ -357,6 +357,21 @@ async def _load_uncached(source, task, dtype, encoder, kw):
         return Model(await OnnxModel.from_source(src), "onnx")
     if task is not None:                                   # explicit task -> registry
         return Model(await pipeline(task, kw.pop("model", "auto"), path=src, **kw), task)
+    # A model that ships a vision tower gets one. The config says so -- `vision_config` is
+    # the standard field and is not specific to any family -- and without this a VLM loaded
+    # by path silently became its text half: it answered, so nothing looked wrong, but no
+    # image could ever reach it.
+    if encoder is None and not src.endswith(".gguf"):
+        try:
+            from . import webio
+            _cfg = await webio.read_json(src + "/config.json")
+        except Exception:
+            _cfg = None
+        if _cfg and _cfg.get("vision_config"):
+            from . import vl
+            vopt = {k: kw[k] for k in ("lmax", "bits") if kw.get(k) is not None}
+            return Model(_apply_gen_defaults(
+                await vl.VLCausalLM.from_qwen2_5_vl(src, **vopt), kw), "multimodal")
     lm = await AutoModelForCausalLM.from_pretrained(
         src, dtype=dtype, **{k: kw[k] for k in _LLM_OPTS if k in kw and k != "dtype"})
     lm = _apply_gen_defaults(lm, kw)
