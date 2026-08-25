@@ -68,6 +68,7 @@ from .webio import (use_directory, get_directory, migrate_cache, set_storage_ful
                     set_read_progress, get_read_progress,
                     set_download_progress, get_download_progress,
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
+                    cancel, Cancelled,
                     use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
                     throttle_reads, prefetch_whole_file, await_inflight, http_get, http_size, HttpError,
                     default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
@@ -96,6 +97,8 @@ __all__ = [
     "MultimodalLM", "register_encoder", "load_encoder", "list_encoders", "splice_embeddings",
     # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None
     "set_io_read", "get_io_read", "io_read", "set_io_write", "get_io_write", "io_write",
+    # cooperative stop for an in-flight load (raises Cancelled at the next IO checkpoint)
+    "cancel", "Cancelled",
     # built-in / hub read callbacks you install via set_io_read (NOT auto-installed)
     "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
     # generic cached-reader tool (cache + read-ahead + adaptive concurrency + persistence) for

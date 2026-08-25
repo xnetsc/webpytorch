@@ -54,10 +54,11 @@ async function loadModel(repo, file, lmax) {
            rate, dlRate: self.__dlRate });
   };
   self.__dl = (rate) => { self.__dlRate = rate; };
-  await pyodide.runPythonAsync(`
+  const out = await pyodide.runPythonAsync(`
 import js, webtorch
 src = _src
 lmax = int(_lmax)
+webtorch.cancel(False)      # a stale stop request must not hit this load
 webtorch.set_read_progress(lambda i: js.self.__prog(i["done"], i["total"] or 0, i["rate"]))
 webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 try:
@@ -68,22 +69,49 @@ try:
 finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
-_KIND = getattr(_MODEL["m"], "kind", "")
+getattr(_MODEL["m"], "kind", "")
 `);
   // The page uses the model kind to offer (or hide) image inputs before the user tries one.
-  const kind = await pyodide.runPythonAsync('_KIND');
+  // It comes back as this block's value: a top-level name assigned inside an awaited block
+  // is local to the coroutine Pyodide wraps it in, so a second runPython could not see it.
   send({ type: 'status', text: `ready: ${src}` });
-  send({ type: 'loaded', id: src, image: kind === 'multimodal' });
+  send({ type: 'loaded', id: src, image: out === 'multimodal' });
+}
+
+// Attached images become real pixels for the model. A data URL means nothing to the
+// decoder, so decode here -- the worker has OffscreenCanvas -- and hand Python raw RGB plus
+// its shape. Sending the bytes rather than the URL also keeps the Python side free of any
+// image format handling.
+async function decodeImages(urls) {
+  const out = [];
+  for (const u of urls || []) {
+    try {
+      const bmp = await createImageBitmap(await (await fetch(u)).blob());
+      const c = new OffscreenCanvas(bmp.width, bmp.height);
+      const g = c.getContext('2d');
+      g.drawImage(bmp, 0, 0);
+      const px = g.getImageData(0, 0, bmp.width, bmp.height).data;   // RGBA
+      const rgb = new Uint8Array(bmp.width * bmp.height * 3);
+      for (let i = 0, j = 0; i < px.length; i += 4, j += 3) {
+        rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2];
+      }
+      out.push({ w: bmp.width, h: bmp.height, rgb });
+      bmp.close();
+    } catch (e) { send({ type: 'log', text: 'image decode failed: ' + e.message }); }
+  }
+  return out;
 }
 
 async function generate(prompt, opts) {
   if (!ready || !pyodide) throw new Error('no runtime');
+  const imgs = await decodeImages((opts || {}).images);
   pyodide.globals.set('_prompt', prompt || '');
+  pyodide.globals.set('_imgs', imgs.map(i => ({ w: i.w, h: i.h, rgb: i.rgb })));
   pyodide.globals.set('_opts', JSON.stringify(opts || {}));
   // Streaming is the default here: each token is pushed to the page the moment it is
   // decoded, so the reply is readable while it is still being written. The SDK's
   // `stream=True` does the decode; this layer only ferries token -> message.
-  self.__chunk = (t) => send({ type: 'chunk', text: t });
+  self.__chunk = (ch, t) => send({ type: 'chunk', channel: ch, text: t });
   try {
     const out = await pyodide.runPythonAsync(`
 import json, js
@@ -94,10 +122,42 @@ _o = json.loads(_opts)
 _n = int(_o.get("max_new") or 0)          # 0 = no budget: run until the model stops itself
 _think = bool(_o.get("enable_thinking"))
 _msgs = _o.get("messages") or None        # full conversation; falls back to the one prompt
-_kw = dict(max_new=_n or None, stream=True, enable_thinking=_think)
-_gen = m.generate(messages=_msgs, **_kw) if _msgs else m.generate(_prompt, **_kw)
-for _t in _gen:
-    js.self.__chunk(_t)
+# Every generation option the SDK takes is forwarded by name, so adding a control to the
+# page needs no change here -- and an option the page does not set stays at the model's own
+# default rather than being overridden with a guess.
+_PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
+         "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop")
+_kw = dict(max_new=_n or None, stream=True, channels=True, enable_thinking=_think)
+for _k in _PASS:
+    _v = _o.get(_k)
+    if _v is not None and _v != "" and _v != []:
+        _kw[_k] = _v
+# Images go to the model as media. That path builds input embeddings, which the streaming
+# decode cannot take, so a reply with a picture is produced in one piece and delivered as a
+# single chunk -- the same message shape either way.
+_media = None
+_lst = _imgs.to_py() if hasattr(_imgs, "to_py") else (list(_imgs) if _imgs else [])
+if _lst:
+    import numpy as _np
+    _media = []
+    for _im in _lst:
+        _w = int(_im["w"]); _h = int(_im["h"])
+        _buf = _im["rgb"]
+        _buf = _buf.to_py() if hasattr(_buf, "to_py") else _buf
+        _media.append(_np.frombuffer(bytes(_buf), dtype=_np.uint8).reshape(_h, _w, 3))
+    _media = _media[0] if len(_media) == 1 else _media
+
+if _media is not None:
+    if not hasattr(m, "encoder") and not hasattr(getattr(m, "impl", m), "encoder"):
+        raise RuntimeError("this model cannot see images — load a vision model to send one")
+    _kw.pop("stream", None); _kw.pop("channels", None)
+    _r = m.generate(_prompt, media=_media, **_kw)
+    _txt = _r.text if hasattr(_r, "text") else str(_r)
+    js.self.__chunk("content", _txt)
+else:
+    _gen = m.generate(messages=_msgs, **_kw) if _msgs else m.generate(_prompt, **_kw)
+    for _c in _gen:
+        js.self.__chunk(_c["channel"], _c["text"])
 _s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
 json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
             "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s")})
@@ -204,12 +264,20 @@ if _MODEL["m"] is not None:
   send({ type: 'status', text: 'model released' });
 }
 
+// Sets the SDK's one-shot stop flag; the load in flight raises at its next IO checkpoint
+// and its own error path reports the cancellation. Nothing to stop before boot finishes.
+async function stopLoad() {
+  if (!ready) return;
+  await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
+}
+
 onmessage = async (e) => {
   const { id, cmd, args } = e.data;
   try {
     let res = null;
     if (cmd === 'boot') await boot();
     else if (cmd === 'load') await loadModel(args.repo, args.file, args.lmax);
+    else if (cmd === 'stopLoad') await stopLoad();
     else if (cmd === 'generate') res = await generate(args.prompt, args);
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'cacheList') res = await cacheList();
@@ -222,7 +290,15 @@ onmessage = async (e) => {
     else if (cmd === 'release') await releaseModel();
     send({ type: 'result', id, res });
   } catch (err) {
-    send({ type: 'result', id, error: (err && err.message) || String(err) });
-    send({ type: 'status', text: 'error: ' + ((err && err.message) || err) });
+    const msg = (err && err.message) || String(err);
+    send({ type: 'result', id, error: msg });
+    // A stop the person asked for is a normal ending, not an error: the page's own handler
+    // already says "load stopped", so do not overwrite it with an error line. Any other
+    // failure shows the LAST line of a Python traceback (the actual error), not the whole
+    // stack — the full trace still rides on the result above for the page to surface.
+    if (!/load cancelled/.test(msg)) {
+      const last = msg.split('\n').filter(l => l.trim()).pop() || msg;
+      send({ type: 'status', text: 'error: ' + last });
+    }
   }
 };

@@ -206,6 +206,56 @@ async def write_json(dst, name, obj, io=None):
 _IO = None        # read  callback — None until the integrator installs one
 _IOW = None       # write callback — None until the integrator installs one
 
+# Cooperative cancellation: Python here cannot be preempted from outside, so an in-flight
+# load checks this flag at every IO checkpoint (io_read/io_write, and every served chunk)
+# and raises once someone asked it to stop. The flag is STICKY on purpose: once set it stays
+# set, and neither a checkpoint nor the transport's abort-conversion clears it. That is what
+# makes a stop reliable — a stop also aborts background read-ahead fetches, and if whichever
+# of them died first could clear the flag, a background task could swallow a stop meant for
+# the load and the load would run on. So the flag stays up and keeps raising until the load's
+# OWN error path runs and the next load clears it on the way in (cancel(False)). Between a
+# stop and the next load, no read/write callback fires at all — which is exactly "stopped".
+# `n` counts stop requests: the built-in transport stamps each fetch with the current count,
+# so a fetch in flight when a stop fires reports Cancelled by generation, independent of
+# the flag. `_INFLIGHT` holds those fetches' abort controllers, which is how a stop
+# interrupts them at once instead of waiting for each to finish on its own.
+_CANCEL = {"on": False, "n": 0}
+_INFLIGHT = {}             # fetch id -> (controller, stop-count): the id is the key because
+                           # the controller is a JS proxy — unhashable, and equality there is
+                           # not ours to rely on
+_next_fetch_id = 0
+
+
+class Cancelled(BaseException):
+    """Raised from inside a load/read after webtorch.cancel() asked it to stop.
+
+    Derives from BaseException the same way asyncio.CancelledError does: loaders are full
+    of broad `except Exception` fallbacks (optional files, retry loops, rate-limit gates),
+    and none of them may swallow a stop — it must always reach the load's own error path."""
+
+
+def cancel(flag=True):
+    """Ask the in-flight load/read to stop. `cancel(False)` withdraws the request.
+
+    The stop lands at the next IO checkpoint (io_read/io_write, or the next served chunk),
+    where it raises `Cancelled`; after that the SDK issues no more read/write callbacks. For
+    the built-in HTTP transport a stop also aborts every fetch in flight right away, so it
+    does not wait for a slow request to finish on its own — aborting a fetch someone's OWN
+    read callback issued is that callback's business, not the SDK's. The flag is sticky: it
+    stays set — keeping any stray IO from running — until `cancel(False)` clears it, which
+    every load does on the way in."""
+    _CANCEL["on"] = bool(flag)
+    if flag:
+        _CANCEL["n"] += 1
+        for _fid, (ctl, _gen) in list(_INFLIGHT.items()):
+            try: ctl.abort()
+            except Exception: pass
+
+
+def _check_cancel():
+    if _CANCEL["on"]:
+        raise Cancelled("load cancelled")
+
 _UNSET_READ = ("webtorch IO is not configured: install a global read callback with "
                "webtorch.set_io_read(async def read(name, offset=0, length=None) -> bytes), "
                "or call webtorch.use_default_io() for the built-in browser-fetch / host-open reader.")
@@ -230,6 +280,7 @@ def get_io_read():
 async def io_read(name, offset=0, length=None, io=None):
     """The one entry point the whole SDK uses to read bytes — routes to the global read
     callback (or a per-call `io` override). Raises RuntimeError if none is configured."""
+    _check_cancel()
     fn = io or _IO
     if fn is None:
         raise RuntimeError(_UNSET_READ)
@@ -252,6 +303,7 @@ def get_io_write():
 async def io_write(name, data, offset=0, io=None):
     """The one entry point the whole SDK uses to write bytes — routes to the global write
     callback (or a per-call `io` override). Raises RuntimeError if none is configured."""
+    _check_cancel()
     fn = io or _IOW
     if fn is None:
         raise RuntimeError(_UNSET_WRITE)
@@ -281,16 +333,55 @@ def _is_rate_limited(status, body):
     return any(w in t for w in _RATE_WORDS)
 
 
+async def _pyfetch(url, **kw):
+    """pyfetch wired to webtorch.cancel(): the request registers its AbortController, so a
+    stop interrupts it at once instead of letting it run to completion. An interrupt is
+    reported as Cancelled — decided by the stop counter, not the flag, so it stays right
+    whichever of several aborted fetches surfaces first. It does NOT clear the stop flag:
+    only the load's own checkpoint (or the next load, clearing it on the way in) accounts
+    for the stop — a background fetch dying here must not swallow a stop meant for the load.
+    Lives here (not in one caller) so EVERY fetch the SDK issues — data reads and size
+    probes alike — stops the same way."""
+    from pyodide.http import pyfetch
+    import js
+    global _next_fetch_id
+    ctl = js.AbortController.new()
+    _next_fetch_id += 1
+    fid = _next_fetch_id
+    gen = _CANCEL["n"]
+    _INFLIGHT[fid] = (ctl, gen)
+    try:
+        return await pyfetch(url, signal=ctl.signal, **kw)
+    except Exception:
+        if _CANCEL["n"] != gen:
+            raise Cancelled("load cancelled") from None
+        raise
+    finally:
+        _INFLIGHT.pop(fid, None)
+
+
 async def _fetch_once(url, rng, headers):
+    _check_cancel()      # a retry loop's next attempt is a checkpoint too, not just the first
     try:
         from pyodide.http import pyfetch                     # browser (Pyodide)
     except ImportError:
         pyfetch = None
     if pyfetch is not None:
+        gen = _CANCEL["n"]
         h = dict(headers or {})
         if rng: h["Range"] = rng
-        r = await pyfetch(url, headers=h)
-        data = bytes(await r.bytes())
+        try:
+            r = await _pyfetch(url, headers=h)
+            data = bytes(await r.bytes())
+        except Exception:
+            # Aborted because a stop fired while it ran -> the stop, not a transport fault.
+            # Decided by the stop counter (not the flag), so it stays right whichever of
+            # several aborted fetches surfaces first. The flag is deliberately left set: a
+            # load's own checkpoint accounts for the stop (or the next load clears it on the
+            # way in), so a fetch dying here can never swallow a stop meant for the load.
+            if _CANCEL["n"] != gen:
+                raise Cancelled("load cancelled") from None
+            raise
         status = int(getattr(r, "status", 200) or 200)
         if status not in (200, 206):                        # pyfetch does not raise on 4xx/5xx
             raise HttpError(status, data[:2048].decode("utf-8", "replace"))
@@ -486,13 +577,13 @@ async def _remote_size(url, headers):
         pyfetch = None
     if pyfetch is not None:
         try:
-            r = await pyfetch(url, method="HEAD", headers=dict(headers or {}))
+            r = await _pyfetch(url, method="HEAD", headers=dict(headers or {}))
             cl = r.headers.get("content-length") or r.headers.get("Content-Length")
             if cl and str(cl).isdigit(): return int(cl)
         except Exception: pass
         try:
             h = dict(headers or {}); h["Range"] = "bytes=0-0"
-            r = await pyfetch(url, headers=h)
+            r = await _pyfetch(url, headers=h)
             cr = r.headers.get("content-range") or r.headers.get("Content-Range")
             if cr and "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
                 return int(cr.rsplit("/", 1)[-1])
@@ -926,6 +1017,7 @@ def _prog_state(key):
 
 
 def _report(key, done, total):
+    _check_cancel()      # every served chunk is a stop checkpoint, progress hook or not
     cb = _progress["cb"]
     if cb is None:
         return
@@ -1339,6 +1431,12 @@ class _AdaptiveLimiter:
             await self._acquire()
             try:
                 r = await attempt()
+            except Cancelled:
+                c = self._c()
+                async with c:
+                    self.inflight -= 1               # a stop is not a transport fault: free
+                    c.notify_all()                   # the slot and let it through, never retried
+                raise
             except Exception as e:
                 action = await self._on_error(e)
                 if action == "raise":
@@ -1503,14 +1601,20 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
     """
     import asyncio
     chunk = chunk_mb << 20
-    started = set()
-    tasks = []
+    bg = {}                       # key -> fill task; a dead one restarts on the next touch
+                                  # (a stop kills it mid-file; the next load resumes where
+                                  # the cache says the covered spans end)
 
     async def fill(k):
+        gen = _CANCEL["n"]            # a stop fired after this read-ahead started ends it,
+                                      # even if its own fetch escaped the abort (it may have
+                                      # been queued, not in flight, when the stop landed)
         try:
             total = await size(k) if size is not None else None
             off = 0
             while total is None or off < total:
+                if _CANCEL["n"] != gen:
+                    return
                 # Skip what is already there, then read and keep the next span. Everything
                 # goes through write_cache, which is what records the bytes as present --
                 # writing chunks behind its back leaves them invisible to every reader.
@@ -1533,7 +1637,7 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
                                       total=total if total is not None
                                       else (off + len(b) if len(b) < n else None),
                                       chunk_mb=chunk_mb)
-                except Exception as e:
+                except (Exception, Cancelled) as e:
                     # Hand it to whoever is waiting on this chunk, then stop reading ahead.
                     _clear_inflight(k, off // chunk, fut, e)
                     raise
@@ -1542,13 +1646,13 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
                 if len(b) < n:
                     break                                # short read == end of file
                 del b
-        except Exception:
+        except (Exception, Cancelled):
             pass                                     # read-ahead is an optimisation, never a failure
 
     async def ahead(k, offset, length):
-        if k not in started:
-            started.add(k)
-            tasks.append(asyncio.ensure_future(fill(k)))
+        t = bg.get(k)
+        if t is None or t.done():
+            bg[k] = asyncio.ensure_future(fill(k))
         return await fetch(k, offset, length)
 
     return ahead

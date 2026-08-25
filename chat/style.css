@@ -87,6 +87,30 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .field .inline{display:flex;gap:6px}
 .field .inline input{flex:1}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px 12px;margin-top:4px}
+@media (max-width:560px){.grid3{grid-template-columns:repeat(2,1fr)}
+                         .grid2{grid-template-columns:1fr}}
+
+/* One card per decision, so a panel reads as a few choices instead of a wall. Explanations
+   sit at the end of a card in a quieter voice -- present for whoever wants them, skippable
+   by everyone else. */
+.grp{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:0 0 12px}
+.grp:last-child{margin-bottom:0}
+.grp>h3,.grp>summary{margin:0 0 8px;font-size:12px;text-transform:uppercase;
+                     letter-spacing:.06em;color:var(--mut);font-weight:700}
+.grp>summary{cursor:pointer;user-select:none;list-style:none;display:flex;
+             align-items:center;gap:8px;margin-bottom:0}
+.grp[open]>summary{margin-bottom:10px}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary::before{content:"▸";font-size:10px;color:var(--mut);transition:transform .15s}
+.grp[open]>summary::before{transform:rotate(90deg)}
+.grp>summary:hover{color:var(--fg)}
+/* the small print that qualifies a heading or a field, inline and unshouted */
+.grp em,.field em{font-style:normal;text-transform:none;letter-spacing:0;
+                  font-weight:400;opacity:.7}
+.note{color:var(--mut);font-size:12px;line-height:1.5;margin:8px 0 0}
+.grp .field:first-of-type,.grp .grid2,.grp .grid3{margin-top:0}
+.grp>input{width:100%}
 .btns{display:flex;gap:8px;flex-wrap:wrap}
 .btns button{margin-top:10px}
 button.ghost{border:none;background:none;color:var(--accent);padding:7px 6px}

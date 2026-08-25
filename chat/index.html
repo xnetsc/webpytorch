@@ -47,54 +47,98 @@
   </nav>
 
   <section class="tab-panel" id="tab-model">
-    <div id="envInfo" class="hint">detecting environment…</div>
-    <div class="row"><select id="preset"></select></div>
-    <div id="customBox" hidden>
-      <input id="modelId" placeholder="org/repo/file.gguf  — or org/repo for a HF-format dir" />
+    <div class="grp">
+      <h3>Which model</h3>
+      <div class="row"><select id="preset"></select></div>
+      <div id="customBox" hidden>
+        <input id="modelId" placeholder="org/repo/file.gguf — or org/repo for a HF-format dir" />
+      </div>
+      <p class="note">“custom” loads any other ModelScope model. “on this device” reads a
+        file or folder from disk — nothing is copied or cached.</p>
+      <div class="row btns">
+        <button id="loadBtn" class="primary">Load model</button>
+        <button id="releaseBtn">Release</button>
+      </div>
+      <div id="modelStatus" class="status">no model loaded</div>
+      <div class="bar"><div id="bar" class="fill"></div></div>
+      <div id="progressText" class="note"></div>
     </div>
-    <p class="hint">Pick “custom” to load any other ModelScope model, or one of the
-      “on this device” entries to load a model file/folder straight from disk — nothing is
-      copied or cached.</p>
 
-    <div class="grid2">
-      <label class="field"><span>GPU memory (GB)</span>
-        <span class="inline"><input id="gpuMem" type="number" min="1" step="1" placeholder="auto">
-        <button id="gpuMemClear" class="ghost">auto</button></span>
-      </label>
-      <label class="field"><span>Context length (tokens)</span>
-        <input id="lmax" type="number" min="512" max="131072" step="512" placeholder="auto" />
-      </label>
+    <div class="grp">
+      <h3>Limits <em>applied the next time a model loads</em></h3>
+      <div class="grid2">
+        <label class="field"><span>GPU memory <em>GB</em></span>
+          <span class="inline"><input id="gpuMem" type="number" min="1" step="1" placeholder="auto">
+          <button id="gpuMemClear" class="ghost">auto</button></span>
+        </label>
+        <label class="field"><span>Context length <em>tokens</em></span>
+          <input id="lmax" type="number" min="512" max="1048576" step="512" placeholder="auto" />
+        </label>
+      </div>
+      <p class="note">Context is conversation plus reply held at once. Every token of it is
+        scanned on every step, so a larger context is a slower reply — left empty it picks a
+        size that stays responsive. GPU memory is guessed from system RAM: right for unified
+        memory, too high for a discrete card — set it to your VRAM if you have one.</p>
     </div>
-    <p class="hint">GPU memory is estimated from system RAM — right for unified memory
-      (Apple silicon, phones, integrated GPUs), too high for a discrete GPU whose VRAM is
-      smaller. Set it to your card’s VRAM if you have one.
-      Context length is everything the model holds at once, conversation plus reply.
-      Left empty it follows the size the model itself declares, trimmed if its KV cache
-      would not fit; applies the next time a model loads.</p>
 
-    <div class="row btns">
-      <button id="loadBtn" class="primary">Load model</button>
-      <button id="releaseBtn">Release</button>
-    </div>
-    <div id="modelStatus" class="status">no model loaded</div>
-    <div class="bar"><div id="bar" class="fill"></div></div>
-    <div id="progressText" class="hint"></div>
+    <details class="grp"><summary>Environment</summary>
+      <div id="envInfo" class="note">detecting environment…</div>
+    </details>
   </section>
 
   <section class="tab-panel" id="tab-gen" hidden>
-    <label class="field"><span>Max reply length (tokens)</span>
-      <input id="maxNew" type="number" min="64" max="16384" step="64" placeholder="auto" />
-    </label>
-    <p class="hint">Left empty, a reply may run as long as the model allows — up to the
-      rest of the context length; the model still stops itself when it is done. A number
-      sets a hard stop instead. A model told to think spends part of any budget on the
-      thinking, so a low limit can end the answer before it starts; a reply cut short by
-      the limit says so.</p>
-    <label class="check"><input type="checkbox" id="thinking" />
-      <span>Let the model write out its thinking before answering</span></label>
-    <p class="hint">Off by default: the model answers directly. On: the reasoning is
-      written first and shown folded away — slower, and it shares the reply budget above.
-      Only models whose chat template knows the option do anything with it.</p>
+    <div class="grp">
+      <h3>Length</h3>
+      <div class="grid2">
+        <label class="field"><span>Max reply <em>tokens</em></span>
+          <input id="maxNew" type="number" min="1" step="64" placeholder="as long as it needs" />
+        </label>
+        <label class="field"><span>Min reply <em>tokens</em></span>
+          <input id="minNew" type="number" min="0" step="16" placeholder="0" />
+        </label>
+      </div>
+      <p class="note">The model stops itself when done; a maximum is a hard cut, and a reply
+        cut short by it says so. Reasoning spends the same budget.</p>
+    </div>
+
+    <div class="grp">
+      <h3>Reasoning</h3>
+      <label class="check"><input type="checkbox" id="thinking" />
+        <span>Write out reasoning before answering</span></label>
+      <p class="note">Shown in its own folded box, never mixed into the answer, and not sent
+        back as context. Only models whose chat template offers the option react to it.</p>
+    </div>
+
+    <div class="grp">
+      <h3>Stop sequences</h3>
+      <input id="stopSeq" placeholder="none — comma-separated, e.g.  \n\n, ###" />
+      <p class="note">Ends the reply at any of these, on top of the model’s own end token.</p>
+    </div>
+
+    <details class="grp" id="advGrp"><summary>Sampling <em>empty = the model’s own value</em></summary>
+      <div class="grid3">
+        <label class="field"><span>temperature</span>
+          <input id="temperature" type="number" min="0" max="5" step="0.05" placeholder="auto" /></label>
+        <label class="field"><span>top_p</span>
+          <input id="topP" type="number" min="0" max="1" step="0.01" placeholder="auto" /></label>
+        <label class="field"><span>top_k</span>
+          <input id="topK" type="number" min="0" step="1" placeholder="auto" /></label>
+        <label class="field"><span>min_p</span>
+          <input id="minP" type="number" min="0" max="1" step="0.01" placeholder="auto" /></label>
+        <label class="field"><span>repetition_penalty</span>
+          <input id="repPen" type="number" min="0.5" max="2" step="0.01" placeholder="auto" /></label>
+        <label class="field"><span>presence_penalty</span>
+          <input id="presPen" type="number" min="-2" max="2" step="0.05" placeholder="0" /></label>
+        <label class="field"><span>frequency_penalty</span>
+          <input id="freqPen" type="number" min="-2" max="2" step="0.05" placeholder="0" /></label>
+        <label class="field"><span>seed</span>
+          <input id="seed" type="number" step="1" placeholder="random" /></label>
+      </div>
+      <p class="note">Temperature 0 is greedy — same prompt, same reply. A seed makes
+        sampling repeatable. repetition_penalty divides a repeated token’s score;
+        presence/frequency subtract from it (flat, and per occurrence).</p>
+      <div class="row btns"><button id="genReset" class="ghost">Reset all to model defaults</button></div>
+    </details>
   </section>
 
   <section class="tab-panel" id="tab-store" hidden>

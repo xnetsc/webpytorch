@@ -1,6 +1,29 @@
 /* Chat UI: model selection (any ModelScope model), load/release with status, cache
    management, camera/file/URL tools, and zip export/import of the conversation. */
 const $ = (s) => document.querySelector(s);
+
+// Opened as a file rather than served. Nothing here can work: a file:// page cannot fetch
+// its own modules, cannot start a worker on some browsers, and can never be cross-origin
+// isolated, so there is no SharedArrayBuffer and no GPU backend. Say that once, plainly,
+// with the command that fixes it -- the alternative is a page that looks alive and fails at
+// every step with opaque CORS errors.
+if (window.__coiFileMode) {
+  document.body.innerHTML =
+    '<div style="max-width:44rem;margin:12vh auto;padding:0 1.5rem;font:15px/1.6 system-ui,sans-serif">' +
+    '<h2 style="margin:0 0 .6rem">This page has to be served over HTTP</h2>' +
+    '<p style="margin:0 0 1rem;opacity:.8">Opening it straight from disk (<code>' +
+    location.protocol + '//</code>) leaves the browser unable to load the runtime, and ' +
+    'unable to grant the shared memory the GPU backend needs.</p>' +
+    '<p style="margin:0 0 .4rem">From the folder that contains <code>chat/</code>:</p>' +
+    '<pre style="background:#1113;padding:.8rem 1rem;border-radius:6px;overflow:auto">' +
+    'node webtorch/serve-coi.mjs webtorch 8119</pre>' +
+    '<p style="margin:.2rem 0 1rem;opacity:.8">then open <code>http://localhost:8119/chat/</code>. ' +
+    'That server sends the two headers the runtime needs. A plain static server works too — ' +
+    'the page falls back to a service worker that adds them.</p>' +
+    '</div>';
+  throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
+}
+
 const worker = new Worker('worker.js');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
@@ -156,7 +179,12 @@ worker.onmessage = (e) => {
     const conv = convs.find(c => c.id === streaming.convId);
     const reply = conv && conv.messages[streaming.idx];
     if (!reply) { streaming = null; return; }
-    reply.content += m.text;
+    // The SDK says which channel a piece belongs to. Reasoning is never appended to the
+    // answer, not even for one frame: a model whose template opens the <think> span emits
+    // only the closing tag, so anything guessing from the text alone shows the scratchpad
+    // as the reply until that tag finally arrives.
+    if (m.channel === 'thinking') reply.think = (reply.think || '') + m.text;
+    else reply.content += m.text;
     const live = streaming.live;
     if (live) {
       stopDots(live);                                       // the wait is over
@@ -172,7 +200,7 @@ worker.onmessage = (e) => {
       }
     }
     if (live && live.ans.isConnected) {
-      fillBody(streaming.body, reply.content, streaming.live);
+      fillBody(streaming.body, reply, streaming.live);
       const el = $('#messages'); el.scrollTop = el.scrollHeight;
     }
   }
@@ -303,17 +331,34 @@ function fillPresets() {
     : best === DEFAULT ? ''
     : ' — the default needs more memory, so ' + best.label + ' is selected') + cacheNote;
 }
+// While a load is in flight the same button is the stop control — the only way out of a
+// multi-GB download — and everything reverts to the initial state once it stops.
+let loading = false;
 $('#loadBtn').onclick = async () => {
+  if (loading) { call('stopLoad'); return; }
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
   const id = $('#modelId').value.trim();
   if (!id) return alert('Enter a model as org/repo/file.gguf (or org/repo).');
   const repo = id, file = '';
-  $('#loadBtn').disabled = true; setBar(0); expected = 0;
+  loading = true;
+  $('#loadBtn').textContent = 'Stop loading';
+  $('#loadBtn').title = 'Stop this load — what is already loaded stays cached';
+  setBar(0); expected = 0;
   const chosen = PRESETS[$('#preset').value];
   if (chosen && chosen.gb) expected = chosen.gb * 1e9;
   try { await call('load', { repo, file, lmax: lmaxValue() }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
-  catch (e) { $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message); }
-  finally { syncButtons(); }
+  catch (e) {
+    // The SDK raises one distinctive message for a stop the person asked for; that is a
+    // normal ending, not a failure — say so, and put the meter back where it started.
+    if (/load cancelled/.test(e.message)) {
+      $('#modelStatus').textContent = 'load stopped';
+      note('Load stopped. What was already loaded stays cached, so the next load resumes.');
+      setBar(0); expected = 0; $('#progressText').textContent = '';
+    } else {
+      $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message);
+    }
+  }
+  finally { loading = false; $('#loadBtn').textContent = 'Load model'; syncButtons(); }
 };
 $('#releaseBtn').onclick = async () => {
   await call('release'); modelLoaded = false; modelImage = false; setBar(0);
@@ -475,9 +520,48 @@ async function localPick(which, onCancel) {
 const MAXNEW_KEY = 'webtorch.maxNew';
 const LMAX_KEY = 'webtorch.lmax';
 const THINK_KEY = 'webtorch.thinking';
-function maxNewValue() { const v = parseInt($('#maxNew').value, 10); return v > 0 ? Math.max(64, v) : 0; }
+function maxNewValue() { const v = parseInt($('#maxNew').value, 10); return v > 0 ? v : 0; }
 function lmaxValue() { const v = parseInt($('#lmax').value, 10); return v >= 512 ? v : 0; }
 function thinkingOn() { return !!$('#thinking').checked; }
+
+// Every sampling control is the same shape: an input that is either empty (the model's own
+// value wins) or a number the SDK takes under that exact name. Listing them once means the
+// page stores, restores, resets and sends them without a branch per parameter.
+const GEN_FIELDS = [
+  ['#minNew', 'min_new_tokens', 'int'],
+  ['#stopSeq', 'stop', 'list'],
+  ['#temperature', 'temperature', 'num'],
+  ['#topP', 'top_p', 'num'],
+  ['#topK', 'top_k', 'int'],
+  ['#minP', 'min_p', 'num'],
+  ['#repPen', 'repetition_penalty', 'num'],
+  ['#presPen', 'presence_penalty', 'num'],
+  ['#freqPen', 'frequency_penalty', 'num'],
+  ['#seed', 'seed', 'int'],
+];
+const genKey = sel => 'webtorch.gen' + sel.slice(1);
+
+// Stop sequences are typed, so the escapes people type have to mean what they look like.
+function parseStops(raw) {
+  return String(raw || '').split(',').map(s => s.trim()).filter(Boolean)
+    .map(s => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r'));
+}
+
+// The generation options for one call: only what was actually set, so an untouched control
+// never overrides what the model asks for.
+function genOpts() {
+  const o = { max_new: maxNewValue(), enable_thinking: thinkingOn() };
+  for (const [sel, name, kind] of GEN_FIELDS) {
+    const el = $(sel); if (!el) continue;
+    const raw = String(el.value || '').trim();
+    if (!raw) continue;
+    if (kind === 'list') { const v = parseStops(raw); if (v.length) o[name] = v; continue; }
+    const v = kind === 'int' ? parseInt(raw, 10) : parseFloat(raw);
+    if (Number.isFinite(v)) o[name] = v;
+  }
+  return o;
+}
+
 (() => {
   $('#maxNew').value = localStorage.getItem(MAXNEW_KEY) || '';
   $('#lmax').value = localStorage.getItem(LMAX_KEY) || '';
@@ -495,6 +579,23 @@ function thinkingOn() { return !!$('#thinking').checked; }
   };
   $('#thinking').onchange = () =>
     localStorage.setItem(THINK_KEY, $('#thinking').checked ? '1' : '0');
+  for (const [sel] of GEN_FIELDS) {
+    const el = $(sel); if (!el) continue;
+    el.value = localStorage.getItem(genKey(sel)) || '';
+    el.onchange = () => localStorage.setItem(genKey(sel), String(el.value || '').trim());
+  }
+  // Open the sampling card already expanded if anything in it is set, so a value that
+  // silently shapes every reply is never hidden behind a fold.
+  const adv = $('#advGrp');
+  if (adv && GEN_FIELDS.slice(2).some(([sel]) => ($(sel) || {}).value)) adv.open = true;
+  const reset = $('#genReset');
+  if (reset) reset.onclick = () => {
+    for (const [sel] of GEN_FIELDS) {
+      const el = $(sel); if (!el) continue;
+      el.value = ''; localStorage.removeItem(genKey(sel));
+    }
+    note('Generation options cleared — the model’s own values apply.');
+  };
 })();
 
 // Settings come in one page per concern instead of one long scroll; the open tab is
@@ -538,8 +639,26 @@ $('#fileInput').onchange = async (e) => {
     const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(f); });
     addAttachment({ kind: 'image', name: f.name, dataUrl });
   } else {
-    const text = await f.text();
-    addAttachment({ kind: 'file', name: f.name, text: text.slice(0, 20000) });
+    // Only text can be attached as text. Decoding a PDF or a zip with .text() yields
+    // mojibake that looks like content and reaches the model as if it were the document --
+    // worse than refusing, because nothing about the reply reveals it. Detect by decoding
+    // strictly and by looking for the NUL bytes no text file contains.
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let text = null;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      if (text.indexOf('\u0000') >= 0) text = null;
+    } catch (_) { text = null; }
+    if (text === null) {
+      note('“' + f.name + '” is not a text file — attach plain text (.txt, .md, .csv, code) '
+           + 'or paste the part you want the model to read.');
+      e.target.value = ''; return;
+    }
+    const clipped = text.length > 20000;
+    addAttachment({ kind: 'file', name: f.name, text: text.slice(0, 20000),
+                    clipped });
+    if (clipped) note('“' + f.name + '” is long — the model gets the first '
+                      + fmt(20000) + ' characters.');
   }
   e.target.value = '';
 };
@@ -560,8 +679,10 @@ $('#toolUrl').onclick = async () => {
     let text = (doc.body || doc.documentElement).textContent.replace(/\s+/g, ' ').trim();
     if (title) text = title + '\n\n' + text;
     if (!text) throw new Error('no readable text on that page');
-    addAttachment({ kind: 'url', name: url, text: text.slice(0, 20000) });
-    note('Added the page text (' + fmt(text.length) + ') — it goes to the model, not into the bubble.');
+    const clipped = text.length > 20000;
+    addAttachment({ kind: 'url', name: url, text: text.slice(0, 20000), clipped });
+    note('Added the page text (' + fmt(text.length) + (clipped ? ', first ' + fmt(20000)
+         + ' characters go to the model' : '') + ') — it goes to the model, not into the bubble.');
   } catch (e) { alert('Fetch failed (the site may block cross-origin requests): ' + e.message); }
 };
 $('#toolCam').onclick = async () => {
@@ -637,7 +758,7 @@ function messageNode(m, live) {
   if (m.role === 'user') {
     b.textContent = m.content;
   } else {
-    fillBody(b, m.content, live);
+    fillBody(b, m, live);
   }
   (m.attachments || []).forEach(a => {
     if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
@@ -657,6 +778,9 @@ function messageNode(m, live) {
 // away — present, expandable, but never mixed into the answer. Also recover replies saved
 // by older builds that kept only part of the template text (a dangling "</think>" with no
 // opener): everything before the closer WAS the thinking, so put the opener back.
+// Messages saved before the stream carried channel labels keep reasoning inline in
+// `content`. Parsing them back is fine — they are complete, so both tags are present or
+// neither is. Live replies never come through here.
 function splitThink(txt) {
   txt = typeof txt === 'string' ? txt : '';
   if (!txt.includes('<think>') && txt.includes('</think>')) txt = '<think>' + txt;
@@ -672,8 +796,15 @@ function splitThink(txt) {
 // detail/text nodes are updated in place, so a person who opened the thinking box while the
 // reply streams keeps it open — the DOM is never rebuilt under their cursor.
 // `live` shape: {det, sum, pre, ans, touched, collapsed}
-function fillBody(b, txt, live) {
-  const { think, rest, open } = splitThink(txt);
+function fillBody(b, msg, live) {
+  // `msg.think` is present once anything arrived on the thinking channel; `undefined` means
+  // a stored message that predates channels, which still needs its tags parsed.
+  const has = msg && msg.think !== undefined;
+  const { think, rest, open } = has
+    ? { think: msg.think === null ? null : msg.think,
+        rest: msg.content || '',
+        open: !(msg.content || '') }
+    : splitThink((msg && msg.content) || '');
   if (live && live.det) {                                            // in-place update
     if (think !== null && !live.det.parentNode) {
       b.prepend(live.det);                                           // thinking appeared mid-stream
@@ -720,7 +851,7 @@ function note(t) { $('#hintbar').textContent = t || ''; }
 function promptFor(m) {
   let p = '';
   (m.attachments || []).forEach(a => {
-    if (a.text) p += `[${a.kind}: ${a.name}]\n${a.text}\n\n`;
+    if (a.text) p += `[${a.kind}: ${a.name}${a.clipped ? ', truncated' : ''}]\n${a.text}\n\n`;
     else if (a.dataUrl) p += `[image attached: ${a.name}]\n`;
   });
   return p + m.content;
@@ -741,7 +872,9 @@ $('#composer').onsubmit = async (e) => {
   // it a chat. Assistant turns go back WITHOUT their thinking: the reasoning was this
   // model's scratch work for its last answer, not context for the next one.
   const msgs = conv.messages.slice(0, -1).map(m => ({
-    role: m.role, content: m.role === 'user' ? promptFor(m) : splitThink(m.content).rest,
+    role: m.role,
+    content: m.role === 'user' ? promptFor(m)
+           : (m.think !== undefined ? (m.content || '') : splitThink(m.content).rest),
   })).filter(m => m.content);
   msgs.push({ role: 'user', content: promptFor(msg) });
 
@@ -767,8 +900,13 @@ $('#composer').onsubmit = async (e) => {
   streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
 
   try {
-    const r = await call('generate', { messages: msgs, max_new: maxNewValue(),
-                                       enable_thinking: thinkingOn() });
+    // Images ride alongside the conversation: the worker turns each data URL into pixels
+    // and gives them to the model as media. Without this the model only ever saw the text
+    // note that a picture existed.
+    const imgs = (msg.attachments || []).filter(a => a.kind === 'image' && a.dataUrl)
+                                        .map(a => a.dataUrl);
+    const r = await call('generate', Object.assign(
+      { messages: msgs, images: imgs, prompt: promptFor(msg) }, genOpts()));
     if (r && r.truncated) {
       reply.content += '\n\n[stopped at ' + r.n + ' tokens — raise “Max reply length”'
                      + ' in ⚙ Settings, or leave it empty for no limit]';
