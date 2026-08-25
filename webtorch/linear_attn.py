@@ -320,9 +320,19 @@ class LinearAttention:
     def forward(self, x, state):
         """x: (T, H) ndarray -> (T, H). Sequential over T (the recurrence is inherently
         sequential); prefill and single-token decode use the same code."""
-        if getattr(x, "shape", (0,))[0] == 1 and self._gpu_step_ok():
+        T0 = int(getattr(x, "shape", (0,))[0] or 0)
+        if T0 >= 1 and self._gpu_step_ok():
             xt = x if isinstance(x, wt.Tensor) else wt.Tensor(np.asarray(x, np.float32))
-            return self._step_gpu(xt.reshape(1, -1), state)
+            if T0 == 1:
+                return self._step_gpu(xt.reshape(1, -1), state)
+            # A prompt runs the same device step once per position. The recurrence is
+            # sequential either way -- state t depends on state t-1 -- so nothing is lost by
+            # stepping, and the alternative was the host path below: it pulls the activations
+            # off the device and does the whole layer in numpy. On a 64-layer hybrid that was
+            # two thirds of prefill (measured: 324ms per layer, 15.5s of a 19.7s prefill).
+            H = int(xt.shape[-1])
+            outs = [self._step_gpu(xt[t:t + 1].reshape(1, H), state) for t in range(T0)]
+            return wt.cat(outs, axis=0)
         state = state.host()                       # host path owns the state from here
         x = np.asarray(x.numpy() if hasattr(x, "numpy") else x, np.float32)
         T = x.shape[0]

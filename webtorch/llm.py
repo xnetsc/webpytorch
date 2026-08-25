@@ -1721,8 +1721,13 @@ class CausalLM:
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
         c, s = self._rope_np(0, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
-        m = np.triu(np.full((T, LMAX), -1e9, np.float32), 1); m[:, T:] = -1e9
-        mask = wt.Tensor(m.reshape(1, T, LMAX))
+        # Attend over the T positions this prompt actually fills, not the whole cache. The
+        # cache is sized for the context, so scanning all of it costs LMAX/T times more for
+        # nothing -- a 28-token prompt in a 16k context is 585x the work, and it showed:
+        # attention was 15% of prefill. Slicing the live rows out costs NKV*T*HD floats
+        # (~114KB here), which is nothing next to what it saves.
+        m = np.triu(np.full((T, T), -1e9, np.float32), 1)
+        mask = wt.Tensor(m.reshape(1, T, T))
         h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
@@ -1735,7 +1740,9 @@ class CausalLM:
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
                 wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
                 wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
-                o = wt.gqa_attention(q, K, V, mask, scale=sc)
+                Kp = wt.Tensor(wt._contig(K.data[:, :T, :]))
+                Vp = wt.Tensor(wt._contig(V.data[:, :T, :]))
+                o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc)
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)

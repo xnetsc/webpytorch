@@ -191,14 +191,15 @@ def dequant(ttype, raw, n):
         d = _f16(b[:, 0:2]); dmin = _f16(b[:, 2:4])
         sc, m = _q4k_scales(b[:, 4:16])
         qs = b[:, 16:144]
-        out = np.empty((blk, 256), np.float32)
-        for g in range(4):                   # 4 groups of 32 bytes -> 8 sub-blocks
-            q = qs[:, g * 32:(g + 1) * 32]
-            i0 = 2 * g
-            d1 = d * sc[:, i0:i0 + 1]; m1 = dmin * m[:, i0:i0 + 1]
-            d2 = d * sc[:, i0 + 1:i0 + 2]; m2 = dmin * m[:, i0 + 1:i0 + 2]
-            out[:, i0 * 32:(i0 + 1) * 32] = d1 * (q & 0x0F).astype(np.float32) - m1
-            out[:, (i0 + 1) * 32:(i0 + 2) * 32] = d2 * (q >> 4).astype(np.float32) - m2
+        # All four groups at once: the low nibbles are the even sub-blocks and the high
+        # nibbles the odd ones, so the whole thing is two strided writes. Same reason as
+        # Q6_K -- a numpy call costs the same whatever its size, so the loop was the cost.
+        q = qs.reshape(blk, 4, 32)
+        ds = (d * sc).reshape(blk, 8, 1)
+        ms = (dmin * m).reshape(blk, 8, 1)
+        out = np.empty((blk, 8, 32), np.float32)
+        out[:, 0::2, :] = (q & 0x0F).astype(np.float32) * ds[:, 0::2] - ms[:, 0::2]
+        out[:, 1::2, :] = (q >> 4).astype(np.float32) * ds[:, 1::2] - ms[:, 1::2]
         return out.reshape(-1)[:n]
     if name == "Q6_K":                       # 256 vals / 210 bytes
         blk = n // 256

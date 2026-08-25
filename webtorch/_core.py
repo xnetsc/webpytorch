@@ -1396,7 +1396,7 @@ var<storage,read> gm: GMeta;
 var<storage,read> ctl: array<i32>;
 var<workgroup> sc: array<f32, 128>;
 var<workgroup> red: array<f32, 128>;
-var<workgroup> acc: array<f32, 128>;
+var<workgroup> acc: array<f32, 256>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -1410,7 +1410,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   if (gm.use_ctl == 1u) { n = u32(max(ctl[0], 0)) + 1u; }
   n = clamp(n, 1u, gm.lmax);
 
-  if (t < gm.hd) { acc[t] = 0.0; }
+  // One lane per head dimension where it fits, striding when hd exceeds the workgroup.
+  for (var d: u32 = t; d < gm.hd; d = d + 128u) { acc[d] = 0.0; }
   var m_run: f32 = -1e30;
   var l_run: f32 = 0.0;
   workgroupBarrier();
@@ -1460,19 +1461,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     workgroupBarrier();
 
     // rescale what is already accumulated, then add this block's weighted values
-    if (t < gm.hd) {
-      var o: f32 = acc[t] * corr;
-      let cnt = min(128u, n - base);
+    let cnt = min(128u, n - base);
+    for (var d: u32 = t; d < gm.hd; d = d + 128u) {
+      var o: f32 = acc[d] * corr;
       for (var pp: u32 = 0u; pp < cnt; pp = pp + 1u) {
-        o = o + sc[pp] * vc[ko + (base + pp) * gm.hd + t];
+        o = o + sc[pp] * vc[ko + (base + pp) * gm.hd + d];
       }
-      acc[t] = o;
+      acc[d] = o;
     }
     workgroupBarrier();
     base = base + 128u;
   }
 
-  if (t < gm.hd) { outp[qo + t] = acc[t] / l_run; }
+  for (var d: u32 = t; d < gm.hd; d = d + 128u) { outp[qo + d] = acc[d] / l_run; }
 }
 """
 _gqa_k = {"added": False}
@@ -1498,9 +1499,9 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     vd = vc.data if isinstance(vc, Tensor) else vc
     nh, T, hd = (int(v) for v in qd.shape)
     nkv, lmax, hd2 = (int(v) for v in kd.shape)
-    # hd > 128 would need more accumulator than one lane per dimension gives; the general
-    # path still covers it.
-    if T != 1 or hd != hd2 or hd > 128 or nh % nkv:
+    # `acc` is sized for hd <= 256, which covers every head dimension in use (128 and 256
+    # are the common ones); anything larger keeps the general path.
+    if T != 1 or hd != hd2 or hd > 256 or nh % nkv:
         return None
     n = lmax if valid is None else max(1, min(int(valid), lmax))
     plat = _adam_kernel["platform"]
@@ -3078,14 +3079,14 @@ OUT1
 }
 """
 
-_GGML_KS = 8                 # split-K rows per workgroup on the decode path
+_GGML_KS = 4                 # split-K rows per workgroup on the decode path
 # Output rows per workgroup on the decode path. WGX * _GGML_KS is the workgroup size, so
 # these trade against each other at a fixed 256 threads -- and the trade matters, because
 # the dispatch is N / WGX workgroups. At 64 a 1024-wide projection filled only 16 of them,
 # far too few to occupy the GPU, and the measured cost per matmul was almost independent of
 # how many bytes it read (gate, N=3072, ran FASTER than q, N=2048, despite being larger).
 # Halving the rows doubles the workgroups and splits K further to keep the threads busy.
-_GGML_WGX = 32
+_GGML_WGX = 64
 
 # The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
