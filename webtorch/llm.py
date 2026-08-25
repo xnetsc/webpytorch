@@ -1882,7 +1882,11 @@ class CausalLM:
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
-        return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
+        fin = self._rms(h, self.final_norm)
+        # Keep the last position's hidden state: a multi-token-prediction head drafts from it,
+        # and recomputing the trunk to get it back would defeat the point of drafting.
+        self._last_hidden = wt.Tensor(wt._contig(fin.data[-1:]))
+        return self._head_argmax(self._last_hidden)
 
     def stream(self, prompt=None, max_new=None, system="You are a helpful assistant.",
                messages=None, tools=None, ids=None, temperature=None, top_p=None,

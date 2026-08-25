@@ -3092,7 +3092,12 @@ PSUM1
         outp[nn] = tot;
       }
     }
+    // The second row keeps its own fixed psum half and its own bounds check. Moving the
+    // `n < gm.N` guard into the loop above left this write unguarded, and every lane past
+    // N wrote into the row after it -- which is most of them whenever N is small.
+    if (n < gm.N) {
 OUT1
+    }
   }
 }
 """
@@ -3810,7 +3815,8 @@ def _ggml_selfcheck(type_name, mode):
     if not (err < 1e-4):
         raise RuntimeError("native ggml %s kernel for %s is wrong (rel err %.3g) -- check "
                            "the console for a WGSL compile error"
-                           % ("gemv" if gemv else "gemm", type_name, err))
+                           % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode),
+                              type_name, err))
 
 
 def ggml_matmul(xf, packed, type_name, K, N):
