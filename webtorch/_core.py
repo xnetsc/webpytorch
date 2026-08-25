@@ -2981,6 +2981,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let n = gid.x;
   let lx = lid.x;
   let ly = lid.y;
+GEMMINIT
   mb = gid.z * 4u;
   mn = select(0u, min(4u, gm.M - mb), mb < gm.M);
   nrow = n;
@@ -3047,6 +3048,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let lx = lid.x;
   let ly = lid.y;
   xoff = ly * BLKVALS;
+HELPERINIT
   acc0 = 0.0;
 ACCINIT1
   for (var q: u32 = 0u; q < ORWu; q = q + 1u) { accs[q] = 0.0; }
@@ -3131,14 +3133,23 @@ _GGML_ORW = 1
 # The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
 _KV_FN = """
-fn kv(i: u32) -> f32 {
-  // Branchless: this is called once per decoded value, and an if-chain here showed up as
-  // the limit on IQ4_XS once its quants were being read a word at a time.
-  let lo = select(0xBFAD9881u, 0xF6EADDCFu, (i & 4u) != 0u);
-  let hi = select(0x26190D01u, 0x71594535u, (i & 4u) != 0u);
-  let p = select(lo, hi, (i & 8u) != 0u);
-  return f32(i32(((p >> (8u * (i & 3u))) & 255u) << 24u) >> 24u);
+// The IQ4 codebook, staged in workgroup memory once per workgroup and then read.
+//
+// Computing it per value -- three selects, a shift, a mask and a sign-extend, packed into
+// four u32s because a dynamically indexed `const` array is not uniformly implemented -- is
+// about ten instructions, and it runs once for every quant in the tensor. Sixteen floats of
+// workgroup memory turn that into one load. Streaming all 80 IQ4_XS tensors in a 27B:
+// 63.3 -> 86.0 GB/s, against 100 GB/s for reading the same bytes and decoding nothing.
+var<workgroup> kvtab: array<f32, 16>;
+fn kvfill(t: u32) {
+  if (t < 16u) {
+    let lo = select(0xBFAD9881u, 0xF6EADDCFu, (t & 4u) != 0u);
+    let hi = select(0x26190D01u, 0x71594535u, (t & 4u) != 0u);
+    let p = select(lo, hi, (t & 8u) != 0u);
+    kvtab[t] = f32(i32(((p >> (8u * (t & 3u))) & 255u) << 24u) >> 24u);
+  }
 }
+fn kv(i: u32) -> f32 { return kvtab[i]; }
 """
 
 # get_scale_min_k4: Q4_K and Q5_K pack eight 6-bit scales and eight 6-bit mins into 12 bytes.
@@ -3746,21 +3757,47 @@ def ggml_native_supported(type_name):
     return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
 
 
+# Below this many output rows, the decode kernel cannot fill the GPU: the dispatch is
+# N / WGX workgroups, so a 48-row projection gets exactly ONE, and the machine idles through
+# it. Such projections are small (a gate or a decay term is a few hundred KB), yet a 27B's
+# 48 beta and alpha projections took 14.8ms a step -- longer than the 1.28GB of fused QKV
+# beside them, at 1.4 GB/s. Narrow shapes get the parallelism moved off the row axis and onto
+# K instead: same threads, more workgroups, each doing less of the reduction.
+_SMALL_N = 512
+
+
+def _small_cfg(vals):
+    """(WGX, KS) for a narrow output. `xs` holds KS * vals floats of workgroup memory, so the
+    split is bounded by the block size of the quantization -- 32 values per block allows a
+    32-way split, 256 values allows 16."""
+    ks = max(_GGML_KS, min(32, 4096 // max(1, vals)))
+    return max(1, 256 // ks), ks
+
+
+def _gemv_cfg(N, vals):
+    """(WGX, KS) to use for this output width."""
+    return _small_cfg(vals) if int(N) <= _SMALL_N else (_GGML_WGX, _GGML_KS)
+
+
 def _orw_for(mode=1):
     """Output rows per lane for this path. Only the single-token decode kernel uses more
     than one; the two-row variant addresses psum with its own fixed layout."""
     return _GGML_ORW if (mode == 1 and _GGML_ORW > 1) else 1
 
 
-def _gemv_groups(N, mode=1):
-    """Workgroups needed to cover N output rows on the decode path."""
-    per = _GGML_WGX * _orw_for(mode)
+def _gemv_groups(N, mode=1, vals=None):
+    """Workgroups needed to cover N output rows on the decode path. `vals` (the block size of
+    the quantization) selects the narrow-output thread shape; pass None for the wide one."""
+    wgx = _small_cfg(vals)[0] if (vals is not None and mode == 1) else _GGML_WGX
+    per = wgx * _orw_for(mode)
     return (int(N) + per - 1) // per
 
 
-def _ggml_src(type_name, mode):
-    """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one."""
+def _ggml_src(type_name, mode, cfg=None):
+    """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one.
+    `cfg` overrides (WGX, KS) for a narrow output."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    _GGML_WGX_L, _GGML_KS_L = cfg if cfg else (_GGML_WGX, _GGML_KS)
     pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
                        else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
@@ -3770,7 +3807,7 @@ def _ggml_src(type_name, mode):
     # Multi-row accumulation is for the single-token decode path, which is the hot one. The
     # two-token variant addresses psum with its own fixed layout, so it stays at one row.
     orw = _orw_for(mode)
-    xrow = _GGML_KS * vals                      # where the second row's activations start
+    xrow = _GGML_KS_L * vals                      # where the second row's activations start
     subs = [("ACCDECL1", "var<private> acc1: f32;" if two else ""),
             ("ACCBODY1", "  acc1 = acc1 + xs[i + %du] * v;" % xrow if two else ""),
             ("ACC4BODY1", ("  acc1 = acc1 + dot(vec4<f32>(xs[i + %du], xs[i + %du], "
@@ -3780,26 +3817,36 @@ def _ggml_src(type_name, mode):
             ("XLOAD1", ("      var xv1: f32 = 0.0;\n"
                         "      if (b < nb) { xv1 = x[gm.K + b * BLKVALS + t]; }\n"
                         "      xs[%du + xoff + t] = xv1;" % xrow) if two else ""),
-            ("PSUM1", "  psum[%du + ly * WGXu + lx] = acc1;" % (_GGML_KS * _GGML_WGX)
+            ("PSUM1", "  psum[%du + ly * WGXu + lx] = acc1;" % (_GGML_KS_L * _GGML_WGX_L)
              if two else ""),
             ("OUT1", ("    var t1: f32 = 0.0;\n"
                       "    for (var i: u32 = 0u; i < KSu; i = i + 1u) "
                       "{ t1 = t1 + psum[%du + i * WGXu + lx]; }\n"
-                      "    outp[gm.N + n] = t1;" % (_GGML_KS * _GGML_WGX)) if two else ""),
-            ("KSxBLKxR", str(_GGML_KS * vals * rows)),
-            ("PSUMSZ", str(_GGML_KS * _GGML_WGX * rows * orw)),
-            ("KSxBLK", str(_GGML_KS * vals)), ("KSxWGX", str(_GGML_KS * _GGML_WGX)),
+                      "    outp[gm.N + n] = t1;" % (_GGML_KS_L * _GGML_WGX_L)) if two else ""),
+            ("KSxBLKxR", str(_GGML_KS_L * vals * rows)),
+            ("PSUMSZ", str(_GGML_KS_L * _GGML_WGX_L * rows * orw)),
+            ("KSxBLK", str(_GGML_KS_L * vals)), ("KSxWGX", str(_GGML_KS_L * _GGML_WGX_L)),
             ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
-            ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
+            ("KSu", "%uu" % _GGML_KS_L), ("MASKBLK", "%uu" % (vals - 1)),
             ("BLKVALS", "%uu" % vals),
-            ("WGXu", "%uu" % _GGML_WGX), ("WGX", str(_GGML_WGX)),
-            ("ORWu", "%uu" % orw), ("ORW", str(orw))]
+            ("WGXu", "%uu" % _GGML_WGX_L), ("WGX", str(_GGML_WGX_L)),
+            ("ORWu", "%uu" % orw), ("ORW", str(orw)),
+            # Helpers that stage a table in workgroup memory fill it here, before the first
+            # barrier of the block loop, so every lane sees it.
+            # Helpers that stage a table in workgroup memory fill it here, before the first
+            # barrier of the block loop, so every lane sees it. BOTH paths need it -- the
+            # batched kernel has its own entry point and its own workgroup shape, and leaving
+            # it out left the table zeroed there (the self-check caught exactly that).
+            ("HELPERINIT", ("  kvfill(lx + ly * %du);\n  workgroupBarrier();" % _GGML_WGX_L)
+             if "fn kvfill" in helpers else ""),
+            ("GEMMINIT", "  kvfill(lx + ly * 64u);\n  workgroupBarrier();"
+             if "fn kvfill" in helpers else "")]
     for k, v in subs:
         src = src.replace(k, v)
     return src
 
 
-def _ggml_selfcheck(type_name, mode):
+def _ggml_selfcheck(type_name, mode, small=False):
     """Multiply one random block and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -3825,15 +3872,15 @@ def _ggml_selfcheck(type_name, mode):
     x = rng.standard_normal((M, vals)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
     pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, blk)
-    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk,
-                                          type_name=type_name, K=vals, N=2))).reshape(M, 2)
+    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
+                                          K=vals, N=2, small=small))).reshape(M, 2)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
         raise RuntimeError("native ggml %s kernel for %s is wrong (rel err %.3g) -- check "
                            "the console for a WGSL compile error"
-                           % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode),
-                              type_name, err))
+                           % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode)
+                              + ("(narrow)" if small else ""), type_name, err))
 
 
 def ggml_matmul(xf, packed, type_name, K, N):
@@ -3845,11 +3892,12 @@ def ggml_matmul(xf, packed, type_name, K, N):
     # batch of two, and it only pays if the second row rides along with the first.
     m = int(xf.shape[0])
     mode = m if m <= 2 else 0
-    key = (type_name, mode)
+    small = mode == 1 and int(N) <= _SMALL_N
+    key = (type_name, mode, small)
     if key not in _ggml_k["added"]:
-        _ggml_add(type_name, mode)
+        _ggml_add(type_name, mode, small)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
-        _ggml_selfcheck(type_name, mode)
+        _ggml_selfcheck(type_name, mode, small)
     return _ggml_run(xf, packed, type_name, K, N)
 
 
@@ -3868,27 +3916,32 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, mode):
+def _ggml_add(type_name, mode, small=False):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
-    plat.addKernel(_ggml_name(type_name, mode),
-                   {"source": _ggml_src(type_name, mode), "bindingTypes": binds})
+    cfg = _small_cfg(_GGML_TYPES[type_name][2]) if small else None
+    plat.addKernel(_ggml_name(type_name, mode, small=small),
+                   {"source": _ggml_src(type_name, mode, cfg), "bindingTypes": binds})
 
 
-def _ggml_name(type_name, mode, orw=None):
-    # ORW is a compile-time constant in the shader, so a kernel is identified by it too --
-    # otherwise a second value would silently reuse the first one's pipeline.
+def _ggml_name(type_name, mode, orw=None, small=False):
+    # ORW and the thread shape are compile-time constants in the shader, so a kernel is
+    # identified by them too -- otherwise a second variant would silently reuse the first
+    # one's pipeline.
     o = _orw_for(mode) if orw is None else orw
-    return "ggml%s_%s%s" % (("v", "v2", "")[mode], type_name.lower(),
-                            "" if o <= 1 else "_r%d" % o)
+    return "ggml%s_%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
+                              "" if o <= 1 else "_r%d" % o, "_s" if small else "")
 
 
-def _ggml_run(xf, packed, type_name, K, N):
+def _ggml_run(xf, packed, type_name, K, N, small=None):
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
     M = int(xf.shape[0])
-    name = _ggml_name(type_name, M if M <= 2 else 0)
+    mode = M if M <= 2 else 0
+    if small is None:
+        small = mode == 1 and int(N) <= _SMALL_N
+    name = _ggml_name(type_name, mode, small=small)
     plat = _adam_kernel["platform"]
     of = _empty((M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk), "u4,u4,u4,u4")
@@ -3897,8 +3950,8 @@ def _ggml_run(xf, packed, type_name, K, N):
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": (_gemv_groups(N) if M <= 2
-                                         else (N + 63) // 64), "y": 1,
+                    "workGroups": {"x": ((_gemv_groups(N, mode, vals if small else None)
+                                          if M <= 2 else (N + 63) // 64)), "y": 1,
                                    "z": 1 if M <= 2 else (M + 3) // 4}})
     return of
 
@@ -4208,6 +4261,16 @@ def _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0, block
 #
 # so the (head, v) pass computes both contractions it needs from S_old, and the (head, k, v)
 # pass updates S independently. Neither has to wait for the other's result.
+# The recurrence's read pass: each (head, value-dim) pair reduces over the key dimension.
+#
+# One thread per pair leaves 6144 of them for a 48-head layer -- 96 workgroups, each thread
+# walking 128 state elements in series with a 512-byte stride. That is far too little
+# parallelism to hide the latency: it read 3MB in 0.61ms, about 5 GB/s on a machine that
+# streams at 100. Splitting the key loop across a few lanes and reducing at the end fixes it
+# without touching the arithmetic: 5.4x faster, and identical output (max rel err 1.4e-07).
+# Two lanes already saturate it; four leaves headroom for models with a larger key dim.
+_GDN_SPLIT = 4
+
 _GDN_STEP_WGSL = """@group(0) @binding(0)
 var<storage,read> S: array<f32>;
 @group(0) @binding(1)
@@ -4217,11 +4280,16 @@ var<storage,read_write> od: array<f32>;
 struct GD { hv: u32, dk: u32, dv: u32, rep: u32, }
 @group(0) @binding(3)
 var<storage,read> gd: GD;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+var<workgroup> rp: array<f32, SPSZ>;
+var<workgroup> rq: array<f32, SPSZ>;
+var<workgroup> rk: array<f32, SPSZ>;
+@compute @workgroup_size(64, SPN)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let lx = lid.x;
+  let ly = lid.y;
+  let i = wid.x * 64u + lx;
   let n = gd.hv * gd.dv;
-  if (i >= n) { return; }
   let h = i / gd.dv;
   let vi = i % gd.dv;
   // qkv packs q | k | v | decay | beta for this token. q and k are stored per KEY head and
@@ -4231,26 +4299,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let nq = hk * gd.dk;
   let qo = (h % hk) * gd.dk;
   let ko = nq + qo;
-  let vo = 2u * nq + h * gd.dv;
-  let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
-  let bta = qkv[2u * nq + gd.hv * gd.dv + gd.hv + h];
   let sbase = h * gd.dk * gd.dv + vi;
   var pred: f32 = 0.0;
   var qs: f32 = 0.0;
   var qk: f32 = 0.0;
-  for (var d: u32 = 0u; d < gd.dk; d = d + 1u) {
-    let sv = S[sbase + d * gd.dv];
-    let kd = qkv[ko + d];
-    let qd = qkv[qo + d];
-    pred = pred + kd * sv;
-    qs = qs + qd * sv;
-    qk = qk + qd * kd;
+  // No early return: the barrier below has to be reached by every lane.
+  if (i < n) {
+    for (var d: u32 = ly; d < gd.dk; d = d + SPu) {
+      let sv = S[sbase + d * gd.dv];
+      let kd = qkv[ko + d];
+      let qd = qkv[qo + d];
+      pred = pred + kd * sv;
+      qs = qs + qd * sv;
+      qk = qk + qd * kd;
+    }
   }
-  let delta = (qkv[vo + vi] - dcy * pred) * bta;
-  od[i] = dcy * qs + delta * qk;          // output, from the old state
-  od[n + i] = delta;                      // handed to the update pass
+  let sl = ly * 64u + lx;
+  rp[sl] = pred; rq[sl] = qs; rk[sl] = qk;
+  workgroupBarrier();
+  if (ly == 0u && i < n) {
+    var p: f32 = 0.0; var q: f32 = 0.0; var k: f32 = 0.0;
+    for (var t: u32 = 0u; t < SPu; t = t + 1u) {
+      p = p + rp[t * 64u + lx]; q = q + rq[t * 64u + lx]; k = k + rk[t * 64u + lx];
+    }
+    let dcy = qkv[2u * nq + gd.hv * gd.dv + h];
+    let bta = qkv[2u * nq + gd.hv * gd.dv + gd.hv + h];
+    let vo = 2u * nq + h * gd.dv;
+    let delta = (qkv[vo + vi] - dcy * p) * bta;
+    od[i] = dcy * q + delta * k;          // output, from the old state
+    od[n + i] = delta;                    // handed to the update pass
+  }
 }
-"""
+""".replace("SPSZ", str(64 * _GDN_SPLIT)).replace("SPu", "%du" % _GDN_SPLIT) \
+   .replace("SPN", str(_GDN_SPLIT))
 
 # S = S * decay + outer(k, delta), one thread per state element.
 _GDN_UPD_WGSL = """@group(0) @binding(0)
