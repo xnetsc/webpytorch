@@ -743,8 +743,19 @@ _GL_FETCH = ("float fetch(sampler2D t, int idx) { int tw = textureSize(t, 0).x; 
 
 
 def _contig(a):
-    # materialize a (possibly transposed/strided) array — WgPy reshape/matmul
-    # are unreliable on non-contiguous views; `* 1.0` forces a stride-aware kernel.
+    # Materialize a (possibly transposed/strided) array — WgPy reshape/matmul are unreliable
+    # on non-contiguous views, and the kernels here index the buffer linearly, so a view that
+    # does not start at offset 0 or does not fill its buffer would read the wrong elements.
+    # `* 1.0` forces a stride-aware kernel that produces one that does.
+    #
+    # An array already satisfying both is returned unchanged. Copying it is pure bandwidth,
+    # and the KV cache is bound this way once per attention layer per token: at a 4096-token
+    # context that copy alone moved ~940 MB per token — more than everything else in the step
+    # put together, and the reason a larger context slowed decode down even when the
+    # conversation was short.
+    f = getattr(a, "flags", None)
+    if f is not None and getattr(f, "c_contiguous_full", False):
+        return a
     return a * 1.0
 
 
@@ -1347,150 +1358,174 @@ def gqa_attention(q, k, v, mask=None, scale=None):
 # is a single workgroup per head: score against each cached key, soft-max in workgroup
 # memory, then accumulate the values. Sizes here are small (LMAX scores, HD lanes), so the
 # reduction cost is dominated by what it replaces.
+# Fused single-position attention, online-softmax (Flash-Attention style).
+#
+# Two things the general path cannot do, and both are why decode was slow:
+#
+#  * It attends over `valid` positions, not over the whole cache. A KV cache is one fixed
+#    buffer sized for the context, and a matmul against it costs the WHOLE buffer on every
+#    step no matter how little is filled -- so a model loaded with room for 32k tokens
+#    decodes at 32k speed while answering its first question. llama.cpp scans n_kv, and so
+#    does this. `valid` arrives in the meta buffer, which keeps ONE captured dispatch
+#    correct for every step: the shape never changes, only a number the shader reads.
+#  * Softmax runs blockwise with a running max and sum, so nothing is sized by the context
+#    length. The previous kernel held every score in workgroup memory, which capped it at
+#    1024 positions; here workgroup memory is 3 * 128 floats regardless.
+#
+# One workgroup per query head, 128 lanes. Per block of 128 positions: each lane scores one
+# position, the block is reduced for its max and sum, and the accumulator is rescaled by
+# exp(m_old - m_new) before the block is added -- the standard stable online update. `m_run`
+# and `l_run` are per-lane but every lane derives them from the same reduced values, so they
+# agree without needing to be shared.
 _GQA_DECODE_WGSL = """@group(0) @binding(0)
-var<storage,read> q: array<f32>;
-@group(0) @binding(1)
-var<storage,read> kc: array<f32>;
-@group(0) @binding(2)
-var<storage,read> vc: array<f32>;
-@group(0) @binding(3)
-var<storage,read> maskb: array<f32>;
-@group(0) @binding(4)
 var<storage,read_write> outp: array<f32>;
-struct GMeta { nh: u32, nkv: u32, hd: u32, lmax: u32, scale: f32, }
-@group(0) @binding(5)
+@group(0) @binding(1)
+var<storage,read> q: array<f32>;
+@group(0) @binding(2)
+var<storage,read> kc: array<f32>;
+@group(0) @binding(3)
+var<storage,read> vc: array<f32>;
+struct GMeta { nh: u32, nkv: u32, hd: u32, lmax: u32, valid: u32, use_ctl: u32, scale: f32, }
+@group(0) @binding(4)
 var<storage,read> gm: GMeta;
-var<workgroup> sc: array<f32, 1024>;
+// The step control block the decode loop already rewrites each token: ctl[0] is the position
+// just written. Reading the length from HERE rather than from GMeta is what lets one
+// captured dispatch serve every step -- a capture replays fixed commands, so a value baked
+// into a meta buffer at capture time would freeze the scan length at the first token's.
+@group(0) @binding(5)
+var<storage,read> ctl: array<i32>;
+var<workgroup> sc: array<f32, 128>;
 var<workgroup> red: array<f32, 128>;
+var<workgroup> acc: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-  // No early return: exactly nh workgroups are dispatched, and a conditional return ahead
-  // of a workgroupBarrier puts the barrier in control flow WGSL cannot prove uniform.
   let h = wid.x;
+  let t = lid.x;
   let rep = gm.nh / gm.nkv;
   let kv = h / rep;
-  let t = lid.x;
   let qo = h * gm.hd;
   let ko = kv * gm.lmax * gm.hd;
+  var n: u32 = gm.valid;
+  if (gm.use_ctl == 1u) { n = u32(max(ctl[0], 0)) + 1u; }
+  n = clamp(n, 1u, gm.lmax);
 
-  // scores, one lane per cached position
-  var s: u32 = t;
+  if (t < gm.hd) { acc[t] = 0.0; }
+  var m_run: f32 = -1e30;
+  var l_run: f32 = 0.0;
+  workgroupBarrier();
+
+  // Uniform loop bound: `n` comes from the meta buffer, so every lane runs the same number
+  // of iterations and the barriers inside stay uniform.
+  var base: u32 = 0u;
   loop {
-    if (s >= gm.lmax) { break; }
-    var d: f32 = 0.0;
-    let kb = ko + s * gm.hd;
-    for (var i: u32 = 0u; i < gm.hd; i = i + 1u) {
-      d = d + q[qo + i] * kc[kb + i];
+    if (base >= n) { break; }
+    let s = base + t;
+    var d: f32 = -1e30;
+    if (s < n) {
+      var dd: f32 = 0.0;
+      let kb = ko + s * gm.hd;
+      for (var i: u32 = 0u; i < gm.hd; i = i + 1u) {
+        dd = dd + q[qo + i] * kc[kb + i];
+      }
+      d = dd * gm.scale;
     }
-    sc[s] = d * gm.scale + maskb[s];
-    s = s + 128u;
-  }
-  workgroupBarrier();
-
-  // max
-  var m: f32 = -3.4028235e38;
-  s = t;
-  loop {
-    if (s >= gm.lmax) { break; }
-    m = max(m, sc[s]);
-    s = s + 128u;
-  }
-  red[t] = m;
-  workgroupBarrier();
-  var r: u32 = 64u;
-  loop {
-    if (r == 0u) { break; }
-    if (t < r) { red[t] = max(red[t], red[t + r]); }
+    red[t] = d;
     workgroupBarrier();
-    r = r / 2u;
-  }
-  let mx = red[0];
-  workgroupBarrier();
-
-  // exp and sum
-  var acc: f32 = 0.0;
-  s = t;
-  loop {
-    if (s >= gm.lmax) { break; }
-    let e = exp(sc[s] - mx);
-    sc[s] = e;
-    acc = acc + e;
-    s = s + 128u;
-  }
-  red[t] = acc;
-  workgroupBarrier();
-  r = 64u;
-  loop {
-    if (r == 0u) { break; }
-    if (t < r) { red[t] = red[t] + red[t + r]; }
-    workgroupBarrier();
-    r = r / 2u;
-  }
-  let inv = 1.0 / red[0];
-  workgroupBarrier();
-
-  // weighted sum of values, one lane per head dimension
-  var d2: u32 = t;
-  loop {
-    if (d2 >= gm.hd) { break; }
-    var o: f32 = 0.0;
-    for (var p: u32 = 0u; p < gm.lmax; p = p + 1u) {
-      o = o + sc[p] * vc[ko + p * gm.hd + d2];
+    var r: u32 = 64u;
+    loop {
+      if (r == 0u) { break; }
+      if (t < r) { red[t] = max(red[t], red[t + r]); }
+      workgroupBarrier();
+      r = r / 2u;
     }
-    outp[qo + d2] = o * inv;
-    d2 = d2 + 128u;
+    let m_new = max(m_run, red[0]);
+    workgroupBarrier();
+
+    var e: f32 = 0.0;
+    if (s < n) { e = exp(d - m_new); }
+    sc[t] = e;
+    red[t] = e;
+    workgroupBarrier();
+    r = 64u;
+    loop {
+      if (r == 0u) { break; }
+      if (t < r) { red[t] = red[t] + red[t + r]; }
+      workgroupBarrier();
+      r = r / 2u;
+    }
+    let corr = exp(m_run - m_new);
+    l_run = l_run * corr + red[0];
+    m_run = m_new;
+    workgroupBarrier();
+
+    // rescale what is already accumulated, then add this block's weighted values
+    if (t < gm.hd) {
+      var o: f32 = acc[t] * corr;
+      let cnt = min(128u, n - base);
+      for (var pp: u32 = 0u; pp < cnt; pp = pp + 1u) {
+        o = o + sc[pp] * vc[ko + (base + pp) * gm.hd + t];
+      }
+      acc[t] = o;
+    }
+    workgroupBarrier();
+    base = base + 128u;
   }
+
+  if (t < gm.hd) { outp[qo + t] = acc[t] / l_run; }
 }
 """
 _gqa_k = {"added": False}
-# OFF until the wrapper below is understood. What is established: the shader compiles and
-# runs -- dispatched by hand with the same bindings and a 1-D output it writes correct
-# sentinels -- and when it is enabled a decode step is 1.8x faster (measured 47.8 vs 26.0
-# tok/s on Qwen3-0.6B). But called through `gqa_decode` it leaves the output buffer
-# untouched, both inside and outside a capture, with no duplicate buffer ids and no
-# compilation error. Ruled out: binding order, held references, workgroup memory size, two
-# workgroup arrays, barrier uniformity, reused loop counters, 1-D vs 2-D output allocation.
-# The general path stays in use until that gap is closed; the speedup is real and worth
-# returning to.
-_GQA_FUSED = False     # A/B switch for the fused decode attention
+_GQA_FUSED = True      # A/B switch for the fused decode attention
 
 
-def gqa_decode(q, kc, vc, mask, scale):
+def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     """Single-position grouped-query attention in one dispatch.
 
-    `q` (nh, 1, hd); `kc`/`vc` (nkv, lmax, hd); `mask` broadcasts over the lmax positions
-    and carries -inf where nothing has been written. Returns None when the backend or the
-    shapes are outside what the kernel covers, so callers keep the general path.
+    `q` (nh, 1, hd); `kc`/`vc` (nkv, lmax, hd). `valid` is how many cache positions actually
+    hold a token -- the kernel reads no further, which is what keeps decode speed tied to the
+    conversation rather than to the context the model was loaded with. `mask` is accepted for
+    signature compatibility and unused: with `valid` there is nothing to mask, since every
+    position scanned is one that was written.
+
+    Returns None when the backend or the shapes fall outside what the kernel covers, so
+    callers keep the general path.
     """
     if not _adam_backend_ready():
         return None
     qd = q.data if isinstance(q, Tensor) else q
     kd = kc.data if isinstance(kc, Tensor) else kc
     vd = vc.data if isinstance(vc, Tensor) else vc
-    md = mask.data if isinstance(mask, Tensor) else mask
     nh, T, hd = (int(v) for v in qd.shape)
     nkv, lmax, hd2 = (int(v) for v in kd.shape)
-    if T != 1 or hd != hd2 or nh % nkv or lmax > 1024:
+    # hd > 128 would need more accumulator than one lane per dimension gives; the general
+    # path still covers it.
+    if T != 1 or hd != hd2 or hd > 128 or nh % nkv:
         return None
+    n = lmax if valid is None else max(1, min(int(valid), lmax))
     plat = _adam_kernel["platform"]
     if not _gqa_k["added"]:
         plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
-                                      "bindingTypes": ["read-only-storage"] * 4
-                                      + ["storage", "read-only-storage"]})
+                                      "bindingTypes": ["storage"]
+                                      + ["read-only-storage"] * 5})
         _gqa_k["added"] = True
     # Bind through named locals. Inlining `_contig(...)` into the list drops the only
     # reference to each temporary as soon as its id is read, so its GPU buffer can be
     # recycled for the next one -- two bindings then silently share a buffer.
-    qc = _contig(qd); kcc = _contig(kd); vcc = _contig(vd); mc = _contig(md)
+    qc = _contig(qd); kcc = _contig(kd); vcc = _contig(vd)
     # Allocate flat: the kernel indexes linearly, and a 2-D allocation is not guaranteed
     # to be an unpadded row-major buffer.
     of = _empty((nh * hd,))
-    meta = _adam_kernel["make_meta"]((nh, nkv, hd, lmax, float(scale)), "u4,u4,u4,u4,f4")
+    meta = _adam_kernel["make_meta"]((nh, nkv, hd, lmax, n,
+                                      1 if ctl is not None else 0, float(scale)),
+                                     "u4,u4,u4,u4,u4,u4,f4")
+    # binding 5 must always be bound; without a control buffer it points at the meta buffer
+    # and `use_ctl` tells the shader to ignore it.
+    cb = ctl.buffer if ctl is not None else meta
     plat.runKernel({"name": "gqa_decode",
-                    "tensors": [qc.buffer.buffer_id, kcc.buffer.buffer_id,
-                                vcc.buffer.buffer_id, mc.buffer.buffer_id,
-                                of.buffer.buffer_id, meta.buffer_id],
+                    "tensors": [of.buffer.buffer_id, qc.buffer.buffer_id,
+                                kcc.buffer.buffer_id, vcc.buffer.buffer_id,
+                                meta.buffer_id, cb.buffer_id],
                     "workGroups": {"x": nh, "y": 1, "z": 1}})
     return Tensor(of.reshape(nh, 1, hd))
 
@@ -2984,7 +3019,7 @@ _GGML_KSG = 2               # split-K rows on the batched path
 # memory once instead of being re-read from global memory 64 times.
 _GGML_GEMV_PRE = """
 var<workgroup> xs: array<f32, KSxBLKxR>;
-var<workgroup> psum: array<f32, KSx64xR>;
+var<workgroup> psum: array<f32, KSxWGXxR>;
 var<private> acc0: f32;
 ACCDECL1
 var<private> xoff: u32;
@@ -3001,7 +3036,7 @@ ACC4BODY1
 """
 
 _GGML_GEMV_MAIN = """
-@compute @workgroup_size(64, KSu)
+@compute @workgroup_size(WGX, KSu)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let n = gid.x;
@@ -3017,7 +3052,7 @@ ACCINIT1
   let steps = (nb + KSu - 1u) / KSu;
   for (var st: u32 = 0u; st < steps; st = st + 1u) {
     let b = st * KSu + ly;
-    for (var t: u32 = lx; t < BLKVALS; t = t + 64u) {
+    for (var t: u32 = lx; t < BLKVALS; t = t + WGXu) {
       var xv: f32 = 0.0;
       if (b < nb) { xv = x[b * BLKVALS + t]; }
       xs[xoff + t] = xv;
@@ -3031,19 +3066,26 @@ _GGML_GEMV_TAIL = """
     }
     workgroupBarrier();
   }
-  psum[ly * 64u + lx] = acc0;
+  psum[ly * WGXu + lx] = acc0;
 PSUM1
   workgroupBarrier();
   if (ly == 0u && n < gm.N) {
     var tot: f32 = 0.0;
-    for (var i: u32 = 0u; i < KSu; i = i + 1u) { tot = tot + psum[i * 64u + lx]; }
+    for (var i: u32 = 0u; i < KSu; i = i + 1u) { tot = tot + psum[i * WGXu + lx]; }
     outp[n] = tot;
 OUT1
   }
 }
 """
 
-_GGML_KS = 4                 # split-K rows per workgroup on the decode path
+_GGML_KS = 8                 # split-K rows per workgroup on the decode path
+# Output rows per workgroup on the decode path. WGX * _GGML_KS is the workgroup size, so
+# these trade against each other at a fixed 256 threads -- and the trade matters, because
+# the dispatch is N / WGX workgroups. At 64 a 1024-wide projection filled only 16 of them,
+# far too few to occupy the GPU, and the measured cost per matmul was almost independent of
+# how many bytes it read (gate, N=3072, ran FASTER than q, N=2048, despite being larger).
+# Halving the rows doubles the workgroups and splits K further to keep the threads busy.
+_GGML_WGX = 32
 
 # The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
@@ -3665,17 +3707,19 @@ def _ggml_src(type_name, mode):
             ("XLOAD1", ("      var xv1: f32 = 0.0;\n"
                         "      if (b < nb) { xv1 = x[gm.K + b * BLKVALS + t]; }\n"
                         "      xs[%du + xoff + t] = xv1;" % xrow) if two else ""),
-            ("PSUM1", "  psum[%du + ly * 64u + lx] = acc1;" % (_GGML_KS * 64) if two else ""),
+            ("PSUM1", "  psum[%du + ly * WGXu + lx] = acc1;" % (_GGML_KS * _GGML_WGX)
+             if two else ""),
             ("OUT1", ("    var t1: f32 = 0.0;\n"
                       "    for (var i: u32 = 0u; i < KSu; i = i + 1u) "
-                      "{ t1 = t1 + psum[%du + i * 64u + lx]; }\n"
-                      "    outp[gm.N + n] = t1;" % (_GGML_KS * 64)) if two else ""),
+                      "{ t1 = t1 + psum[%du + i * WGXu + lx]; }\n"
+                      "    outp[gm.N + n] = t1;" % (_GGML_KS * _GGML_WGX)) if two else ""),
             ("KSxBLKxR", str(_GGML_KS * vals * rows)),
-            ("KSx64xR", str(_GGML_KS * 64 * rows)),
-            ("KSxBLK", str(_GGML_KS * vals)), ("KSx64", str(_GGML_KS * 64)),
+            ("KSxWGXxR", str(_GGML_KS * _GGML_WGX * rows)),
+            ("KSxBLK", str(_GGML_KS * vals)), ("KSxWGX", str(_GGML_KS * _GGML_WGX)),
             ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
             ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
-            ("BLKVALS", "%uu" % vals)]
+            ("BLKVALS", "%uu" % vals),
+            ("WGXu", "%uu" % _GGML_WGX), ("WGX", str(_GGML_WGX))]
     for k, v in subs:
         src = src.replace(k, v)
     return src
@@ -3774,7 +3818,8 @@ def _ggml_run(xf, packed, type_name, K, N):
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": (N + 63) // 64, "y": 1,
+                    "workGroups": {"x": ((N + _GGML_WGX - 1) // _GGML_WGX if M <= 2
+                                         else (N + 63) // 64), "y": 1,
                                    "z": 1 if M <= 2 else (M + 3) // 4}})
     return of
 

@@ -270,6 +270,73 @@ class BPETokenizer:
 
 
 # ----------------------------- result --------------------------------------
+# Reasoning models emit their scratchpad inside a tagged span, and several of them OPEN that
+# span in the chat template rather than in the generated text -- Qwen3 ends its prompt with
+# "<think>\n", so the model itself only ever emits the CLOSING tag. Anything that pairs tags
+# by looking at the output alone therefore renders raw reasoning as if it were the answer,
+# right up until the closing tag finally arrives. Only the prompt settles which channel a
+# stream starts in, so resolve it here, once, and hand callers text that is already labelled.
+# Pairs are matched against the vocabulary and the rendered prompt, never assumed per model.
+_THINK_TAGS = (("<think>", "</think>"), ("<thinking>", "</thinking>"),
+               ("<reasoning>", "</reasoning>"), ("<reason>", "</reason>"),
+               ("<|thinking|>", "<|/thinking|>"), ("<|think|>", "<|/think|>"))
+
+
+class _Channels:
+    """Split a decoded token stream into 'thinking' and 'content'.
+
+    `opened` is the closing tag the prompt already committed us to, if the template opened a
+    reasoning span itself. Tags survive token boundaries: a tag can arrive split across any
+    number of chunks, so text that is still a possible prefix of one is held back rather than
+    emitted into the wrong channel."""
+
+    def __init__(self, opened=None):
+        self.close = opened
+        self.ch = "thinking" if opened else "content"
+        self.buf = ""
+
+    @staticmethod
+    def _prefix_len(s, tags):
+        """How many trailing chars of `s` could still grow into one of `tags`."""
+        for n in range(min(len(s), max(len(t) for t in tags) - 1), 0, -1):
+            tail = s[-n:]
+            if any(t.startswith(tail) for t in tags):
+                return n
+        return 0
+
+    def feed(self, text):
+        """Consume a chunk, return a list of (channel, text) with empty pieces dropped."""
+        self.buf += text
+        out = []
+        while True:
+            tags = [self.close] if self.close else [o for o, _ in _THINK_TAGS]
+            hit = min(((self.buf.find(t), t) for t in tags if self.buf.find(t) >= 0),
+                      default=None)
+            if hit is None:
+                break
+            i, tag = hit
+            if i:
+                out.append((self.ch, self.buf[:i]))
+            self.buf = self.buf[i + len(tag):]
+            if self.close:                       # closing a span: back to the answer
+                self.close = None; self.ch = "content"
+            else:                                # the model opened one itself
+                self.close = dict(_THINK_TAGS)[tag]; self.ch = "thinking"
+        keep = self._prefix_len(self.buf, [self.close] if self.close
+                                else [o for o, _ in _THINK_TAGS])
+        if len(self.buf) > keep:
+            out.append((self.ch, self.buf[:len(self.buf) - keep]))
+            self.buf = self.buf[len(self.buf) - keep:]
+        return [(c, t) for c, t in out if t]
+
+    def flush(self):
+        """Whatever is still held back when the stream ends -- a partial tag that never
+        completed is just text."""
+        out = [(self.ch, self.buf)] if self.buf else []
+        self.buf = ""
+        return out
+
+
 class GenResult:
     def __init__(self, text, tokens, ttft_s, decode_tok_s):
         self.text = text; self.tokens = tokens
@@ -614,8 +681,15 @@ class CausalLM:
     @classmethod
     async def from_gptq(cls, base, lmax=None):
         """Stream + build from a served AutoGPTQ int4 dir (e.g. '/models/qwen7b-gptq')."""
-        from . import webio
         self = cls(base)
+        try:
+            return await self._from_gptq(lmax)
+        except BaseException:
+            self._abort_build()      # a dead load must not strand half a model in GPU memory
+            raise
+
+    async def _from_gptq(self, lmax=None):
+        from . import webio
         self.lmax = lmax
         self._shard_hdr = {}
         cfg = await webio.read_json(self.base + "config.json")
@@ -723,7 +797,8 @@ class CausalLM:
         except Exception:
             return                                  # optional file
         keys = ("temperature", "top_p", "top_k", "do_sample", "repetition_penalty", "min_p",
-                "max_new_tokens", "max_length", "min_new_tokens")
+                "max_new_tokens", "max_length", "min_new_tokens", "presence_penalty",
+                "frequency_penalty", "stop")
         got = {k: gc[k] for k in keys if gc.get(k) is not None}
         if got:
             self.gen_defaults = dict(getattr(self, "gen_defaults", {}) or {}, **got)
@@ -874,8 +949,16 @@ class CausalLM:
         `ffn_*_exps`). So any Llama-style decoder GGUF (llama / qwen2 / qwen3 / mistral / …)
         loads without a per-model branch. A GGUF whose weights use a quantization type this
         SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error."""
+        self = cls(None)
+        try:
+            return await self._from_gguf(url, lmax, bits, quantize, weights)
+        except BaseException:
+            self._abort_build()      # a dead load must not strand half a model in GPU memory
+            raise
+
+    async def _from_gguf(self, url, lmax=None, bits=None, quantize=True, weights="native"):
         from . import ggufload as G
-        self = cls(None); self.lmax = lmax; self._gguf = url
+        self.lmax = lmax; self._gguf = url
         size = 12 << 20
         while True:
             buf = await self._grng(0, size - 1)
@@ -1224,8 +1307,16 @@ class CausalLM:
         model UNquantized by default (fp16 weights, fp32 compute); pass `quantize=4` or `8`
         to instead quantize every linear to int on load (same served fp16 model → int
         inference). Same engine (KV cache, capture/replay, generate) as the int loaders."""
+        self = cls(base)
+        try:
+            return await self._from_fp16(lmax, quantize)
+        except BaseException:
+            self._abort_build()      # a dead load must not strand half a model in GPU memory
+            raise
+
+    async def _from_fp16(self, lmax=None, quantize=None):
         from . import webio
-        self = cls(base); self.lmax = lmax; self._shard_hdr = {}
+        self.lmax = lmax; self._shard_hdr = {}
         self._qbits = int(quantize) if quantize else 0
         if self._qbits:
             self.bits = self._qbits                        # gs keeps the default 128
@@ -1325,6 +1416,18 @@ class CausalLM:
             v = lg[idx]
             lg = lg.copy()
             lg[idx] = np.where(v > 0, v / rp, v * rp)   # the usual asymmetric form
+        # OpenAI-style additive penalties, which are a different knob from the multiplicative
+        # repetition_penalty above and compose with it: presence is a flat charge for having
+        # appeared at all, frequency scales with the count.
+        pp = float(sp.get("presence_penalty", 0.0) or 0.0)
+        fp = float(sp.get("frequency_penalty", 0.0) or 0.0)
+        if (pp or fp) and self._seen:
+            ids = np.asarray(self._seen, np.int64)
+            ids = ids[(ids >= 0) & (ids < lg.size)]
+            if ids.size:
+                idx, cnt = np.unique(ids, return_counts=True)
+                lg = lg.copy()
+                lg[idx] -= pp + fp * cnt.astype(np.float32)
         mn = int(sp.get("min_new_tokens", 0) or 0)
         if mn and len(self._seen) - self._gen_start < mn and self.tok.eos_ids:
             eos = np.asarray(self.tok.eos_ids, np.int64)
@@ -1351,19 +1454,47 @@ class CausalLM:
             top_p=float(sp.get("top_p", 1.0) or 1.0),
             top_k=int(sp.get("top_k", 0) or 10 ** 9), rng=sp.get("rng")))
 
+    def _pieces(self):
+        """id -> text for the whole vocabulary, built once. Only the widened constraint search
+        needs it, and only for models that are actually asked to satisfy a constraint."""
+        if getattr(self, "_piece_tab", None) is None:
+            dec = self.tok.decode
+            self._piece_tab = [dec([i]) for i in range(len(self.tok.dec))]
+        return self._piece_tab
+
     def _pick_constrained(self, lg, con, sp):
         """Sample from just the candidates the constraint accepts.
 
-        Only the most likely handful are checked. Scoring a 250k-token vocabulary through a
-        constraint would cost more than the model step that produced the logits, and gains
-        nothing: what matters is which tokens are allowed, not the exact ordering of ones
-        the model was never going to pick. If none of them fit, fall back to the plain pick
-        rather than stalling -- a constraint the model cannot satisfy should not hang."""
-        k = min(int(sp.get("constraint_candidates", 64) or 64), int(lg.size) - 1)
-        order = np.argpartition(-lg, k)[:k]
-        order = order[np.argsort(-lg[order])]
-        allowed = [int(t) for t in order
-                   if con.allows(self._con_text, self.tok.decode([int(t)]))]
+        The likely handful is checked first: scoring a 250k-token vocabulary through a
+        constraint costs more than the model step that produced the logits, and usually buys
+        nothing, since what matters is which tokens are allowed rather than the exact
+        ordering of ones the model was never going to pick.
+
+        But the window WIDENS instead of giving up. The opening tokens of a constrained reply
+        are often ones the model ranks nowhere -- asked in prose for JSON it wants to answer
+        in prose, and `{` may sit far outside the top 64. Falling back to an unconstrained
+        pick there does not just lose one token: that token makes every later prefix invalid,
+        so no candidate is ever acceptable again and the constraint is silently dropped for
+        the whole reply. Widening to the full vocabulary is the difference between a
+        constraint that holds and one that only appears to. The plain pick remains the last
+        resort, for a constraint nothing at all can satisfy -- that must not hang."""
+        n = int(lg.size)
+        k0 = max(1, int(sp.get("constraint_candidates", 64) or 64))
+        allowed, order = [], None
+        for k in (min(k0, n), min(k0 * 16, n), n):
+            if k < n:
+                idx = np.argpartition(-lg, k - 1)[:k]
+                order = idx[np.argsort(-lg[idx])]
+                pieces = None
+            else:
+                order = np.argsort(-lg)
+                pieces = self._pieces()
+            allowed = [int(t) for t in order
+                       if con.allows(self._con_text,
+                                     pieces[int(t)] if pieces is not None and int(t) < len(pieces)
+                                     else self.tok.decode([int(t)]))]
+            if allowed:
+                break
         if not allowed:
             return int(lg.argmax())
         if not sp.get("do_sample"):
@@ -1378,15 +1509,25 @@ class CausalLM:
     # is trimmed to this; an explicit `lmax` always wins.
     _KV_BUDGET = 2 << 30
 
+    # Decode cost used to scale with the context because a step scanned the whole KV buffer
+    # and re-uploaded a full-length mask every token. Both are gone -- the fused attention
+    # reads the live length from the step control block, and the mask is only built for the
+    # general path -- so a step now costs the same at 512 as at 4096 (measured: 35.6 vs
+    # 35.0 ms). Context is therefore a memory question again, and only memory caps it.
+
     def _auto_lmax(self, requested, declared):
         """The context size to load with: an explicit request, else what the model declares,
         capped by the KV memory budget."""
-        if requested:
-            return int(requested)
         n_full = sum(1 for t in getattr(self, "layer_types", []) if t == "full_attention")
         n_full = n_full or self.L
         per_tok = 2 * n_full * self.NKV * self.HD * 4
         cap = max(512, self._KV_BUDGET // per_tok)
+        if requested:
+            got = max(512, min(int(requested), cap))
+            if got < int(requested):
+                print("webtorch: context %d -> %d tokens (KV cache budget %.1f GB)"
+                      % (int(requested), got, self._KV_BUDGET / 2 ** 30))
+            return got
         want = int(declared) if declared else 2048
         got = max(512, min(want, cap))
         if got < want:
@@ -1435,7 +1576,8 @@ class CausalLM:
 
     def _set_sampling(self, temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
                       repetition_penalty=None, min_p=None, constraint=None,
-                      min_new_tokens=None, prompt_ids=None, **_ignored):
+                      min_new_tokens=None, prompt_ids=None, presence_penalty=None,
+                      frequency_penalty=None, stop=None, **_ignored):
         """Install generation parameters. Defaults from the model's generation_config.json (or
         from load()) are kept; anything passed to generate() overrides them for that call."""
         from . import constrain
@@ -1443,6 +1585,8 @@ class CausalLM:
         for k, v in (("temperature", temperature), ("top_p", top_p), ("top_k", top_k),
                      ("seed", seed), ("do_sample", do_sample), ("min_p", min_p),
                      ("repetition_penalty", repetition_penalty),
+                     ("presence_penalty", presence_penalty),
+                     ("frequency_penalty", frequency_penalty),
                      ("min_new_tokens", min_new_tokens)):
             if v is not None:
                 base[k] = v
@@ -1450,7 +1594,14 @@ class CausalLM:
             base["do_sample"] = float(base.get("temperature", 0) or 0) > 0
         if base.get("seed") is not None:
             base["rng"] = np.random.default_rng(int(base["seed"]))
+        stops = stop if stop is not None else base.get("stop")
+        if isinstance(stops, str):
+            stops = [stops]
+        base["stop"] = stops
         con = constrain.build(constraint if constraint is not None else base.get("constraint"))
+        if stops:
+            sc = constrain.StopConstraint(stops)
+            con = sc if con is None else constrain.AllOf([con, sc])
         if con is not None:
             con.reset()
         base["constraint"] = con
@@ -1464,6 +1615,7 @@ class CausalLM:
 
     def _init_state(self):
         L, NKV, HD, LMAX, H = self.L, self.NKV, self.HD, self.lmax, self.H
+        NH = self.NH
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
@@ -1484,6 +1636,16 @@ class CausalLM:
             self.sin_b = wt.Tensor(np.zeros((1, HD), np.float32))
             self.mask_b = wt.Tensor(np.zeros((1, 1, LMAX), np.float32))
             self.ctl = xp.asarray(np.array([0, 1, NKV, HD, LMAX], np.int32))
+            # Does the fused decode attention cover this model's shapes? If it does, it reads
+            # the length from `ctl` and never looks at the mask -- and the mask is the single
+            # most expensive thing in a decode step, because keeping it current means
+            # allocating and uploading LMAX floats EVERY token. That upload, not the
+            # attention itself, is what made a large context slow down short conversations.
+            self._fused_attn = False
+            if wt._GQA_FUSED and n:
+                probe = wt.gqa_decode(wt.Tensor(np.zeros((NH, 1, HD), np.float32)),
+                                      self.Kc[0], self.Vc[0], self.mask_b, 1.0, ctl=self.ctl)
+                self._fused_attn = probe is not None
 
     # ---- prefill (fresh, fills KV 0..P-1) ----
     def _mlp(self, lay, x):
@@ -1584,8 +1746,9 @@ class CausalLM:
         self.h_in.data.buffer.set_data(np.asarray(self.embed[token], np.float32))
         c, s = self._rope_np(pos)
         self.cos_b.data.buffer.set_data(c.reshape(-1)); self.sin_b.data.buffer.set_data(s.reshape(-1))
-        m = np.zeros((1, 1, LMAX), np.float32); m[0, 0, pos + 1:] = -1e9
-        self.mask_b.data.buffer.set_data(m)
+        if not getattr(self, "_fused_attn", False):    # only the general path reads the mask
+            m = np.zeros((1, 1, LMAX), np.float32); m[0, 0, pos + 1:] = -1e9
+            self.mask_b.data.buffer.set_data(m)
         self.ctl.buffer.set_data(np.array([pos, 1, NKV, HD, LMAX], np.int32))
 
     def _decode_fwd(self):
@@ -1606,8 +1769,11 @@ class CausalLM:
                 wt.kv_write(V.data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
                 # One dispatch for the single decode position; falls back for anything the
                 # fused kernel does not cover.
-                o = (wt.gqa_decode(q, K, V, self.mask_b, sc) if wt._GQA_FUSED
-                     else None)
+                # `ctl` carries the position, so the fused kernel scans only what the
+                # conversation has actually filled -- decode speed follows the conversation,
+                # not the context the model was loaded with.
+                o = (wt.gqa_decode(q, K, V, self.mask_b, sc, ctl=self.ctl)
+                     if wt._GQA_FUSED else None)
                 if o is None:
                     o = wt.gqa_attention(q, K, V, self.mask_b, scale=sc)
                 h = h + self._attn_out(lay, o, 1)
@@ -1639,23 +1805,71 @@ class CausalLM:
                messages=None, tools=None, ids=None, temperature=None, top_p=None,
                top_k=None, seed=None, do_sample=None, repetition_penalty=None, min_p=None,
                constraint=None, max_length=None, min_new_tokens=None, truncate=True,
-               enable_thinking=False, **chat_kw):
+               enable_thinking=None, presence_penalty=None, frequency_penalty=None,
+               stop=None, channels=False, **chat_kw):
         """Streaming decode: yield each new token's text as it is produced (render live,
         bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
         Takes the same parameters as `generate`.
 
+        `channels=True` yields `{"channel": "thinking"|"content", "text": ...}` instead of
+        bare text. A reader cannot work this out for itself: models whose template opens the
+        reasoning span emit only the CLOSING tag, so pairing tags in the output alone shows
+        reasoning as if it were the answer until that tag lands. Tags are also split across
+        token boundaries at will, and are held back here rather than leaked into the wrong
+        channel. Models without reasoning simply yield everything as "content".
+
         When the stream ends, `self.last_stream` holds `{n, truncated, ttft_s, tok_s}` —
         `truncated` says the length limit, not the model, ended the reply."""
+        box = {}
+        it = self._stream_raw(prompt, max_new, system, messages, tools, ids, temperature,
+                              top_p, top_k, seed, do_sample, repetition_penalty, min_p,
+                              constraint, max_length, min_new_tokens, truncate,
+                              enable_thinking, presence_penalty, frequency_penalty, stop,
+                              box, **chat_kw)
+        return self._stream_channels(it, box) if channels else it
+
+    def _stream_channels(self, it, box):
+        """Label a raw text stream by channel. `box` is filled by the generator once it has
+        the prompt, which is the only thing that says whether reasoning is already open."""
+        ch = None
+        for piece in it:
+            if ch is None:
+                ch = _Channels(box.get("close"))
+            for c, t in ch.feed(piece):
+                yield {"channel": c, "text": t}
+        for c, t in (ch.flush() if ch is not None else ()):
+            yield {"channel": c, "text": t}
+
+    def _stream_raw(self, prompt=None, max_new=None, system="You are a helpful assistant.",
+                    messages=None, tools=None, ids=None, temperature=None, top_p=None,
+                    top_k=None, seed=None, do_sample=None, repetition_penalty=None,
+                    min_p=None, constraint=None, max_length=None, min_new_tokens=None,
+                    truncate=True, enable_thinking=None, presence_penalty=None,
+                    frequency_penalty=None, stop=None, box=None, **chat_kw):
+        """The decode loop itself: yields plain text per token."""
         self._check_live()
         eot = self.tok.eot
         self._reset_linear_state()
+        if enable_thinking is None:
+            enable_thinking = bool((getattr(self, "gen_defaults", {}) or {})
+                                   .get("enable_thinking", False))
         if ids is None:
             ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools,
                                        enable_thinking=enable_thinking, **chat_kw)
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
+        if box is not None:
+            # Does the rendered prompt END inside a reasoning span? That is what decides the
+            # starting channel, and only the template knows -- so ask the template's output.
+            tail = self.tok.decode(ids[-16:]).rstrip() if ids else ""
+            for o, c in _THINK_TAGS:
+                if tail.endswith(o):
+                    box["close"] = c
+                    break
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, constraint, min_new_tokens, prompt_ids=ids)
+                           min_p, constraint, min_new_tokens, prompt_ids=ids,
+                           presence_penalty=presence_penalty,
+                           frequency_penalty=frequency_penalty, stop=stop)
         t0 = time.perf_counter()
 
         def _stats(n, truncated, steps, td):
@@ -1709,6 +1923,15 @@ class CausalLM:
         _sdk._impl_release(self)
         return self
 
+    def _abort_build(self):
+        """A load that dies part-way — stopped, or a bad/unsupported file — drops the weights
+        it had already uploaded, so a failed load never strands half a model in GPU memory.
+        The object was never published to the impl cache, so this is a plain drop."""
+        try:
+            self.release()
+        except Exception:
+            pass
+
     def _check_live(self):
         if self.__dict__.get("_released"):
             raise RuntimeError("this model has been released; load it again to use it")
@@ -1718,7 +1941,8 @@ class CausalLM:
                  temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
                  repetition_penalty=None, min_p=None, constraint=None,
                  max_length=None, min_new_tokens=None, truncate=True,
-                 stream=False, enable_thinking=False, **chat_kw):
+                 stream=False, enable_thinking=None, presence_penalty=None,
+                 frequency_penalty=None, stop=None, channels=False, **chat_kw):
         """Chat prompt -> decode -> GenResult. WebGPU replays a captured decode step per
         token (~20x); WebGL uses a correct growing-cache forward.
 
@@ -1726,11 +1950,19 @@ class CausalLM:
         GenResult at the end (same parameters either way; `stream(...)` is a shorthand for
         it). Render live, keep the reply visible while it is being written.
 
-        `enable_thinking=False` by default: a model whose chat template knows the option
+        `enable_thinking` defaults to False unless the model or `load(...)` set otherwise: a
+        model whose chat template knows the option
         answers directly instead of writing out its reasoning first; pass True to get the
         reasoning too. A template that does not know the option ignores it.
 
         `messages` is a full conversation instead of the `prompt`/`system` shorthand.
+
+        `stop="..."` or `stop=[...]` ends the reply at any of those strings, on top of the
+        model's own end-of-turn token. `presence_penalty`/`frequency_penalty` are the
+        additive OpenAI-style knobs; `repetition_penalty` is the multiplicative HF one, and
+        they compose. Every sampling parameter here can also be set once at load time (as
+        `load(..., temperature=...)`) or come from the model's own generation_config.json;
+        what is passed to this call wins for this call.
 
         Any other keyword goes to the model's chat template unchanged -- `tools=[...]`,
         `reasoning_effort="low"`, whatever that model documents. This is why those work
@@ -1754,15 +1986,23 @@ class CausalLM:
                                repetition_penalty=repetition_penalty, min_p=min_p,
                                constraint=constraint, max_length=max_length,
                                min_new_tokens=min_new_tokens, truncate=truncate,
-                               enable_thinking=enable_thinking, **chat_kw)
+                               enable_thinking=enable_thinking,
+                               presence_penalty=presence_penalty,
+                               frequency_penalty=frequency_penalty, stop=stop,
+                               channels=channels, **chat_kw)
         eot = self.tok.eot
+        if enable_thinking is None:
+            enable_thinking = bool((getattr(self, "gen_defaults", {}) or {})
+                                   .get("enable_thinking", False))
         if ids is None:
             ids = self.tok.encode_chat(prompt, system, messages=messages, tools=tools,
                                        enable_thinking=enable_thinking, **chat_kw)
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, constraint, min_new_tokens, prompt_ids=ids)
+                           min_p, constraint, min_new_tokens, prompt_ids=ids,
+                           presence_penalty=presence_penalty,
+                           frequency_penalty=frequency_penalty, stop=stop)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
         # A decode step can only be captured if it is the same sequence of GPU commands every

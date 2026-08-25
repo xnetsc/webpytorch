@@ -207,21 +207,27 @@ def dequant(ttype, raw, n):
         sc = b[:, 192:208].view(np.int8).astype(np.float32)
         d = _f16(b[:, 208:210])
         out = np.empty((blk, 256), np.float32)
+        # Vectorised over the 32 positions rather than looping them. Under WASM a numpy call
+        # costs ~10us of fixed overhead whatever its size, so the per-element loop this
+        # replaces made ~768 calls per invocation -- about 7ms, and this is the table a
+        # decode step reads its token embedding from, once per token. Same arithmetic, same
+        # bits out (checked against the loop on random blocks).
+        d0 = d[:, 0:1]
+        ii = np.arange(32) // 16
         for half in range(2):
             qlh = ql[:, half * 64:(half + 1) * 64]
             qhh = qh[:, half * 32:(half + 1) * 32]
             sch = sc[:, half * 8:(half + 1) * 8]
             base = half * 128
-            for l in range(32):
-                ii = l // 16
-                q1 = ((qlh[:, l] & 0x0F) | (((qhh[:, l] >> 0) & 3) << 4)).astype(np.int16) - 32
-                q2 = ((qlh[:, l + 32] & 0x0F) | (((qhh[:, l] >> 2) & 3) << 4)).astype(np.int16) - 32
-                q3 = ((qlh[:, l] >> 4) | (((qhh[:, l] >> 4) & 3) << 4)).astype(np.int16) - 32
-                q4 = ((qlh[:, l + 32] >> 4) | (((qhh[:, l] >> 6) & 3) << 4)).astype(np.int16) - 32
-                out[:, base + l] = d[:, 0] * sch[:, ii + 0] * q1
-                out[:, base + l + 32] = d[:, 0] * sch[:, ii + 2] * q2
-                out[:, base + l + 64] = d[:, 0] * sch[:, ii + 4] * q3
-                out[:, base + l + 96] = d[:, 0] * sch[:, ii + 6] * q4
+            lo = qlh[:, :32]; hi = qlh[:, 32:]
+            q1 = ((lo & 0x0F) | ((qhh & 3) << 4)).astype(np.int16) - 32
+            q2 = ((hi & 0x0F) | (((qhh >> 2) & 3) << 4)).astype(np.int16) - 32
+            q3 = ((lo >> 4) | (((qhh >> 4) & 3) << 4)).astype(np.int16) - 32
+            q4 = ((hi >> 4) | (((qhh >> 6) & 3) << 4)).astype(np.int16) - 32
+            out[:, base:base + 32] = d0 * sch[:, ii + 0] * q1
+            out[:, base + 32:base + 64] = d0 * sch[:, ii + 2] * q2
+            out[:, base + 64:base + 96] = d0 * sch[:, ii + 4] * q3
+            out[:, base + 96:base + 128] = d0 * sch[:, ii + 6] * q4
         return out.reshape(-1)[:n]
     if name == "Q5_K":                       # 256 vals / 176 bytes
         # f16 d | f16 dmin | scales[12] (6-bit, get_scale_min_k4) | qh[32] (5th bit) | qs[128]
