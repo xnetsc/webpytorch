@@ -3020,7 +3020,8 @@ _GGML_KSG = 2               # split-K rows on the batched path
 # memory once instead of being re-read from global memory 64 times.
 _GGML_GEMV_PRE = """
 var<workgroup> xs: array<f32, KSxBLKxR>;
-var<workgroup> psum: array<f32, KSxWGXxR>;
+var<workgroup> psum: array<f32, PSUMSZ>;
+var<private> accs: array<f32, ORW>;
 var<private> acc0: f32;
 ACCDECL1
 var<private> xoff: u32;
@@ -3039,14 +3040,16 @@ ACC4BODY1
 _GGML_GEMV_MAIN = """
 @compute @workgroup_size(WGX, KSu)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let n = gid.x;
+  let rowbase = wid.x * (WGXu * ORWu);
   let lx = lid.x;
   let ly = lid.y;
   xoff = ly * BLKVALS;
-  nrow = n;
   acc0 = 0.0;
 ACCINIT1
+  for (var q: u32 = 0u; q < ORWu; q = q + 1u) { accs[q] = 0.0; }
   let base = 0u;
   let nb = gm.K / BLKVALS;
   // A fixed step count, not `b < nb` per row: every thread must reach the same barriers.
@@ -3060,20 +3063,35 @@ ACCINIT1
 XLOAD1
     }
     workgroupBarrier();
-    if (b < nb && n < gm.N) {
+    for (var orw: u32 = 0u; orw < ORWu; orw = orw + 1u) {
+    let nn = rowbase + orw * WGXu + lx;
+    nrow = nn;
+    acc0 = accs[orw];
+    if (b < nb && nn < gm.N) {
 """
 
 _GGML_GEMV_TAIL = """
     }
+    accs[orw] = acc0;
+    }
     workgroupBarrier();
   }
-  psum[ly * WGXu + lx] = acc0;
+  for (var q: u32 = 0u; q < ORWu; q = q + 1u) {
+    psum[q * KSxWGX + ly * WGXu + lx] = accs[q];
+  }
 PSUM1
   workgroupBarrier();
-  if (ly == 0u && n < gm.N) {
-    var tot: f32 = 0.0;
-    for (var i: u32 = 0u; i < KSu; i = i + 1u) { tot = tot + psum[i * WGXu + lx]; }
-    outp[n] = tot;
+  if (ly == 0u) {
+    for (var q: u32 = 0u; q < ORWu; q = q + 1u) {
+      let nn = rowbase + q * WGXu + lx;
+      if (nn < gm.N) {
+        var tot: f32 = 0.0;
+        for (var i: u32 = 0u; i < KSu; i = i + 1u) {
+          tot = tot + psum[q * KSxWGX + i * WGXu + lx];
+        }
+        outp[nn] = tot;
+      }
+    }
 OUT1
   }
 }
@@ -3087,6 +3105,23 @@ _GGML_KS = 4                 # split-K rows per workgroup on the decode path
 # how many bytes it read (gate, N=3072, ran FASTER than q, N=2048, despite being larger).
 # Halving the rows doubles the workgroups and splits K further to keep the threads busy.
 _GGML_WGX = 64
+# Output rows each lane accumulates. The activations for a block are loaded into workgroup
+# memory once and then multiplied against every row the lane owns, so this divides how many
+# times the activation vector is re-read across the dispatch -- and that repetition is not
+# small: at N=17408 with WGX=64 the 5120-float input was pulled in 272 times over, gigabytes
+# per token of pure duplication. Unlike WGX it is not bounded by the 256-thread workgroup
+# limit, and it raises instruction-level parallelism at the same time.
+#
+# It is nonetheless 1, because the saving does not survive contact with the hardware: raising
+# it divides the workgroup count by the same factor, and on this GPU the lost occupancy costs
+# more than the duplicated reads. Measured on the 27B (64 layers, 12 quant types), whole
+# captured decode step: ORW=1 187.9ms, ORW=2 194.4ms, ORW=4 214.8ms. Per-matmul microbenchmarks
+# agree -- ORW=1 wins on 22 of the 28 distinct (type, N, K) shapes in that model, and where 2
+# wins it is by a few percent, against a 67% win on exactly one shape (IQ2_S at N=5120).
+# Outputs are identical across values (checked shape by shape, and on the full logit vector
+# from a clean state), so this is purely a performance knob -- worth revisiting on a GPU with
+# different occupancy characteristics.
+_GGML_ORW = 1
 
 # The IQ4_NL/IQ4_XS codebook. Indexing a `const` array dynamically is legal WGSL but not
 # uniformly implemented, so the sixteen signed bytes ride in four u32s, sign-extended on read.
@@ -3689,6 +3724,18 @@ def ggml_native_supported(type_name):
     return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
 
 
+def _orw_for(mode=1):
+    """Output rows per lane for this path. Only the single-token decode kernel uses more
+    than one; the two-row variant addresses psum with its own fixed layout."""
+    return _GGML_ORW if (mode == 1 and _GGML_ORW > 1) else 1
+
+
+def _gemv_groups(N, mode=1):
+    """Workgroups needed to cover N output rows on the decode path."""
+    per = _GGML_WGX * _orw_for(mode)
+    return (int(N) + per - 1) // per
+
+
 def _ggml_src(type_name, mode):
     """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
@@ -3698,6 +3745,9 @@ def _ggml_src(type_name, mode):
     src = _GGML_BIND + helpers + pre + main + dec + tail
     rows = max(1, mode)
     two = rows == 2
+    # Multi-row accumulation is for the single-token decode path, which is the hot one. The
+    # two-token variant addresses psum with its own fixed layout, so it stays at one row.
+    orw = _orw_for(mode)
     xrow = _GGML_KS * vals                      # where the second row's activations start
     subs = [("ACCDECL1", "var<private> acc1: f32;" if two else ""),
             ("ACCBODY1", "  acc1 = acc1 + xs[i + %du] * v;" % xrow if two else ""),
@@ -3715,12 +3765,13 @@ def _ggml_src(type_name, mode):
                       "{ t1 = t1 + psum[%du + i * WGXu + lx]; }\n"
                       "    outp[gm.N + n] = t1;" % (_GGML_KS * _GGML_WGX)) if two else ""),
             ("KSxBLKxR", str(_GGML_KS * vals * rows)),
-            ("KSxWGXxR", str(_GGML_KS * _GGML_WGX * rows)),
+            ("PSUMSZ", str(_GGML_KS * _GGML_WGX * rows * orw)),
             ("KSxBLK", str(_GGML_KS * vals)), ("KSxWGX", str(_GGML_KS * _GGML_WGX)),
             ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
             ("KSu", "%uu" % _GGML_KS), ("MASKBLK", "%uu" % (vals - 1)),
             ("BLKVALS", "%uu" % vals),
-            ("WGXu", "%uu" % _GGML_WGX), ("WGX", str(_GGML_WGX))]
+            ("WGXu", "%uu" % _GGML_WGX), ("WGX", str(_GGML_WGX)),
+            ("ORWu", "%uu" % orw), ("ORW", str(orw))]
     for k, v in subs:
         src = src.replace(k, v)
     return src
@@ -3803,8 +3854,12 @@ def _ggml_add(type_name, mode):
                    {"source": _ggml_src(type_name, mode), "bindingTypes": binds})
 
 
-def _ggml_name(type_name, mode):
-    return "ggml%s_%s" % (("v", "v2", "")[mode], type_name.lower())
+def _ggml_name(type_name, mode, orw=None):
+    # ORW is a compile-time constant in the shader, so a kernel is identified by it too --
+    # otherwise a second value would silently reuse the first one's pipeline.
+    o = _orw_for(mode) if orw is None else orw
+    return "ggml%s_%s%s" % (("v", "v2", "")[mode], type_name.lower(),
+                            "" if o <= 1 else "_r%d" % o)
 
 
 def _ggml_run(xf, packed, type_name, K, N):
@@ -3819,7 +3874,7 @@ def _ggml_run(xf, packed, type_name, K, N):
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": ((N + _GGML_WGX - 1) // _GGML_WGX if M <= 2
+                    "workGroups": {"x": (_gemv_groups(N) if M <= 2
                                          else (N + 63) // 64), "y": 1,
                                    "z": 1 if M <= 2 else (M + 3) // 4}})
     return of
