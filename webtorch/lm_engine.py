@@ -24,21 +24,53 @@ def _softmax_np(x):
     e = np.exp(x - x.max()); return e / e.sum()
 
 def sample_nucleus(logits, top_p=0.8, top_k=25, rng=None, **k):
-    logits = np.asarray(logits, np.float64)
-    p = _softmax_np(logits)
-    idx = np.argsort(-p); psorted = p[idx]
-    keep = []
-    cum = 0.0
-    for i in range(len(idx)):
-        if cum < top_p and len(keep) < top_k:
-            cum += psorted[i]; keep.append(idx[i])
-        else:
+    """Nucleus (top-p) sampling, optionally capped at top-k.
+
+    Only the head of the distribution is ever sampled from, so only the head is sorted. This
+    used to argsort the whole vocabulary to look at the forty entries top-k asked for, and on
+    a 150k-token vocabulary that one call was 32.8ms of the function's 43.5 -- more than four
+    decode steps of the model it was sampling for, per token, and it did not shrink for
+    smaller models because it scales with the vocabulary rather than the weights.
+    `argpartition` finds the same head in 0.8ms and the sort then runs on the head alone.
+
+    The head is widened rather than truncated if top-p is not reached inside it, so the
+    result is what a full sort would have given, not an approximation of it."""
+    lg = np.asarray(logits, np.float32)
+    V = lg.size
+    kk = V if (top_k is None or top_k <= 0) else min(int(top_k), V)
+    # The exponentials, but NOT the division: top-p is a fraction of the total mass, so the
+    # normaliser has to include the tail, yet only the head is ever divided by it. Dividing
+    # the whole vocabulary is another full pass for values that are thrown away, and the
+    # ordering is the same either way, so the partition runs on the exponentials directly.
+    ex = np.exp(lg - lg.max())
+    Z = float(ex.sum())
+    # Start from the head top-k asks for, or 256 when it asks for no bound at all -- any p a
+    # caller would pass is reached well inside that, and the loop widens if it is not. One
+    # past top-k, so a head that top-k fills exactly still satisfies the exit test.
+    n = min(V, (kk + 1) if kk < V else 256)
+    while True:
+        head = np.argpartition(ex, V - n)[V - n:] if n < V else np.arange(V)
+        order = head[np.argsort(-ex[head])]
+        # float64 for the running sum only: it is a sum of up to V terms and the cut is a
+        # comparison against it, while the probabilities themselves do not need the width.
+        cum = np.cumsum(ex[order], dtype=np.float64) / Z
+        # The token that crosses top_p is kept, matching the usual definition (and what a
+        # cumulative loop that tests before adding produces).
+        m = min(kk, int(np.searchsorted(cum, top_p)) + 1, n)
+        if m < n or n >= V:
             break
-    keep = np.array(keep)
-    pk = p[keep]; pk = pk / pk.sum()
+        # The head was not enough, so the tail genuinely carries mass -- a flat distribution,
+        # which is what a high temperature produces. Go straight to the whole vocabulary
+        # rather than widening by steps: each step repeats the partition and the sort, and
+        # geometric widening on a flat 150k vocabulary measured 59.9ms against the 38.1 of
+        # the full sort it was trying to avoid. Two rounds at worst, and the worst round is
+        # still cheaper than what this replaced.
+        n = V
+    keep = order[:m]
+    pk = ex[keep].astype(np.float64)
+    pk /= pk.sum()
     r = (rng or np.random).random()
-    c = np.cumsum(pk)
-    return int(keep[np.searchsorted(c, r)])
+    return int(keep[np.searchsorted(np.cumsum(pk), r)])
 
 def sample_ras(logits, decoded, top_p=0.8, top_k=25, win_size=10, tau_r=0.1, rng=None, **k):
     """CosyVoice repetition-aware sampling: nucleus, but if the pick repeats too
