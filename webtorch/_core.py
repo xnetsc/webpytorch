@@ -3277,13 +3277,23 @@ _MOE_BIND = """
 var<storage,read> eidx: array<u32>;
 """
 
-_GGML_GEMV_PRE = """
+# The activation window comes in two shapes and the format picks one.
+#
+# `ACC4` reads four consecutive activations for every four weights it decodes. As four scalar
+# indices that is four workgroup-memory accesses where one vec4 access would do, and it is the
+# second-largest cost in the decode path after the decode arithmetic -- isolated by running
+# the kernel with the same reads and the same number of ACC4 calls but no decode maths, which
+# came out at 97.2 GB/s against 121.1 for the reads alone on IQ3_S. Making the window a vec4
+# array is worth 17-21% on every format that decodes four at a time.
+#
+# It is worth MINUS 30% on the ones that do not. Twenty formats accumulate a value at a time,
+# and a scalar read from a vec4 window is a dynamic component index -- Q4_K measured 95.8 ->
+# 68.2 GB/s that way. So the window type follows the fragment: four-at-a-time formats get
+# vec4, the rest keep the float array they were already fast with. (It is also what keeps
+# F16/F32/BF16 working at all: their "block" is a single value, so there is no vec4 to fill.)
+_GGML_GEMV_PRE_F32 = """
 var<workgroup> xs: array<f32, KSxBLKxR>;
-var<workgroup> psum: array<f32, PSUMSZ>;
-var<private> accs: array<f32, ORW>;
-var<private> acc0: f32;
-ACCDECL1
-var<private> xoff: u32;
+XSCOMMON
 fn ACC(k: u32, v: f32) {
   let i = xoff + (k & MASKBLK);
   acc0 = acc0 + xs[i] * v;
@@ -3295,6 +3305,48 @@ fn ACC4(k: u32, v: vec4<f32>) {
 ACC4BODY1
 }
 """
+
+_GGML_GEMV_PRE_V4 = """
+var<workgroup> xs: array<vec4<f32>, XSVEC4N>;
+XSCOMMON
+fn ACC(k: u32, v: f32) {
+  let i = xoff + (k & MASKBLK);
+  acc0 = acc0 + xs[i >> 2u][i & 3u] * v;
+ACCBODY1
+}
+fn ACC4(k: u32, v: vec4<f32>) {
+  // Every ACC4 call site indexes a multiple of four -- checked across all eight formats that
+  // use it, and `MASKBLK` and `xoff` both preserve it -- so the vec4 index is just i >> 2.
+  let i = xoff + (k & MASKBLK);
+  acc0 = acc0 + dot(xs[i >> 2u], v);
+ACC4BODY1
+}
+"""
+
+_XS_COMMON = """var<workgroup> psum: array<f32, PSUMSZ>;
+var<private> accs: array<f32, ORW>;
+var<private> acc0: f32;
+ACCDECL1
+var<private> xoff: u32;"""
+
+# The fill matches how the window is read: one float per thread per pass, or one vec4.
+_XS_FILL_F32 = """    for (var t: u32 = lx; t < BLKVALS; t = t + WGXu) {
+      var xv: f32 = 0.0;
+      if (b < nb) { xv = x[XBASb * BLKVALS + t]; }
+      xs[xoff + t] = xv;
+XLOAD1
+    }"""
+
+_XS_FILL_V4 = """    for (var t: u32 = lx * 4u; t < BLKVALS; t = t + WGXu * 4u) {
+      var xv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (b < nb) {
+        let sx = XBASb * BLKVALS + t;
+        xv = vec4<f32>(x[sx], x[sx + 1u], x[sx + 2u], x[sx + 3u]);
+      }
+      xs[(xoff + t) >> 2u] = xv;
+XLOAD1
+    }"""
+
 
 _GGML_GEMV_MAIN = """
 @compute @workgroup_size(WGX, KSu)
@@ -3317,12 +3369,7 @@ ACCINIT1
   let steps = (nb + KSu - 1u) / KSu;
   for (var st: u32 = 0u; st < steps; st = st + 1u) {
     let b = st * KSu + ly;
-    for (var t: u32 = lx; t < BLKVALS; t = t + WGXu) {
-      var xv: f32 = 0.0;
-      if (b < nb) { xv = x[XBASb * BLKVALS + t]; }
-      xs[xoff + t] = xv;
-XLOAD1
-    }
+XSFILL
     workgroupBarrier();
     for (var orw: u32 = 0u; orw < ORWu; orw = orw + 1u) {
     let nn = rowbase + orw * WGXu + lx;
@@ -4267,7 +4314,13 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     _ng = _grid_u32(type_name)
     stage_grid = 0 < _ng * 4 <= _GRID_WG_BUDGET
     _GGML_WGX_L, _GGML_KS_L = cfg if cfg else (_GGML_WGX, _GGML_KS)
-    pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
+    # Four-at-a-time formats get the vec4 activation window; a fragment that accumulates a
+    # value at a time is faster with the float one, and a single-value "block" (F16 and
+    # friends) cannot use vec4 at all.
+    vec_win = (vals % 4 == 0 and "ACC4(" in dec
+               and "ACC(" not in dec.replace("ACC4(", ""))
+    pre, main, tail = (((_GGML_GEMV_PRE_V4 if vec_win else _GGML_GEMV_PRE_F32),
+                        _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
                        else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
     src = _GGML_BIND + (_MOE_BIND if moe else "") + helpers + pre + main + dec + tail
@@ -4277,15 +4330,34 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     # two-token variant addresses psum with its own fixed layout, so it stays at one row.
     orw = _orw_for(mode)
     xrow = _GGML_KS_L * vals                      # where the second row's activations start
-    subs = [("ACCDECL1", "var<private> acc1: f32;" if two else ""),
-            ("ACCBODY1", "  acc1 = acc1 + xs[i + %du] * v;" % xrow if two else ""),
-            ("ACC4BODY1", ("  acc1 = acc1 + dot(vec4<f32>(xs[i + %du], xs[i + %du], "
-                           "xs[i + %du], xs[i + %du]), v);"
-                           % (xrow, xrow + 1, xrow + 2, xrow + 3)) if two else ""),
+    # These two go FIRST: what they expand to contains other placeholders -- XSFILL brings
+    # in XLOAD1 and XBAS, XSCOMMON brings in ACCDECL1 -- and a placeholder that arrives after
+    # its own substitution has run is left in the source, which compiles to nothing and reads
+    # as a numerically broken kernel.
+    subs = [("XSFILL", _XS_FILL_V4 if vec_win else _XS_FILL_F32),
+            ("XSCOMMON", _XS_COMMON),
+            ("ACCDECL1", "var<private> acc1: f32;" if two else ""),
+            ("ACCBODY1", (("  let j1 = i + %du;\n"
+                           "  acc1 = acc1 + xs[j1 >> 2u][j1 & 3u] * v;" % xrow) if vec_win
+                          else "  acc1 = acc1 + xs[i + %du] * v;" % xrow)
+             if two else ""),
+            ("ACC4BODY1", ("  acc1 = acc1 + dot(xs[(i + %du) >> 2u], v);" % xrow if vec_win
+                           else ("  acc1 = acc1 + dot(vec4<f32>(xs[i + %du], xs[i + %du], "
+                                 "xs[i + %du], xs[i + %du]), v);"
+                                 % (xrow, xrow + 1, xrow + 2, xrow + 3)))
+             if two else ""),
             ("ACCINIT1", "  acc1 = 0.0;" if two else ""),
-            ("XLOAD1", ("      var xv1: f32 = 0.0;\n"
-                        "      if (b < nb) { xv1 = x[gm.K + b * BLKVALS + t]; }\n"
-                        "      xs[%du + xoff + t] = xv1;" % xrow) if two else ""),
+            ("XLOAD1", (("      var xv1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);\n"
+                         "      if (b < nb) { let s1 = gm.K + b * BLKVALS + t;\n"
+                         "        xv1 = vec4<f32>(x[s1], x[s1 + 1u], x[s1 + 2u], "
+                         "x[s1 + 3u]); }\n"
+                         "      xs[(%du + xoff + t) >> 2u] = xv1;" % xrow) if vec_win
+                        else ("      var xv1: f32 = 0.0;\n"
+                              "      if (b < nb) { xv1 = x[gm.K + b * BLKVALS + t]; }\n"
+                              "      xs[%du + xoff + t] = xv1;" % xrow)) if two else ""),
+            # Its own key rather than a expression on KSxBLKxR, so neither is a prefix of
+            # the other and the substitution order cannot matter.
+            ("XSVEC4N", str(_GGML_KS_L * vals * rows // 4)),
             ("PSUM1", "  psum[%du + ly * WGXu + lx] = acc1;" % (_GGML_KS_L * _GGML_WGX_L)
              if two else ""),
             ("OUT1", ("    var t1: f32 = 0.0;\n"
