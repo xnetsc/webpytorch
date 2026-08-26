@@ -1777,6 +1777,23 @@ class CausalLM:
                 self._fused_attn = probe is not None
 
     # ---- prefill (fresh, fills KV 0..P-1) ----
+    def _capturable(self):
+        """Can a decode step be replayed as a fixed command sequence?
+
+        Two things make it not. A recurrent layer whose step runs on the host reads and
+        writes state outside the graph. And a sparse-MoE layer picks its experts on the
+        host -- the router's output comes back, numpy chooses the top-k, and that choice is
+        what decides which expert kernels get dispatched. A capture freezes those dispatches,
+        so every later token would be routed to whatever the FIRST one happened to select:
+        the reply starts correctly and then repeats one token forever, which is exactly what
+        it looked like. Routing on the device would lift this."""
+        rec = [j for j in range(len(self.layers)) if self._is_linear_layer(j)]
+        if rec and not all(self.layers[j]["linear"]._gpu_step_ok() for j in rec):
+            return False
+        if any(lay.get("moe") for lay in self.layers):
+            return False
+        return bool(self._gpu)
+
     def _mlp(self, lay, x):
         """Dense SwiGLU, or generic sparse-MoE (router top-k + optional shared expert) when the
         layer carries `moe` — same layer dict shape as `lm_engine.build_lm`, so the proven
@@ -2019,11 +2036,8 @@ class CausalLM:
                                 "tok_s": round(steps / max(dec, 1e-9), 2)}
             return self.last_stream
 
-        # Same capture condition as `generate`: a decode step is capturable only when every
-        # recurrent layer can run its step on the device; otherwise grow a cache instead.
-        rec = [i for i in range(len(self.layers)) if self._is_linear_layer(i)]
-        on_gpu = all(self.layers[i]["linear"]._gpu_step_ok() for i in rec)
-        if not self._gpu or (rec and not on_gpu):
+        # Same capture condition as `generate` -- see `_capturable`.
+        if not self._capturable():
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             nxt = self._kv_forward(ids, 0, cache)
             self._stream_ttft = time.perf_counter() - t0
@@ -2162,9 +2176,7 @@ class CausalLM:
         # one whose step runs on the device, where the state is just a buffer being read and
         # written in place. So hybrids are captured when every recurrent layer can do that,
         # and fall back to the growing-cache forward when one cannot.
-        rec = [i for i in range(len(self.layers)) if self._is_linear_layer(i)]
-        on_gpu = all(self.layers[i]["linear"]._gpu_step_ok() for i in rec)
-        if not self._gpu or (rec and not on_gpu):      # WebGL fallback, or a host-side mixer
+        if not self._capturable():                     # WebGL, host-side mixer, or sparse MoE
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0

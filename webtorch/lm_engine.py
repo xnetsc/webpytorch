@@ -305,20 +305,34 @@ def moe_mlp(lm, lay, x):
     topk_w = np.take_along_axis(probs, topk_idx, axis=1)
     if m.get("norm_topk_prob", True):
         topk_w = topk_w / topk_w.sum(1, keepdims=True)
-    out = wt.Tensor(np.zeros((T, lm.H), np.float32))
-    # gather tokens per expert (host indices), run each selected expert once
-    for e in range(ne):
-        rows, slot = np.where(topk_idx == e)
-        if len(rows) == 0:
-            continue
-        xe = wt.Tensor(wt._contig(x.data[rows]))          # (m, H)
-        exp = m["experts"][e]
-        ye = exp["down"](wt.silu(exp["gate"](xe)) * exp["up"](xe))
-        w = topk_w[rows, slot].astype(np.float32)
-        ye = ye * wt.Tensor(w.reshape(-1, 1))
-        acc = out.data
-        acc[rows] = acc[rows] + ye.data
-        out = wt.Tensor(acc)
+    if T == 1:
+        # Decode: one token, so every selected expert contributes to the same single row.
+        # Walking all `ne` experts to find which were picked, and scattering each result back
+        # with a fancy-index assignment, costs a host round-trip per expert for a routing
+        # decision already made -- and this is the step that runs once per token. Sum the k
+        # selected experts directly instead; nothing leaves the device.
+        acc = None
+        for slot in range(k):
+            exp = m["experts"][int(topk_idx[0, slot])]
+            ye = exp["down"](wt.silu(exp["gate"](x)) * exp["up"](x))
+            ye = ye * float(topk_w[0, slot])
+            acc = ye if acc is None else acc + ye
+        out = acc
+    else:
+        out = wt.Tensor(np.zeros((T, lm.H), np.float32))
+        # gather tokens per expert (host indices), run each selected expert once
+        for e in range(ne):
+            rows, slot = np.where(topk_idx == e)
+            if len(rows) == 0:
+                continue
+            xe = wt.Tensor(wt._contig(x.data[rows]))      # (m, H)
+            exp = m["experts"][e]
+            ye = exp["down"](wt.silu(exp["gate"](xe)) * exp["up"](xe))
+            w = topk_w[rows, slot].astype(np.float32)
+            ye = ye * wt.Tensor(w.reshape(-1, 1))
+            acc = out.data
+            acc[rows] = acc[rows] + ye.data
+            out = wt.Tensor(acc)
     if m.get("shared"):
         s = m["shared"]
         ys = s["down"](wt.silu(s["gate"](x)) * s["up"](x))

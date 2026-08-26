@@ -3323,17 +3323,17 @@ _Q3K_DEC = """
           let dl = d * sc;
           let qo = o + 32u + blk2 * 32u + half * 16u;
           let mo = o + half * 16u;
-          // Four at a time (110-byte block, both sub-arrays word-aligned): one word of
-          // quants and one of high-bit masks per group of four, then a dot product.
+          // Byte-addressed, NOT a word read: this block is 110 bytes, so `o` is only
+          // 4-aligned on even blocks and `W((qo + l) >> 2u)` silently reads the wrong word
+          // on the odd ones -- half the columns of every tensor. Q5_K (176) and Q2_K (84)
+          // are whole numbers of words and may read directly; this one may not.
           for (var lw: u32 = 0u; lw < 4u; lw = lw + 1u) {
             let l = lw * 4u;
-            let qw = W((qo + l) >> 2u);
-            let mw = W((mo + l) >> 2u);
             let v = vec4<f32>(
-              f32((qw >> shift) & 3u) - select(4.0, 0.0, ((mw & 255u) & mbit) != 0u),
-              f32((qw >> (8u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 8u) & 255u) & mbit) != 0u),
-              f32((qw >> (16u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 16u) & 255u) & mbit) != 0u),
-              f32((qw >> (24u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 24u) & 255u) & mbit) != 0u));
+              f32((B(qo + l) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l) & mbit) != 0u),
+              f32((B(qo + l + 1u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 1u) & mbit) != 0u),
+              f32((B(qo + l + 2u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 2u) & mbit) != 0u),
+              f32((B(qo + l + 3u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 3u) & mbit) != 0u));
             ACC4(kb + k + l, v * dl);
           }
           k = k + 16u; is = is + 1u;
@@ -3885,29 +3885,38 @@ def _ggml_selfcheck(type_name, mode, small=False):
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
     exception -- which reads exactly like a working kernel on an all-zero weight, and has
-    twice sent me chasing a numerical bug that was a syntax error. One block per type, once
-    per session, turns both failure modes into something that raises."""
+    twice sent me chasing a numerical bug that was a syntax error. A couple of blocks per
+    type, once per session, turns both failure modes into something that raises."""
     from . import ggufload as G
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
-    # Random bytes are a legal block for every type, and exercise every scale and codebook
-    # index -- but a random f16 scale is Inf or NaN one time in 32, and the f16 fields sit at
-    # a different offset in each format. Rather than teach the table where they are, redraw
-    # until the reference comes out finite.
-    for seed in range(32):
+    # THREE blocks per row, not one. A block is not always a whole number of words -- Q3_K is
+    # 110 bytes -- so a decode fragment that reads a word directly is only correct on blocks
+    # whose byte offset happens to land on a word boundary. With one block per row the offset
+    # is always zero and such a bug is invisible; it cost half the columns of every Q3_K
+    # tensor, which on a model whose experts are all Q3_K is the whole model.
+    NB = 3
+    K = NB * vals
+    # Random bytes are a legal block for every type and exercise every scale and codebook
+    # index -- but an f16 field is Inf or NaN whenever its exponent is all ones, and with
+    # several blocks per row that happens more often than not. The exponent's top bit lives
+    # in bit 6 of a byte whatever the field's offset, so clearing it rules the case out
+    # without needing to know where each format keeps its scales. Redrawing as well, since
+    # a format may produce a large value some other way.
+    for seed in range(64):
         rng = np.random.default_rng(seed)
-        raw = rng.integers(0, 256, (2, blk), dtype=np.uint8).tobytes()
-        ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, 2 * vals),
-                         np.float32).reshape(2, vals)
+        raw = (rng.integers(0, 256, (2, NB * blk), dtype=np.uint8) & 0xBF).tobytes()
+        ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, 2 * K),
+                         np.float32).reshape(2, K)
         if np.all(np.isfinite(ref)) and float(np.abs(ref).max()) < 1e4:
             break
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
     M = mode if mode else 3
-    x = rng.standard_normal((M, vals)).astype(np.float32)
+    x = rng.standard_normal((M, K)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
-    pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, blk)
+    pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, NB * blk)
     got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
-                                          K=vals, N=2, small=small))).reshape(M, 2)
+                                          K=K, N=2, small=small))).reshape(M, 2)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
