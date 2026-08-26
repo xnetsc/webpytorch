@@ -3248,13 +3248,32 @@ _Q5K_DEC = """
       let s1 = k4sc(so, i0); let s2 = k4sc(so, i0 + 1u);
       let d1 = d * s1.x; let m1 = dmin * s1.y;
       let d2 = d * s2.x; let m2 = dmin * s2.y;
-      for (var l: u32 = 0u; l < 32u; l = l + 1u) {
-        let q = B(qo + g * 32u + l);
-        let h = B(ho + l);
-        let lo = f32(q & 15u) + select(0.0, 16.0, (h & (1u << i0)) != 0u);
-        let hi = f32(q >> 4u) + select(0.0, 16.0, (h & (1u << (i0 + 1u))) != 0u);
-        ACC(kb + i0 * 32u + l, d1 * lo - m1);
-        ACC(kb + (i0 + 1u) * 32u + l, d2 * hi - m2);
+      // Four values at a time. Every offset here is 4-aligned (the block is 176 bytes and
+      // both sub-arrays start on a word), so the quants and the high bits each come from ONE
+      // word read instead of four byte extractions, and the results land on four consecutive
+      // activations -- one dot product each.
+      let hb0 = 1u << i0;
+      let hb1 = 1u << (i0 + 1u);
+      for (var lw: u32 = 0u; lw < 8u; lw = lw + 1u) {
+        let l = lw * 4u;
+        let qw = W((qo + g * 32u + l) >> 2u);
+        let hw = W((ho + l) >> 2u);
+        let a0 = qw & 255u; let a1 = (qw >> 8u) & 255u;
+        let a2 = (qw >> 16u) & 255u; let a3 = (qw >> 24u) & 255u;
+        let e0 = hw & 255u; let e1 = (hw >> 8u) & 255u;
+        let e2 = (hw >> 16u) & 255u; let e3 = (hw >> 24u) & 255u;
+        let vlo = vec4<f32>(
+          f32(a0 & 15u) + select(0.0, 16.0, (e0 & hb0) != 0u),
+          f32(a1 & 15u) + select(0.0, 16.0, (e1 & hb0) != 0u),
+          f32(a2 & 15u) + select(0.0, 16.0, (e2 & hb0) != 0u),
+          f32(a3 & 15u) + select(0.0, 16.0, (e3 & hb0) != 0u));
+        let vhi = vec4<f32>(
+          f32(a0 >> 4u) + select(0.0, 16.0, (e0 & hb1) != 0u),
+          f32(a1 >> 4u) + select(0.0, 16.0, (e1 & hb1) != 0u),
+          f32(a2 >> 4u) + select(0.0, 16.0, (e2 & hb1) != 0u),
+          f32(a3 >> 4u) + select(0.0, 16.0, (e3 & hb1) != 0u));
+        ACC4(kb + i0 * 32u + l, vlo * d1 - vec4<f32>(m1, m1, m1, m1));
+        ACC4(kb + (i0 + 1u) * 32u + l, vhi * d2 - vec4<f32>(m2, m2, m2, m2));
       }
     }
 """
@@ -3304,9 +3323,18 @@ _Q3K_DEC = """
           let dl = d * sc;
           let qo = o + 32u + blk2 * 32u + half * 16u;
           let mo = o + half * 16u;
-          for (var l: u32 = 0u; l < 16u; l = l + 1u) {
-            let q = f32((B(qo + l) >> shift) & 3u);
-            ACC(kb + k + l, dl * (q - select(4.0, 0.0, (B(mo + l) & mbit) != 0u)));
+          // Four at a time (110-byte block, both sub-arrays word-aligned): one word of
+          // quants and one of high-bit masks per group of four, then a dot product.
+          for (var lw: u32 = 0u; lw < 4u; lw = lw + 1u) {
+            let l = lw * 4u;
+            let qw = W((qo + l) >> 2u);
+            let mw = W((mo + l) >> 2u);
+            let v = vec4<f32>(
+              f32((qw >> shift) & 3u) - select(4.0, 0.0, ((mw & 255u) & mbit) != 0u),
+              f32((qw >> (8u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 8u) & 255u) & mbit) != 0u),
+              f32((qw >> (16u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 16u) & 255u) & mbit) != 0u),
+              f32((qw >> (24u + shift)) & 3u) - select(4.0, 0.0, (((mw >> 24u) & 255u) & mbit) != 0u));
+            ACC4(kb + k + l, v * dl);
           }
           k = k + 16u; is = is + 1u;
         }
@@ -3327,8 +3355,17 @@ _Q2K_DEC = """
           let sc = B(o + is);
           let dl = d * f32(sc & 15u); let ml = dmin * f32(sc >> 4u);
           let qo = o + 16u + blk2 * 32u + half * 16u;
-          for (var l: u32 = 0u; l < 16u; l = l + 1u) {
-            ACC(kb + k + l, dl * f32((B(qo + l) >> shift) & 3u) - ml);
+          // Four at a time: the offsets are 4-aligned (84-byte block, quants start at 16),
+          // so one word read replaces four byte extractions and the four results are one
+          // dot product.
+          for (var lw: u32 = 0u; lw < 4u; lw = lw + 1u) {
+            let l = lw * 4u;
+            let qw = W((qo + l) >> 2u);
+            let v = vec4<f32>(f32((qw >> shift) & 3u),
+                              f32((qw >> (8u + shift)) & 3u),
+                              f32((qw >> (16u + shift)) & 3u),
+                              f32((qw >> (24u + shift)) & 3u));
+            ACC4(kb + k + l, v * dl - vec4<f32>(ml, ml, ml, ml));
           }
           k = k + 16u; is = is + 1u;
         }
@@ -3391,13 +3428,10 @@ _IQ2XS_DEC = """
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
         let gx = (q & 511u) * 2u;
-        let ga = G4(gx); let gb = G4(gx + 1u);
         let sm = GB(q >> 9u);
         let k0 = kb + ib * 32u + l * 8u;
-        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-          ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
-          ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
-        }
+        ACC4(k0, G4V(gx) * SGN4(sm, 0u) * db);
+        ACC4(k0 + 4u, G4V(gx + 1u) * SGN4(sm, 4u) * db);
       }
     }
 """
@@ -3416,13 +3450,13 @@ _IQ2S_DEC = """
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
         let gx = (B(o + 2u + ib * 4u + l) | ((qh << (8u - 2u * l)) & 768u)) * 2u;
-        let ga = G4(gx); let gb = G4(gx + 1u);
         let sm = B(o + 34u + ib * 4u + l);
         let k0 = kb + ib * 32u + l * 8u;
-        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-          ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
-          ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
-        }
+        // G4V unpacks the codebook entry's four bytes in one instruction, and each half
+        // lands on four consecutive activations -- so this is two dot products, not eight
+        // scalar accumulates with a byte extraction and a sign select apiece.
+        ACC4(k0, G4V(gx) * SGN4(sm, 0u) * db);
+        ACC4(k0 + 4u, G4V(gx + 1u) * SGN4(sm, 4u) * db);
       }
     }
 """
