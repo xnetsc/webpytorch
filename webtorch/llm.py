@@ -258,7 +258,8 @@ class BPETokenizer:
                                       m["content"]) for m in turns)
         return self.encode(pre + body + "Assistant:")
 
-    def decode(self, ids):
+    def to_bytes(self, ids):
+        """Token ids -> the raw bytes they stand for, specials dropped."""
         buf = bytearray()
         for i in ids:
             t = self.dec.get(int(i), "")
@@ -266,7 +267,55 @@ class BPETokenizer:
                 continue
             for ch in t:
                 buf.append(self.u2b.get(ch, 32))
-        return buf.decode("utf-8", "replace")
+        return buf
+
+    def decode(self, ids):
+        return self.to_bytes(ids).decode("utf-8", "replace")
+
+    def stream_decoder(self):
+        """A decoder that can be fed one token at a time without mangling the text.
+
+        A BPE token is a run of BYTES, not characters. A Chinese character is three bytes and
+        routinely straddles two tokens, so decoding each token on its own turns the first
+        part into U+FFFD -- the ids are right, the decode is not, and the replacement
+        character is what reaches the screen. This holds back a trailing partial sequence
+        until the bytes that finish it arrive."""
+        return _ByteStream(self)
+
+
+def _utf8_split(buf):
+    """(complete, tail) where `tail` is an unfinished multi-byte sequence at the end."""
+    n = len(buf)
+    for back in range(1, min(4, n) + 1):
+        b = buf[n - back]
+        if b < 0x80:                       # ASCII: nothing pending
+            break
+        if b >= 0xC0:                      # a lead byte: does it have all its continuations?
+            need = 2 if b < 0xE0 else (3 if b < 0xF0 else 4)
+            if back < need:
+                return buf[:n - back], buf[n - back:]
+            break
+    return buf, bytearray()
+
+
+class _ByteStream:
+    """Incremental token -> text decoding that never splits a character."""
+
+    def __init__(self, tok):
+        self.tok = tok
+        self.buf = bytearray()
+
+    def push(self, ids):
+        self.buf += self.tok.to_bytes(ids)
+        done, self.buf = _utf8_split(self.buf)
+        return done.decode("utf-8", "replace") if done else ""
+
+    def flush(self):
+        """Whatever is still held when the stream ends. A sequence that never completed is
+        genuinely broken, so it is decoded with replacement rather than dropped."""
+        out = self.buf.decode("utf-8", "replace") if self.buf else ""
+        self.buf = bytearray()
+        return out
 
 
 # ----------------------------- result --------------------------------------
@@ -1509,7 +1558,7 @@ class CausalLM:
                else (self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())))
         self._seen.append(tok)
         if con is not None:
-            self._con_text += self.tok.decode([tok])
+            self._con_text += self._con_dec.push([tok])
         return tok
 
     def _sample(self, lg, sp):
@@ -1687,6 +1736,10 @@ class CausalLM:
         self._seen = list(prompt_ids or [])
         self._gen_start = len(self._seen)
         self._con_text = ""
+        # Constraint and stop matching read the text produced so far, so it has to be decoded
+        # the same careful way the stream is -- a half-written character would otherwise put
+        # a replacement char in the middle of the string a stop sequence is matched against.
+        self._con_dec = self.tok.stream_decoder()
         return base
 
     def _init_state(self):
@@ -1975,12 +2028,18 @@ class CausalLM:
             nxt = self._kv_forward(ids, 0, cache)
             self._stream_ttft = time.perf_counter() - t0
             pos = P; n = 0; steps = 0
+            dec = self.tok.stream_decoder()
             td = time.perf_counter()
             while n < max_new and nxt != eot:
-                yield self.tok.decode([nxt]); n += 1; steps += 1
+                piece = dec.push([nxt]); n += 1; steps += 1
+                if piece:
+                    yield piece
                 if self._stop_now():
                     break                       # just-yielded text satisfies the constraint
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1
+            tail = dec.flush()
+            if tail:
+                yield tail
             _stats(n, n >= max_new and nxt != eot, steps, td)
             return
         for c in self.Kc: c.data[:] = 0.0
@@ -1990,13 +2049,19 @@ class CausalLM:
         self._set_inputs(g0, P)
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
+        dec = self.tok.stream_decoder()
         td = time.perf_counter()
         while n < max_new and nxt != eot:
-            yield self.tok.decode([nxt]); n += 1; steps += 1
+            piece = dec.push([nxt]); n += 1; steps += 1
+            if piece:
+                yield piece
             if self._stop_now():
                 break                           # just-yielded text satisfies the constraint
             self._set_inputs(nxt, pos); plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
+        tail = dec.flush()
+        if tail:
+            yield tail
         _stats(n, n >= max_new and nxt != eot, steps, td)
 
     def release(self):
