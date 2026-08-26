@@ -921,7 +921,7 @@ class CausalLM:
         if got:
             self.gen_defaults = dict(getattr(self, "gen_defaults", {}) or {}, **got)
 
-    async def _gexperts_stacked(self, name):
+    async def _gexperts_stacked(self, name, also=None):
         """A layer's experts for one projection, as a single stacked weight -- or None when
         this build cannot keep them in their native encoding.
 
@@ -942,7 +942,22 @@ class CausalLM:
         nb = G.tensor_nbytes(t["type"], per)
         off = self._gds + t["offset"]
         raw = await self._grng(off, off + nb * ne - 1)
-        return wt.GGMLMoELinear([raw[e * nb:(e + 1) * nb] for e in range(ne)], nm, in_d, out_d)
+        chunks = [raw[e * nb:(e + 1) * nb] for e in range(ne)]
+        if also is not None:
+            t2 = self._ginfo.get(also)
+            if t2 is None or t2["type"] != t["type"]:
+                return None
+            ne2, out2, in2 = (int(d) for d in reversed(t2["dims"]))
+            if (ne2, in2) != (ne, in_d):
+                return None
+            nb2 = G.tensor_nbytes(t2["type"], out2 * in2)
+            off2 = self._gds + t2["offset"]
+            raw2 = await self._grng(off2, off2 + nb2 * ne - 1)
+            # One weight per expert holding both: the first out_d rows are this tensor's, the
+            # rest the other's, so a single matmul produces both halves at once.
+            chunks = [chunks[e] + raw2[e * nb2:(e + 1) * nb2] for e in range(ne)]
+            out_d = out_d + out2
+        return wt.GGMLMoELinear(chunks, nm, in_d, out_d)
 
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
@@ -1334,14 +1349,22 @@ class CausalLM:
                 # fit, and only the packed result is kept.
                 ne = int(self._ginfo[p + "ffn_gate_exps.weight"]["dims"][-1])
                 stacked, experts = {}, None
-                for key, nm in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"),
-                                ("down", "ffn_down_exps")):
-                    st = await self._gexperts_stacked(p + nm + ".weight")
-                    if st is not None:
-                        stacked[key] = st
-                    else:                                  # a path that cannot stack them
-                        if experts is None:
-                            experts = [{} for _ in range(ne)]
+                # gate and up take the same input and the same experts, so they ride in one
+                # weight of twice the output width and one dispatch. Not for speed: it was
+                # meant to be, on the theory that a routed layer's matmuls are small enough
+                # that the command count limits the step, and the step did not move (35.57ms
+                # against 35.62ms). Kept because one weight and one dispatch is less to hold
+                # than two, and it halves the routed layer's descriptor and capture work.
+                gu = await self._gexperts_stacked(p + "ffn_gate_exps.weight",
+                                                  also=p + "ffn_up_exps.weight")
+                dn = await self._gexperts_stacked(p + "ffn_down_exps.weight")
+                if gu is not None and dn is not None:
+                    stacked = {"gate_up": gu, "down": dn}
+                else:                                      # a path that cannot stack them
+                    stacked = {}
+                    experts = [{} for _ in range(ne)]
+                    for key, nm in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"),
+                                    ("down", "ffn_down_exps")):
                         e = 0
                         async for lin in self._gexperts(p + nm + ".weight"):
                             experts[e][key] = lin; e += 1

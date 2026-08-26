@@ -3013,17 +3013,8 @@ var<storage,read> gm: GM;
 // Q3_K and IQ3_S 110, MXFP4 17), so a u32 index would drift out of alignment after the
 // first block. These mirror the reference dequantizer's own byte offsets exactly.
 var<private> nrow: u32;
-// Base word offset into `w`. Zero for an ordinary weight; for a sparse-MoE projection all
-// experts live in ONE buffer and this selects the slice, so the dispatch is the same command
-// whichever expert the router picked -- which is what lets a MoE step be captured at all.
-var<private> woff: u32;
-// Which routed slot this invocation serves; also selects the output row. Zero when the
-// weight is an ordinary one, which costs nothing.
-var<private> oslot: u32;
-// Where this slot's input starts. A routed layer's first two projections share one input
-// row; the third takes the row that projection produced for the same slot, so it strides.
-var<private> xbase: u32;
-fn W(wo: u32) -> u32 { return w[woff + wo * gm.N + nrow]; }
+MOEVARS
+fn W(wo: u32) -> u32 { return w[WOFSwo * gm.N + nrow]; }
 fn B(o: u32) -> u32 { return (W(o >> 2u) >> ((o & 3u) * 8u)) & 255u; }
 fn I8(o: u32) -> f32 { return f32(i32(B(o) << 24u) >> 24u); }
 fn U16(o: u32) -> u32 { return B(o) | (B(o + 1u) << 8u); }
@@ -3127,6 +3118,17 @@ _GGML_KSG = 2               # split-K rows on the batched path
 # for that slot on this token; the host rewrites this small buffer each step, and the captured
 # command list never changes. This mirrors what llama.cpp does with ggml_mul_mat_id: one
 # stacked expert tensor plus an index, rather than a separate dispatch per expert.
+_MOE_VARS = """// Base word offset into `w`: all experts of a projection live in ONE buffer and this
+// selects the slice, so the dispatch is the same command whichever expert the router
+// picked -- which is what lets a MoE step be captured at all.
+var<private> woff: u32;
+// Which routed slot this invocation serves; also selects the output row.
+var<private> oslot: u32;
+// Where this slot's input starts. A routed layer's first two projections share one
+// input row; the third takes the row that projection produced for the same slot.
+var<private> xbase: u32;"""
+
+
 _MOE_BIND = """
 @group(0) @binding(4)
 var<storage,read> eidx: array<u32>;
@@ -3174,7 +3176,7 @@ ACCINIT1
     let b = st * KSu + ly;
     for (var t: u32 = lx; t < BLKVALS; t = t + WGXu) {
       var xv: f32 = 0.0;
-      if (b < nb) { xv = x[xbase + b * BLKVALS + t]; }
+      if (b < nb) { xv = x[XBASb * BLKVALS + t]; }
       xs[xoff + t] = xv;
 XLOAD1
     }
@@ -3205,7 +3207,7 @@ PSUM1
         for (var i: u32 = 0u; i < KSu; i = i + 1u) {
           tot = tot + psum[q * KSxWGX + i * WGXu + lx];
         }
-        outp[oslot * gm.N + nn] = tot;
+        outp[OSLTnn] = tot;
       }
     }
     // The second row keeps its own fixed psum half and its own bounds check. Moving the
@@ -3922,9 +3924,52 @@ def _small_cfg(vals):
     return max(1, 256 // ks), ks
 
 
-def _gemv_cfg(N, vals):
-    """(WGX, KS) to use for this output width."""
-    return _small_cfg(vals) if int(N) <= _SMALL_N else (_GGML_WGX, _GGML_KS)
+# Blocks per row below which the reduction would be split further -- OFF, because it does not
+# pay. The idea: split-K is how many lanes share one output row's reduction, so a short row
+# (a routed expert's K is 2048, eight blocks, against a dense layer's 5120 or 17408) gives
+# each lane almost nothing and leaves few workgroups. A microbenchmark said 32x8 was 1.85x
+# the default shape on exactly that matmul.
+#
+# It moved nothing in a real step: the MoE portion measured 22.1ms against 21.1ms for the
+# default, and 16x16 (what the narrow-output rule would have chosen) was worse still at
+# 42.7ms for the whole step. The microbenchmark had to override the group count to test a
+# shape, and that override -- not the shape -- is what it was measuring. Left here with the
+# numbers so the next person does not re-derive it; set it to 8 to try again on other
+# hardware.
+_SHORT_K_BLOCKS = 0
+
+
+def _cfg_for(kind, vals):
+    """The (WGX, KS) a kernel variant was built with. `kind` is what `_shape_kind` returned."""
+    if kind == "narrow":
+        return _small_cfg(vals)
+    if kind == "shortk":
+        return _SHORT_K_CFG
+    return None
+
+
+_AUTO = object()      # "work it out"; None means the default shape, explicitly
+
+
+def _shape_kind(N, K, vals):
+    """Which thread shape this matmul wants: 'narrow', 'shortk', or None for the default.
+
+    A narrow output cannot fill the machine along the row axis at all. A short reduction
+    gives each lane almost nothing at the default split and leaves few workgroups besides --
+    which is every routed expert, whose K is a fraction of a dense layer's."""
+    if int(N) <= _SMALL_N:
+        return "narrow"
+    if (int(K) // max(1, int(vals))) <= _SHORT_K_BLOCKS:
+        return "shortk"
+    return None
+
+
+# Thread shape for a short reduction. Not the same as the narrow-output one: that pushes the
+# split as far as the workgroup memory allows (16 ways at a 256-value block), which is too far
+# here -- measured on a routed expert at K=2048, 16x16 was slower end to end than the default
+# while 32x8 was the best of the shapes tried. Few blocks want more lanes on the reduction,
+# not the most possible.
+_SHORT_K_CFG = (32, 8)
 
 
 def _orw_for(mode=1):
@@ -3933,10 +3978,11 @@ def _orw_for(mode=1):
     return _GGML_ORW if (mode == 1 and _GGML_ORW > 1) else 1
 
 
-def _gemv_groups(N, mode=1, vals=None):
-    """Workgroups needed to cover N output rows on the decode path. `vals` (the block size of
-    the quantization) selects the narrow-output thread shape; pass None for the wide one."""
-    wgx = _small_cfg(vals)[0] if (vals is not None and mode == 1) else _GGML_WGX
+def _gemv_groups(N, mode=1, vals=None, kind=None):
+    """Workgroups needed to cover N output rows on the decode path. `kind` is the thread
+    shape the kernel was built with, from `_shape_kind`."""
+    cfg = _cfg_for(kind, vals) if (kind and vals is not None and mode == 1) else None
+    wgx = cfg[0] if cfg else _GGML_WGX
     per = wgx * _orw_for(mode)
     return (int(N) + per - 1) // per
 
@@ -3986,18 +4032,26 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
             # barrier of the block loop, so every lane sees it. BOTH paths need it -- the
             # batched kernel has its own entry point and its own workgroup shape, and leaving
             # it out left the table zeroed there (the self-check caught exactly that).
-            # The expert this dispatch multiplies against, read at run time so one captured
-            # command serves whichever expert the router picks. Zero for an ordinary weight,
-            # which the compiler folds away -- the dense path pays nothing.
+            # Routing offsets, and ONLY in the routed kernel: a dense weight gets no `woff`
+            # at all rather than `woff = 0`. This is for clarity, not speed -- `W` is the
+            # innermost function in the kernel, called once per four bytes of every weight,
+            # so carrying a dead add through it looked like it had to cost something, and it
+            # does not: the dense 27B measured 162.6ms with the term and 162.1ms without,
+            # i.e. nothing. The compiler folds it after all. Kept because a kernel that
+            # cannot express routing is easier to reason about than one where routing is
+            # always present and always disabled.
+            ("MOEVARS", _MOE_VARS if moe else ""),
+            ("WOFS", "woff + " if moe else ""),
+            ("XBAS", "xbase + " if moe else ""),
+            ("OSLT", "oslot * gm.N + " if moe else ""),
             # One dispatch covers every routed slot: z indexes the slot, so a MoE
             # projection is a single command with k times the work rather than k commands
-            # each too small to fill the machine. `orow` shifts the output to that slot's row.
+            # each too small to fill the machine.
             ("WOFFINIT", ("  oslot = gid.z;\n  woff = eidx[oslot] * gm.estride;\n"
                           "  xbase = select(0u, oslot * gm.K, gm.xper == 1u);"
                           if (moe and mode == 1) else
                           ("  oslot = 0u;\n  woff = eidx[gm.eslot] * gm.estride;\n"
-                           "  xbase = 0u;" if moe
-                           else "  oslot = 0u;\n  woff = 0u;\n  xbase = 0u;"))),
+                           "  xbase = 0u;" if moe else ""))),
             # The codebook sits after the expert index when there is one.
             ("GBIND", "5" if moe else "4"),
             ("HELPERINIT", ("  kvfill(lx + ly * %du);\n  workgroupBarrier();" % _GGML_WGX_L)
@@ -4009,7 +4063,7 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     return src
 
 
-def _ggml_selfcheck(type_name, mode, small=False, moe=False):
+def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
     """Multiply one random block and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -4054,6 +4108,16 @@ def _ggml_selfcheck(type_name, mode, small=False, moe=False):
         pk = xp.asarray(np.concatenate([cp.asnumpy(pk), cp.asnumpy(pk)]))
         eidx = xp.asarray(np.array([0, 1], np.int32))
         eslot = 1
+    # Build the variant if nobody has. `ggml_matmul` calls this right after adding one, so
+    # this only fires for a standalone call -- but a self-check you cannot run on its own is
+    # not much of a self-check, and without it a sweep of every format reports every one of
+    # them broken (the kernel is missing, so nothing runs and the output stays zero).
+    if small is _AUTO:
+        small = _shape_kind(2, K, vals) if mode == 1 else None
+    key = (type_name, mode, small, moe)
+    if key not in _ggml_k["added"]:
+        _ggml_add(type_name, mode, small, moe)
+        _ggml_k["added"].add(key)
     raw_out = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
                                               K=K, N=2, small=small, eidx=eidx,
                                               eslot=(eslot or 0), estride=estride)))
@@ -4087,7 +4151,7 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     # batch of two, and it only pays if the second row rides along with the first.
     m = 1 if (eidx is not None and xper) else int(xf.shape[0])
     mode = m if m <= 2 else 0
-    small = mode == 1 and int(N) <= _SMALL_N
+    small = _shape_kind(N, K, _GGML_TYPES[type_name][2]) if mode == 1 else None
     moe = eidx is not None
     key = (type_name, mode, small, moe)
     if key not in _ggml_k["added"]:
@@ -4113,29 +4177,30 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, mode, small=False, moe=False):
+def _ggml_add(type_name, mode, small=None, moe=False):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if moe:
         binds.append("read-only-storage")               # the expert index, before the grid
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
-    cfg = _small_cfg(_GGML_TYPES[type_name][2]) if small else None
+    cfg = _cfg_for(small, _GGML_TYPES[type_name][2])
     plat.addKernel(_ggml_name(type_name, mode, small=small, moe=moe),
                    {"source": _ggml_src(type_name, mode, cfg, moe=moe), "bindingTypes": binds})
 
 
-def _ggml_name(type_name, mode, orw=None, small=False, moe=False):
+def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
     # ORW and the thread shape are compile-time constants in the shader, so a kernel is
     # identified by them too -- otherwise a second variant would silently reuse the first
     # one's pipeline.
     o = _orw_for(mode) if orw is None else orw
     return "ggml%s_%s%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
-                                "" if o <= 1 else "_r%d" % o, "_s" if small else "",
+                                "" if o <= 1 else "_r%d" % o,
+                                "_%s" % small if small else "",
                                 "_e" if moe else "")
 
 
-def _ggml_run(xf, packed, type_name, K, N, small=None, eidx=None, eslot=0,
+def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
               estride=0, xper=False):
     """`eidx`/`eslot`/`estride` select one expert out of a stacked MoE weight at run time:
     the shader reads `eidx[eslot]` and offsets into `packed` by `estride` words. Passing them
@@ -4143,9 +4208,17 @@ def _ggml_run(xf, packed, type_name, K, N, small=None, eidx=None, eslot=0,
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
     M = 1 if (eidx is not None and xper) else int(xf.shape[0])
     mode = M if M <= 2 else 0
-    if small is None:
-        small = mode == 1 and int(N) <= _SMALL_N
+    if small is _AUTO:
+        small = _shape_kind(N, K, vals) if mode == 1 else None
     moe = eidx is not None
+    # Asking for a variant nobody built is the same silent failure the self-check exists to
+    # catch: the platform does not know the name, runs nothing, and leaves the output buffer
+    # zeroed -- which reads as a numerically wrong kernel. It cost a full sweep reported as
+    # "168 of 168 formats broken" while the model beside it generated perfectly.
+    if (type_name, mode, small, moe) not in _ggml_k["added"]:
+        raise RuntimeError("ggml kernel variant %r was never built -- go through ggml_matmul, "
+                           "or pass the same `small` it derives (_AUTO works)"
+                           % ((type_name, mode, small, moe),))
     # A MoE decode runs every routed slot in one dispatch, z indexing the slot, and returns
     # one row per slot for the caller to weight and sum. Batched prefill keeps z for its own
     # row blocking and takes a slot at a time.
@@ -4162,7 +4235,7 @@ def _ggml_run(xf, packed, type_name, K, N, small=None, eidx=None, eslot=0,
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
-                    "workGroups": {"x": ((_gemv_groups(N, mode, vals if small else None)
+                    "workGroups": {"x": ((_gemv_groups(N, mode, vals, small)
                                           if M <= 2 else (N + 63) // 64)), "y": 1,
                                    "z": slots if M <= 2 else (M + 3) // 4}})
     return of

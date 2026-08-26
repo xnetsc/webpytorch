@@ -312,9 +312,9 @@ def moe_mlp(lm, lay, x):
             m["_gpu_route"] = buf
         wt.moe_route(rlog.data, buf["eidx"], buf["ew"].data, ne, k, norm)
         eidx = buf["eidx"]
-        g = st["gate"].forward(x, eidx)
-        u = st["up"].forward(x, eidx)
-        y = st["down"].forward(wt.silu(g) * u, eidx)
+        gu = st["gate_up"].forward(x, eidx)               # (k, 2*inter): gate then up
+        half = gu.data.shape[-1] // 2
+        y = st["down"].forward(wt.silu(gu[:, :half]) * gu[:, half:], eidx)
         out = (y * buf["ew"].reshape(k, 1)).sum(axis=0).reshape(1, -1)
         if m.get("shared"):
             sh = m["shared"]
@@ -376,9 +376,9 @@ def moe_mlp(lm, lay, x):
         for ti in range(T):
             xt = wt.Tensor(wt._contig(x.data[ti:ti + 1]))
             eidx.buffer.set_data(np.ascontiguousarray(topk_idx[ti, :k].astype(np.int32)))
-            g = st["gate"].forward(xt, eidx)
-            u = st["up"].forward(xt, eidx)
-            y = st["down"].forward(wt.silu(g) * u, eidx)
+            gu = st["gate_up"].forward(xt, eidx)
+            half = gu.data.shape[-1] // 2
+            y = st["down"].forward(wt.silu(gu[:, :half]) * gu[:, half:], eidx)
             wv = wt.Tensor(np.ascontiguousarray(topk_w[ti, :k].astype(np.float32)))
             rows.append((y * wv.reshape(k, 1)).sum(axis=0).reshape(1, -1))
         out = wt.cat(rows, axis=0)
