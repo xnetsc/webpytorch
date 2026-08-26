@@ -3924,18 +3924,26 @@ def _small_cfg(vals):
     return max(1, 256 // ks), ks
 
 
-# Blocks per row below which the reduction would be split further -- OFF, because it does not
-# pay. The idea: split-K is how many lanes share one output row's reduction, so a short row
-# (a routed expert's K is 2048, eight blocks, against a dense layer's 5120 or 17408) gives
-# each lane almost nothing and leaves few workgroups. A microbenchmark said 32x8 was 1.85x
-# the default shape on exactly that matmul.
+# Blocks per row at or below which the reduction would not be split at all -- OFF, at 0,
+# because it measures slower. A short row is every routed expert (K is the hidden size,
+# 2048, eight blocks, against a dense layer's 5120 or 17408), and dropping the split there
+# looks like it must pay: the split exists to give a lane something to do, and at eight
+# blocks each lane has almost nothing while still paying the workgroup staging, the barrier
+# and the psum reduction.
 #
-# It moved nothing in a real step: the MoE portion measured 22.1ms against 21.1ms for the
-# default, and 16x16 (what the narrow-output rule would have chosen) was worse still at
-# 42.7ms for the whole step. The microbenchmark had to override the group count to test a
-# shape, and that override -- not the shape -- is what it was measuring. Left here with the
-# numbers so the next person does not re-derive it; set it to 8 to try again on other
-# hardware.
+# It does not. Measured twice, each from a clean load rather than by re-pointing constants
+# in a live session, on a routed 30B: 35.8ms with the split, 37.8ms without it. The shape is
+# not broken -- `_selfcheck_shape` now builds and checks it like any other, and it is exact
+# -- it is simply slower, and 256 rows of one lane each apparently costs more in occupancy
+# than the reduction costs in synchronisation.
+#
+# Two earlier readings said otherwise and both were artefacts, which is why the numbers here
+# are only from clean loads: a microbenchmark that had to override the group count to test a
+# shape (it was measuring the override), and a live-session sweep that clear()ed the kernel
+# cache between captures and produced a 31% "win" no clean run could reproduce.
+#
+# Set to 8 to try again on other hardware: 8 clears a routed expert and leaves a 5120-wide
+# layer (20 blocks) alone.
 _SHORT_K_BLOCKS = 0
 
 
@@ -3954,9 +3962,10 @@ _AUTO = object()      # "work it out"; None means the default shape, explicitly
 def _shape_kind(N, K, vals):
     """Which thread shape this matmul wants: 'narrow', 'shortk', or None for the default.
 
-    A narrow output cannot fill the machine along the row axis at all. A short reduction
-    gives each lane almost nothing at the default split and leaves few workgroups besides --
-    which is every routed expert, whose K is a fraction of a dense layer's."""
+    The two are opposites and the order matters. A narrow output cannot fill the machine
+    along the row axis at all, so parallelism has to move onto K. A short reduction has rows
+    to spare and nothing to gain from splitting K, so the split comes off entirely. A matmul
+    that is both narrow and short is narrow first: no rows is the harder problem."""
     if int(N) <= _SMALL_N:
         return "narrow"
     if (int(K) // max(1, int(vals))) <= _SHORT_K_BLOCKS:
@@ -3964,12 +3973,13 @@ def _shape_kind(N, K, vals):
     return None
 
 
-# Thread shape for a short reduction. Not the same as the narrow-output one: that pushes the
-# split as far as the workgroup memory allows (16 ways at a 256-value block), which is too far
-# here -- measured on a routed expert at K=2048, 16x16 was slower end to end than the default
-# while 32x8 was the best of the shapes tried. Few blocks want more lanes on the reduction,
-# not the most possible.
-_SHORT_K_CFG = (32, 8)
+# The shape `_SHORT_K_BLOCKS` would select if it were on: every one of the workgroup's 256
+# threads takes its own output row and walks the whole of K, so there is no split to reduce
+# afterwards. It is the opposite of the narrow-output shape, which splits as far as the
+# workgroup memory allows (16 ways at a 256-value block) because there the row axis is what
+# cannot fill the machine. Of the shapes tried on a routed expert, nothing beat the default:
+# 128x2 and 32x8 came out level with it, and 256x1 is the 35.8 -> 37.8ms above.
+_SHORT_K_CFG = (256, 1)
 
 
 def _orw_for(mode=1):
@@ -4063,41 +4073,92 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     return src
 
 
+def _selfcheck_shape(kind, vals):
+    """An (N, blocks-per-row) that provably lands on `kind`, or None if it cannot.
+
+    The self-check used a single shape -- two output rows, three blocks -- for every variant
+    it tested. Two rows is below `_SMALL_N`, so `_shape_kind` called every one of them
+    'narrow' and the other thread shapes were never run by it at all. A shape that is never
+    checked is a shape that can be silently broken, and one was: a short-K variant produced
+    nothing but zeros and read as a 31% speedup, because a kernel that does nothing is fast
+    and a self-check that never builds it has nothing to say.
+
+    N is deliberately not a multiple of the group width, so the last group is partial and the
+    `n < gm.N` guard is exercised rather than assumed."""
+    n_wide = _SMALL_N + 64
+    if kind == "narrow":
+        n, nb = 2, 3
+    elif kind == "shortk":
+        n, nb = n_wide, 3
+    else:
+        n, nb = n_wide, _SHORT_K_BLOCKS + 3
+    # A kind can be unreachable -- 'shortk' is, whenever its threshold is off -- and there is
+    # nothing to check in that case.
+    return (n, nb) if _shape_kind(n, nb * vals, vals) == kind else None
+
+
 def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
-    """Multiply one random block and compare against the reference dequantizer.
+    """Multiply a few random blocks and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
     exception -- which reads exactly like a working kernel on an all-zero weight, and has
     twice sent me chasing a numerical bug that was a syntax error. A couple of blocks per
-    type, once per session, turns both failure modes into something that raises."""
+    type, once per session, turns both failure modes into something that raises.
+
+    With `small` left at `_AUTO` this checks EVERY thread shape the decode path can pick,
+    not just the one some particular matmul happens to want."""
+    if small is _AUTO and mode == 1:
+        vals = _GGML_TYPES[type_name][2]
+        for kind in ("narrow", "shortk", None):
+            shape = _selfcheck_shape(kind, vals)
+            if shape is not None:
+                _selfcheck_one(type_name, mode, kind, moe, *shape)
+        return
+    if small is _AUTO:
+        small = None
+    vals = _GGML_TYPES[type_name][2]
+    shape = _selfcheck_shape(small, vals) or (_SMALL_N + 64, 3)
+    _selfcheck_one(type_name, mode, small, moe, *shape)
+
+
+def _selfcheck_one(type_name, mode, small, moe, N, NB):
+    """One (thread shape, N, blocks) against the reference. Raises on a mismatch."""
     from . import ggufload as G
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
-    # THREE blocks per row, not one. A block is not always a whole number of words -- Q3_K is
-    # 110 bytes -- so a decode fragment that reads a word directly is only correct on blocks
-    # whose byte offset happens to land on a word boundary. With one block per row the offset
-    # is always zero and such a bug is invisible; it cost half the columns of every Q3_K
-    # tensor, which on a model whose experts are all Q3_K is the whole model.
-    NB = 3
+    # THREE blocks per row at least, not one. A block is not always a whole number of words
+    # -- Q3_K is 110 bytes -- so a decode fragment that reads a word directly is only correct
+    # on blocks whose byte offset happens to land on a word boundary. With one block per row
+    # the offset is always zero and such a bug is invisible; it cost half the columns of
+    # every Q3_K tensor, which on a model whose experts are all Q3_K is the whole model.
     K = NB * vals
     # Random bytes are a legal block for every type and exercise every scale and codebook
-    # index -- but an f16 field is Inf or NaN whenever its exponent is all ones, and with
-    # several blocks per row that happens more often than not. The exponent's top bit lives
-    # in bit 6 of a byte whatever the field's offset, so clearing it rules the case out
-    # without needing to know where each format keeps its scales. Redrawing as well, since
-    # a format may produce a large value some other way.
-    for seed in range(64):
-        rng = np.random.default_rng(seed)
-        raw = (rng.integers(0, 256, (2, NB * blk), dtype=np.uint8) & 0xBF).tobytes()
-        ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, 2 * K),
-                         np.float32).reshape(2, K)
-        if np.all(np.isfinite(ref)) and float(np.abs(ref).max()) < 1e4:
-            break
+    # index -- but an f16 field is Inf or NaN whenever its exponent is all ones, and over
+    # hundreds of rows that is a certainty rather than a risk. The exponent's top bit lives
+    # in bit 6 of a byte whatever the field's offset, so clearing it rules the f16 case out
+    # without needing to know where each format keeps its scales.
+    #
+    # That is not enough for every format: MXFP4's scale is a bare e8m0 exponent, so bit 6
+    # clear still allows 2^64, and at 576 rows one such row always turns up. Clearing more
+    # bits fixes it but costs coverage of the quantized fields, so the masks are tried in
+    # order and the loosest one that yields a finite block wins -- full coverage for the
+    # formats that can take it, and a checkable block for the ones that cannot.
+    for mask in (0xBF, 0x3F, 0x0F):
+        for seed in range(32):
+            rng = np.random.default_rng(seed)
+            raw = (rng.integers(0, 256, (N, NB * blk), dtype=np.uint8) & mask).tobytes()
+            ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, N * K),
+                             np.float32).reshape(N, K)
+            if np.all(np.isfinite(ref)) and float(np.abs(ref).max()) < 1e4:
+                break
+        else:
+            continue
+        break
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
     M = mode if mode else 3
     x = rng.standard_normal((M, K)).astype(np.float32)
-    raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
-    pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, NB * blk)
+    raw = raw + b"\x00" * ((-len(raw)) % 4)     # a block is not always a whole number of u32
+    pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), N, NB * blk)
     eidx = eslot = None
     estride = 0
     if moe:
@@ -4112,29 +4173,27 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
     # this only fires for a standalone call -- but a self-check you cannot run on its own is
     # not much of a self-check, and without it a sweep of every format reports every one of
     # them broken (the kernel is missing, so nothing runs and the output stays zero).
-    if small is _AUTO:
-        small = _shape_kind(2, K, vals) if mode == 1 else None
     key = (type_name, mode, small, moe)
     if key not in _ggml_k["added"]:
         _ggml_add(type_name, mode, small, moe)
         _ggml_k["added"].add(key)
     raw_out = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
-                                              K=K, N=2, small=small, eidx=eidx,
+                                              K=K, N=N, small=small, eidx=eidx,
                                               eslot=(eslot or 0), estride=estride)))
     if moe and mode == 1:
         # One row per routed slot. Take the SECOND -- it must have read the second copy of
         # the weight, so a stride that is ignored or wrong shows up here.
-        got = raw_out.reshape(-1, M, 2)[1]
+        got = raw_out.reshape(-1, M, N)[1]
     else:
-        got = raw_out.reshape(M, 2)
+        got = raw_out.reshape(M, N)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
-        raise RuntimeError("native ggml %s kernel for %s is wrong (rel err %.3g) -- check "
-                           "the console for a WGSL compile error"
+        raise RuntimeError("native ggml %s kernel for %s at N=%d K=%d is wrong (rel err %.3g)"
+                           " -- check the console for a WGSL compile error"
                            % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode)
-                              + ("(narrow)" if small else "") + ("(moe)" if moe else ""),
-                              type_name, err))
+                              + ("(%s)" % small if small else "") + ("(moe)" if moe else ""),
+                              type_name, N, K, err))
 
 
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
