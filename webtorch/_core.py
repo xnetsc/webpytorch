@@ -3576,12 +3576,65 @@ _Q2K_DEC = """
 # needs the grids too. They are 1-16 KB -- too big to inline as WGSL constants, and dynamic
 # indexing of a `const` array is unevenly supported anyway -- so each type gets one extra
 # storage binding: ksigns in the first 128 bytes, the grid from byte 128 on.
+# Workgroup memory a staged codebook may use -- 0, so none of them are staged, because it
+# does not pay. The reasoning was sound and the precedent was right there: staging IQ4_XS's
+# codebook took it from 63.3 to 86.0 GB/s. But that replaced about ten ALU instructions per
+# value with one load, whereas this replaces a global load with a workgroup load, and the
+# grids are small enough to sit in L1 already.
+#
+# Measured on a 27B, 64 distinct weights per format so cache cannot carry it, global read
+# against staged:
+#   IQ3_S    71.3 -> 71.6 GB/s        IQ2_XS   56.4 -> 58.7
+#   IQ3_XXS  71.1 -> 75.6             IQ2_S    61.8 -> 63.2
+#   whole captured step             150.79 -> 150.05ms   (0.5%, noise)
+#
+# Against that: 1 to 8 KB of workgroup memory per kernel. The narrow shape already spends
+# 17408 bytes, so staging IQ2_S's 8 KB grid would put the requirement at 25.7 KB -- against
+# a WebGPU guaranteed minimum of 16384. Not worth narrowing what the code runs on for half
+# a percent. Raise this to 8704 to stage everything but IQ1_S, or to 2176 for the small
+# grids only, if a GPU with a weaker L1 turns up.
+_GRID_WG_BUDGET = 0
+
+
+def _grid_u32(type_name):
+    """u32 length of the codebook buffer for this format, or 0 if it has none.
+
+    Mirrors `_ggml_grid`'s layout exactly -- ksigns[128] then the grid -- because the shader
+    stages the whole buffer and indexes it with the same offsets."""
+    tab = _GGML_TYPES[type_name][4]
+    if tab is None:
+        return 0
+    from . import iqtables as T
+    g = np.ascontiguousarray(getattr(T, tab)).view(np.uint8).reshape(-1)
+    return (128 + g.size + (-(128 + g.size)) % 4) // 4
+
+
+# Staged codebook. The i-quants read one grid entry per four values straight out of the
+# storage buffer, which is a global load on top of the loads for the weight itself -- and
+# IQ4_XS shows what that costs: staging ITS codebook (all sixteen entries of it) in
+# workgroup memory took it from 63.3 to 86.0 GB/s. These grids are 1 KB to 8 KB rather than
+# 64 bytes, but they are read just as often, and a workgroup fills one in a few instructions
+# per thread before the barrier that was already there.
+_GRID_STAGE = """
+var<workgroup> gtab: array<u32, NGRIDu>;
+fn kvfill(t: u32) {
+  // Strided by 64 because a workgroup is at least that wide on every path here, and the
+  // thread count is not visible from inside this function. Threads past 64 do nothing;
+  // the fill is a handful of loads either way.
+  if (t < 64u) {
+    for (var q: u32 = t; q < NGRIDu; q = q + 64u) { gtab[q] = gr[q]; }
+  }
+}
+"""
+
+
 _GRID_FN = """
 @group(0) @binding(GBIND)
 var<storage,read> gr: array<u32>;
-fn GB(o: u32) -> u32 { return (gr[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
-fn G4(idx: u32) -> u32 { return gr[32u + idx]; }        // one 4-byte entry, one read
-fn G4V(idx: u32) -> vec4<f32> { return unpack4x8unorm(gr[32u + idx]) * 255.0; }
+GRIDSTAGE
+fn GB(o: u32) -> u32 { return (GSRC[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+fn G4(idx: u32) -> u32 { return GSRC[32u + idx]; }      // one 4-byte entry, one read
+fn G4V(idx: u32) -> vec4<f32> { return unpack4x8unorm(GSRC[32u + idx]) * 255.0; }
 fn SGN4(mask: u32, j0: u32) -> vec4<f32> {
   return vec4<f32>(SGN(mask, j0), SGN(mask, j0 + 1u), SGN(mask, j0 + 2u), SGN(mask, j0 + 3u));
 }
@@ -4121,6 +4174,13 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
     expert from an index buffer instead of being bound to one expert's weights."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    # Whether this format's codebook gets staged in workgroup memory. Decided once, because
+    # three substitutions below have to agree about it -- and the one that nearly got away is
+    # the fill call: it is emitted on a test for `fn kvfill`, which lives in the text this
+    # flag SUBSTITUTES IN, so testing the raw helpers string leaves the table unfilled and
+    # every value zero. The self-check caught exactly that, at N=576 on IQ2_XS.
+    _ng = _grid_u32(type_name)
+    stage_grid = 0 < _ng * 4 <= _GRID_WG_BUDGET
     _GGML_WGX_L, _GGML_KS_L = cfg if cfg else (_GGML_WGX, _GGML_KS)
     pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
                        else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
@@ -4183,10 +4243,15 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
                            "  xbase = 0u;" if moe else ""))),
             # The codebook sits after the expert index when there is one.
             ("GBIND", "5" if moe else "4"),
+            # Stage the codebook in workgroup memory when it fits, and read it from there.
+            # A grid too large for the budget keeps the global read -- correct either way,
+            # and the substitution is what makes that a one-line difference.
+            ("GRIDSTAGE", _GRID_STAGE.replace("NGRIDu", "%du" % _ng) if stage_grid else ""),
+            ("GSRC", "gtab" if stage_grid else "gr"),
             ("HELPERINIT", ("  kvfill(lx + ly * %du);\n  workgroupBarrier();" % _GGML_WGX_L)
-             if "fn kvfill" in helpers else ""),
+             if ("fn kvfill" in helpers or stage_grid) else ""),
             ("GEMMINIT", "  kvfill(lx + ly * 64u);\n  workgroupBarrier();"
-             if "fn kvfill" in helpers else "")]
+             if ("fn kvfill" in helpers or stage_grid) else "")]
     for k, v in subs:
         src = src.replace(k, v)
     return src
