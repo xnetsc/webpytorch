@@ -735,6 +735,99 @@ def _empty(shape):
     return xp.empty(shape, np.float32)
 
 
+_MOE_ROUTE_WGSL = """@group(0) @binding(0)
+var<storage,read> lg: array<f32>;
+@group(0) @binding(1)
+var<storage,read_write> eidx: array<i32>;
+@group(0) @binding(2)
+var<storage,read_write> ew: array<f32>;
+struct RM { ne: u32, k: u32, norm: u32, pad: u32, }
+@group(0) @binding(3)
+var<storage,read> rm: RM;
+var<workgroup> v: array<f32, 512>;
+var<workgroup> red: array<f32, 128>;
+var<workgroup> ridx: array<u32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  // stage the router's scores; anything past ne is -inf so it never wins a pass
+  for (var e: u32 = t; e < 512u; e = e + 128u) {
+    v[e] = select(-1e30, lg[e], e < rm.ne);
+  }
+  workgroupBarrier();
+  // k passes of argmax, each taking the winner out of the running
+  for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+    var best: f32 = -1e30;
+    var bi: u32 = 0u;
+    for (var e: u32 = t; e < rm.ne; e = e + 128u) {
+      if (v[e] > best) { best = v[e]; bi = e; }
+    }
+    red[t] = best; ridx[t] = bi;
+    workgroupBarrier();
+    var r: u32 = 64u;
+    loop {
+      if (r == 0u) { break; }
+      if (t < r) {
+        if (red[t + r] > red[t]) { red[t] = red[t + r]; ridx[t] = ridx[t + r]; }
+      }
+      workgroupBarrier();
+      r = r / 2u;
+    }
+    if (t == 0u) {
+      eidx[s] = i32(ridx[0]);
+      ew[s] = red[0];
+      v[ridx[0]] = -1e30;
+    }
+    workgroupBarrier();
+  }
+  // softmax over ALL experts, then renormalise across the chosen ones (the Qwen convention);
+  // with norm == 0 the raw softmax weights are kept.
+  if (t == 0u) {
+    var mx: f32 = -1e30;
+    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { mx = max(mx, lg[e]); }
+    var den: f32 = 0.0;
+    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { den = den + exp(lg[e] - mx); }
+    var tot: f32 = 0.0;
+    for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+      let p = exp(ew[s] - mx) / den;
+      ew[s] = p; tot = tot + p;
+    }
+    if (rm.norm == 1u && tot > 0.0) {
+      for (var s: u32 = 0u; s < rm.k; s = s + 1u) { ew[s] = ew[s] / tot; }
+    }
+  }
+}
+"""
+_moe_r = {"added": False}
+
+
+def moe_route(logits, eidx, ew, ne, k, norm=True):
+    """Router scores -> chosen experts and their weights, entirely on the device.
+
+    Doing this on the host means reading the router's output back once per MoE layer, which
+    at 48 layers is most of a decode step -- and it is a tiny amount of data, so the cost is
+    all round-trip. Keeping it here also keeps the step capturable: the indices land in a
+    buffer the expert matmuls already read, and no command depends on their value."""
+    plat = _adam_kernel["platform"]
+    if not _moe_r["added"]:
+        plat.addKernel("moe_route", {"source": _MOE_ROUTE_WGSL,
+                                     "bindingTypes": ["read-only-storage", "storage",
+                                                      "storage", "read-only-storage"]})
+        _moe_r["added"] = True
+    meta = _adam_kernel["make_meta"]((int(ne), int(k), 1 if norm else 0, 0), "u4,u4,u4,u4")
+    plat.runKernel({"name": "moe_route",
+                    "tensors": [logits.buffer.buffer_id, eidx.buffer.buffer_id,
+                                ew.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": 1, "y": 1, "z": 1}})
+
+
+def _empty_i32(shape):
+    """A small int32 buffer the host rewrites between dispatches -- a step's control block,
+    or the expert indices a MoE layer routes to. Persistent, so a capture can bind it once
+    and see the new contents on every replay."""
+    return xp.empty(shape, np.int32)
+
+
 # GLSL helper: read element `idx` of a texture laid out row-major (width from the
 # texture). Shared by all WebGL kernels. Defined early so module-level kernel
 # strings that .replace("FETCH", _GL_FETCH) can use it.
@@ -2913,14 +3006,24 @@ var<storage,read> x: array<f32>;
 var<storage,read> w: array<u32>;
 @group(0) @binding(2)
 var<storage,read_write> outp: array<f32>;
-struct GM { M: u32, N: u32, K: u32, rowb: u32, }
+struct GM { M: u32, N: u32, K: u32, rowb: u32, estride: u32, eslot: u32, xper: u32, pad: u32, }
 @group(0) @binding(3)
 var<storage,read> gm: GM;
 // Byte addressing, not word: most ggml blocks are not a multiple of four bytes (Q8_0 is 34,
 // Q3_K and IQ3_S 110, MXFP4 17), so a u32 index would drift out of alignment after the
 // first block. These mirror the reference dequantizer's own byte offsets exactly.
 var<private> nrow: u32;
-fn W(wo: u32) -> u32 { return w[wo * gm.N + nrow]; }
+// Base word offset into `w`. Zero for an ordinary weight; for a sparse-MoE projection all
+// experts live in ONE buffer and this selects the slice, so the dispatch is the same command
+// whichever expert the router picked -- which is what lets a MoE step be captured at all.
+var<private> woff: u32;
+// Which routed slot this invocation serves; also selects the output row. Zero when the
+// weight is an ordinary one, which costs nothing.
+var<private> oslot: u32;
+// Where this slot's input starts. A routed layer's first two projections share one input
+// row; the third takes the row that projection produced for the same slot, so it strides.
+var<private> xbase: u32;
+fn W(wo: u32) -> u32 { return w[woff + wo * gm.N + nrow]; }
 fn B(o: u32) -> u32 { return (W(o >> 2u) >> ((o & 3u) * 8u)) & 255u; }
 fn I8(o: u32) -> f32 { return f32(i32(B(o) << 24u) >> 24u); }
 fn U16(o: u32) -> u32 { return B(o) | (B(o + 1u) << 8u); }
@@ -2981,6 +3084,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let n = gid.x;
   let lx = lid.x;
   let ly = lid.y;
+WOFFINIT
 GEMMINIT
   mb = gid.z * 4u;
   mn = select(0u, min(4u, gm.M - mb), mb < gm.M);
@@ -3019,6 +3123,15 @@ _GGML_KSG = 2               # split-K rows on the batched path
 # parallelism on a matmul that is otherwise one long serial walk per output column. And all
 # 64 threads in a row want the SAME activations, so a block's worth is staged in workgroup
 # memory once instead of being re-read from global memory 64 times.
+# Bound only by the MoE variant of a kernel. `eidx[slot]` is the expert the router chose
+# for that slot on this token; the host rewrites this small buffer each step, and the captured
+# command list never changes. This mirrors what llama.cpp does with ggml_mul_mat_id: one
+# stacked expert tensor plus an index, rather than a separate dispatch per expert.
+_MOE_BIND = """
+@group(0) @binding(4)
+var<storage,read> eidx: array<u32>;
+"""
+
 _GGML_GEMV_PRE = """
 var<workgroup> xs: array<f32, KSxBLKxR>;
 var<workgroup> psum: array<f32, PSUMSZ>;
@@ -3047,6 +3160,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   let rowbase = wid.x * (WGXu * ORWu);
   let lx = lid.x;
   let ly = lid.y;
+WOFFINIT
   xoff = ly * BLKVALS;
 HELPERINIT
   acc0 = 0.0;
@@ -3060,7 +3174,7 @@ ACCINIT1
     let b = st * KSu + ly;
     for (var t: u32 = lx; t < BLKVALS; t = t + WGXu) {
       var xv: f32 = 0.0;
-      if (b < nb) { xv = x[b * BLKVALS + t]; }
+      if (b < nb) { xv = x[xbase + b * BLKVALS + t]; }
       xs[xoff + t] = xv;
 XLOAD1
     }
@@ -3091,7 +3205,7 @@ PSUM1
         for (var i: u32 = 0u; i < KSu; i = i + 1u) {
           tot = tot + psum[q * KSxWGX + i * WGXu + lx];
         }
-        outp[nn] = tot;
+        outp[oslot * gm.N + nn] = tot;
       }
     }
     // The second row keeps its own fixed psum half and its own bounds check. Moving the
@@ -3378,7 +3492,7 @@ _Q2K_DEC = """
 # indexing of a `const` array is unevenly supported anyway -- so each type gets one extra
 # storage binding: ksigns in the first 128 bytes, the grid from byte 128 on.
 _GRID_FN = """
-@group(0) @binding(4)
+@group(0) @binding(GBIND)
 var<storage,read> gr: array<u32>;
 fn GB(o: u32) -> u32 { return (gr[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
 fn G4(idx: u32) -> u32 { return gr[32u + idx]; }        // one 4-byte entry, one read
@@ -3827,15 +3941,16 @@ def _gemv_groups(N, mode=1, vals=None):
     return (int(N) + per - 1) // per
 
 
-def _ggml_src(type_name, mode, cfg=None):
+def _ggml_src(type_name, mode, cfg=None, moe=False):
     """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one.
-    `cfg` overrides (WGX, KS) for a narrow output."""
+    `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
+    expert from an index buffer instead of being bound to one expert's weights."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
     _GGML_WGX_L, _GGML_KS_L = cfg if cfg else (_GGML_WGX, _GGML_KS)
     pre, main, tail = ((_GGML_GEMV_PRE, _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
                        else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
-    src = _GGML_BIND + helpers + pre + main + dec + tail
+    src = _GGML_BIND + (_MOE_BIND if moe else "") + helpers + pre + main + dec + tail
     rows = max(1, mode)
     two = rows == 2
     # Multi-row accumulation is for the single-token decode path, which is the hot one. The
@@ -3871,6 +3986,20 @@ def _ggml_src(type_name, mode, cfg=None):
             # barrier of the block loop, so every lane sees it. BOTH paths need it -- the
             # batched kernel has its own entry point and its own workgroup shape, and leaving
             # it out left the table zeroed there (the self-check caught exactly that).
+            # The expert this dispatch multiplies against, read at run time so one captured
+            # command serves whichever expert the router picks. Zero for an ordinary weight,
+            # which the compiler folds away -- the dense path pays nothing.
+            # One dispatch covers every routed slot: z indexes the slot, so a MoE
+            # projection is a single command with k times the work rather than k commands
+            # each too small to fill the machine. `orow` shifts the output to that slot's row.
+            ("WOFFINIT", ("  oslot = gid.z;\n  woff = eidx[oslot] * gm.estride;\n"
+                          "  xbase = select(0u, oslot * gm.K, gm.xper == 1u);"
+                          if (moe and mode == 1) else
+                          ("  oslot = 0u;\n  woff = eidx[gm.eslot] * gm.estride;\n"
+                           "  xbase = 0u;" if moe
+                           else "  oslot = 0u;\n  woff = 0u;\n  xbase = 0u;"))),
+            # The codebook sits after the expert index when there is one.
+            ("GBIND", "5" if moe else "4"),
             ("HELPERINIT", ("  kvfill(lx + ly * %du);\n  workgroupBarrier();" % _GGML_WGX_L)
              if "fn kvfill" in helpers else ""),
             ("GEMMINIT", "  kvfill(lx + ly * 64u);\n  workgroupBarrier();"
@@ -3880,7 +4009,7 @@ def _ggml_src(type_name, mode, cfg=None):
     return src
 
 
-def _ggml_selfcheck(type_name, mode, small=False):
+def _ggml_selfcheck(type_name, mode, small=False, moe=False):
     """Multiply one random block and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -3915,33 +4044,58 @@ def _ggml_selfcheck(type_name, mode, small=False):
     x = rng.standard_normal((M, K)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)      # a block is not always a whole number of u32
     pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), 2, NB * blk)
-    got = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
-                                          K=K, N=2, small=small))).reshape(M, 2)
+    eidx = eslot = None
+    estride = 0
+    if moe:
+        # Stack the same weight twice and ask for the SECOND copy through a non-zero slot, so
+        # a wrong stride or a slot that is ignored both show up as a mismatch rather than
+        # accidentally reading the right bytes.
+        estride = int(pk.size)                   # one expert's words, BEFORE stacking
+        pk = xp.asarray(np.concatenate([cp.asnumpy(pk), cp.asnumpy(pk)]))
+        eidx = xp.asarray(np.array([0, 1], np.int32))
+        eslot = 1
+    raw_out = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
+                                              K=K, N=2, small=small, eidx=eidx,
+                                              eslot=(eslot or 0), estride=estride)))
+    if moe and mode == 1:
+        # One row per routed slot. Take the SECOND -- it must have read the second copy of
+        # the weight, so a stride that is ignored or wrong shows up here.
+        got = raw_out.reshape(-1, M, 2)[1]
+    else:
+        got = raw_out.reshape(M, 2)
     want = x @ ref.T
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
         raise RuntimeError("native ggml %s kernel for %s is wrong (rel err %.3g) -- check "
                            "the console for a WGSL compile error"
                            % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode)
-                              + ("(narrow)" if small else ""), type_name, err))
+                              + ("(narrow)" if small else "") + ("(moe)" if moe else ""),
+                              type_name, err))
 
 
-def ggml_matmul(xf, packed, type_name, K, N):
+def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
+                xper=False):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
 
     `packed` must be in the transposed (word, row) layout that `ggml_transpose` produces --
-    GGMLLinear does that once at upload."""
+    GGMLLinear does that once at upload.
+
+    With `eidx`, `packed` holds SEVERAL weights of that shape end to end and the shader picks
+    one at run time: `eidx[eslot]` is its index and `estride` its size in words. That is how a
+    sparse-MoE projection runs without the choice of expert being baked into the command."""
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
-    m = int(xf.shape[0])
+    m = 1 if (eidx is not None and xper) else int(xf.shape[0])
     mode = m if m <= 2 else 0
     small = mode == 1 and int(N) <= _SMALL_N
-    key = (type_name, mode, small)
+    moe = eidx is not None
+    key = (type_name, mode, small, moe)
     if key not in _ggml_k["added"]:
-        _ggml_add(type_name, mode, small)
+        _ggml_add(type_name, mode, small, moe)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
-        _ggml_selfcheck(type_name, mode, small)
-    return _ggml_run(xf, packed, type_name, K, N)
+        _ggml_selfcheck(type_name, mode, small, moe)
+    return _ggml_run(xf, packed, type_name, K, N, small=small,
+                     eidx=eidx, eslot=eslot, estride=estride, xper=xper)
 
 
 def _ggml_grid(type_name):
@@ -3959,43 +4113,58 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, mode, small=False):
+def _ggml_add(type_name, mode, small=False, moe=False):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
+    if moe:
+        binds.append("read-only-storage")               # the expert index, before the grid
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
     cfg = _small_cfg(_GGML_TYPES[type_name][2]) if small else None
-    plat.addKernel(_ggml_name(type_name, mode, small=small),
-                   {"source": _ggml_src(type_name, mode, cfg), "bindingTypes": binds})
+    plat.addKernel(_ggml_name(type_name, mode, small=small, moe=moe),
+                   {"source": _ggml_src(type_name, mode, cfg, moe=moe), "bindingTypes": binds})
 
 
-def _ggml_name(type_name, mode, orw=None, small=False):
+def _ggml_name(type_name, mode, orw=None, small=False, moe=False):
     # ORW and the thread shape are compile-time constants in the shader, so a kernel is
     # identified by them too -- otherwise a second variant would silently reuse the first
     # one's pipeline.
     o = _orw_for(mode) if orw is None else orw
-    return "ggml%s_%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
-                              "" if o <= 1 else "_r%d" % o, "_s" if small else "")
+    return "ggml%s_%s%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
+                                "" if o <= 1 else "_r%d" % o, "_s" if small else "",
+                                "_e" if moe else "")
 
 
-def _ggml_run(xf, packed, type_name, K, N, small=None):
+def _ggml_run(xf, packed, type_name, K, N, small=None, eidx=None, eslot=0,
+              estride=0, xper=False):
+    """`eidx`/`eslot`/`estride` select one expert out of a stacked MoE weight at run time:
+    the shader reads `eidx[eslot]` and offsets into `packed` by `estride` words. Passing them
+    is what keeps the command identical from token to token, so the step stays capturable."""
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
-    M = int(xf.shape[0])
+    M = 1 if (eidx is not None and xper) else int(xf.shape[0])
     mode = M if M <= 2 else 0
     if small is None:
         small = mode == 1 and int(N) <= _SMALL_N
-    name = _ggml_name(type_name, mode, small=small)
+    moe = eidx is not None
+    # A MoE decode runs every routed slot in one dispatch, z indexing the slot, and returns
+    # one row per slot for the caller to weight and sum. Batched prefill keeps z for its own
+    # row blocking and takes a slot at a time.
+    slots = int(eidx.size) if (moe and mode == 1) else 1
+    name = _ggml_name(type_name, mode, small=small, moe=moe)
     plat = _adam_kernel["platform"]
-    of = _empty((M, N))
-    meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk), "u4,u4,u4,u4")
+    of = _empty((slots * M, N))
+    meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk, estride, eslot,
+                                      1 if xper else 0, 0), "u4,u4,u4,u4,u4,u4,u4,u4")
     bufs = [xf.buffer.buffer_id, packed.buffer.buffer_id, of.buffer.buffer_id, meta.buffer_id]
+    if moe:
+        bufs.append(eidx.buffer.buffer_id)
     grid = _ggml_grid(type_name)
     if grid is not None:
         bufs.append(grid.buffer.buffer_id)
     plat.runKernel({"name": name, "tensors": bufs,
                     "workGroups": {"x": ((_gemv_groups(N, mode, vals if small else None)
                                           if M <= 2 else (N + 63) // 64)), "y": 1,
-                                   "z": 1 if M <= 2 else (M + 3) // 4}})
+                                   "z": slots if M <= 2 else (M + 3) // 4}})
     return of
 
 
@@ -4527,7 +4696,7 @@ _TRANSPOSE_WGSL = """@group(0) @binding(0)
 var<storage,read> src: array<u32>;
 @group(0) @binding(1)
 var<storage,read_write> dst: array<u32>;
-struct TM { n: u32, words: u32, rowb: u32, total: u32, gx: u32, pad: u32, }
+struct TM { n: u32, words: u32, rowb: u32, total: u32, gx: u32, dstoff: u32, }
 @group(0) @binding(2)
 var<storage,read> tm: TM;
 @group(0) @binding(3)
@@ -4552,7 +4721,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       k = k + 1u;
     }
   }
-  dst[i] = v;
+  dst[tm.dstoff + i] = v;
   if (i == 0u) { flag[0] = 1.0; }        // four bytes to read back, instead of the tensor
 }
 """
@@ -4560,8 +4729,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 _tr_k = {"added": False}
 
 
-def ggml_transpose(src, n, rowb):
-    """(n, rowb bytes) -> (words, n) u32, so a matmul's threads read adjacent words."""
+def ggml_transpose(src, n, rowb, dst=None, dstoff=0):
+    """(n, rowb bytes) -> (words, n) u32, so a matmul's threads read adjacent words.
+
+    `dst`/`dstoff` write into an existing buffer instead of a fresh one, which is how a
+    stack of MoE experts is assembled: each is transposed straight into its slice. Assigning
+    into a slice from the host instead would read the whole destination back -- and at a
+    hundred-odd megabytes the backend refuses to stage it."""
     words = (rowb + 3) // 4
     plat = _adam_kernel["platform"]
     if not _tr_k["added"]:
@@ -4570,11 +4744,14 @@ def ggml_transpose(src, n, rowb):
                                                     "read-only-storage", "storage"]})
         _tr_k["added"] = True
     total = words * n
-    dst = _empty((total,))
+    if dst is None:
+        dst = _empty((total,))
+        dstoff = 0
     groups = (total + 63) // 64
     gx = min(groups, 32768)                     # a dispatch dimension caps at 65535
     gy = (groups + gx - 1) // gx
-    meta = _adam_kernel["make_meta"]((n, words, rowb, total, gx, 0), "u4,u4,u4,u4,u4,u4")
+    meta = _adam_kernel["make_meta"]((n, words, rowb, total, gx, int(dstoff)),
+                                     "u4,u4,u4,u4,u4,u4")
     flag = _empty((1,))
     plat.runKernel({"name": "ggml_tr",
                     "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id,
@@ -4652,6 +4829,55 @@ class GGMLLinear(Module):
         if self.bias is not None:
             of = of + self.bias
         return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
+
+
+class GGMLMoELinear(Module):
+    """One projection of a sparse-MoE layer: every expert's weight, stacked in one buffer.
+
+    A MoE layer picks a few experts per token, so which weight a matmul reads is decided at
+    run time. Holding one Linear per expert forces that choice into the command stream --
+    which expert kernels get dispatched -- and a captured decode step then replays whatever
+    the first token selected, for every token after it. Stacking them and passing an index
+    keeps the command identical: the shader offsets into this buffer by `estride` words.
+    This is the same shape as llama.cpp's ggml_mul_mat_id.
+
+    Experts are transposed one at a time into the destination, so the peak stays at a single
+    expert rather than the whole stack.
+    """
+
+    def __init__(self, chunks, type_name, K, N):
+        vals, blk_b = _GGML_TYPES[type_name][2], _GGML_TYPES[type_name][3]
+        rowb = (int(K) // vals) * blk_b
+        words = (rowb + 3) // 4
+        self.estride = words * int(N)
+        ne = len(chunks)
+        dst = _empty((self.estride * ne,))
+        for e, raw in enumerate(chunks):
+            b = np.frombuffer(raw, np.uint8)
+            pad = (-b.size) % 4
+            if pad:
+                b = np.concatenate([b, np.zeros(pad, np.uint8)])
+            up = xp.asarray(b.view(np.int32))
+            ggml_transpose(up, int(N), rowb, dst=dst, dstoff=e * self.estride)
+            del up
+        self.packed = dst
+        self.type_name = type_name
+        self.Kt = int(K); self.Nt = int(N); self.n_experts = ne
+
+    def forward(self, x, eidx):
+        """One dispatch for every expert in `eidx`; the result is (k, N), a row per slot.
+
+        `x` is either a single row -- shared by all slots, as the first two projections of a
+        routed layer are -- or already one row per slot, which is what the third takes from
+        the second. The shader is told which by the row count."""
+        xd = x.data
+        xper = int(xd.shape[0]) > 1
+        of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed, self.type_name,
+                         self.Kt, self.Nt, eidx=eidx, estride=self.estride, xper=xper)
+        return Tensor(of)
+
+    def nbytes(self):
+        return int(self.packed.size) * 4
 
 
 class QuantizedLinear(Module):

@@ -921,6 +921,29 @@ class CausalLM:
         if got:
             self.gen_defaults = dict(getattr(self, "gen_defaults", {}) or {}, **got)
 
+    async def _gexperts_stacked(self, name):
+        """A layer's experts for one projection, as a single stacked weight -- or None when
+        this build cannot keep them in their native encoding.
+
+        Stacking is what makes the layer capturable: with the experts in one buffer the
+        shader selects one by index, so the dispatch does not depend on which experts the
+        router chose. The requantizing path has to produce a Linear per expert and stays on
+        `_gexperts`.
+        """
+        from . import ggufload as G
+        t = self._ginfo[name]
+        ne, out_d, in_d = (int(d) for d in reversed(t["dims"]))
+        nm = G.GGML_NAMES.get(t["type"])
+        if not (getattr(self, "_weights", "native") == "native"
+                and nm is not None and wt.ggml_native_supported(nm)
+                and in_d % wt._GGML_TYPES[nm][2] == 0):
+            return None
+        per = out_d * in_d
+        nb = G.tensor_nbytes(t["type"], per)
+        off = self._gds + t["offset"]
+        raw = await self._grng(off, off + nb * ne - 1)
+        return wt.GGMLMoELinear([raw[e * nb:(e + 1) * nb] for e in range(ne)], nm, in_d, out_d)
+
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
 
@@ -1310,14 +1333,22 @@ class CausalLM:
                 # Taken one expert at a time -- see _gload_expert; the full stack does not
                 # fit, and only the packed result is kept.
                 ne = int(self._ginfo[p + "ffn_gate_exps.weight"]["dims"][-1])
-                experts = [{} for _ in range(ne)]
+                stacked, experts = {}, None
                 for key, nm in (("gate", "ffn_gate_exps"), ("up", "ffn_up_exps"),
                                 ("down", "ffn_down_exps")):
-                    e = 0
-                    async for lin in self._gexperts(p + nm + ".weight"):
-                        experts[e][key] = lin; e += 1
+                    st = await self._gexperts_stacked(p + nm + ".weight")
+                    if st is not None:
+                        stacked[key] = st
+                    else:                                  # a path that cannot stack them
+                        if experts is None:
+                            experts = [{} for _ in range(ne)]
+                        e = 0
+                        async for lin in self._gexperts(p + nm + ".weight"):
+                            experts[e][key] = lin; e += 1
                 lay["moe"] = {"gate": await self._gload_quant(p + "ffn_gate_inp.weight"),
-                              "top_k": self.top_k or 2, "norm_topk": True, "experts": experts}
+                              "top_k": self.top_k or 2, "norm_topk": True,
+                              "experts": experts, "stacked": stacked or None,
+                              "n_experts": ne}
             else:
                 lay["gate"] = await qb("ffn_gate"); lay["up"] = await qb("ffn_up")
                 lay["down"] = await qb("ffn_down")
@@ -1790,7 +1821,11 @@ class CausalLM:
         rec = [j for j in range(len(self.layers)) if self._is_linear_layer(j)]
         if rec and not all(self.layers[j]["linear"]._gpu_step_ok() for j in rec):
             return False
-        if any(lay.get("moe") for lay in self.layers):
+        # A MoE layer is capturable exactly when its experts are stacked: the shader then
+        # reads the chosen expert from a buffer the host rewrites each step, so the command
+        # list is the same one every token. Without stacking, the routing decision picks
+        # which kernels get dispatched, and a capture would freeze the first token's choice.
+        if any(lay.get("moe") and not lay["moe"].get("stacked") for lay in self.layers):
             return False
         return bool(self._gpu)
 

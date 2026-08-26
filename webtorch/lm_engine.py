@@ -297,15 +297,64 @@ def moe_mlp(lm, lay, x):
     norm_topk_prob, shared=(gate,up,down)|None, shared_gate=QLinear|None).
     Runs on host for routing (small) + QuantizedLinear experts on GPU."""
     m = lay["moe"]; T = x.shape[0]
-    router_logits = m["gate"](x).numpy()                  # (T, n_experts)
-    ne = router_logits.shape[1]; k = m["top_k"]
+    k = int(m["top_k"])
+    st = m.get("stacked")
+    norm = bool(m.get("norm_topk_prob", m.get("norm_topk", True)))
+    rlog = m["gate"](x)                                   # (T, n_experts), on device
+    if T == 1 and st is not None and getattr(wt, "moe_route", None) is not None:
+        # Everything on the device: the router's scores go straight into the index and weight
+        # buffers the expert matmuls read, so a decode step makes no round-trip at all. On a
+        # 48-layer model, reading the router back once per layer WAS most of the step.
+        ne = int(m.get("n_experts") or st["gate"].n_experts)
+        buf = m.get("_gpu_route")
+        if buf is None:
+            buf = {"eidx": wt._empty_i32((k,)), "ew": wt.Tensor(np.zeros((k,), np.float32))}
+            m["_gpu_route"] = buf
+        wt.moe_route(rlog.data, buf["eidx"], buf["ew"].data, ne, k, norm)
+        eidx = buf["eidx"]
+        g = st["gate"].forward(x, eidx)
+        u = st["up"].forward(x, eidx)
+        y = st["down"].forward(wt.silu(g) * u, eidx)
+        out = (y * buf["ew"].reshape(k, 1)).sum(axis=0).reshape(1, -1)
+        if m.get("shared"):
+            sh = m["shared"]
+            ys = sh["down"](wt.silu(sh["gate"](x)) * sh["up"](x))
+            if m.get("shared_gate") is not None:
+                ys = ys * m["shared_gate"](x).sigmoid()
+            out = out + ys
+        return out
+    # Paths that still decide on the host need the scores there.
+    router_logits = rlog.numpy()                          # (T, n_experts)
+    ne = router_logits.shape[1]
     # top-k gates (softmax over full set, then renorm over top-k like Qwen)
     probs = _softmax_rows(router_logits)
     topk_idx = np.argpartition(-probs, k - 1, axis=1)[:, :k]
     topk_w = np.take_along_axis(probs, topk_idx, axis=1)
-    if m.get("norm_topk_prob", True):
+    if norm:
         topk_w = topk_w / topk_w.sum(1, keepdims=True)
-    if T == 1:
+    if T == 1 and st is not None:
+        # Decode with the experts stacked: the chosen indices go into a small buffer and the
+        # dispatches are the same commands every token, whichever experts the router picked.
+        # That is what keeps the step capturable -- the alternative bakes the first token's
+        # routing into the command list and repeats it forever.
+        eidx = m.get("_eidx")
+        if eidx is None or int(eidx.size) < k:
+            eidx = wt._empty_i32((max(k, 1),))
+            m["_eidx"] = eidx
+        eidx.buffer.set_data(np.ascontiguousarray(topk_idx[0, :k].astype(np.int32)))
+        wsel = m.get("_w")
+        if wsel is None or int(wsel.data.size) < k:
+            wsel = wt.Tensor(np.zeros((k,), np.float32))
+            m["_w"] = wsel
+        wsel.data.buffer.set_data(np.ascontiguousarray(topk_w[0, :k].astype(np.float32)))
+        # Three dispatches for the whole layer, not three per slot: each covers all k routed
+        # experts at once (z indexes the slot), which is the difference between a command
+        # with enough work to fill the GPU and k commands that each leave it idle.
+        g = st["gate"].forward(x, eidx)            # (k, inter)
+        u = st["up"].forward(x, eidx)
+        y = st["down"].forward(wt.silu(g) * u, eidx)   # (k, H)
+        out = (y * wsel.reshape(k, 1)).sum(axis=0).reshape(1, -1)
+    elif T == 1:
         # Decode: one token, so every selected expert contributes to the same single row.
         # Walking all `ne` experts to find which were picked, and scattering each result back
         # with a fancy-index assignment, costs a host round-trip per expert for a routing
@@ -318,6 +367,21 @@ def moe_mlp(lm, lay, x):
             ye = ye * float(topk_w[0, slot])
             acc = ye if acc is None else acc + ye
         out = acc
+    elif st is not None:
+        # Prefill, one token at a time through the same batched form. Gathering tokens per
+        # expert would cut the work, but a prompt is a handful of steps against a decode's
+        # thousands, and this keeps one code path.
+        eidx = wt._empty_i32((k,))
+        rows = []
+        for ti in range(T):
+            xt = wt.Tensor(wt._contig(x.data[ti:ti + 1]))
+            eidx.buffer.set_data(np.ascontiguousarray(topk_idx[ti, :k].astype(np.int32)))
+            g = st["gate"].forward(xt, eidx)
+            u = st["up"].forward(xt, eidx)
+            y = st["down"].forward(wt.silu(g) * u, eidx)
+            wv = wt.Tensor(np.ascontiguousarray(topk_w[ti, :k].astype(np.float32)))
+            rows.append((y * wv.reshape(k, 1)).sum(axis=0).reshape(1, -1))
+        out = wt.cat(rows, axis=0)
     else:
         out = wt.Tensor(np.zeros((T, lm.H), np.float32))
         # gather tokens per expert (host indices), run each selected expert once
