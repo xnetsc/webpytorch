@@ -3620,10 +3620,19 @@ _IQ2XS_DEC = """
     let o = base + b * 74u;
     let d = F16(o);
     let kb = b * 256u;
+    // Whole words, not a load per byte. IQ4_XS runs at 110 GB/s on this hardware because
+    // its block is a multiple of four bytes and it reads quants with a plain word load; the
+    // i-quants below are 74, 82, 98 and 110 bytes, so their offsets land at any alignment and
+    // they went through `B`, which is a whole global load for each byte. That is what put
+    // them at a third to a half of IQ4_XS's rate. `B4` funnels the two words when it has to,
+    // and anything constant for the block is hoisted out of the loop that was re-reading it.
+    let sc0 = B4(o + 66u); let sc1 = B4(o + 70u);
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
-      let sc = B(o + 66u + ib);
+      let sc = (select(sc0, sc1, ib >= 4u) >> (8u * (ib & 3u))) & 255u;
+      let qb = o + 2u + ib * 8u;
+      let qw0 = B4(qb); let qw1 = B4(qb + 4u);
       for (var l: u32 = 0u; l < 4u; l = l + 1u) {
-        let q = U16(o + 2u + ib * 8u + l * 2u);
+        let q = (select(qw0, qw1, l >= 2u) >> (16u * (l & 1u))) & 65535u;
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
         let gx = (q & 511u) * 2u;
@@ -3642,14 +3651,24 @@ _IQ2S_DEC = """
     let o = base + b * 82u;
     let d = F16(o);
     let kb = b * 256u;
+    // Whole words, not a load per byte. IQ4_XS runs at 110 GB/s on this hardware because
+    // its block is a multiple of four bytes and it reads quants with a plain word load; the
+    // i-quants below are 74, 82, 98 and 110 bytes, so their offsets land at any alignment and
+    // they went through `B`, which is a whole global load for each byte. That is what put
+    // them at a third to a half of IQ4_XS's rate. `B4` funnels the two words when it has to,
+    // and anything constant for the block is hoisted out of the loop that was re-reading it.
+    let sc0 = B4(o + 74u); let sc1 = B4(o + 78u);
+    let qh0 = B4(o + 66u); let qh1 = B4(o + 70u);
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
-      let sc = B(o + 74u + ib);
-      let qh = B(o + 66u + ib);
+      let sc = (select(sc0, sc1, ib >= 4u) >> (8u * (ib & 3u))) & 255u;
+      let qh = (select(qh0, qh1, ib >= 4u) >> (8u * (ib & 3u))) & 255u;
+      let qw = B4(o + 2u + ib * 4u);
+      let sw = B4(o + 34u + ib * 4u);
       for (var l: u32 = 0u; l < 4u; l = l + 1u) {
         let nib = select(sc & 15u, sc >> 4u, l >= 2u);
         let db = d * (0.5 + f32(nib)) * 0.25;
-        let gx = (B(o + 2u + ib * 4u + l) | ((qh << (8u - 2u * l)) & 768u)) * 2u;
-        let sm = B(o + 34u + ib * 4u + l);
+        let gx = (((qw >> (8u * l)) & 255u) | ((qh << (8u - 2u * l)) & 768u)) * 2u;
+        let sm = (sw >> (8u * l)) & 255u;
         let k0 = kb + ib * 32u + l * 8u;
         // G4V unpacks the codebook entry's four bytes in one instruction, and each half
         // lands on four consecutive activations -- so this is two dot products, not eight
@@ -3666,14 +3685,23 @@ _IQ3XXS_DEC = """
     let o = base + b * 98u;
     let d = F16(o);
     let kb = b * 256u;
+    // Whole words, not a load per byte. IQ4_XS runs at 110 GB/s on this hardware because
+    // its block is a multiple of four bytes and it reads quants with a plain word load; the
+    // i-quants below are 74, 82, 98 and 110 bytes, so their offsets land at any alignment and
+    // they went through `B`, which is a whole global load for each byte. That is what put
+    // them at a third to a half of IQ4_XS's rate. `B4` funnels the two words when it has to,
+    // and anything constant for the block is hoisted out of the loop that was re-reading it.
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
       let a1 = U32(o + 66u + ib * 4u);
       let db = d * (0.5 + f32(a1 >> 28u)) * 0.5;
       let k0 = kb + ib * 32u;
+      let qb = o + 2u + ib * 8u;
+      let qw0 = B4(qb); let qw1 = B4(qb + 4u);
       for (var p: u32 = 0u; p < 8u; p = p + 1u) {
         let f0 = p * 4u;
         let sm = GB((a1 >> (7u * (f0 >> 3u))) & 127u);
-        ACC4(k0 + f0, G4V(B(o + 2u + ib * 8u + p)) * SGN4(sm, f0 & 7u) * db);
+        let qv = (select(qw0, qw1, p >= 4u) >> (8u * (p & 3u))) & 255u;
+        ACC4(k0 + f0, G4V(qv) * SGN4(sm, f0 & 7u) * db);
       }
     }
 """
@@ -3685,25 +3713,33 @@ _IQ3S_DEC = """
     let o = base + b * 110u;
     let d = F16(o);
     let kb = b * 256u;
+    // Whole words, not a load per byte. IQ4_XS runs at 110 GB/s on this hardware because
+    // its block is a multiple of four bytes and it reads quants with a plain word load; the
+    // i-quants below are 74, 82, 98 and 110 bytes, so their offsets land at any alignment and
+    // they went through `B`, which is a whole global load for each byte. That is what put
+    // them at a third to a half of IQ4_XS's rate. `B4` funnels the two words when it has to,
+    // and anything constant for the block is hoisted out of the loop that was re-reading it.
+    let scw = B4(o + 106u);
+    let qh0 = B4(o + 66u); let qh1 = B4(o + 70u);
     for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
-      let scb = B(o + 106u + (ib >> 1u));
+      let scb = (scw >> (8u * (ib >> 1u))) & 255u;
       let nib = select(scb & 15u, scb >> 4u, (ib & 1u) != 0u);
       let db = d * (1.0 + 2.0 * f32(nib));
-      let qh = B(o + 66u + ib);
+      let qh = (select(qh0, qh1, ib >= 4u) >> (8u * (ib & 3u))) & 255u;
       let k0 = kb + ib * 32u;
       // Two consecutive p share one sign byte (f0 is a multiple of four, and f0 >> 3 is
-      // p >> 1), so read it once for the pair instead of once per value. Same caveat as
-      // IQ4_XS above: 1.5x on a cached weight, no change in a real step.
-      let sb = o + 74u + ib * 4u;
+      // p >> 1), so read it once for the pair instead of once per value.
+      let smw = B4(o + 74u + ib * 4u);
       let qb = o + 2u + ib * 8u;
+      let qw0 = B4(qb); let qw1 = B4(qb + 4u);
       for (var pg: u32 = 0u; pg < 4u; pg = pg + 1u) {
-        let sm = B(sb + pg);
+        let sm = (smw >> (8u * pg)) & 255u;
         let p0 = pg * 2u;
         let p1 = p0 + 1u;
-        ACC4(k0 + p0 * 4u, G4V(B(qb + p0) | ((qh << (8u - p0)) & 256u))
-                           * SGN4(sm, 0u) * db);
-        ACC4(k0 + p1 * 4u, G4V(B(qb + p1) | ((qh << (8u - p1)) & 256u))
-                           * SGN4(sm, 4u) * db);
+        let qa = (select(qw0, qw1, p0 >= 4u) >> (8u * (p0 & 3u))) & 255u;
+        let qc = (select(qw0, qw1, p1 >= 4u) >> (8u * (p1 & 3u))) & 255u;
+        ACC4(k0 + p0 * 4u, G4V(qa | ((qh << (8u - p0)) & 256u)) * SGN4(sm, 0u) * db);
+        ACC4(k0 + p1 * 4u, G4V(qc | ((qh << (8u - p1)) & 256u)) * SGN4(sm, 4u) * db);
       }
     }
 """
