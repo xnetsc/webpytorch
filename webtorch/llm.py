@@ -1859,7 +1859,8 @@ class CausalLM:
         if lay.get("moe"):
             from . import lm_engine
             return lm_engine.moe_mlp(self, lay, x)
-        return lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+        from . import lm_engine
+        return lay["down"](lm_engine._swiglu(lay["gate"](x), lay["up"](x)))
 
     def _qkv(self, lay, x, T):
         """q,k,v projections -> (heads, T, HD). Applies per-head QK-norm (RMSNorm over head_dim,

@@ -116,7 +116,7 @@ class TransformerLM:
     def _mlp(self, lay, x):
         if lay.get("moe"):
             return moe_mlp(self, lay, x)
-        return lay["down"](wt.silu(lay["gate"](x)) * lay["up"](x))
+        return lay["down"](_swiglu(lay["gate"](x), lay["up"](x)))
 
     def _block(self, i, h, cos, sin, K, V, mask):
         H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
@@ -323,6 +323,20 @@ class TransformerLM:
 
 
 # ----------------------------- generic MoE (series-level) -----------------------------
+def _swiglu(gate, up=None):
+    """The SwiGLU activation, fused when the device can and the graph form otherwise.
+
+    One dispatch instead of six, and with a fused gate/up weight the two halves are read in
+    place rather than sliced into their own buffers first."""
+    r = wt.swiglu(gate, up)
+    if r is not None:
+        return r
+    if up is None:
+        half = gate.data.shape[-1] // 2
+        return wt.silu(gate[:, :half]) * gate[:, half:]
+    return wt.silu(gate) * up
+
+
 def moe_mlp(lm, lay, x):
     """Generic sparse-MoE MLP: router top-k over experts (+ optional shared expert,
     Qwen-style). `lay['moe']` = dict(gate, experts=[{gate,up,down}], top_k,
@@ -345,12 +359,11 @@ def moe_mlp(lm, lay, x):
         wt.moe_route(rlog.data, buf["eidx"], buf["ew"].data, ne, k, norm)
         eidx = buf["eidx"]
         gu = st["gate_up"].forward(x, eidx)               # (k, 2*inter): gate then up
-        half = gu.data.shape[-1] // 2
-        y = st["down"].forward(wt.silu(gu[:, :half]) * gu[:, half:], eidx)
+        y = st["down"].forward(_swiglu(gu), eidx)
         out = (y * buf["ew"].reshape(k, 1)).sum(axis=0).reshape(1, -1)
         if m.get("shared"):
             sh = m["shared"]
-            ys = sh["down"](wt.silu(sh["gate"](x)) * sh["up"](x))
+            ys = sh["down"](_swiglu(sh["gate"](x), sh["up"](x)))
             if m.get("shared_gate") is not None:
                 ys = ys * m["shared_gate"](x).sigmoid()
             out = out + ys
@@ -384,7 +397,7 @@ def moe_mlp(lm, lay, x):
         # with enough work to fill the GPU and k commands that each leave it idle.
         g = st["gate"].forward(x, eidx)            # (k, inter)
         u = st["up"].forward(x, eidx)
-        y = st["down"].forward(wt.silu(g) * u, eidx)   # (k, H)
+        y = st["down"].forward(_swiglu(g, u), eidx)   # (k, H)
         out = (y * wsel.reshape(k, 1)).sum(axis=0).reshape(1, -1)
     elif T == 1:
         # Decode: one token, so every selected expert contributes to the same single row.
@@ -395,7 +408,7 @@ def moe_mlp(lm, lay, x):
         acc = None
         for slot in range(k):
             exp = m["experts"][int(topk_idx[0, slot])]
-            ye = exp["down"](wt.silu(exp["gate"](x)) * exp["up"](x))
+            ye = exp["down"](_swiglu(exp["gate"](x), exp["up"](x)))
             ye = ye * float(topk_w[0, slot])
             acc = ye if acc is None else acc + ye
         out = acc
@@ -409,8 +422,7 @@ def moe_mlp(lm, lay, x):
             xt = wt.Tensor(wt._contig(x.data[ti:ti + 1]))
             eidx.buffer.set_data(np.ascontiguousarray(topk_idx[ti, :k].astype(np.int32)))
             gu = st["gate_up"].forward(xt, eidx)
-            half = gu.data.shape[-1] // 2
-            y = st["down"].forward(wt.silu(gu[:, :half]) * gu[:, half:], eidx)
+            y = st["down"].forward(_swiglu(gu), eidx)
             wv = wt.Tensor(np.ascontiguousarray(topk_w[ti, :k].astype(np.float32)))
             rows.append((y * wv.reshape(k, 1)).sum(axis=0).reshape(1, -1))
         out = wt.cat(rows, axis=0)
@@ -423,7 +435,7 @@ def moe_mlp(lm, lay, x):
                 continue
             xe = wt.Tensor(wt._contig(x.data[rows]))      # (m, H)
             exp = m["experts"][e]
-            ye = exp["down"](wt.silu(exp["gate"](xe)) * exp["up"](xe))
+            ye = exp["down"](_swiglu(exp["gate"](xe), exp["up"](xe)))
             w = topk_w[rows, slot].astype(np.float32)
             ye = ye * wt.Tensor(w.reshape(-1, 1))
             acc = out.data
@@ -431,7 +443,7 @@ def moe_mlp(lm, lay, x):
             out = wt.Tensor(acc)
     if m.get("shared"):
         s = m["shared"]
-        ys = s["down"](wt.silu(s["gate"](x)) * s["up"](x))
+        ys = s["down"](_swiglu(s["gate"](x), s["up"](x)))
         if m.get("shared_gate") is not None:
             g = wt.Tensor(1.0 / (1.0 + np.exp(-m["shared_gate"](x).numpy())))
             ys = ys * g

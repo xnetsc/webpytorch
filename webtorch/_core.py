@@ -2409,6 +2409,83 @@ _RMS_FUSED = True      # A/B switch for the fused path
 _ROPE_FUSED = True     # A/B switch for the fused rope
 
 
+_SWIGLU_WGSL = """@group(0) @binding(0)
+var<storage,read> g: array<f32>;
+@group(0) @binding(1)
+var<storage,read> u: array<f32>;
+@group(0) @binding(2)
+var<storage,read_write> outp: array<f32>;
+@group(0) @binding(3)
+var<storage,read> sw: SW;
+struct SW { half: u32, gstride: u32, ustride: u32, uoff: u32, }
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c = gid.x;
+  if (c >= sw.half) { return; }
+  let r = gid.y;
+  let x = g[r * sw.gstride + c];
+  // silu(x) * y, written as the division rather than x * sigmoid(x): same value, and the
+  // reciprocal is one instruction where the graph form was neg, exp, add, div and mul --
+  // five dispatches, each reading and writing the whole tensor.
+  outp[r * sw.half + c] = (x / (1.0 + exp(-x))) * u[r * sw.ustride + sw.uoff + c];
+}
+"""
+
+_swiglu_k = {"added": False}
+
+
+def swiglu(gate, up=None):
+    """silu(gate) * up, in one dispatch.
+
+    With `up` omitted, `gate` holds both halves along its last axis -- the layout a fused
+    gate/up projection produces -- and the two halves are read in place, so the slices that
+    would otherwise be materialised never exist.
+
+    This is the whole activation of a SwiGLU MLP, which is every Llama-family model, dense or
+    routed. The graph form costs six dispatches (neg, exp, add, div for the sigmoid, then two
+    multiplies) plus a copy per slice, each of them a full pass over the tensor; a routed 30B
+    spent 240 elementwise multiplies and 192 sigmoid fragments a token on it.
+
+    Returns None when there is no WebGPU backend, so callers keep their own expression.
+    Inference-only: no autograd node is built.
+    """
+    if not _adam_backend_ready():
+        return None
+    gd = gate.data if isinstance(gate, Tensor) else gate
+    shape = tuple(gd.shape)
+    rows = 1
+    for d in shape[:-1]:
+        rows *= int(d)
+    if up is None:
+        w = int(shape[-1])
+        if w % 2:
+            return None
+        half, gstride, ustride, uoff = w // 2, w, w, w // 2
+        ud = gd
+    else:
+        ud = up.data if isinstance(up, Tensor) else up
+        if tuple(ud.shape) != shape:
+            return None
+        half = gstride = ustride = int(shape[-1])
+        uoff = 0
+    gd = _contig(gd)
+    ud = gd if up is None else _contig(ud)
+    plat = _adam_kernel["platform"]
+    if not _swiglu_k["added"]:
+        plat.addKernel("swiglu", {"source": _SWIGLU_WGSL,
+                                  "bindingTypes": ["read-only-storage", "read-only-storage",
+                                                   "storage", "read-only-storage"]})
+        _swiglu_k["added"] = True
+    of = _empty((rows, half))
+    meta = _adam_kernel["make_meta"]((half, gstride, ustride, uoff), "u4,u4,u4,u4")
+    plat.runKernel({"name": "swiglu",
+                    "tensors": [gd.buffer.buffer_id, ud.buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (half + 63) // 64, "y": rows, "z": 1}})
+    return Tensor(of.reshape(*(shape[:-1] + (half,))))
+
+
 def rmsnorm(x, w, eps):
     """Fused RMS norm: `x * rsqrt(mean(x^2) + eps) * w`, one dispatch instead of six.
 
