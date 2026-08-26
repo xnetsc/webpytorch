@@ -835,21 +835,70 @@ _GL_FETCH = ("float fetch(sampler2D t, int idx) { int tw = textureSize(t, 0).x; 
              "int y = idx / tw; int x = idx - y * tw; return texelFetch(t, ivec2(x, y), 0).r; }")
 
 
+def _laid_out_contiguously(a):
+    """Is `a` laid out byte for byte like a C-contiguous array filling its own buffer?
+
+    `flags.c_contiguous` compares strides axis by axis, so it says no to an axis of length 1
+    that a transpose moved -- even though an axis holding no elements cannot move any. Decode
+    transposes exactly that shape on every attention layer: k and v come out (1, heads, dim)
+    and are wanted (heads, 1, dim), which is the same bytes in the same order.
+
+    Skipping those axes is not a relaxation of what the caller needs. The requirement is that
+    a kernel indexing the buffer linearly reads the right elements, and that holds exactly
+    when the strides of the axes that DO hold elements are the C-contiguous ones, the view
+    starts at 0, and it covers the whole buffer -- which is what this checks."""
+    st = getattr(a, "strides", None)
+    if st is None or getattr(a, "offset", 0) != 0:
+        return False
+    buf = getattr(a, "buffer", None)
+    if buf is None or int(a.size) != int(buf.size):
+        return False
+    exp = a.itemsize
+    for d, s in zip(reversed(a.shape), reversed(st)):
+        if d == 1:
+            continue                      # no elements on this axis; its stride is unused
+        if s != exp:
+            return False
+        exp *= d
+    return True
+
+
 def _contig(a):
     # Materialize a (possibly transposed/strided) array — WgPy reshape/matmul are unreliable
     # on non-contiguous views, and the kernels here index the buffer linearly, so a view that
     # does not start at offset 0 or does not fill its buffer would read the wrong elements.
-    # `* 1.0` forces a stride-aware kernel that produces one that does.
+    # Multiplying by one forces a stride-aware kernel that produces one that does.
     #
     # An array already satisfying both is returned unchanged. Copying it is pure bandwidth,
     # and the KV cache is bound this way once per attention layer per token: at a 4096-token
     # context that copy alone moved ~940 MB per token — more than everything else in the step
     # put together, and the reason a larger context slowed decode down even when the
     # conversation was short.
+    #
+    # The stride check catches what the flag misses -- a transposed axis of length 1 -- which
+    # on a 28-layer decode step was 168 copies of 4 KB, each costing two dispatches, to
+    # produce buffers identical to what it read.
+    # A Tensor has no `flags`, so before this it failed both checks and was copied every
+    # time -- silently, since the copy is correct, just wasted. Decode binds k and v this way
+    # on every attention layer.
+    if isinstance(a, Tensor):
+        d = _contig(a.data)
+        if d is a.data:
+            return a
+        out = Tensor(d, a.requires_grad, (a,), "contig")
+
+        def _backward():
+            if a.requires_grad:
+                a._accum(out.grad)          # same elements in the same order; layout only
+        out._backward = _backward
+        return out
     f = getattr(a, "flags", None)
-    if f is not None and getattr(f, "c_contiguous_full", False):
+    if (f is not None and getattr(f, "c_contiguous_full", False)) or _laid_out_contiguously(a):
         return a
-    return a * 1.0
+    # np.float32(1.0), not 1.0: a Python float is float64 to the ufunc, so it inserts an
+    # astype over the whole array before the multiply and the copy costs two dispatches
+    # instead of one.
+    return a * np.float32(1.0)
 
 
 def _pad2d(x, ph, pw):
