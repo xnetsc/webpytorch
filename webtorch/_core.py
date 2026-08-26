@@ -3066,8 +3066,25 @@ MOEVARS
 fn W(wo: u32) -> u32 { return w[WOFSwo * gm.N + nrow]; }
 fn B(o: u32) -> u32 { return (W(o >> 2u) >> ((o & 3u) * 8u)) & 255u; }
 fn I8(o: u32) -> f32 { return f32(i32(B(o) << 24u) >> 24u); }
-fn U16(o: u32) -> u32 { return B(o) | (B(o + 1u) << 8u); }
-fn U32(o: u32) -> u32 { return U16(o) | (U16(o + 2u) << 16u); }
+// Four consecutive bytes at byte offset `o`, packed little-endian, in ONE load when `o` is
+// word-aligned and two when it is not. `B` is a whole load per byte, so anything reading a
+// field a byte at a time paid four loads for four bytes that are almost always in the same
+// word -- and a decode fragment does that thousands of times per block. Blocks whose size is
+// not a multiple of four (Q3_K and IQ3_S are 110 bytes, Q6_K 210) put `o` at any alignment,
+// which is why the aligned fast path cannot simply be assumed.
+//
+// The second load stays inside the row: `W` strides by gm.N, so wo+1 is the next word of
+// THIS row, not the next row. Past the last word of a row it reads whatever follows, but
+// every field this is used for has its bytes inside the block, so those bits are masked off.
+fn B4(o: u32) -> u32 {
+  let wo = o >> 2u;
+  let sh = (o & 3u) * 8u;
+  let lo = W(wo);
+  if (sh == 0u) { return lo; }
+  return (lo >> sh) | (W(wo + 1u) << (32u - sh));
+}
+fn U16(o: u32) -> u32 { return B4(o) & 65535u; }
+fn U32(o: u32) -> u32 { return B4(o); }
 fn F16(o: u32) -> f32 { return HF(U16(o)); }
 fn HF(h: u32) -> f32 {
   let m = h & 1023u;
@@ -3464,20 +3481,48 @@ _Q6K_DEC = """
     }
 """
 
+_Q3K_HELP = """
+// One 16-byte group of quants against one 16-byte group of hmask, for a given 2-bit lane
+// and hmask bit. Both arrive as four bytes packed in a u32, so the whole group is register
+// work: `(q >> (8*i)) >> shift` folds into a single shift, and `mbit` is under 256 so the
+// per-byte mask needs no truncation.
+fn Q3V(q: u32, m: u32, shift: u32, mbit: u32) -> vec4<f32> {
+  return vec4<f32>(
+    f32((q >> shift) & 3u)         - select(4.0, 0.0, (m & mbit) != 0u),
+    f32((q >> (shift + 8u)) & 3u)  - select(4.0, 0.0, ((m >> 8u) & mbit) != 0u),
+    f32((q >> (shift + 16u)) & 3u) - select(4.0, 0.0, ((m >> 16u) & mbit) != 0u),
+    f32((q >> (shift + 24u)) & 3u) - select(4.0, 0.0, ((m >> 24u) & mbit) != 0u));
+}
+"""
+
 # Q3_K: 256 values / 110 bytes -- hmask[32] | qs[64] | scales[12] | f16 d.
 # The sixteen 6-bit scales are split across three u32s and reassembled four at a time;
 # hmask supplies a per-value bit that shifts the 2-bit quant from [-4,-1] to [0,3].
+#
+# The loops are ordered by what each field depends on, not by the output order. hmask is
+# selected by `half` alone and qs by (half, blk2), while the original nesting put `j`
+# outside them and so re-read hmask eight times and qs four times per block -- through `B`,
+# which is a whole load per byte. That came to 512 loads to read a 28-word block. Ordering
+# the loops by dependency and reading four bytes at a time brings it under 60.
+#
+# `is` and `k` were carried across the loops, which is what forced the original order; they
+# are derived from the indices now, so the reorder is pure code motion and the value written
+# to any k is unchanged.
 _Q3K_DEC = """
     let o = base + b * 110u;
     let d = F16(o + 108u);
     let a0 = U32(o + 96u); let a1 = U32(o + 100u); let a2 = U32(o + 104u);
     let kb = b * 256u;
-    var k: u32 = 0u; var is: u32 = 0u;
-    for (var blk2: u32 = 0u; blk2 < 2u; blk2 = blk2 + 1u) {
-      for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-        let shift = 2u * j;
-        let mbit = 1u << (blk2 * 4u + j);
-        for (var half: u32 = 0u; half < 2u; half = half + 1u) {
+    for (var half: u32 = 0u; half < 2u; half = half + 1u) {
+      let mo = o + half * 16u;
+      let m0 = B4(mo); let m1 = B4(mo + 4u); let m2 = B4(mo + 8u); let m3 = B4(mo + 12u);
+      for (var blk2: u32 = 0u; blk2 < 2u; blk2 = blk2 + 1u) {
+        let qo = o + 32u + blk2 * 32u + half * 16u;
+        let q0 = B4(qo); let q1 = B4(qo + 4u); let q2 = B4(qo + 8u); let q3 = B4(qo + 12u);
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+          let shift = 2u * j;
+          let mbit = 1u << (blk2 * 4u + j);
+          let is = (blk2 * 4u + j) * 2u + half;
           var v: u32;
           let wsel = is >> 2u;
           if (wsel == 0u) { v = (a0 & 0x0F0F0F0Fu) | (((a2 >> 0u) & 0x03030303u) << 4u); }
@@ -3486,22 +3531,11 @@ _Q3K_DEC = """
           else { v = ((a1 >> 4u) & 0x0F0F0F0Fu) | (((a2 >> 6u) & 0x03030303u) << 4u); }
           let sc = f32(i32(((v >> (8u * (is & 3u))) & 255u) << 24u) >> 24u) - 32.0;
           let dl = d * sc;
-          let qo = o + 32u + blk2 * 32u + half * 16u;
-          let mo = o + half * 16u;
-          // Byte-addressed, NOT a word read: this block is 110 bytes, so `o` is only
-          // 4-aligned on even blocks and `W((qo + l) >> 2u)` silently reads the wrong word
-          // on the odd ones -- half the columns of every tensor. Q5_K (176) and Q2_K (84)
-          // are whole numbers of words and may read directly; this one may not.
-          for (var lw: u32 = 0u; lw < 4u; lw = lw + 1u) {
-            let l = lw * 4u;
-            let v = vec4<f32>(
-              f32((B(qo + l) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l) & mbit) != 0u),
-              f32((B(qo + l + 1u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 1u) & mbit) != 0u),
-              f32((B(qo + l + 2u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 2u) & mbit) != 0u),
-              f32((B(qo + l + 3u) >> shift) & 3u) - select(4.0, 0.0, (B(mo + l + 3u) & mbit) != 0u));
-            ACC4(kb + k + l, v * dl);
-          }
-          k = k + 16u; is = is + 1u;
+          let k = is * 16u;
+          ACC4(kb + k +  0u, Q3V(q0, m0, shift, mbit) * dl);
+          ACC4(kb + k +  4u, Q3V(q1, m1, shift, mbit) * dl);
+          ACC4(kb + k +  8u, Q3V(q2, m2, shift, mbit) * dl);
+          ACC4(kb + k + 12u, Q3V(q3, m3, shift, mbit) * dl);
         }
       }
     }
@@ -3936,7 +3970,7 @@ _GGML_TYPES = {
     "Q4_K":    (_Q4K_DEC,     _K4SC_FN,           256, 144, None),
     "Q5_K":    (_Q5K_DEC,     _K4SC_FN,           256, 176, None),
     "Q6_K":    (_Q6K_DEC,     "",                 256, 210, None),
-    "Q3_K":    (_Q3K_DEC,     "",                 256, 110, None),
+    "Q3_K":    (_Q3K_DEC,     _Q3K_HELP,          256, 110, None),
     "Q2_K":    (_Q2K_DEC,     "",                 256,  84, None),
     "IQ2_XXS": (_IQ2XXS_DEC,  _GRID_FN,           256,  66, "IQ2XXS_GRID_U8"),
     "IQ2_XS":  (_IQ2XS_DEC,   _GRID_FN,           256,  74, "IQ2XS_GRID_U8"),
