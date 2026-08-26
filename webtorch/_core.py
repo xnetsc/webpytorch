@@ -4103,18 +4103,25 @@ def _small_cfg(vals):
 # blocks each lane has almost nothing while still paying the workgroup staging, the barrier
 # and the psum reduction.
 #
-# It does not. Measured twice, each from a clean load rather than by re-pointing constants
-# in a live session, on a routed 30B: 35.8ms with the split, 37.8ms without it. The shape is
-# not broken -- `_selfcheck_shape` now builds and checks it like any other, and it is exact
-# -- it is simply slower, and 256 rows of one lane each apparently costs more in occupancy
-# than the reduction costs in synchronisation.
+# It does not, and worse: ANY WGX ABOVE 64 IS WRONG. 128x2, 128x4 and 256x1 all fail the
+# self-check at N=576 K=768 with a relative error around 0.92 -- not 1.0, so they are not
+# failing to compile, they are computing the wrong answer. Something in the psum layout or
+# the row indexing assumes the 64-wide workgroup; nobody has needed a wider one, so it has
+# never been fixed. Do not set _SHORT_K_CFG's first element above 64 without fixing that
+# first, and do not trust a timing from a shape until the self-check has passed it.
 #
-# Two earlier readings said otherwise and both were artefacts, which is why the numbers here
-# are only from clean loads: a microbenchmark that had to override the group count to test a
-# shape (it was measuring the override), and a live-session sweep that clear()ed the kernel
-# cache between captures and produced a 31% "win" no clean run could reproduce.
+# That is also the real story behind a 31% "win" this constant once appeared to produce:
+# 256x1 was not fast, it was wrong. An earlier note here blamed the measurement. The
+# measurement was fine; the kernel was not, and the self-check could not say so because it
+# only ever built the narrow shape.
 #
-# Set to 8 to try again on other hardware: 8 clears a routed expert and leaves a 5120-wide
+# Of the shapes that ARE correct, none beats the default. Screened on the routed experts of
+# a 30B, all 48 layers in one capture: default 10.97ms, 64x4 10.92, 64x2 10.88, 64x8 10.88,
+# 32x4 11.01, 32x8 11.06. That spread is noise, and 10.9ms for 0.768 GB is 70.5 GB/s --
+# exactly what the same Q3_K kernel reaches on the dense 27B, so there is nothing shape-
+# dependent left to find here.
+#
+# Set to 8 to try again on other hardware; 8 clears a routed expert and leaves a 5120-wide
 # layer (20 blocks) alone.
 _SHORT_K_BLOCKS = 0
 
@@ -4149,8 +4156,9 @@ def _shape_kind(N, K, vals):
 # threads takes its own output row and walks the whole of K, so there is no split to reduce
 # afterwards. It is the opposite of the narrow-output shape, which splits as far as the
 # workgroup memory allows (16 ways at a 256-value block) because there the row axis is what
-# cannot fill the machine. Of the shapes tried on a routed expert, nothing beat the default:
-# 128x2 and 32x8 came out level with it, and 256x1 is the 35.8 -> 37.8ms above.
+# cannot fill the machine. It is also WRONG -- see _SHORT_K_BLOCKS: every WGX above 64 fails
+# the self-check. Left as the documented shape only because that is where the investigation
+# ended; a correct wide-workgroup variant would have to fix the psum layout first.
 _SHORT_K_CFG = (256, 1)
 
 
