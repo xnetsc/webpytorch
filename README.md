@@ -1,155 +1,150 @@
+<div align="center">
+
 # webtorch
 
-**Train and run PyTorch-style models — CNNs, Transformers, LLMs — in the browser, on the GPU.**
+### Run a 30-billion-parameter model in a browser tab.
 
-webtorch is a PyTorch-compatible ML SDK that runs inside [Pyodide](https://pyodide.org/)
-on **WebGPU** (with a **WebGL** fallback), backed by a modified
-[WgPy](https://github.com/mil-tokyo/wgpy). It gives you a torch-compatible core
-(`Tensor`/autograd/`nn`/`optim`), a transformers-style model API, a generic ONNX
-runtime, and a streaming quantizer — so a third party can drop it in for PyTorch and
-train/infer real models client-side, with **no server and no native install**.
+**No server. No install. No native runtime.**
+PyTorch-compatible, on the GPU, in Python — inside the page.
 
-> **Where this runs:** webtorch is **Python-in-the-browser**. Every snippet below executes
-> **inside Pyodide** (CPython compiled to WASM), normally in a Web Worker, run via
-> `pyodide.runPythonAsync(code)` on top of the WgPy WebGPU/WebGL backend — that async
-> runtime is why top-level `await` works in the examples. You do **not** `pip install`
-> webtorch into system Python; the package files are loaded into Pyodide's in-memory
-> filesystem alongside the backend wheels (the demo's [`webapp/worker.js`](webapp/worker.js)
-> shows the full bootstrap; steps in **[docs/BUILD.md](docs/BUILD.md)**). Plain host CPython
-> can only `import webtorch` as a numpy-fallback smoke test — the GPU paths need the browser.
+<img src="images/architecture.svg" alt="webtorch runs inside one browser tab: your PyTorch code on Pyodide, weights streamed from a hub or a local file, WgPy kernels on WebGPU" width="880">
+
+[Quickstart](#quickstart) · [What it does](#what-it-does) · [Speed](#speed) ·
+[The chat app](#the-chat-app) · [Docs](docs/API.md)
+
+</div>
+
+---
 
 ```python
-# ── inside Pyodide (browser) ──
+# ── this is running inside the browser tab ──
 import webtorch
-webtorch.install_torch()                 # `import torch` now resolves to webtorch
+webtorch.use_default_io()
 
-import torch, torch.nn as nn             # train, exactly like PyTorch
-net = nn.Sequential(nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(),
-                    nn.Flatten(), nn.Linear(16*28*28, 10))
-opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-loss = nn.CrossEntropyLoss()(net(x), y); loss.backward(); opt.step()
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen3-30b-a3b.gguf")
+print(lm.generate("Why is this surprising?", max_new=64))
 ```
 
-Loading models needs IO, and **IO is required** — install it once (or use the built-in):
+Nothing was downloaded to the machine. Nothing was installed. The weights were read
+by range straight from disk or a hub, the layers ran on the GPU through WebGPU, and the
+whole thing was CPython — compiled to WebAssembly — executing in a worker.
 
-Installing a read callback selects **where the bytes come from** — these are parallel choices:
+## What it does
 
-```python
-import webtorch
+**Drop-in PyTorch.** `install_torch()` and `import torch` resolves here. `Tensor` with
+autograd, `nn.{Linear, Conv1d/2d/3d, LayerNorm, RMSNorm, MultiheadAttention, …}`,
+`optim.{SGD, Adam, AdamW}`. Trains real GPT/CNN/Transformer models on WebGPU **and** WebGL.
 
-# (A) Your OWN files (your server / a CDN / local disk). use_default_io() is NOT a hub:
-#     it fetches the `name` string as-is (browser: relative to the page origin). Network reads
-#     are cached by default (persist across reloads); local host files are read directly.
-webtorch.use_default_io()                    # built-in browser fetch / host open, cached
-lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen-gptq")  # /models/… you host
-print(lm.generate("Hello", max_new=64))
+**LLMs by config, not by a supported-model list.** `AutoModelForCausalLM.from_pretrained`
+reads the model's own config and runs the CausalLM family (Qwen2/Qwen3/Llama-shaped) and the
+MoE family, from an AutoGPTQ directory, a **GGUF** file, or a plain **fp16/bf16 HF** folder —
+at int4, int8, or fp16. Twenty-eight quantisation formats, from `Q4_K` to the 2-bit i-quants.
 
-# (B) Straight from a model hub by repo id — install the hub reader (cached + read-ahead,
-#     persists across page reloads via IndexedDB). This is what maps to Hugging Face / 魔搭:
-webtorch.set_io_read(webtorch.hf_read())            # or webtorch.modelscope_read() for 魔搭
-lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct", dtype="fp16")
-print(lm.generate("The capital of France is", max_new=8))
+**Streaming quantisation.** Turn an fp16 model into int4/int8 without ever holding it in RAM:
+weights stream in and quantised shards stream out through your own async IO callbacks. The
+output is standard AutoGPTQ, loadable by auto_gptq / vLLM / transformers.
 
-# (C) Bring your own storage (OPFS / IndexedDB / S3 / …): your own async read/write callbacks.
-#   async def read(name, offset=0, length=None) -> bytes: ...
-#   webtorch.set_io_read(read); webtorch.set_io_write(write)
+**Multimodal, generically.** `register_encoder` + `MultimodalLM` pair **any** decoder with
+**any** media encoder, so vision and audio are not welded to one model family. Ships
+text-to-speech (CosyVoice2 with zero-shot voice cloning, VITS), detection (YOLO/DETR) and
+vision-language (Qwen2.5-VL).
 
-# Task pipelines: built-in names are pre-registered loaders — add your own, no SDK edit:
-async def load_my_llm(**kw):
-    return await webtorch.AutoModelForCausalLM.from_pretrained(kw["path"])
-webtorch.register_pipeline("text-generation", "my-llm", load_my_llm)
-gen = await webtorch.pipeline("text-generation", "my-llm", path="/models/qwen-gptq")
-print(gen("Hi", max_new=32))
-```
+**A generic ONNX runtime.** Any `.onnx`, a pure-Python parser and ~50 ops, no dependencies.
 
-## Features
+**Task pipelines, an open registry.** `pipeline("text-generation" | "text-to-speech" |
+"object-detection" | "image-to-text" | …)`. The built-in names are *pre-registered* loaders;
+register your own task without touching the SDK.
 
-- **Drop-in PyTorch** — `Tensor` + autograd, `nn.{Linear,Conv1d/2d/3d,LayerNorm,RMSNorm,
-  MultiheadAttention,…}`, `optim.{SGD,Adam,AdamW}`. Trains real GPT/CNN/Transformer on
-  WebGPU **and** WebGL.
-- **LLMs (any CausalLM/MoE, by config — not a fixed model list)** —
-  `AutoModelForCausalLM.from_pretrained(path, dtype=…)` loads the CausalLM series
-  (Qwen2/Qwen3/Llama-shaped) and the **MoE series** (Qwen2-MoE/Qwen3-MoE) by reading the
-  model's `config`, and runs inference at **int4, int8, *or* fp16**: an AutoGPTQ dir (int4/
-  int8), a **GGUF** file, or a plain **fp16/bf16 HF** dir (run unquantized, or quantized on
-  load with `dtype="int8"`/`"int4"`). int4/int8 use the capture-replay kernel (~20×); fp16
-  uses a plain matmul. General training/CNN/`nn` in the core runs in native fp32.
-- **Streaming quantization** — turn any fp16 model into int4/int8 without holding it in
-  RAM; streams weights **in** and quantized shards **out** through the global async IO
-  callbacks (`set_io_read`/`set_io_write`), so nothing needs to fit in memory; output is
-  standard AutoGPTQ, loadable by auto_gptq / vLLM / transformers.
-- **Generic ONNX runtime** — run any `.onnx` (pure-Python parser + ~50 ops, no deps).
-- **Task pipelines (open registry, not a whitelist)** — uniform, model-agnostic
-  `pipeline("text-to-speech" | "object-detection" | "image-to-text" | "text-generation")`.
-  The built-in model names are just *pre-registered* loaders; add your own (any task, incl.
-  LLMs) with `register_pipeline` **without changing the SDK**. Ships text-to-speech
-  (CosyVoice2 incl. zero-shot voice cloning, VITS), detection (YOLO/DETR), and
-  vision-language (Qwen2.5-VL).
-- **Multimodal, generically** — `register_encoder` + `MultimodalLM` pair **any** decoder with
-  **any** media encoder (encode → splice at placeholder tokens → decode), so vision/audio is
-  not tied to one model family; decoders also accept prebuilt `ids=`/`embeds=`.
-- **One loader, one call** — `webtorch.load(...)` handles a model dir, hub repo id, `.gguf`,
-  `.onnx` or a task, and `model.infer(...)`/`model(...)` runs any of them. Loading the same
-  model twice reuses it instead of re-downloading; `model.release()` frees it.
-- **Bring-your-own IO (required) — pick your data source.** The core does no IO itself; the
-  callback you install decides where bytes come from: `use_default_io()` for **your own
-  files** (fetch/open the `name` as-is — *not* a hub; network reads cached, local files read
-  directly), `hf_read()` / `modelscope_read()` to load **from Hugging Face / ModelScope** by
-  repo id (cached + read-ahead), or your own `set_io_read`/`set_io_write` for any storage.
-  Until one is installed, any load fails fast.
+**Bring your own IO — and you must.** The core does no IO itself. The callback you install
+decides where bytes come from: `use_default_io()` for your own files, `hf_read()` /
+`modelscope_read()` for a hub repo id, or your own `set_io_read` / `set_io_write` for any
+storage at all. Reads are cached, resumable, and persist across reloads.
+
+## Speed
+
+Measured on Apple silicon (`metal-3`), one captured decode step, from a clean load. These are
+the models running *in the tab*, not a server:
+
+| Model | Size on disk | GPU step | tok/s |
+|---|---:|---:|---:|
+| Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | 25.3 ms | **39.6** |
+| Qwen3.8-27B · dense · hybrid SSM | 12.0 GB | 134.5 ms | **7.4** |
+| Qwen3-0.6B · Q4_K_M | 0.4 GB | 6.7 ms | **149.5** |
+
+Weight streaming runs at **106–121 GB/s** — the hardware's read ceiling — for every
+quantisation format. What is left is decode arithmetic, and it is close to uniform across
+formats at 199–233 G values/s.
+
+## The chat app
+
+A complete local chat client lives in [`chat/`](chat/) — the SDK driving a real interface.
+
+<!-- SCREENSHOT: chat/desktop -->
+<!-- SCREENSHOT: chat/models -->
+<!-- SCREENSHOT: chat/mobile -->
+
+- **Any model that fits.** Load a GGUF or an HF folder from the device, or any repo id from a
+  hub. The list is examples, not a whitelist; the only real limit is GPU memory.
+- **Replies that render.** Markdown, syntax-highlighted code, LaTeX typeset with KaTeX,
+  tables. Sanitised before it reaches the DOM.
+- **Press the code.** A Python block gets a ▶ and runs in its own Pyodide — separate from the
+  one holding the model — with output, tracebacks and matplotlib figures inline. numpy,
+  pandas and matplotlib are loaded before you ask; add wheels from a URL or from disk.
+- **Edit anything, block by block.** A paragraph as text, a code block in the block, a table
+  cell by cell — a formula cell opens as LaTeX, an image cell as an image.
+- **Works offline.** A service worker keeps every wheel, the wasm and the runtime
+  permanently; the app's own files stay network-first, so an update still lands the moment
+  there is a network.
+- **On a phone**, too.
 
 ## Quickstart
 
-Requires a browser with WebGPU (Chrome/Edge) or WebGL. Build the backend + serve, then
-open the demo — see **[docs/BUILD.md](docs/BUILD.md)**. Short version:
+Needs a browser with WebGPU (Chrome/Edge) or WebGL, and the COOP/COEP headers that
+`SharedArrayBuffer` requires.
 
 ```bash
-# 1. build the WgPy backend wheels + fetch Pyodide (one-time)   → docs/BUILD.md
-# 2. serve with the required COOP/COEP headers
+# 1. build the WgPy backend wheels + fetch Pyodide (one-time) → docs/BUILD.md
+# 2. serve with the required headers
 node serve-coi.mjs . 8119
-# 3. open http://localhost:8119/webapp/ , pick an example, Run
+# 3. open http://localhost:8119/chat/   (or /webapp/ for the example runner)
 ```
 
-More usage (LLMs, quantization, pipelines): **[docs/SDK_README.md](docs/SDK_README.md)**
-and the **[API reference](docs/API.md)**.
+Full steps, including where to get weights: **[docs/BUILD.md](docs/BUILD.md)**.
 
-## Repository layout
+## Where things are
 
 ```
-webtorch/            ← the SDK package  (public API in __init__.py; internals under webtorch.models.*)
-  __init__.py          public API: install_torch / AutoModelForCausalLM / Quantizer / pipeline / OnnxModel / …
-  _core.py             torch-compatible Tensor / autograd / nn / optim + GPU kernels
-  _sdk.py              transformers-style facade + task pipeline registry
-  lm_engine.py         generic decoder (CausalLM + MoE series) + samplers + capture
-  quantize.py          streaming quantizer (IO-free core)
-  webio.py             the only IO layer: global read/write callbacks, hub readers, cached-reader tool + cache mgmt
+webtorch/            the SDK
+  _core.py             torch-compatible Tensor / autograd / nn / optim + the GPU kernels
+  _sdk.py              transformers-style facade + the task-pipeline registry
+  lm_engine.py         generic decoder (dense + MoE) + samplers + capture/replay
+  quantize.py          streaming quantiser (IO-free core)
+  webio.py             the only IO layer: global callbacks, hub readers, cache management
   onnxrt.py            generic ONNX runtime
   torchshim.py         `import torch` compatibility
-  cosyvoice.py tts.py detection.py vl.py audiofe.py   model implementations (internal)
-examples/            runnable examples (loaded by the web demo; io_cache_tools.py runs on the host too)
-webapp/              browser demo harness (index.html, worker.js, main.js) + run.py
-serve-coi.mjs        dev server with COOP/COEP + HTTP Range
-tools/               weight-preparation scripts
-docs/                API.md, SDK_README.md, ARCHITECTURE.md, BUILD.md, WGPY_BACKEND.md
-pyproject.toml       package metadata
-
-# vendored backend (modified WgPy — WebGPU/WebGL array kernels; see NOTICE):
-src/ webgl/ webgpu/ wgpy/ cupy/ cupyx/   (+ webpack.config.js, setup_*.py, package.json)
+chat/                the chat app (index.html, app.js, worker.js, pyworker.js)
+webapp/              example runner
+examples/            runnable examples
+docs/                API.md · SDK_README.md · ARCHITECTURE.md · BUILD.md · WGPY_BACKEND.md
+src/ webgl/ webgpu/ wgpy/ cupy/ cupyx/     vendored WgPy backend (modified — see NOTICE)
 ```
 
-Weights (`models/`), the Pyodide runtime (`lib/`), and build output (`dist/`, `build/`,
-`node_modules/`) are **not** in git — see [docs/BUILD.md](docs/BUILD.md) to obtain/build them.
+Weights (`models/`), the Pyodide runtime (`lib/`) and build output are not in git.
 
-## Documentation
+## Docs
 
-- [docs/SDK_README.md](docs/SDK_README.md) — SDK usage (torch / LLMs / quantization / pipelines)
-- [docs/API.md](docs/API.md) — API reference
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how webtorch sits on WgPy; module map
-- [docs/BUILD.md](docs/BUILD.md) — build the backend, fetch models, run the demo
-- [docs/WGPY_BACKEND.md](docs/WGPY_BACKEND.md) — the WgPy backend (upstream)
+- [SDK usage](docs/SDK_README.md) — torch, LLMs, quantisation, pipelines
+- [API reference](docs/API.md)
+- [Architecture](docs/ARCHITECTURE.md) — how webtorch sits on WgPy
+- [Build](docs/BUILD.md) — backend, models, running the demo
+- [WgPy backend](docs/WGPY_BACKEND.md)
 
-## License & credits
+## License
 
-MIT — see [LICENSE](LICENSE). Built on **WgPy** (© The University of Tokyo, Edge
-Intelligence Systems, Inc.; MIT), whose WebGPU/WebGL backend we modified (batched matmul,
-graph capture/replay, fused kernels, int4/int8 kernels). See [NOTICE](NOTICE).
+MIT — see [LICENSE](LICENSE). Built on **WgPy** (© The University of Tokyo, Edge Intelligence
+Systems, Inc.; MIT), whose WebGPU/WebGL backend is modified here: batched matmul, graph
+capture/replay, fused kernels, and the quantised matmul kernels. See [NOTICE](NOTICE).
+
+The chat app renders with [marked](https://github.com/markedjs/marked),
+[DOMPurify](https://github.com/cure53/DOMPurify), [KaTeX](https://katex.org) and
+[highlight.js](https://highlightjs.org), loaded from a CDN at runtime.
