@@ -5,9 +5,34 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
 <link rel="stylesheet" href="style.css" />
+
+<!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
+     `crossorigin` is required, not cosmetic: this page is served with
+     Cross-Origin-Embedder-Policy: require-corp for SharedArrayBuffer, which blocks every
+     cross-origin subresource that does not come back with CORS.
+     The chat degrades to plain text if these do not load, so it still works offline. -->
+<link rel="stylesheet" crossorigin="anonymous"
+      href="https://cdn.jsdelivr.net/npm/katex@0.18.4/dist/katex.min.css" />
+<link rel="stylesheet" crossorigin="anonymous"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.12.0/build/styles/github.min.css" />
+<link rel="stylesheet" crossorigin="anonymous" media="(prefers-color-scheme: dark)"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.12.0/build/styles/github-dark.min.css" />
+<script defer crossorigin="anonymous"
+        src="https://cdn.jsdelivr.net/npm/marked@18.0.11/lib/marked.umd.js"></script>
+<script defer crossorigin="anonymous"
+        src="https://cdn.jsdelivr.net/npm/dompurify@3.4.14/dist/purify.min.js"></script>
+<script defer crossorigin="anonymous"
+        src="https://cdn.jsdelivr.net/npm/katex@0.18.4/dist/katex.min.js"></script>
+<script defer crossorigin="anonymous"
+        src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.1.12/lib/index.umd.js"></script>
+<script defer crossorigin="anonymous"
+        src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.12.0/build/highlight.min.js"></script>
 </head>
 <body>
 <div id="app">
+  <!-- Only visible on a narrow screen, where the sidebar becomes a drawer. -->
+  <button id="navBtn" type="button" aria-label="Conversations">☰</button>
+  <div id="navScrim"></div>
   <aside id="sidebar">
     <div class="side-top">
       <div class="brand">webtorch<span>chat</span></div>
@@ -43,6 +68,7 @@
   <nav class="tabs" id="tabs">
     <button data-tab="model" class="on">Model</button>
     <button data-tab="gen">Generation</button>
+    <button data-tab="python">Python</button>
     <button data-tab="store">Storage</button>
   </nav>
 
@@ -139,6 +165,30 @@
         presence/frequency subtract from it (flat, and per occurrence).</p>
       <div class="row btns"><button id="genReset" class="ghost">Reset all to model defaults</button></div>
     </details>
+  </section>
+
+  <section class="tab-panel" id="tab-python" hidden>
+    <div class="grp">
+      <h3>Running code from a reply</h3>
+      <p class="hint">A reply's Python blocks get a ▶ button. The code runs in its own
+        Python — a separate runtime from the one holding the model, so nothing it does can
+        disturb a conversation.</p>
+      <label class="check"><input type="checkbox" id="pyEnabled" checked />
+        Enable running code</label>
+      <label class="fld">Modules to have ready
+        <input id="pyPackages" type="text" placeholder="numpy, pandas, matplotlib" />
+      </label>
+      <p class="hint">Loaded when the page opens, not when you press Run — a first
+        <code>import pandas</code> otherwise costs a long pause with nothing to look at.
+        Anything the Pyodide distribution ships can go here (scipy, sympy, scikit-learn,
+        pillow, networkx, …); a module you import without listing it still loads on demand,
+        just not instantly. Plots are captured and shown under the code.</p>
+      <div class="row btns">
+        <button id="pyApply" class="primary">Apply &amp; load</button>
+        <button id="pyReset">Restart runtime</button>
+      </div>
+      <div class="hint">status: <span id="pyState">off</span></div>
+    </div>
   </section>
 
   <section class="tab-panel" id="tab-store" hidden>

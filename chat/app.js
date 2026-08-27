@@ -30,9 +30,16 @@ const worker = new Worker('worker.js');
 const gpuInit = webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] })
   .then(r => r.backend, () => 'cpu');
 let seq = 0; const pending = new Map();
-// Conversations live in localStorage so the sidebar survives a reload.
+// Conversations live in IndexedDB so the sidebar survives a reload.
 // Each: {id, title, messages:[{role, content, attachments:[{kind,name,text,dataUrl}]}], updated}
-const STORE = 'webtorch-chat-convs';
+//
+// NOT localStorage, which is where they used to be: it holds about 5 MB per origin, stores
+// only strings, and every write is synchronous on the UI thread. One conversation with a
+// couple of pasted images (attachments are data URLs) is enough to hit that ceiling, and a
+// write that fails there fails silently -- the reply is on screen and gone after a reload.
+// IndexedDB has room, takes structured values as they are, and writes off the main thread.
+const STORE = 'webtorch-chat-convs';          // the old localStorage key, read once to migrate
+const DB_NAME = 'webtorch-chat', DB_STORE = 'convs';
 let convs = [];
 let curId = null;
 let attachments = [];
@@ -45,12 +52,77 @@ let modelImage = false;
 // time anyway.
 let streaming = null;
 
-function loadConvs() {
-  try { convs = JSON.parse(localStorage.getItem(STORE) || '[]'); } catch (e) { convs = []; }
-  if (!Array.isArray(convs)) convs = [];
+let dbPromise = null;
+function db() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((res, rej) => {
+    const rq = indexedDB.open(DB_NAME, 1);
+    rq.onupgradeneeded = () => {
+      const d = rq.result;
+      if (!d.objectStoreNames.contains(DB_STORE)) d.createObjectStore(DB_STORE, { keyPath: 'id' });
+    };
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+  return dbPromise;
 }
+function tx(mode, fn) {
+  return db().then(d => new Promise((res, rej) => {
+    const t = d.transaction(DB_STORE, mode);
+    const out = fn(t.objectStore(DB_STORE));
+    t.oncomplete = () => res(out && out.result !== undefined ? out.result : out);
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  }));
+}
+
+// Until the store has been read once, `convs` is not the truth and must not be written back
+// as if it were -- `saveConvs` deletes every record that is not in it, so one early write
+// would empty the store. The window is milliseconds, and the cost of losing it is every
+// conversation the person has.
+let convsReady = false;
+
+async function loadConvs() {
+  try {
+    convs = await tx('readonly', st => st.getAll());
+  } catch (e) { convs = []; }
+  if (!Array.isArray(convs)) convs = [];
+  // One-time move of anything the localStorage version left behind. The old key is cleared
+  // only after the new store has the records, so an interrupted migration retries rather
+  // than losing the conversations.
+  let old = null;
+  try { old = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { old = null; }
+  if (Array.isArray(old) && old.length) {
+    const have = new Set(convs.map(c => c.id));
+    const add = old.filter(c => c && c.id && !have.has(c.id));
+    let moved = !add.length;                    // nothing to move is nothing to lose
+    if (add.length) {
+      try {
+        await tx('readwrite', st => { add.forEach(c => st.put(c)); });
+        convs = convs.concat(add);
+        moved = true;
+      } catch (e) { /* keep the localStorage copy for the next attempt */ }
+    }
+    // Only now, with the records confirmed in the new store.
+    if (moved) { try { localStorage.removeItem(STORE); } catch (e) {} }
+  }
+  convs.sort((a, b) => (b.updated || 0) - (a.updated || 0));
+  convsReady = true;
+}
+
+// Writes are fire-and-forget: every caller is a UI action that has already updated `convs`
+// and re-rendered, and none of them can do anything useful with a storage failure. The
+// whole set is written because that is the granularity every caller already works at --
+// they mutate `convs` and call this -- and a handful of conversations is nothing to write.
 function saveConvs() {
-  try { localStorage.setItem(STORE, JSON.stringify(convs)); } catch (e) { /* quota */ }
+  if (!convsReady) return;                     // see convsReady
+  const snapshot = convs.map(c => JSON.parse(JSON.stringify(c)));
+  const keep = new Set(snapshot.map(c => c.id));
+  tx('readwrite', st => {
+    const all = st.getAllKeys();
+    all.onsuccess = () => (all.result || []).forEach(k => { if (!keep.has(k)) st.delete(k); });
+    snapshot.forEach(c => st.put(c));
+  }).catch(() => { /* nothing the page can do about it */ });
 }
 function current() { return convs.find(c => c.id === curId) || null; }
 
@@ -248,6 +320,13 @@ function syncButtons() {
   ['#input', '#send', '#toolFile', '#toolCam', '#toolUrl', '#newChat'].forEach(sel => {
     const el = $(sel); if (el) el.disabled = off;
   });
+  // While a reply is being written the send control is the stop control -- there is nothing
+  // else to do with it, and a reply you cannot interrupt is a reply you have to wait out.
+  const send = $('#send');
+  send.classList.toggle('stopping', !!streaming);
+  send.textContent = streaming ? 'Stop' : 'Send';
+  send.title = streaming ? 'Stop generating' : '';
+  if (streaming) send.disabled = false;
   // Image sources go away with a model that cannot see: the file picker stays (text files
   // still make sense), the camera does not.
   $('#toolCam').disabled = off || !modelImage;
@@ -759,6 +838,70 @@ function renderConvs() {
   });
 }
 
+// Edit a message in place — either role. Prose gets a plain box holding exactly what the
+// message says; code blocks are edited in the block itself (see wireRunButtons), which is
+// why this deliberately does NOT open the Markdown for a reply full of code.
+function editMessage(m, body) {
+  if (body.querySelector('textarea')) return;                 // already editing
+  const prev = body.cloneNode(true);
+  const ta = document.createElement('textarea');
+  ta.className = 'editbox'; ta.value = m.content || '';
+  ta.rows = Math.min(20, Math.max(3, (m.content || '').split('\n').length + 1));
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const ok = document.createElement('button'); ok.type = 'button';
+  ok.className = 'primary'; ok.textContent = 'Save';
+  const no = document.createElement('button'); no.type = 'button'; no.textContent = 'Cancel';
+  bar.append(ok, no);
+  body.textContent = ''; body.append(ta, bar);
+  ta.focus();
+  const restore = () => { body.replaceWith(prev); };
+  no.onclick = restore;
+  ok.onclick = () => {
+    m.content = ta.value;
+    if (m.role === 'assistant') m.think = m.think === undefined ? undefined : m.think;
+    saveConvs(); renderConvs(); render();
+  };
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Escape') restore();
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
+  });
+}
+
+// Remove one message. Emptying a conversation this way removes the conversation -- a
+// conversation with nothing in it is not a thing anyone wants left in the list -- so that
+// case asks first, and a cancelled ask leaves the message alone.
+function deleteMessage(m) {
+  const conv = current();
+  if (!conv) return;
+  const i = conv.messages.indexOf(m);
+  if (i < 0) return;
+  if (conv.messages.length === 1) {
+    if (!confirm('This is the last message. Deleting it deletes the whole conversation.\n\nDelete the conversation?')) return;
+    convs = convs.filter(c => c.id !== conv.id);
+    curId = convs.length ? convs[0].id : null;
+    saveConvs(); renderConvs(); render();
+    return;
+  }
+  // A reply still being written is driven by an index into this array; deleting it (or
+  // anything before it) would leave the stream appending to the wrong message. Say so
+  // rather than corrupt the conversation -- it is over in a few seconds.
+  if (streaming && streaming.convId === conv.id && streaming.idx >= i) {
+    note('That reply is still being written — wait for it to finish.');
+    return;
+  }
+  conv.messages.splice(i, 1);
+  saveConvs(); renderConvs(); render();
+}
+
+// The sidebar is a column on a desktop and a drawer on a phone: the same markup, with the
+// narrow layout in the stylesheet and this toggling one class. Tapping the backdrop or
+// picking a conversation closes it, because on a phone it covers what you came to read.
+function toggleSidebar(open) {
+  const app = document.getElementById('app');
+  const want = open === undefined ? !app.classList.contains('nav-open') : !!open;
+  app.classList.toggle('nav-open', want);
+}
+
 function render() {
   const el = $('#messages'); el.innerHTML = '';
   const conv = current();
@@ -778,12 +921,29 @@ function messageNode(m, live) {
   const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
   const w = document.createElement('div'); w.className = 'who'; w.textContent = m.role === 'user' ? 'You' : 'AI';
   const b = document.createElement('div'); b.className = 'body';
-  d.append(w, b);
+  const tools = document.createElement('div'); tools.className = 'mtools';
+  const ed = document.createElement('button');
+  ed.type = 'button'; ed.className = 'edit'; ed.textContent = '✎';
+  ed.title = 'Edit this message';
+  ed.onclick = () => editMessage(m, b);
+  const x = document.createElement('button');
+  x.type = 'button'; x.className = 'del'; x.textContent = '✕';
+  x.title = 'Delete this message';
+  x.onclick = () => deleteMessage(m);
+  tools.append(ed, x);
+  d.append(w, b, tools);
   if (m.role === 'user') {
     b.textContent = m.content;
   } else {
     fillBody(b, m, live);
   }
+  if (live) tools.style.display = 'none';        // nothing to edit or delete mid-stream
+  // Double-click the message to edit it — except inside a code block, which is its own
+  // editor already and where a double-click is how you select a word.
+  else b.addEventListener('dblclick', (e) => {
+    if (e.target.closest('pre, .runout, .editbox')) return;
+    editMessage(m, b);
+  });
   (m.attachments || []).forEach(a => {
     if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
     else { const p = document.createElement('div'); p.className = 'hint'; p.textContent = a.kind + ': ' + a.name; b.appendChild(p); }
@@ -820,6 +980,250 @@ function splitThink(txt) {
 // detail/text nodes are updated in place, so a person who opened the thinking box while the
 // reply streams keeps it open — the DOM is never rebuilt under their cursor.
 // `live` shape: {det, sum, pre, ans, touched, collapsed}
+// ---- running the Python in a reply ---------------------------------------------------
+// A model that answers with code should let you press it. The code runs in its OWN Pyodide,
+// in its own worker: the model's runtime is holding gigabytes of weights and is busy
+// decoding, and someone's `while True` must not be able to take the chat down with it.
+//
+// It is booted at page load with the packages from Settings, not on the first Run. Loading
+// pandas the first time someone presses the button is a ten-second pause with nothing to
+// look at, and the person pressing Run has already decided they want this.
+// What the page asks every model for, because the page is what renders the answer. Kept
+// short and concrete: a long style guide costs context on every turn and models follow the
+// specific instructions better than the general ones.
+const UI_SYSTEM = [
+  'Format every reply as Markdown.',
+  'Put code in fenced blocks with a language tag (```python).',
+  'Write mathematics as LaTeX: $inline$ and $$display$$.',
+  'Use tables, lists and headings where they make the answer clearer.',
+].join(' ');
+
+const PYPKG_KEY = 'webtorch.pyPackages';
+const PYON_KEY = 'webtorch.pyEnabled';
+const PY_DEFAULT = 'numpy, pandas, matplotlib';
+let pyWorker = null, pySeq = 0, pyState = 'off';
+const pyPending = new Map();
+
+function pyPackages() {
+  const v = localStorage.getItem(PYPKG_KEY);
+  return (v === null ? PY_DEFAULT : v).split(/[\s,]+/).filter(Boolean);
+}
+function pyEnabled() { return localStorage.getItem(PYON_KEY) !== '0'; }
+
+function pyCall(cmd, args) {
+  if (!pyWorker) return Promise.reject(new Error('the Python runtime is off'));
+  const id = ++pySeq;
+  return new Promise((res, rej) => {
+    pyPending.set(id, { res, rej });
+    pyWorker.postMessage({ id, cmd, args });
+  });
+}
+
+function pyStart() {
+  if (pyWorker || !pyEnabled()) return;
+  pyWorker = new Worker('pyworker.js');
+  pyWorker.onmessage = (e) => {
+    const m = e.data || {};
+    if (m.type === 'res') {
+      const p = pyPending.get(m.id); pyPending.delete(m.id);
+      if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
+    } else if (m.type === 'state') {
+      pyState = m.state;
+      const el = $('#pyState');
+      if (el) el.textContent = m.state === 'ready'
+        ? 'ready · ' + (m.packages || []).join(', ') : m.state + '…';
+      document.querySelectorAll('.runbtn').forEach(b => { b.disabled = pyState !== 'ready'; });
+    }
+  };
+  pyCall('boot', { packages: pyPackages() }).catch(() => {});
+}
+function pyStop() {
+  if (!pyWorker) return;
+  pyWorker.terminate(); pyWorker = null; pyState = 'off';
+  const el = $('#pyState'); if (el) el.textContent = 'off';
+  document.querySelectorAll('.runbtn').forEach(b => { b.disabled = true; });
+}
+
+// Attach a Run control to every Python block in `root` that has not got one. Called after a
+// reply is rendered rather than woven into the renderer, so the sanitiser still sees plain
+// Markdown output and no button can arrive from the model's own text.
+function wireRunButtons(root, msg) {
+  let idx = -1;
+  root.querySelectorAll('pre > code').forEach(code => {
+    const pre = code.parentNode;
+    idx += 1;                                   // every fence, so the index matches the source
+    if (pre.dataset.run) return;
+    pre.dataset.run = '1';
+    const wrap = document.createElement('div'); wrap.className = 'codewrap';
+    pre.parentNode.insertBefore(wrap, pre); wrap.appendChild(pre);
+
+    // Editable in place. Not a textarea of Markdown: the person wants to fix a line of
+    // Python, and being handed the backticks to edit around is a worse tool than the block
+    // they are already looking at. `plaintext-only` keeps pasted rich text from arriving as
+    // markup, and the edit is written back into the message's own fence on blur.
+    if (msg) {
+      const n = idx;
+      code.setAttribute('contenteditable', 'plaintext-only');
+      code.spellcheck = false;
+      code.title = 'Click to edit';
+      code.addEventListener('focus', () => wrap.classList.add('editing'));
+      code.addEventListener('blur', () => {
+        wrap.classList.remove('editing');
+        if (replaceFence(msg, n, code.textContent)) { saveConvs(); }
+        rehighlight(code);
+      });
+      // Enter must not end the edit and Tab must indent -- this is a code box, not a form.
+      code.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          document.execCommand('insertText', false, '    ');
+        } else if (e.key === 'Escape') { code.blur(); }
+      });
+    }
+
+    const lang = (code.className.match(/language-([\w+-]+)/) || [])[1] || '';
+    if (!/^(py|python|python3)$/i.test(lang)) return;
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'runbtn'; btn.title = 'Run this code';
+    btn.textContent = '▶';
+    btn.disabled = pyState !== 'ready';
+    btn.onclick = () => runBlock(code.textContent, wrap, btn);
+    wrap.appendChild(btn);
+  });
+}
+
+// Colour the block again after an edit, keeping the language it was tagged with.
+function rehighlight(code) {
+  if (typeof hljs === 'undefined') return;
+  const lang = (code.className.match(/language-([\w+-]+)/) || [])[1] || '';
+  const text = code.textContent;
+  try {
+    code.innerHTML = lang && hljs.getLanguage(lang)
+      ? hljs.highlight(text, { language: lang }).value
+      : hljs.highlightAuto(text).value;
+  } catch (e) { code.textContent = text; }
+}
+
+// Put `body` into the n-th fenced block of the message's Markdown. Counting fences in the
+// source the same way the renderer emits them is what keeps the two in step; a message
+// whose fences cannot be counted is left alone rather than rewritten wrongly.
+function replaceFence(msg, n, body) {
+  const src = msg.content || '';
+  const re = /^([ \t]*)(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)^[ \t]*\2[ \t]*$/gm;
+  let i = 0, found = false;
+  const out = src.replace(re, (whole, ind, fence, info, inner) => {
+    if (i++ !== n) return whole;
+    found = true;
+    const b = body.replace(/\n+$/, '');
+    return ind + fence + info + '\n' + b + '\n' + ind + fence;
+  });
+  if (!found || out === src) return false;
+  msg.content = out;
+  return true;
+}
+
+async function runBlock(code, wrap, btn) {
+  let panel = wrap.nextElementSibling;
+  if (!panel || !panel.classList.contains('runout')) {
+    panel = document.createElement('div'); panel.className = 'runout';
+    wrap.parentNode.insertBefore(panel, wrap.nextSibling);
+  }
+  panel.textContent = 'running…'; panel.className = 'runout';
+  btn.disabled = true;
+  try {
+    const r = await pyCall('run', { code });
+    panel.textContent = '';
+    // Output first, then the value of the last expression, then whatever it drew. Errors
+    // are shown in the same place: a traceback is a result too.
+    if (r.out) { const p = document.createElement('pre'); p.textContent = r.out.replace(/\n$/, ''); panel.appendChild(p); }
+    if (r.value != null && r.value !== 'None') {
+      const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.value; panel.appendChild(p);
+    }
+    (r.images || []).forEach(b64 => {
+      const im = new Image(); im.src = 'data:image/png;base64,' + b64; panel.appendChild(im);
+    });
+    if (r.error) {
+      panel.classList.add('bad');
+      const p = document.createElement('pre'); p.textContent = r.error; panel.appendChild(p);
+    }
+    if (!panel.childNodes.length) panel.textContent = '(no output)';
+  } catch (e) {
+    panel.classList.add('bad'); panel.textContent = String(e.message || e);
+  } finally { btn.disabled = pyState !== 'ready'; }
+}
+
+// ---- reply rendering ----------------------------------------------------------------
+// A model's answer is Markdown: fenced code, tables, lists, and — for anything technical —
+// LaTeX. Rendering it as plain text showed people the backticks and the dollar signs.
+//
+// marked does the Markdown (GFM: tables, task lists, strikethrough), KaTeX the maths,
+// highlight.js the code, and DOMPurify decides what is allowed to reach the DOM. That last
+// one is not optional: marked deliberately does not sanitise, and the text being rendered
+// comes out of a language model. Checked, not assumed -- `javascript:` and `data:text/html`
+// hrefs and an `onerror` attribute all come back stripped, while `https:` links survive.
+//
+// Everything is loaded from a CDN, so all of it may simply be absent: offline, or blocked.
+// `renderMarkdown` then returns null and the caller writes the text as it always did. The
+// chat is usable either way; it is only prettier with them.
+// Built on first use and kept. A MISSING library is not cached as a failure: these are
+// `defer` scripts, so the first message rendered can easily arrive before they do, and
+// latching then would leave the chat in plain text for the rest of the session. Only a
+// library that is present and throws is given up on.
+let MD = null, mdBroken = false;
+function markdown() {
+  if (MD || mdBroken) return MD;
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') return null;
+  try {
+    const m = new marked.Marked({ gfm: true, breaks: true });
+    if (typeof markedKatex === 'function' && typeof katex !== 'undefined') {
+      // `nonStandard` also accepts $…$ with no space around it, which is how models write it.
+      m.use(markedKatex({ throwOnError: false, nonStandard: true }));
+    }
+    if (typeof hljs !== 'undefined') {
+      m.use({ renderer: { code(token) {
+        const src = token.text != null ? token.text : String(token);
+        const lang = ((token.lang || '') + '').trim().split(/\s+/)[0];
+        let body;
+        try {
+          body = lang && hljs.getLanguage(lang)
+               ? hljs.highlight(src, { language: lang }).value
+               : hljs.highlightAuto(src).value;
+        } catch (e) { body = null; }
+        if (body == null) return false;                      // let marked render it plainly
+        return '<pre><code class="hljs' + (lang ? ' language-' + lang : '') + '">'
+             + body + '</code></pre>';
+      } } });
+    }
+    MD = m;
+  } catch (e) { mdBroken = true; }
+  return MD;
+}
+// KaTeX emits MathML and a pile of positioned spans; the allow-list has to cover them or the
+// formula arrives as loose letters.
+const MD_TAGS = ['math', 'semantics', 'annotation', 'mrow', 'mi', 'mo', 'mn', 'ms', 'mtext',
+                 'msup', 'msub', 'msubsup', 'mfrac', 'msqrt', 'mroot', 'mover', 'munder',
+                 'munderover', 'mtable', 'mtr', 'mtd', 'mspace', 'mpadded', 'mphantom',
+                 'menclose', 'mstyle', 'svg', 'path', 'line'];
+const MD_ATTR = ['aria-hidden', 'style', 'class', 'encoding', 'displaystyle', 'scriptlevel',
+                 'mathvariant', 'stretchy', 'width', 'height', 'viewBox', 'preserveAspectRatio',
+                 'd', 'x1', 'x2', 'y1', 'y2'];
+function renderMarkdown(text) {
+  const m = markdown();
+  if (!m) return null;
+  try {
+    return DOMPurify.sanitize(m.parse(String(text)),
+                              { ADD_TAGS: MD_TAGS, ADD_ATTR: MD_ATTR });
+  } catch (e) { return null; }
+}
+// Put `text` into `el` as rendered Markdown, or as plain text when rendering is unavailable.
+function setRendered(el, text, msg) {
+  const html = renderMarkdown(text);
+  if (html == null) { el.textContent = text; el.classList.remove('md'); return; }
+  el.innerHTML = html;
+  el.classList.add('md');
+  wireRunButtons(el, msg);
+}
+
 function fillBody(b, msg, live) {
   // `msg.think` is present once anything arrived on the thinking channel; `undefined` means
   // a stored message that predates channels, which still needs its tags parsed.
@@ -842,7 +1246,7 @@ function fillBody(b, msg, live) {
         live.det.open = false; live.collapsed = true;                // auto-fold once the answer starts
       }
     }
-    live.ans.data = rest;
+    setRendered(live.ans, rest);          // no msg: a reply still arriving is not editable
     return;
   }
   if (think !== null) {
@@ -853,7 +1257,10 @@ function fillBody(b, msg, live) {
     det.append(sum, pre); b.appendChild(det);
     det.open = open;                                                 // mid-think: watch it; done: folded
   }
-  b.appendChild(document.createTextNode(rest));
+  const ans = document.createElement('div');
+  ans.className = 'ans';
+  setRendered(ans, rest, live ? null : msg);
+  b.appendChild(ans);
 }
 // The waiting dots: prefill can take seconds before the first token exists, and an empty
 // bubble reads as a frozen page. They live in the reply body from submit until the first
@@ -895,12 +1302,19 @@ $('#composer').onsubmit = async (e) => {
   // The whole conversation goes to the model, not just the last line — that is what makes
   // it a chat. Assistant turns go back WITHOUT their thinking: the reasoning was this
   // model's scratch work for its last answer, not context for the next one.
-  const msgs = conv.messages.slice(0, -1).map(m => ({
+  // A system turn the page adds, not the SDK: this is about how the ANSWER IS DISPLAYED
+  // here — the chat renders Markdown, highlights code and typesets LaTeX, and a model that
+  // replies in prose gets none of that. It belongs to the client that does the rendering,
+  // so the SDK stays neutral about presentation.
+  const msgs = [{ role: 'system', content: UI_SYSTEM }];
+  conv.messages.slice(0, -1).forEach(m => msgs.push({
     role: m.role,
     content: m.role === 'user' ? promptFor(m)
            : (m.think !== undefined ? (m.content || '') : splitThink(m.content).rest),
-  })).filter(m => m.content);
+  }));
   msgs.push({ role: 'user', content: promptFor(msg) });
+
+  for (let i = msgs.length - 1; i > 0; i--) if (!msgs[i].content) msgs.splice(i, 1);
 
   const reply = { role: 'assistant', content: '' };
   conv.messages.push(reply);
@@ -914,7 +1328,8 @@ $('#composer').onsubmit = async (e) => {
   const pre = document.createElement('pre');
   det.append(sum, pre);
   det.ontoggle = () => { if (streaming) streaming.live.touched = true; };
-  const live = { det, sum, pre, ans: document.createTextNode(''),
+  const ansEl = document.createElement('div'); ansEl.className = 'ans';
+  const live = { det, sum, pre, ans: ansEl,
                  touched: false, collapsed: false, tokens: 0, t0: 0, rateT: 0 };
   startDots(live, body);                              // until the first token lands
   body.appendChild(live.ans);
@@ -922,6 +1337,7 @@ $('#composer').onsubmit = async (e) => {
   rate.className = 'tokrate'; rate.hidden = true;
   body.appendChild(rate); live.rate = rate;
   streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
+  syncButtons();                                      // Send becomes Stop
 
   try {
     // Images ride alongside the conversation: the worker turns each data URL into pixels
@@ -941,12 +1357,61 @@ $('#composer').onsubmit = async (e) => {
     reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
   } finally { stopDots(live); }
   streaming = null;
+  syncButtons();                                      // Stop becomes Send again
   conv.updated = Date.now(); saveConvs(); render();
 };
+// The form's submit is the send path; while streaming, the same button stops instead. The
+// worker sets the SDK's cancel flag and `generate` returns the part of the reply that
+// exists, so the stopped answer stays in the conversation.
+$('#send').addEventListener('click', e => {
+  if (!streaming) return;                       // idle: let the form submit as usual
+  e.preventDefault();
+  call('stopGen').catch(() => {});
+  note('Stopping…');
+});
 $('#input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#composer').requestSubmit(); }
 });
-$('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv(); };
+$('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv();
+                                toggleSidebar(false); };
+// ---- the Python-environment settings -------------------------------------------------
+function wirePython() {
+  const box = $('#pyPackages'), on = $('#pyEnabled'), st = $('#pyState');
+  if (!box) return;
+  const saved = localStorage.getItem(PYPKG_KEY);
+  box.value = saved === null ? PY_DEFAULT : saved;
+  on.checked = pyEnabled();
+  st.textContent = pyEnabled() ? 'starting…' : 'off';
+  $('#pyApply').onclick = async () => {
+    localStorage.setItem(PYPKG_KEY, box.value);
+    if (!on.checked) { localStorage.setItem(PYON_KEY, '0'); pyStop(); return; }
+    localStorage.setItem(PYON_KEY, '1');
+    // Applying LOADS. That is the whole point of the setting existing.
+    if (!pyWorker) { pyStart(); return; }
+    st.textContent = 'loading…';
+    try {
+      const r = await pyCall('packages', { packages: pyPackages() });
+      if (r.unavailable && r.unavailable.length) {
+        note('Not in this Pyodide build: ' + r.unavailable.join(', '));
+      }
+    } catch (e) { st.textContent = 'failed: ' + e.message; }
+  };
+  $('#pyReset').onclick = async () => {
+    if (!pyWorker) { pyStart(); return; }
+    try { await pyCall('reset'); } catch (e) {}
+    pyStop(); pyStart();
+  };
+  on.onchange = () => {
+    localStorage.setItem(PYON_KEY, on.checked ? '1' : '0');
+    if (on.checked) pyStart(); else pyStop();
+  };
+}
+
+$('#navBtn').onclick = () => toggleSidebar();
+$('#navScrim').onclick = () => toggleSidebar(false);
+// A conversation picked from the drawer is a conversation you want to read, so get out of
+// the way. Delegated, because the list is rebuilt on every change.
+$('#convList').addEventListener('click', () => toggleSidebar(false));
 $('#openSettings').onclick = () => { $('#settingsDlg').showModal(); refreshCache(); };
 $('#closeSettings').onclick = () => $('#settingsDlg').close();
 
@@ -980,11 +1445,20 @@ $('#importFile').onchange = async (e) => {
   e.target.value = '';
 };
 
-loadConvs(); if (!convs.length) newConv(); else curId = convs[0].id;
-renderConvs(); render(); syncButtons();
+// The conversation store is async now, so the first paint happens without it and the
+// sidebar fills in when it arrives -- a few milliseconds, and nothing else waits on it.
+render(); syncButtons();
+loadConvs().then(() => {
+  if (!convs.length) newConv(); else curId = convs[0].id;
+  renderConvs(); render();
+});
 detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 // Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
 call('armStorage', {}).catch(() => {});
+wirePython();
+// After the first paint: booting a second Python is a few seconds of CPU, and the model
+// runtime starting up is what the person is actually waiting for.
+setTimeout(pyStart, 1200);
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
 call('boot').then(refreshCache).catch(e => {
   $('#modelStatus').textContent = 'runtime failed: ' + e.message;

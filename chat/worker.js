@@ -103,6 +103,8 @@ async function decodeImages(urls) {
 }
 
 async function generate(prompt, opts) {
+  // A stop asked for during the LAST reply must not end this one before it starts.
+  await pyodide.runPythonAsync('import webtorch; webtorch.cancel(False)');
   if (!ready || !pyodide) throw new Error('no runtime');
   const imgs = await decodeImages((opts || {}).images);
   pyodide.globals.set('_prompt', prompt || '');
@@ -283,6 +285,12 @@ onmessage = async (e) => {
     if (cmd === 'boot') await boot();
     else if (cmd === 'load') await loadModel(args.repo, args.file, args.lmax);
     else if (cmd === 'stopLoad') await stopLoad();
+    // Stop a reply mid-flight. The same flag the loader uses, read (not raised on) between
+    // tokens, so `generate` returns the part of the answer that already exists.
+    else if (cmd === 'stopGen') {
+      await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
+      res = true;
+    }
     else if (cmd === 'generate') res = await generate(args.prompt, args);
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'cacheList') res = await cacheList();
