@@ -197,7 +197,14 @@ details.think.live summary{color:var(--accent)}
   #navBtn{display:block;position:fixed;z-index:40;top:8px;left:8px;width:38px;height:38px;
           border:1px solid var(--line);border-radius:10px;background:var(--panel);
           color:var(--fg);font-size:17px;line-height:1;cursor:pointer}
-  #messages{padding-top:52px}                    /* clear of the floating menu button */
+  /* An opaque strip for the button to sit in, not a pill floating over the conversation.
+     Padding alone only holds the two apart at the top of the scroll: the button is fixed, so
+     the moment the list moves, whatever is passing behind it -- an avatar, the start of a
+     line -- collides with it. Under a solid strip the content simply scrolls out of view,
+     which is what a reader expects. */
+  #app::before{content:'';position:fixed;z-index:35;top:0;left:0;right:0;height:54px;
+               background:var(--bg);pointer-events:none}
+  #messages{padding-top:60px}                    /* the strip, plus a gap under it */
   .msg{gap:8px}
   .msg .who{width:26px;height:26px;font-size:11px}
   .msg .del{opacity:.5}                          /* no hover on touch: always reachable */
@@ -237,6 +244,15 @@ details.think.live summary{color:var(--accent)}
                   opacity:.55;transition:opacity .12s}
 .codewrap:hover .runbtn{opacity:1}
 .codewrap .runbtn:disabled{opacity:.3;cursor:default}
+/* Without hover the overlay is wrong twice over: it cannot be revealed, and it sits on top
+   of the code -- a long first line runs underneath it, and scrolling the block horizontally
+   just feeds more text under it, so reserving padding would not help. On such a device the
+   button leaves the overlay and takes a line of its own under the code. Keyed on the
+   capability rather than on a width: a narrow window with a mouse still reveals on hover. */
+@media (hover: none) {
+  .codewrap .runbtn{position:static;display:block;margin:6px 0 0 auto;opacity:1}
+  .runout > .x{opacity:1}
+}
 .md pre code[contenteditable]{outline:none;cursor:text}
 .codewrap.editing pre{box-shadow:0 0 0 2px var(--accent) inset}
 
