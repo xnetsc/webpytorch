@@ -3286,6 +3286,16 @@ var<storage,read> eidx: array<u32>;
 # came out at 97.2 GB/s against 121.1 for the reads alone on IQ3_S. Making the window a vec4
 # array is worth 17-21% on every format that decodes four at a time.
 #
+# Reading the bytes runs at 106-121 GB/s for EVERY format, so there is no memory problem to
+# find here -- and GB/s is the wrong way to compare two formats anyway, because the work is
+# per value and a 2-bit format packs more values into each byte. In values per second the
+# formats are within 15% of each other:
+#   IQ4_XS 1.88 vals/byte  116.8 GB/s  220 G/s     IQ2_S   3.12  74.6  233 G/s
+#   IQ3_S  2.33            85.4        199         IQ2_XS  3.46  66.5  230
+#   IQ3_XXS 2.61           86.8        227
+# IQ2_XS at 66.5 GB/s is decoding MORE values per second than IQ4_XS at 116.8. Asking it to
+# reach 100 GB/s is asking for 346 G values/s, half again what anything here achieves.
+#
 # It is worth MINUS 30% on the ones that do not. Twenty formats accumulate a value at a time,
 # and a scalar read from a vec4 window is a dynamic component index -- Q4_K measured 95.8 ->
 # 68.2 GB/s that way. So the window type follows the fragment: four-at-a-time formats get
@@ -3759,6 +3769,21 @@ GRIDSTAGE
 fn GB(o: u32) -> u32 { return (GSRC[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
 fn G4(idx: u32) -> u32 { return GSRC[32u + idx]; }      // one 4-byte entry, one read
 fn G4V(idx: u32) -> vec4<f32> { return unpack4x8unorm(GSRC[32u + idx]) * 255.0; }
+// These two are the i-quant decode arithmetic, and they are the last 13-18% between these
+// formats and their own read rate. Two attempts to cut them, both correct and both SLOWER,
+// so leave them alone unless you have a measurement that says otherwise:
+//
+//   * signs by xor into the float's sign bit, and the 255 folded into the scale, replacing
+//     a select and two multiplies per value with a vec4 shift and a vec4 xor:
+//     IQ3_S 71 -> 66 GB/s, IQ2_S 62 -> 56, whole 27B step 149.9 -> 154.3ms.
+//   * signs from a 16-entry workgroup table indexed by the nibble, one vec4 load instead of
+//     four shift-mask-select groups -- the trick that makes IQ4_XS nearly free:
+//     IQ3_XXS 86.6 -> 69, IQ2_XS 66.4 -> 53.7, whole step 134.5 -> 143.9ms.
+//
+// The pattern in both: `select` plus a multiply is a predicated fma here, about as cheap as
+// an instruction gets, while a bitcast round-trip breaks the float pipeline and a workgroup
+// lookup pays latency and bank conflicts on a data-dependent index. IQ4_XS's table wins
+// because what it replaces is ten instructions of bit-fiddling, not four selects.
 fn SGN4(mask: u32, j0: u32) -> vec4<f32> {
   return vec4<f32>(SGN(mask, j0), SGN(mask, j0 + 1u), SGN(mask, j0 + 2u), SGN(mask, j0 + 3u));
 }
