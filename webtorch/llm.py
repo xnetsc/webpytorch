@@ -1993,8 +1993,8 @@ class CausalLM:
                 q, k, v = self._qkv(lay, x, T)
                 q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
-                wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
-                wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
+                K.data = wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
+                V.data = wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
                 Kp = wt.Tensor(wt._contig(K.data[:, :T, :]))
                 Vp = wt.Tensor(wt._contig(V.data[:, :T, :]))
                 o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc)
@@ -2027,8 +2027,8 @@ class CausalLM:
                 q, k, v = self._qkv(lay, x, 1)
                 q = self._rope1(q); k = self._rope1(k)
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
-                wt.kv_write(K.data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-                wt.kv_write(V.data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                K.data = wt.kv_write(K.data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                V.data = wt.kv_write(V.data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
                 # One dispatch for the single decode position; falls back for anything the
                 # fused kernel does not cover.
                 # `ctl` carries the position, so the fused kernel scans only what the

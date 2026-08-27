@@ -191,8 +191,8 @@ class TransformerLM:
             k = lay["k"](x).reshape(T, NKV, HD).permute(1, 0, 2)
             v = lay["v"](x).reshape(T, NKV, HD).permute(1, 0, 2)
             q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
-            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
-            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
+            self.Kc[i].data = wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
+            self.Vc[i].data = wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], mask, scale=sc)
             h = h + lay["o"](o.permute(1, 0, 2).reshape(T, H))
             x = self._rms(h, lay["post_ln"]); h = h + self._mlp(lay, x)
@@ -218,8 +218,8 @@ class TransformerLM:
             v = lay["v"](x).reshape(1, NKV, HD).permute(1, 0, 2)
             q = q * self.cos_b + self._rot(q) * self.sin_b
             k = k * self.cos_b + self._rot(k) * self.sin_b
-            wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-            wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+            self.Kc[i].data = wt.kv_write(self.Kc[i].data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+            self.Vc[i].data = wt.kv_write(self.Vc[i].data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
             o = wt.gqa_attention(q, self.Kc[i], self.Vc[i], self.mask_b, scale=sc)
             h = h + lay["o"](o.permute(1, 0, 2).reshape(1, H))
             x = self._rms(h, lay["post_ln"]); h = h + self._mlp(lay, x)

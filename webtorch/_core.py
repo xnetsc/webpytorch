@@ -1687,7 +1687,7 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     Returns None when the backend or the shapes fall outside what the kernel covers, so
     callers keep the general path.
     """
-    if not _adam_backend_ready():
+    if not (_adam_backend_ready() or _webgl_ready()):
         return None
     qd = q.data if isinstance(q, Tensor) else q
     kd = kc.data if isinstance(kc, Tensor) else kc
@@ -1699,6 +1699,17 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     if T != 1 or hd != hd2 or hd > 256 or nh % nkv:
         return None
     n = lmax if valid is None else max(1, min(int(valid), lmax))
+    # Defaulted here, above the backend split: `gqa_attention` has always filled this in for
+    # its callers, and routing the single-position case here instead handed `None` straight
+    # to a `float()` on the WebGPU side.
+    if scale is None:
+        scale = 1.0 / (float(hd) ** 0.5)
+    if _webgl_ready() and not _adam_backend_ready():
+        # No `ctl`: reading the scan length from a control buffer is what keeps ONE captured
+        # dispatch correct across steps, and WebGL does not capture here. `n` is passed as a
+        # uniform, which is the same number by a shorter route.
+        return Tensor(_webgl_gqa_decode(_contig(qd), _contig(kd), _contig(vd),
+                                        nh, nkv, hd, n, scale))
     plat = _adam_kernel["platform"]
     if not _gqa_k["added"]:
         plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
@@ -1754,7 +1765,13 @@ def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
     """cache[:, pos:pos+T, :] = src, in place on GPU (no readback).
     cache: WgPy ndarray (NKV,LMAX,HD); src: (NKV,T,HD). `ctl`, if given, is a
     persistent int32 ndarray [pos,T,nkv,hd,lmax] (for capture) whose content is
-    set outside the graph via ctl.buffer.set_data(...) each step."""
+    set outside the graph via ctl.buffer.set_data(...) each step.
+
+    Returns the cache to use next: `cache` itself where the backend writes it in place, and
+    a NEW buffer on WebGL, where a fragment shader cannot render into a texture it samples.
+    The caller stores what comes back -- the same contract the recurrent state uses."""
+    if _webgl_ready() and not _adam_backend_ready():
+        return _webgl_kv_write(cache, src, pos, T, nkv, hd, lmax)
     plat = _adam_kernel["platform"]
     if not _kvw["added"]:
         plat.addKernel("kv_write", {"source": _KVWRITE_WGSL,
@@ -1769,6 +1786,7 @@ def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
     plat.runKernel({"name": "kv_write",
         "tensors": [cache.buffer.buffer_id, src.buffer.buffer_id, meta_id],
         "workGroups": {"x": (total + 63) // 64, "y": 1, "z": 1}})
+    return cache
 
 
 class KVCache:
@@ -1810,9 +1828,11 @@ class KVCache:
         """Write k,v (nkv,T,hd) at `pos`, then attend q (nh,T,hd). Returns (nh,T,hd)."""
         T = k.shape[1]
         if self.scatter:
+            self.K[i] = Tensor(kv_write(self.K[i].data, _contig(k).data, pos, T,
+                                        self.nkv, self.hd, self.lmax))
+            self.V[i] = Tensor(kv_write(self.V[i].data, _contig(v).data, pos, T,
+                                        self.nkv, self.hd, self.lmax))
             kc, vc = self.K[i], self.V[i]
-            kv_write(kc.data, _contig(k).data, pos, T, self.nkv, self.hd, self.lmax)
-            kv_write(vc.data, _contig(v).data, pos, T, self.nkv, self.hd, self.lmax)
             return gqa_attention(q, kc, vc, self._gpu_mask(pos, T), scale)
         # growing cache via cat (both backends)
         if self.K[i] is None:
@@ -1820,6 +1840,14 @@ class KVCache:
         else:
             self.K[i] = cat([self.K[i], k], axis=1); self.V[i] = cat([self.V[i], v], axis=1)
         S = self.K[i].shape[1]
+        if T == 1:
+            # One query position is the decode step, and the fused kernel covers it: two
+            # dispatches against the ten the expression form costs. It reads the cache as it
+            # stands, so `valid` is simply its length -- there are no unwritten slots in a
+            # cache that grew to fit.
+            o = gqa_decode(q, self.K[i], self.V[i], None, scale, valid=S)
+            if o is not None:
+                return o
         mask = None
         if T > 1:                                     # prefill: causal, aligned to the end
             mm = np.triu(np.full((T, S), -1e9, np.float32), 1 + (S - T))
@@ -5144,6 +5172,105 @@ def _webgl_moe_route(logits, eidx, ew, ne, k, norm):
             [("u_ne", int(ne)), ("u_k", int(k))])
     _gl_run("moe_w_gl", _MOE_W_GL, [("tex_lg", logits), ("tex_idx", eidx)], ew,
             [("u_ne", int(ne)), ("u_k", int(k)), ("u_norm", 1 if norm else 0)])
+
+
+# Fused single-position attention, on WebGL.
+#
+# The general path is about ten dispatches per layer -- transpose the cache, a batched
+# matmul, a scale, a mask add, a multi-pass softmax, a second matmul, two reshapes -- and on
+# this backend a dispatch is not free. Two passes replace all of it, and neither needs
+# workgroup memory:
+#
+#   scores: one fragment per (head, position), each a dot product over `hd`
+#   output: one fragment per (head, dim), walking the positions once with the running
+#           max-and-sum of the online (Flash-Attention style) softmax
+#
+# The second pass never materialises the probabilities, so nothing is sized by the context
+# length. Splitting it this way rather than doing everything in the output pass matters: the
+# scores would otherwise be recomputed once per output dimension, which is `hd` times over.
+_GQA_SCORE_GL = _gl_head([("tex_q", "Qf"), ("tex_k", "Kf")],
+                         ("u_nh", "u_nkv", "u_hd", "u_S", "u_n"), ("u_scale",)) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int h = i / u_S; int s = i - h * u_S;
+  int kvh = h / (u_nh / u_nkv);
+  int qo = h * u_hd;
+  int ko = (kvh * u_S + s) * u_hd;
+  float acc = 0.0;
+  for (int d = 0; d < u_hd; d = d + 1) { acc += Qf(qo + d) * Kf(ko + d); }
+  fragColor = acc * u_scale;
+}
+"""
+
+_GQA_OUT_GL = _gl_head([("tex_sc", "Sf"), ("tex_v", "Vf")],
+                       ("u_nh", "u_nkv", "u_hd", "u_S", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int h = i / u_hd; int d = i - h * u_hd;
+  int kvh = h / (u_nh / u_nkv);
+  int so = h * u_S;
+  int vo = kvh * u_S * u_hd + d;
+  // Running max and sum, rescaling what is already accumulated when the max moves. The
+  // first step has m at -inf, so its rescale factor is zero and the empty accumulator is
+  // discarded rather than needing a special case.
+  float m = -1e30; float l = 0.0; float acc = 0.0;
+  for (int s = 0; s < u_S; s = s + 1) {
+    float x = Sf(so + s);
+    float mn = max(m, x);
+    float w = exp(x - mn);
+    float r = exp(m - mn);
+    l = l * r + w;
+    acc = acc * r + w * Vf(vo + s * u_hd);
+    m = mn;
+  }
+  fragColor = acc / l;
+}
+"""
+
+
+def _webgl_gqa_decode(qd, kd, vd, nh, nkv, hd, S, scale):
+    sc = _empty((nh, S))
+    _gl_run("gqa_score_gl", _GQA_SCORE_GL, [("tex_q", qd), ("tex_k", kd)], sc,
+            [("u_nh", nh), ("u_nkv", nkv), ("u_hd", hd), ("u_S", S),
+             ("u_n", nh * S), ("u_scale", float(scale))])
+    of = _empty((nh, 1, hd))
+    _gl_run("gqa_out_gl", _GQA_OUT_GL, [("tex_sc", sc), ("tex_v", vd)], of,
+            [("u_nh", nh), ("u_nkv", nkv), ("u_hd", hd), ("u_S", S), ("u_n", nh * hd)])
+    return of
+
+
+# The KV scatter, on WebGL. There is no in-place form -- a fragment shader cannot render
+# into a texture it samples -- so this reads the old cache and writes a new one, and returns
+# it for the caller to keep. That is a pass over the WHOLE cache per token, against the
+# growing `cat` path's pass over the positions actually in use, so it is the more expensive
+# of the two until the context is about half of LMAX. It exists because the fixed-capacity
+# cache is a real mode with a real caller, not because it should be the default here; the
+# default stays the growing cache (see `KVCache`).
+_KVWRITE_GL = _gl_head([("tex_dst", "Df"), ("tex_src", "Sf")],
+                       ("u_pos", "u_T", "u_nkv", "u_hd", "u_lmax", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int hv = i / (u_lmax * u_hd); int rem = i - hv * (u_lmax * u_hd);
+  int p = rem / u_hd; int d = rem - p * u_hd;
+  if (p >= u_pos && p < u_pos + u_T) {
+    fragColor = Sf((hv * u_T + (p - u_pos)) * u_hd + d);
+  } else {
+    fragColor = Df(i);
+  }
+}
+"""
+
+
+def _webgl_kv_write(cache, src, pos, T, nkv, hd, lmax):
+    of = _empty(tuple(cache.shape))
+    return _gl_run("kv_write_gl", _KVWRITE_GL,
+                   [("tex_dst", cache), ("tex_src", _contig(src))], of,
+                   [("u_pos", int(pos)), ("u_T", int(T)), ("u_nkv", int(nkv)),
+                    ("u_hd", int(hd)), ("u_lmax", int(lmax)),
+                    ("u_n", int(nkv) * int(lmax) * int(hd))])
 
 
 def _webgl_swiglu(gd, ud, rows, half, gstride, ustride, uoff):
