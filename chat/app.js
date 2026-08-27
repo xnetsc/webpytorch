@@ -371,6 +371,63 @@ function warnCpuFallback(name, sdkWhy) {
   dlg.showModal();
 }
 
+// A reply that came back far slower than the machine should manage. The GPU dialog covers
+// the case where there is no GPU at all; this covers the rest -- a GPU that is being used
+// and is still slow, which is the harder one to notice because nothing is obviously wrong.
+//
+// The thresholds are per model size because tokens per second means nothing without it: a
+// 0.6B and a 30B that both answer at 5 tok/s are one broken machine and one normal one.
+// Deliberately well under what the same models actually reach here (0.6B at 149, a 30B MoE
+// at 39), so this fires on something being wrong rather than on a slow afternoon.
+const SLOW_LIMITS = [
+  { maxGB: 1, floor: 40, label: 'under 1 GB' },
+  { maxGB: 10, floor: 10, label: '1-10 GB' },
+  { maxGB: Infinity, floor: 1, label: 'over 10 GB' },
+];
+function modelSizeGB() {
+  const chosen = PRESETS[+$('#preset').value];
+  if (chosen && chosen.gb) return chosen.gb;
+  const t = ($('#progressText').textContent || '').match(/loaded ([\d.]+) GB/);
+  return t ? parseFloat(t[1]) : null;
+}
+function checkSlow(stats) {
+  if (!stats || stats.tok_s == null) return;             // too short to have measured
+  const gb = modelSizeGB();
+  if (!gb) return;
+  const lim = SLOW_LIMITS.find(l => gb <= l.maxGB);
+  if (!lim || stats.tok_s >= lim.floor) { hideSlowNote(); return; }
+  showSlowNote(stats.tok_s, gb, lim);
+}
+function hideSlowNote() { const el = $('#slowNote'); if (el) el.remove(); }
+function showSlowNote(rate, gb, lim) {
+  hideSlowNote();
+  const box = document.createElement('div');
+  box.id = 'slowNote'; box.className = 'slownote';
+  const t = document.createElement('div');
+  t.innerHTML = '<strong>' + rate.toFixed(1) + ' tok/s</strong> for a ' + gb + ' GB model — ' +
+    'a model this size (' + lim.label + ') should manage at least ' + lim.floor + ' here.';
+  const det = document.createElement('details');
+  const sum = document.createElement('summary'); sum.textContent = 'Why might that be';
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify({
+    tok_s: rate, modelGB: gb, backend: ENV.backend || null,
+    webgpuAdapter: ENV.webgpu ? (ENV.gpuName || 'yes') : false,
+    crossOriginIsolated: !!window.crossOriginIsolated,
+    contextTokens: lmaxValue() || 'auto',
+    conversationMessages: (current() || { messages: [] }).messages.length,
+    recentErrors: DBG_ERRS.slice(-3),
+    diagnosticsTopic: DBG_TOPIC,
+  }, null, 2);
+  det.append(sum, pre);
+  const x = document.createElement('button');
+  x.type = 'button'; x.className = 'x'; x.textContent = '✕';
+  x.onclick = hideSlowNote;
+  box.append(t, det, x);
+  const msgs = $('#messages');
+  msgs.appendChild(box);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
 // ---- remote diagnostics --------------------------------------------------------------
 // A problem that only happens on someone else's machine is the hardest kind to fix, and the
 // facts that would settle it -- which backend started, what is cached, what threw -- all
@@ -1875,6 +1932,7 @@ $('#composer').onsubmit = async (e) => {
     }
     if (!reply.content.trim()) reply.content = '(empty reply)';
     reply.stats = r || null;                    // final n / tok_s for the footer line
+    checkSlow(r);
   } catch (err) {
     reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
   } finally { stopDots(live); }

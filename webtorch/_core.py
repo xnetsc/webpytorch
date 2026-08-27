@@ -4618,6 +4618,22 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
     m = 1 if (eidx is not None and xper) else int(xf.shape[0])
+    # The batched kernel is where prefill goes, and it is BAD: it reads the weight once and
+    # still costs what reading it once per row costs, because it accumulates through memory
+    # rather than registers. On a 2048x11008 Q4_K weight at M=256, one batched call is
+    # 42.8ms; the same work as 128 calls to the two-row decode kernel -- 128 weight reads
+    # instead of one -- is 21.4ms, and as 256 single-row calls it is 42.4ms.
+    #
+    # Routing batches through pairs was tried on the strength of that and is NOT here,
+    # because it made real prefill SLOWER: 12755ms against 11121ms at T=512 on a 3B. The
+    # microbenchmark left out what the routing actually costs -- a slice and a copy per
+    # pair, then a 256-way concatenate per matmul -- and that is more than the kernel saves.
+    # (Output was exact, max abs difference 0.0 at M=3, 7 and 16, so this is purely about
+    # speed.)
+    #
+    # Prefill is 61% MLP and runs at about 0.6 GB/s against the decode path's 100+. The fix
+    # is a GEMM that tiles K into workgroup memory and keeps its accumulators in registers,
+    # not a different way to call the one that exists.
     mode = m if m <= 2 else 0
     small = _shape_kind(N, K, _GGML_TYPES[type_name][2]) if mode == 1 else None
     moe = eidx is not None

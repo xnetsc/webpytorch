@@ -317,3 +317,17 @@ dialog.cpuwarn summary{cursor:pointer;color:var(--mut);font-size:13px}
 dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-radius:8px;
                    font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
                    white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}
+
+/* A reply that was far slower than this machine should manage: said in the conversation,
+   where the wait happened, rather than in a dialog that interrupts the next thing. */
+.slownote{position:relative;max-width:760px;margin:0 auto 18px;padding:12px 34px 12px 14px;
+          border:1px solid var(--line);border-left:3px solid var(--danger);border-radius:10px;
+          background:var(--panel);font-size:13px;line-height:1.55}
+.slownote details{margin-top:8px}
+.slownote summary{cursor:pointer;color:var(--mut)}
+.slownote pre{margin:8px 0 0;padding:9px;background:var(--code);border-radius:7px;
+              font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+              white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto}
+.slownote .x{position:absolute;top:6px;right:8px;border:0;background:none;color:var(--mut);
+             cursor:pointer;font-size:13px;padding:3px 5px;border-radius:6px}
+.slownote .x:hover{background:var(--code);color:var(--fg)}

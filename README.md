@@ -7,7 +7,7 @@
 **No server. No install. No native runtime.**
 PyTorch-compatible, on the GPU, in Python — inside the page.
 
-<img src="images/architecture.svg" alt="webtorch runs inside one browser tab: your PyTorch code on Pyodide, weights streamed from a hub or a local file, WgPy kernels on WebGPU" width="880">
+<!-- HERO -->
 
 [Quickstart](#quickstart) · [What it does](#what-it-does) · [Speed](#speed) ·
 [The chat app](#the-chat-app) · [Docs](docs/API.md)
