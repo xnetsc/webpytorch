@@ -271,12 +271,18 @@ worker.onmessage = (e) => {
     if (live) {
       stopDots(live);                                       // the wait is over
       live.tokens += 1;
-      const now = performance.now();
+      // The worker's stamp, not this thread's: timing the arrivals here counts the cost of
+      // rendering the reply and of delivering the message, neither of which the model spent
+      // on the token. It is the same quantity the final footer reports, so the number does
+      // not change when the reply finishes. `at` is absent only if a build without it is
+      // still in a cache -- then this falls back to the old reading rather than to nothing.
+      const now = (m.at != null) ? m.at : performance.now();
+      const wall = performance.now();
       if (!live.t0) live.t0 = now;
       // decode speed = tokens after the first, over the time since the first; updated at
       // most twice a second so the number stays readable
-      if (live.rate && live.tokens >= 2 && (live.tokens === 2 || now - live.rateT > 500)) {
-        live.rateT = now; live.rate.hidden = false;
+      if (live.rate && live.tokens >= 2 && (live.tokens === 2 || wall - live.rateT > 500)) {
+        live.rateT = wall; live.rate.hidden = false;
         const sps = (live.tokens - 1) / ((now - live.t0) / 1000);
         live.rate.textContent = live.tokens + ' tokens · ' + sps.toFixed(1) + ' tok/s';
       }
@@ -1715,6 +1721,33 @@ function renderMarkdown(text) {
 // A finished message is rendered BLOCK BY BLOCK, each in its own container that can be
 // edited on its own. A reply still streaming is rendered as one piece: it changes every
 // token, nothing in it is editable yet, and re-splitting it per token buys nothing.
+// Re-parsing the whole reply for every token is O(n^2) over a reply, and on a fast model it
+// is the largest cost in the loop: measured on a 0.6B, 109-112 tok/s through the API against
+// 91-95 through the chat, for the same prompt and the same model. The tokens still arrive
+// one at a time -- only the PARSE is throttled, so the screen is at most one interval behind,
+// and the `render()` that ends a stream draws the final text whatever the last tick did.
+//
+// The counter and the thinking pane are not throttled with it: those are textContent writes,
+// and they are what makes the reply feel live.
+const STREAM_RENDER_MS = 60;
+const liveRender = { t: 0, timer: 0, el: null, text: '' };
+function flushLiveRender() {
+  if (liveRender.timer) { clearTimeout(liveRender.timer); liveRender.timer = 0; }
+  liveRender.t = performance.now();
+  const el = liveRender.el;
+  if (el && el.isConnected) setRendered(el, liveRender.text);
+}
+function setRenderedLive(el, text) {
+  liveRender.el = el; liveRender.text = text;
+  const due = performance.now() - liveRender.t;
+  if (due >= STREAM_RENDER_MS) { flushLiveRender(); return; }
+  if (!liveRender.timer) liveRender.timer = setTimeout(flushLiveRender, STREAM_RENDER_MS - due);
+}
+function resetLiveRender() {
+  if (liveRender.timer) { clearTimeout(liveRender.timer); liveRender.timer = 0; }
+  liveRender.t = 0; liveRender.el = null; liveRender.text = '';
+}
+
 function setRendered(el, text, msg) {
   if (renderMarkdown('') == null) {            // no renderer: plain text, as before
     el.textContent = text; el.classList.remove('md'); el.classList.remove('blocks');
@@ -1976,7 +2009,7 @@ function fillBody(b, msg, live) {
         live.det.open = false; live.collapsed = true;                // auto-fold once the answer starts
       }
     }
-    setRendered(live.ans, rest);          // no msg: a reply still arriving is not editable
+    setRenderedLive(live.ans, rest);      // no msg: a reply still arriving is not editable
     return;
   }
   if (think !== null) {
@@ -2066,6 +2099,7 @@ $('#composer').onsubmit = async (e) => {
   const rate = document.createElement('div');
   rate.className = 'tokrate'; rate.hidden = true;
   body.appendChild(rate); live.rate = rate;
+  resetLiveRender();                    // the first token of a reply renders immediately
   streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
   syncButtons();                                      // Send becomes Stop
 
@@ -2086,7 +2120,7 @@ $('#composer').onsubmit = async (e) => {
     checkSlow(r);
   } catch (err) {
     reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
-  } finally { stopDots(live); }
+  } finally { stopDots(live); resetLiveRender(); }
   streaming = null;
   syncButtons();                                      // Stop becomes Send again
   conv.updated = Date.now(); saveConvs(); render();

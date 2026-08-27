@@ -142,7 +142,13 @@ async function generate(prompt, opts) {
   // Streaming is the default here: each token is pushed to the page the moment it is
   // decoded, so the reply is readable while it is still being written. The SDK's
   // `stream=True` does the decode; this layer only ferries token -> message.
-  self.__chunk = (ch, t) => send({ type: 'chunk', channel: ch, text: t });
+  // Stamped on the WORKER's clock, at the moment the token leaves the decode loop.
+  // The page used to time these on its own clock, which put the cost of rendering the
+  // reply -- and the delivery latency of the message itself -- inside the tok/s it was
+  // reporting for the model. Only differences between these stamps are ever used, so
+  // the worker having its own time origin does not matter.
+  self.__chunk = (ch, t) => send({ type: 'chunk', channel: ch, text: t,
+                                   at: performance.now() });
   try {
     const out = await pyodide.runPythonAsync(`
 import json, js

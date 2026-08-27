@@ -9,7 +9,7 @@ PyTorch-compatible, on the GPU, in Python — inside the page.
 
 <img src="images/chat-desktop.png" alt="webtorch chat: a 30B MoE answering in the browser, with typeset LaTeX and highlighted code" width="900">
 
-<sub>Qwen3-30B-A3B answering in a tab — 13.8 GB of weights, 25 tok/s, nothing installed.</sub>
+<sub>Qwen3-30B-A3B answering in a tab — 13.8 GB of weights, 32 tok/s, nothing installed.</sub>
 
 [Quickstart](#quickstart) · [What it does](#what-it-does) · [Speed](#speed) ·
 [The chat app](#the-chat-app) · [Docs](docs/API.md)
