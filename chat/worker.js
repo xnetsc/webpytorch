@@ -48,7 +48,16 @@ webtorch.set_io_read(webtorch.modelscope_read())
 webtorch.set_io_write(webtorch.default_io_write)
 _MODEL = {"m": None, "id": None}
 `);
-  send({ type: 'backend', name: r.backend });
+  // When it is not the GPU, ask the SDK why. The reason is recorded at the point of failure
+  // rather than inferred here, which is the only way to tell a missing WebGPU from a page
+  // that is simply not cross-origin isolated.
+  let why = null;
+  if (r.backend !== 'webgpu') {
+    try {
+      why = await pyodide.runPythonAsync('import webtorch; webtorch.backend_reason()');
+    } catch (e) { why = null; }
+  }
+  send({ type: 'backend', name: r.backend, why: why });
   ready = true;
   send({ type: 'ready' });
 }

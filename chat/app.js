@@ -292,8 +292,230 @@ worker.onmessage = (e) => {
     $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
       ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
       : ' — compute: ' + m.name);
+    if (m.name !== 'webgpu') warnCpuFallback(m.name, m.why);
   }
 };
+// No GPU backend. This is worth interrupting for: the difference is roughly three hundred
+// times, and it is invisible until someone has waited out a reply. A line in Settings was
+// not enough -- a report came in of 0.5 tok/s on an M4 Pro, a machine that should manage
+// hundreds, and nobody involved knew the page had fallen back.
+//
+// The cause matters as much as the fact, because two of the three are fixable by the person
+// reading this, so the page says which one it is from what it can actually observe.
+function warnCpuFallback(name, sdkWhy) {
+  if (sessionStorage.getItem('webtorch.cpuWarned')) return;   // once per session
+  sessionStorage.setItem('webtorch.cpuWarned', '1');
+  const why = [];
+  // What the SDK recorded at the point it gave up, which is the only account of the real
+  // cause; everything after it is what the page can see for itself.
+  if (sdkWhy) why.push('The runtime reports: ' + sdkWhy + '.');
+  if (window.__coiFileMode) {
+    why.push('This page was opened as a file. Serve the folder over HTTP instead — ' +
+             'a file:// page cannot be cross-origin isolated, and without that the GPU ' +
+             'backend cannot start.');
+  } else if (!window.crossOriginIsolated) {
+    why.push('This page is not cross-origin isolated, so SharedArrayBuffer is unavailable ' +
+             'and the GPU backend cannot start. The server must send ' +
+             'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy, ' +
+             'or the bundled service worker must be allowed to add them.');
+    if (window.__coiNoSW) why.push('This browser has no service worker support to fall back on.');
+    if (window.__coiSWFailed) why.push('The service worker failed to register: ' + window.__coiSWFailed);
+  } else if (!ENV.webgpu) {
+    why.push('This browser reports no WebGPU. Chrome or Edge 113+, or Safari 18+, ' +
+             'have it; Firefox does not yet enable it by default.');
+  } else {
+    why.push('WebGPU is present but the backend did not start. The browser console will ' +
+             'have the reason.');
+  }
+  const dlg = document.createElement('dialog');
+  dlg.className = 'cpuwarn';
+  const h = document.createElement('h2'); h.textContent = 'Running on the CPU';
+  const p1 = document.createElement('p');
+  p1.textContent = 'No GPU backend is available, so the model runs on the CPU. Expect ' +
+    'minutes per reply rather than seconds — a small model that would answer at a hundred ' +
+    'tokens a second manages well under one.';
+  const p2 = document.createElement('p'); p2.className = 'why'; p2.textContent = why.join(' ');
+  const diag = {
+    backend: name || 'unknown',
+    reason: sdkWhy || null,
+    crossOriginIsolated: !!window.crossOriginIsolated,
+    sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+    navigatorGPU: !!navigator.gpu,
+    webgpuAdapter: ENV.webgpu ? (ENV.gpuName || 'yes') : false,
+    serviceWorker: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+    protocol: location.protocol,
+    coiFileMode: !!window.__coiFileMode,
+    coiNoSW: !!window.__coiNoSW,
+    coiSWFailed: window.__coiSWFailed || null,
+    cores: navigator.hardwareConcurrency || null,
+    ua: navigator.userAgent,
+  };
+  const det = document.createElement('details');
+  const sum = document.createElement('summary'); sum.textContent = 'Diagnostics';
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(diag, null, 2);
+  det.append(sum, pre);
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const ok = document.createElement('button'); ok.type = 'button';
+  ok.className = 'primary'; ok.textContent = 'Continue anyway';
+  ok.onclick = () => dlg.close();
+  const cp = document.createElement('button'); cp.type = 'button';
+  cp.textContent = 'Copy diagnostics';
+  cp.onclick = () => {
+    navigator.clipboard.writeText(JSON.stringify(diag, null, 2))
+      .then(() => { cp.textContent = 'Copied'; }, () => { cp.textContent = 'Copy failed'; });
+  };
+  bar.append(ok, cp);
+  dlg.append(h, p1, p2, det, bar);
+  document.body.appendChild(dlg);
+  dlg.showModal();
+}
+
+// ---- remote diagnostics --------------------------------------------------------------
+// A problem that only happens on someone else's machine is the hardest kind to fix, and the
+// facts that would settle it -- which backend started, what is cached, what threw -- all
+// live in their browser. This publishes those facts, on request, over MQTT: the page joins
+// a random topic, the person hands that topic to whoever is helping, and the helper can ask.
+//
+// IT CANNOT RUN CODE, and that is deliberate rather than unfinished. The default broker is
+// public: anyone who learns the topic can send to it. A request handler that evaluated what
+// it received would be a remote shell into a stranger's browser, published to the open
+// internet, in exchange for saving the trouble of adding a command. So there is a fixed
+// list, each item returning facts the page already shows someone who knows where to look,
+// and nothing that reaches a conversation, a file, or anything typed.
+const DBG_ON_KEY = 'webtorch.dbgEnabled';
+const DBG_URL_KEY = 'webtorch.dbgUrl';
+const DBG_URL_DEFAULT = 'wss://broker.hivemq.com:8884/mqtt';
+// New each time the page starts, and 128 bits of it: the topic is the only thing standing
+// between a public broker and this page's diagnostics, so it is not guessable and it does
+// not outlive the session that had the problem.
+const DBG_TOPIC = 'webtorch/' + Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                                     .map(b => b.toString(16).padStart(2, '0')).join('');
+let dbgClient = null;
+
+function dbgEnabled() { return localStorage.getItem(DBG_ON_KEY) !== '0'; }
+function dbgUrl() { return localStorage.getItem(DBG_URL_KEY) || DBG_URL_DEFAULT; }
+function dbgSay(t) { const el = $('#dbgState'); if (el) el.textContent = t; }
+
+// The recent errors a report needs. Kept in a ring so a page that has been open all day
+// does not accumulate an unbounded log, and captured here rather than asked for later
+// because by the time anyone asks, the console has usually been cleared.
+const DBG_ERRS = [];
+function dbgNoteError(kind, msg, extra) {
+  DBG_ERRS.push({ t: new Date().toISOString(), kind: kind, msg: String(msg).slice(0, 400),
+                  at: extra || null });
+  if (DBG_ERRS.length > 40) DBG_ERRS.shift();
+}
+window.addEventListener('error', (e) => dbgNoteError('error', e.message,
+  e.filename ? e.filename.split('/').pop() + ':' + e.lineno : null));
+window.addEventListener('unhandledrejection', (e) =>
+  dbgNoteError('unhandledrejection', (e.reason && e.reason.message) || e.reason));
+
+async function dbgAnswer(cmd) {
+  switch (cmd) {
+    case 'ping':
+      return { pong: true, at: new Date().toISOString(), topic: DBG_TOPIC };
+    case 'diag':
+      return { backend: ENV.backend || null, crossOriginIsolated: !!window.crossOriginIsolated,
+               sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+               navigatorGPU: !!navigator.gpu, webgpuAdapter: ENV.webgpu ? (ENV.gpuName || 'yes') : false,
+               serviceWorker: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+               protocol: location.protocol, coiFileMode: !!window.__coiFileMode,
+               coiNoSW: !!window.__coiNoSW, coiSWFailed: window.__coiSWFailed || null,
+               ramGB: ENV.ramGB, quotaGB: ENV.quotaGB, cores: ENV.cores, ua: navigator.userAgent };
+    case 'state':
+      return { modelLoaded: modelLoaded, modelId: ($('#modelId') || {}).value || null,
+               status: ($('#modelStatus') || {}).textContent || null,
+               streaming: !!streaming, python: pyState,
+               conversations: convs.length, convsReady: convsReady };
+    case 'caches': {
+      const out = {};
+      for (const name of await caches.keys()) {
+        const c = await caches.open(name);
+        const keys = await c.keys();
+        let bytes = 0;
+        for (const r of keys) {
+          const m = await c.match(r);
+          if (m) { try { bytes += (await m.clone().arrayBuffer()).byteLength; } catch (e) {} }
+        }
+        out[name] = { entries: keys.length, MB: +(bytes / 1e6).toFixed(1) };
+      }
+      return out;
+    }
+    case 'errors':
+      return { count: DBG_ERRS.length, recent: DBG_ERRS.slice(-15) };
+    case 'perf': {
+      const conv = current();
+      const last = conv && [...conv.messages].reverse().find(m => m.stats);
+      return { last: last ? last.stats : null, backend: ENV.backend || null };
+    }
+    default:
+      return { error: 'unknown request',
+               understood: ['ping', 'diag', 'state', 'caches', 'errors', 'perf'] };
+  }
+}
+
+async function dbgStart() {
+  dbgStop();
+  if (!dbgEnabled()) { dbgSay('off'); return; }
+  dbgSay('connecting…');
+  try {
+    if (typeof mqtt === 'undefined') {
+      await new Promise((res, rej) => {
+        const sc = document.createElement('script');
+        sc.src = 'https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js';
+        sc.crossOrigin = 'anonymous';
+        sc.onload = res; sc.onerror = () => rej(new Error('client script blocked'));
+        document.head.appendChild(sc);
+      });
+    }
+    const c = mqtt.connect(dbgUrl(), { connectTimeout: 10000, reconnectPeriod: 15000 });
+    dbgClient = c;
+    c.on('connect', () => {
+      c.subscribe(DBG_TOPIC + '/ask', (e) => {
+        dbgSay(e ? ('subscribe failed: ' + e.message) : 'listening on ' + DBG_TOPIC);
+      });
+    });
+    c.on('message', async (_t, payload) => {
+      const cmd = payload.toString().trim().slice(0, 32) || 'ping';
+      let body;
+      try { body = await dbgAnswer(cmd); }
+      catch (e) { body = { error: String(e && e.message || e) }; }
+      try { c.publish(DBG_TOPIC + '/say', JSON.stringify({ cmd: cmd, body: body })); }
+      catch (e) { /* nothing useful to do about a failed reply */ }
+    });
+    c.on('error', (e) => { dbgSay('error: ' + String(e && e.message || e)); });
+    c.on('close', () => { if (dbgClient === c) dbgSay('disconnected'); });
+  } catch (e) {
+    dbgSay('unavailable: ' + String(e && e.message || e));
+  }
+}
+function dbgStop() {
+  if (dbgClient) { try { dbgClient.end(true); } catch (e) {} dbgClient = null; }
+}
+
+function wireDebug() {
+  const t = $('#dbgTopic'); if (!t) return;
+  t.value = DBG_TOPIC;
+  $('#dbgUrl').value = dbgUrl();
+  $('#dbgEnabled').checked = dbgEnabled();
+  $('#dbgApply').onclick = () => {
+    localStorage.setItem(DBG_ON_KEY, $('#dbgEnabled').checked ? '1' : '0');
+    const u = $('#dbgUrl').value.trim();
+    if (u) localStorage.setItem(DBG_URL_KEY, u); else localStorage.removeItem(DBG_URL_KEY);
+    $('#dbgUrl').value = dbgUrl();
+    dbgStart();
+  };
+  $('#dbgNew').onclick = () => {
+    // A topic is per-session by design; changing it means reloading into a new one.
+    note('The topic is new every time the page starts — reload to get another.');
+  };
+  $('#dbgEnabled').onchange = () => {
+    localStorage.setItem(DBG_ON_KEY, $('#dbgEnabled').checked ? '1' : '0');
+    if ($('#dbgEnabled').checked) dbgStart(); else { dbgStop(); dbgSay('off'); }
+  };
+}
+
 function setBar(f) { $('#bar').style.width = Math.min(100, f * 100) + '%'; }
 // A model stays resident until it is released, so loading is blocked while one is held —
 // otherwise a second multi-GB model would be pulled in on top of the first.
@@ -1782,6 +2004,9 @@ detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 // Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
 call('armStorage', {}).catch(() => {});
 wirePython();
+wireDebug();
+// After the model runtime, which is what the person is waiting for.
+setTimeout(dbgStart, 2500);
 // After the first paint: booting a second Python is a few seconds of CPU, and the model
 // runtime starting up is what the person is actually waiting for.
 setTimeout(pyStart, 1200);

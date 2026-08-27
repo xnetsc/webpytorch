@@ -304,3 +304,16 @@ img.zoomable{cursor:zoom-in}
 .cellprev{min-height:1.6em;padding:4px 2px;border-top:1px dashed var(--line)}
 .cellpop .editbar{margin-top:2px}
 .cellpop .editbar button{padding:3px 10px;font-size:12px}
+
+/* No GPU: said once, in the way, because the alternative is finding out after a long wait. */
+dialog.cpuwarn{max-width:480px;padding:22px 24px;border:1px solid var(--line);border-radius:14px;
+               background:var(--panel);color:var(--fg);font:inherit}
+dialog.cpuwarn::backdrop{background:rgba(0,0,0,.4)}
+dialog.cpuwarn h2{margin:0 0 10px;font-size:17px}
+dialog.cpuwarn p{margin:0 0 10px;line-height:1.55}
+dialog.cpuwarn p.why{color:var(--mut);font-size:13px}
+dialog.cpuwarn details{margin:0 0 12px}
+dialog.cpuwarn summary{cursor:pointer;color:var(--mut);font-size:13px}
+dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-radius:8px;
+                   font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+                   white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}

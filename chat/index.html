@@ -70,6 +70,7 @@
     <button data-tab="gen">Generation</button>
     <button data-tab="python">Python</button>
     <button data-tab="store">Storage</button>
+    <button data-tab="support">Support</button>
   </nav>
 
   <section class="tab-panel" id="tab-model">
@@ -220,6 +221,34 @@
       <input type="file" id="importFile" accept=".zip" hidden />
     </div>
     <p class="hint">Export saves every conversation as a real .zip containing JSON.</p>
+  </section>
+  <section class="tab-panel" id="tab-support" hidden>
+    <div class="grp">
+      <h3>Remote diagnostics</h3>
+      <p class="hint">When something goes wrong on your machine and not on ours, this is how
+        the two can be compared. The page joins an MQTT topic and answers a fixed set of
+        questions about itself — which backend it got, what is cached, what errored. Give
+        whoever is helping you the topic below and they can ask.</p>
+      <label class="check"><input type="checkbox" id="dbgEnabled" checked />
+        Answer diagnostic requests</label>
+      <label class="fld">Your topic
+        <input id="dbgTopic" type="text" readonly />
+      </label>
+      <label class="fld">Broker (WebSocket MQTT)
+        <input id="dbgUrl" type="text" placeholder="wss://broker.hivemq.com:8884/mqtt" />
+      </label>
+      <p class="hint"><strong>It cannot run code.</strong> The broker is public, so anyone
+        who learns your topic could send it requests; it answers only the fixed list
+        (<code>ping</code>, <code>diag</code>, <code>state</code>, <code>caches</code>,
+        <code>errors</code>, <code>perf</code>) and never your conversations, your files or
+        anything you typed. Point it at your own broker, or switch it off, if even that is
+        more than you want to share.</p>
+      <div class="row btns">
+        <button id="dbgApply" class="primary">Apply</button>
+        <button id="dbgNew">New topic</button>
+      </div>
+      <div class="hint">status: <span id="dbgState">off</span></div>
+    </div>
   </section>
 </dialog>
 
