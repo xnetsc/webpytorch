@@ -7,7 +7,9 @@
 **No server. No install. No native runtime.**
 PyTorch-compatible, on the GPU, in Python — inside the page.
 
-<!-- HERO -->
+<img src="images/chat-desktop.png" alt="webtorch chat: a 30B MoE answering in the browser, with typeset LaTeX and highlighted code" width="900">
+
+<sub>Qwen3-30B-A3B answering in a tab — 13.8 GB of weights, 25 tok/s, nothing installed.</sub>
 
 [Quickstart](#quickstart) · [What it does](#what-it-does) · [Speed](#speed) ·
 [The chat app](#the-chat-app) · [Docs](docs/API.md)
@@ -62,26 +64,43 @@ storage at all. Reads are cached, resumable, and persist across reloads.
 
 ## Speed
 
-Measured on Apple silicon (`metal-3`), one captured decode step, from a clean load. These are
-the models running *in the tab*, not a server:
+These are the models running *in the tab*, not a server. Apple silicon (`metal-3`),
+end-to-end tok/s from a clean load, same prompt and same warm-up on both backends, each
+figure the middle of three or four runs:
 
-| Model | Size on disk | GPU step | tok/s |
+| Model | Size on disk | WebGPU | WebGL |
 |---|---:|---:|---:|
-| Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | 25.3 ms | **39.6** |
-| Qwen3.8-27B · dense · hybrid SSM | 12.0 GB | 134.5 ms | **7.4** |
-| Qwen3-0.6B · Q4_K_M | 0.4 GB | 6.7 ms | **149.5** |
+| Qwen3-0.6B · Q4_K_M | 0.4 GB | **118.6** | 19.8 |
+| Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | **34.8** | 5.1 |
+| Qwen 3B · Q4_K | 2.0 GB | **35.7** | 5.3 |
+| Qwen3.8-27B · hybrid SSM · i-quant | 13.0 GB | **6.8** | 0.76 |
 
-Weight streaming runs at **106–121 GB/s** — the hardware's read ceiling — for every
-quantisation format. What is left is decode arithmetic, and it is close to uniform across
-formats at 199–233 G values/s.
+On WebGPU, weight streaming runs at the hardware's read ceiling for every quantisation
+format, and what is left is decode arithmetic — close to uniform across formats.
+
+**WebGL is a fallback, not a peer.** Every kernel exists on it and every format is checked
+against the reference decoder there too, but expect 6–9×. The reason is structural rather
+than unfinished: WebGL2 has no compute stage, so each kernel is a fragment shader with one
+invocation per output value and no memory shared between invocations. A thread cannot stage
+the activations for its neighbours, so each one re-reads them — measured, that costs more
+than reading the weights does.
 
 ## The chat app
 
 A complete local chat client lives in [`chat/`](chat/) — the SDK driving a real interface.
 
-<!-- SCREENSHOT: chat/desktop -->
-<!-- SCREENSHOT: chat/models -->
-<!-- SCREENSHOT: chat/mobile -->
+<table>
+<tr>
+<td width="55%" valign="top">
+<img src="images/chat-models.png" alt="The model picker: 30B MoE, 27B hybrid, 32B dense, Gemma, Mistral, gpt-oss and the Qwen sizes, or a file from the device">
+<br><sub><b>Pick anything.</b> The presets span 0.4 GB to 13.8 GB — dense, MoE and hybrid-SSM — and the last three entries are “any other repo id”, “a GGUF from this device”, “a folder from this device”.</sub>
+</td>
+<td width="45%" valign="top">
+<img src="images/chat-mobile.png" alt="The same conversation on a phone-width screen">
+<br><sub><b>And on a phone.</b> The same client, the same rendering — code scrolls in its own track rather than stretching the page.</sub>
+</td>
+</tr>
+</table>
 
 - **Any model that fits.** Load a GGUF or an HF folder from the device, or any repo id from a
   hub. The list is examples, not a whitelist; the only real limit is GPU memory.
@@ -99,8 +118,10 @@ A complete local chat client lives in [`chat/`](chat/) — the SDK driving a rea
 
 ## Quickstart
 
-Needs a browser with WebGPU (Chrome/Edge) or WebGL, and the COOP/COEP headers that
-`SharedArrayBuffer` requires.
+Needs the COOP/COEP headers that `SharedArrayBuffer` requires, and a GPU backend: WebGPU
+(Chrome/Edge 113+, Safari 18+) for the speeds above, or WebGL as a slower fallback. Without
+either, the weights fall back to the page's WASM heap — about 4 GB in total — and anything
+past roughly 2 GB runs out of memory while loading rather than running slowly.
 
 ```bash
 # 1. build the WgPy backend wheels + fetch Pyodide (one-time) → docs/BUILD.md
