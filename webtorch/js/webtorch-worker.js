@@ -13,7 +13,9 @@
   const wt = root.webtorch || (root.webtorch = {});
 
   // Where Pyodide itself comes from. Overridable before initWorker for an offline copy.
-  wt.PYODIDE_URL = wt.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+  // The SDK's own default, for a host that sets nothing. The chat app overrides it from
+  // chat/pyodide-version.js, which is the single place this project pins a release.
+  wt.PYODIDE_URL = wt.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/';
 
   // The package's own inventory, read from a manifest generated with it, so adding a
   // module never needs an edit here. The inline list is the fallback for a tree served
@@ -50,7 +52,7 @@
   /**
    * Boot everything. Options (all optional):
    *   baseURL        prefix for dist/ and webtorch/ (default '../')
-   *   pyodideIndexURL  default `${baseURL}lib/pyodide/`
+   *   pyodideIndexURL  where to load Pyodide from (default: the CDN, see PYODIDE_URL)
    *   onStatus       (text) => void, progress for the UI
    * Resolves to { pyodide, backend } where backend is what actually came up:
    * 'webgpu' | 'webgl' | 'cpu'.

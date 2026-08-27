@@ -30,10 +30,13 @@ npm run build            # -> dist/wgpy-worker.js etc.
 > so **Python-only** kernel edits need only the wheel rebuilt — no JS/webpack rebuild.
 
 ## 2. Pyodide runtime
-Put Pyodide 0.25.0 under `lib/pyodide/` (the demo loads `../lib/pyodide/pyodide.js`):
+Pyodide is NOT vendored: the workers load it from the CDN, pinned in one place
+(`chat/pyodide-version.js`), and the service worker caches it — the version is in the
+URL, so changing that file is all an upgrade takes. `scripts/download-pyodide.sh` is
+only for serving it from your own host.
 
 ```bash
-bash scripts/download-pyodide.sh        # or download pyodide-0.25.0 and extract into lib/pyodide/
+bash scripts/download-pyodide.sh        # optional: serve Pyodide from your own host
 ```
 
 ## 3. Serve (COOP/COEP required)

@@ -15,20 +15,8 @@
 // evictable. A copy served from this origin is not a cache, it is the source -- no network,
 // no eviction, and it works with the machine offline.
 //
-// docs/BUILD.md puts the distribution in lib/, which is not in git, so a fresh clone falls
-// back to the CDN and still runs. A synchronous probe is fine here: it happens once, before
-// anything else, in a worker.
-function pyodideBase() {
-  const local = '../lib/pyodide/';
-  try {
-    const r = new XMLHttpRequest();
-    r.open('HEAD', local + 'pyodide-lock.json', false);
-    r.send();
-    if (r.status >= 200 && r.status < 300) return local;
-  } catch (e) { /* not served here */ }
-  return 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
-}
-const PYODIDE_URL = self.PYODIDE_URL || pyodideBase();
+importScripts('./pyodide-version.js');
+const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
 importScripts(PYODIDE_URL + 'pyodide.js');
 
 let py = null;                 // the interpreter, once booted
@@ -47,7 +35,8 @@ async function boot(packages) {
     // what the figure capture below reads.
     py.runPython('import os; os.environ.setdefault("MPLBACKEND", "AGG")');
     await add(packages || []);
-    send({ type: 'state', state: 'ready', packages: [...loaded] });
+    send({ type: 'state', state: 'ready', packages: [...loaded],
+           version: (py && py.version) || null });
     return py;
   })();
   return booting;

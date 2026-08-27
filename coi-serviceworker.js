@@ -44,7 +44,7 @@ function isFixed(url) {
     var u = new URL(url);
     if (FIXED_EXT.test(u.pathname)) return true;
     if (/pyodide-lock\.json$/.test(u.pathname)) return true;
-    // A CDN path that pins a version: /npm/marked@18.0.11/…, /pyodide/v0.25.0/…
+    // A CDN path that pins a version: /npm/marked@18.0.11/…, /pyodide/v0.27.7/…
     if (u.origin !== self.location.origin && /@[\w.+-]+\/|\/v\d[\w.]*\//.test(u.pathname)) return true;
     return false;
   } catch (e) { return false; }
