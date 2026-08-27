@@ -1743,7 +1743,15 @@ class CausalLM:
         return ids, max(1, min(mx, lmax - len(ids)))
 
     def _stop_now(self):
-        """True when an output constraint says the text is complete."""
+        """True when this generation should end early.
+
+        Two reasons, checked between tokens: an output constraint says the text is complete,
+        or someone asked the SDK to stop (`webtorch.cancel()`). The second is a plain read of
+        the flag, not the raising checkpoint the IO path uses -- a stopped generation returns
+        the tokens it has, it does not throw them away."""
+        from .webio import cancel_requested
+        if cancel_requested():
+            return True
         con = (getattr(self, "_sampling", None) or {}).get("constraint")
         return bool(con is not None and con.finished(self._con_text))
 

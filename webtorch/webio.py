@@ -262,8 +262,17 @@ class Cancelled(BaseException):
     and none of them may swallow a stop — it must always reach the load's own error path."""
 
 
+def cancel_requested():
+    """Has a stop been asked for? True until `cancel(False)` withdraws it.
+
+    Reading the flag rather than raising on it is what a decode loop needs: a generation is
+    not IO, has no checkpoint to raise at, and should hand back the tokens it already has
+    instead of losing them to an exception."""
+    return bool(_CANCEL["on"])
+
+
 def cancel(flag=True):
-    """Ask the in-flight load/read to stop. `cancel(False)` withdraws the request.
+    """Ask the in-flight load/read/generation to stop. `cancel(False)` withdraws the request.
 
     The stop lands at the next IO checkpoint (io_read/io_write, or the next served chunk),
     where it raises `Cancelled`; after that the SDK issues no more read/write callbacks. For
@@ -271,7 +280,11 @@ def cancel(flag=True):
     does not wait for a slow request to finish on its own — aborting a fetch someone's OWN
     read callback issued is that callback's business, not the SDK's. The flag is sticky: it
     stays set — keeping any stray IO from running — until `cancel(False)` clears it, which
-    every load does on the way in."""
+    every load does on the way in.
+
+    A generation stops the same way, but gracefully: the decode loop checks the flag between
+    tokens (see `cancel_requested`) and returns the reply as far as it got, because half an
+    answer is worth keeping and a half-finished load is not."""
     _CANCEL["on"] = bool(flag)
     if flag:
         _CANCEL["n"] += 1

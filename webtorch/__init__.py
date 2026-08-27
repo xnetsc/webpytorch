@@ -65,6 +65,7 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 # request or seek into local/remote storage.
 from .webio import (use_directory, get_directory, migrate_cache, set_storage_full,
                     use_model_file, local_files, forget_model_file,
+                    cancel_requested,
                     set_read_progress, get_read_progress,
                     set_download_progress, get_download_progress,
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
@@ -81,6 +82,7 @@ __all__ = [
     "prefetch_whole_file",
     "throttle_reads",
     "set_download_progress", "get_download_progress",
+    "cancel_requested",
     "set_read_progress", "get_read_progress",
     "export_model", "import_model", "model_groups",
     "backend", "has_gpu", "require_gpu",
