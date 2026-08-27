@@ -483,8 +483,18 @@ async function localFileId(handle) {
   sized.set(new Uint8Array(head), 8);
   const digest = await crypto.subtle.digest('SHA-256', sized);
   const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
-  const ext = (handle.name.match(/\.[a-z0-9]+$/i) || ['.gguf'])[0];
-  return 'local-' + hex.slice(0, 20) + ext;
+  const dot = handle.name.lastIndexOf('.');
+  const hasExt = dot > 0 && /^\.[a-z0-9]+$/i.test(handle.name.slice(dot));
+  const ext = hasExt ? handle.name.slice(dot) : '.gguf';
+  // The person's own filename, then the fingerprint. The name is what they picked and what
+  // they will look for in the box; the fingerprint is what makes the id an identity. It
+  // used to be the fingerprint alone, which is correct and unreadable -- the box showed
+  // "local-74b11e0d206b9cac6e45.gguf" for a file the person had just chosen by name.
+  //
+  // The FOLDER it came from cannot be shown: the File System Access API hands the page a
+  // handle and a name, never a path, and that is deliberate on the browser's part.
+  const base = hasExt ? handle.name.slice(0, dot) : handle.name;
+  return (base || 'model') + '@' + hex.slice(0, 8) + ext;
 }
 
 // Runs one of the "from this device" dropdown entries: open the picker, register the model
