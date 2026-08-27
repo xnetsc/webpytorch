@@ -301,7 +301,10 @@ worker.onmessage = (e) => {
     // stated rather than left for the user to infer from the wait.
     $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
       ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
+      : m.name === 'webgl'
+      ? ' — compute: WebGL (no WebGPU here; about ' + WEBGL_SLOWDOWN + ' slower)'
       : ' — compute: ' + m.name);
+    if (m.name === 'webgl') warnWebglFallback(m.why || null);
     // Only for no GPU at all. WebGL is a GPU backend -- slower than WebGPU, but a dialog
     // headed "Running on the CPU" would be simply false, and the slow-reply note covers a
     // backend that is working and still not fast enough.
@@ -315,6 +318,87 @@ worker.onmessage = (e) => {
 //
 // The cause matters as much as the fact, because two of the three are fixable by the person
 // reading this, so the page says which one it is from what it can actually observe.
+// Above this, a CPU-only page cannot hold the weights: they are numpy arrays in the WASM
+// heap rather than GPU buffers. Deliberately approximate -- the ceiling depends on what
+// else the heap holds -- and it warns rather than blocks, because the number is a guide.
+const CPU_MAX_GB = 2;
+
+// What WebGL costs, measured on this codebase rather than estimated: same models, same
+// prompt, same warm-up, each repeated three or four times.
+//
+//   Qwen3-0.6B Q4_K_M      118.6 -> 19.8 tok/s   6.0x
+//   Qwen 3B Q4_K            35.7 -> 5.3          6.7x
+//   Qwen3-30B-A3B MoE       34.8 -> 5.1          6.8x
+//   Qwen3.8-27B hybrid       6.8 -> 0.76         8.9x   (i-quant, 48 of 64 layers recurrent)
+//
+// Stated inline rather than as a dialog: WebGL works and answers correctly, it is only
+// slower, and the dialog is reserved for the case where the model will not run at all.
+const WEBGL_SLOWDOWN = '6-9x';
+// WebGL is a working backend, so this is not the CPU dialog's problem -- but the gap is
+// large enough that a user who does not know which backend they got will read it as the
+// model being slow rather than the browser lacking WebGPU. Same shape as the CPU dialog,
+// once per session, and it does not block: "Continue" is the only outcome.
+function warnWebglFallback(sdkWhy) {
+  if (sessionStorage.getItem('webtorch.webglWarned')) return;
+  sessionStorage.setItem('webtorch.webglWarned', '1');
+  const dlg = document.createElement('dialog');
+  dlg.className = 'cpuwarn';
+  const h = document.createElement('h2'); h.textContent = 'Running on WebGL, not WebGPU';
+  const p1 = document.createElement('p');
+  // Which of the two it is, rather than assuming the first: WebGPU can be present and still
+  // fail to start (the same distinction the CPU dialog makes), and telling someone their
+  // browser has no WebGPU when the environment line above says it does is simply wrong.
+  p1.textContent = (ENV.webgpu
+      ? 'WebGPU is present but did not start, so the models run on WebGL. '
+      : 'This browser has no WebGPU, so the models run on WebGL. ')
+    + 'Replies are correct \u2014 every quantization format is checked against the reference '
+    + 'decoder on this backend too \u2014 but they arrive about ' + WEBGL_SLOWDOWN + ' slower.';
+  const p2 = document.createElement('p');
+  p2.innerHTML = 'Measured here, same prompt and same warm-up: '
+    + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 118.6 on WebGPU; '
+    + '<strong>Qwen 3B</strong> 5.3 against 35.7; '
+    + '<strong>Qwen3-30B-A3B</strong> (MoE) 5.1 against 34.8; '
+    + '<strong>Qwen3.8-27B</strong> (hybrid, i-quant) 0.76 against 6.8 \u2014 the widest gap, '
+    + 'because its quantization is the most arithmetic to decode.';
+  const p3 = document.createElement('p'); p3.className = 'why';
+  p3.textContent = 'WebGL2 has no compute stage: every kernel is a fragment shader, one '
+    + 'invocation per output value, with no memory shared between invocations. A thread '
+    + 'cannot stage the activations for its neighbours, so each one re-reads them \u2014 '
+    + 'which costs more than reading the weights does.'
+    + (ENV.webgpu ? '' : ' For WebGPU: Chrome or Edge 113+, or Safari 18+; Firefox does not '
+                       + 'enable it by default yet.')
+    + (sdkWhy ? ' The runtime reports: ' + sdkWhy + '.' : '');
+  const diag = {
+    backend: 'webgl',
+    reason: sdkWhy || null,
+    navigatorGPU: !!navigator.gpu,
+    webgpuAdapter: ENV.webgpu ? (ENV.gpuName || 'yes') : false,
+    crossOriginIsolated: !!window.crossOriginIsolated,
+    protocol: location.protocol,
+    cores: navigator.hardwareConcurrency || null,
+    ua: navigator.userAgent,
+  };
+  const det = document.createElement('details');
+  const sum = document.createElement('summary'); sum.textContent = 'Diagnostics';
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(diag, null, 2);
+  det.append(sum, pre);
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const ok = document.createElement('button'); ok.type = 'button';
+  ok.className = 'primary'; ok.textContent = 'Continue';
+  ok.onclick = () => dlg.close();
+  const cp = document.createElement('button'); cp.type = 'button';
+  cp.textContent = 'Copy diagnostics';
+  cp.onclick = () => {
+    navigator.clipboard.writeText(JSON.stringify(diag, null, 2))
+      .then(() => { cp.textContent = 'Copied'; }, () => { cp.textContent = 'Copy failed'; });
+  };
+  bar.append(ok, cp);
+  dlg.append(h, p1, p2, p3, det, bar);
+  document.body.appendChild(dlg);
+  dlg.showModal();
+}
+
 function warnCpuFallback(name, sdkWhy) {
   if (sessionStorage.getItem('webtorch.cpuWarned')) return;   // once per session
   sessionStorage.setItem('webtorch.cpuWarned', '1');
@@ -344,9 +428,17 @@ function warnCpuFallback(name, sdkWhy) {
   dlg.className = 'cpuwarn';
   const h = document.createElement('h2'); h.textContent = 'Running on the CPU';
   const p1 = document.createElement('p');
-  p1.textContent = 'No GPU backend is available, so the model runs on the CPU. Expect ' +
-    'minutes per reply rather than seconds — a small model that would answer at a hundred ' +
-    'tokens a second manages well under one.';
+  // Speed is the smaller half of this. With a GPU backend the weights live in GPU buffers
+  // and the WASM heap holds almost nothing; without one they are numpy arrays inside that
+  // heap, which is a 32-bit address space -- about 4 GB, shared with the interpreter and
+  // every intermediate. So most of the models in the picker do not run slowly on the CPU,
+  // they fail to load at all, and saying only "slow" sets the wrong expectation.
+  p1.textContent = 'No GPU backend is available. Two things follow, and the first is the '
+    + 'one that decides whether a model runs at all: on the CPU the weights are held in '
+    + 'the page\u2019s WASM heap, which caps out near 4 GB in total, so anything past '
+    + 'roughly ' + CPU_MAX_GB + ' GB runs out of memory while loading rather than running '
+    + 'slowly. Under that size it does run, at minutes per reply rather than seconds \u2014 '
+    + 'a small model that would answer at a hundred tokens a second manages well under one.';
   const p2 = document.createElement('p'); p2.className = 'why'; p2.textContent = why.join(' ');
   const diag = {
     backend: name || 'unknown',
@@ -741,6 +833,17 @@ $('#loadBtn').onclick = async () => {
   setBar(0); expected = 0;
   const chosen = PRESETS[$('#preset').value];
   if (chosen && chosen.gb) expected = chosen.gb * 1e9;
+  // Checked BEFORE the download, not after it. Without a GPU the weights go into the WASM
+  // heap and a large model runs out of memory at the end of a multi-gigabyte transfer --
+  // which is a long way to travel to be told it was never going to work.
+  if (ENV.backend === 'cpu' && chosen && chosen.gb > CPU_MAX_GB
+      && !confirm('This page has no GPU backend, so the weights would go into the WASM '
+                  + 'heap (about 4 GB in total, shared with everything else). At '
+                  + chosen.gb + ' GB this model will almost certainly run out of memory '
+                  + 'while loading, after downloading all of it.\n\nDownload it anyway?')) {
+    loading = false; $('#loadBtn').textContent = 'Load'; $('#loadBtn').title = '';
+    return;
+  }
   try { await call('load', { repo, file, lmax: lmaxValue() }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) {
     // The SDK raises one distinctive message for a stop the person asked for; that is a
