@@ -2193,29 +2193,64 @@ function wirePython() {
   box.value = saved === null ? PY_DEFAULT : saved;
   on.checked = pyEnabled();
   st.textContent = pyEnabled() ? 'starting…' : 'off';
+  // What "Apply & load" did, said in the panel rather than on the hint bar under the
+  // composer -- the settings dialog covers that, so a name that could not be loaded was
+  // reported to a place nobody pressing this button can see. Silence read as success.
+  const pyResult = (html, bad) => {
+    const el = $('#pyResult');
+    if (!el) return;
+    el.hidden = false; el.innerHTML = html;
+    el.classList.toggle('bad', !!bad);
+  };
+  const esc = (t) => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const nameList = (a) => a.map(n => '<code>' + esc(n) + '</code>').join(', ');
+
   $('#pyApply').onclick = async () => {
     localStorage.setItem(PYPKG_KEY, box.value);
-    if (!on.checked) { localStorage.setItem(PYON_KEY, '0'); pyStop(); return; }
+    if (!on.checked) {
+      localStorage.setItem(PYON_KEY, '0'); pyStop();
+      pyResult('Running code is off. Nothing is loaded.', false);
+      return;
+    }
     localStorage.setItem(PYON_KEY, '1');
+    const want = pyPackages();
     // Applying LOADS. That is the whole point of the setting existing.
-    if (!pyWorker) { pyStart(); return; }
+    if (!pyWorker) {
+      pyResult('Starting the runtime and loading ' + nameList(want) + '…', false);
+      pyStart(); return;
+    }
     st.textContent = 'loading…';
+    pyResult('Loading ' + nameList(want) + '…', false);
     try {
-      const r = await pyCall('packages', { packages: pyPackages() });
-      if (r.unavailable && r.unavailable.length) {
-        note('Not in this Pyodide build: ' + r.unavailable.join(', '));
+      const r = await pyCall('packages', { packages: want });
+      const missing = (r && r.unavailable) || [];
+      const got = (r && r.loaded) || [];
+      // Named individually, and said as what it means: the distribution has no such module,
+      // so listing it here cannot make it appear. A wheel is the way in, and it is directly
+      // below.
+      const parts = ['Ready: ' + (got.length ? nameList(got) : 'nothing')];
+      if (missing.length) {
+        parts.push('<span class="miss">Not in this Pyodide distribution: ' + nameList(missing)
+                 + ' — listing a name here cannot add it. Install a wheel below, '
+                 + 'or use a module the distribution ships.</span>');
       }
-    } catch (e) { st.textContent = 'failed: ' + e.message; }
+      pyResult(parts.join('<br>'), missing.length > 0);
+    } catch (e) {
+      st.textContent = 'failed';
+      pyResult('<span class="miss">Loading failed: ' + esc(e.message || e) + '</span>', true);
+    }
   };
   const install = async (args, label) => {
     st.textContent = 'installing ' + label + '…';
+    pyResult('Installing <code>' + esc(label) + '</code>…', false);
     if (!pyWorker) pyStart();
     try {
       const r = await pyCall('install', args);
-      note('Installed ' + (r && r.installed ? r.installed : label) + '.');
+      pyResult('Installed <code>' + esc((r && r.installed) || label) + '</code>.', false);
     } catch (e) {
       st.textContent = 'install failed';
-      note('Could not install ' + label + ': ' + e.message);
+      pyResult('<span class="miss">Could not install <code>' + esc(label) + '</code>: '
+             + esc(e.message || e) + '</span>', true);
     }
   };
   $('#pyInstallUrl').onclick = () => {

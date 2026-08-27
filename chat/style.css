@@ -357,3 +357,12 @@ dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-rad
 .slownote .x{position:absolute;top:6px;right:8px;border:0;background:none;color:var(--mut);
              cursor:pointer;font-size:13px;padding:3px 5px;border-radius:6px}
 .slownote .x:hover{background:var(--code);color:var(--fg)}
+
+/* The outcome of "Apply & load", where the person pressing it is looking. It used to go to
+   the hint bar under the composer -- which the settings dialog is sitting on top of, so the
+   report existed and could not be seen. */
+.pyresult{margin:10px 0 0;padding:9px 11px;border-radius:8px;font-size:12.5px;line-height:1.55;
+          background:var(--code);color:var(--fg);border:1px solid var(--line)}
+.pyresult.bad{border-color:var(--danger)}
+.pyresult .miss{color:var(--danger)}
+.pyresult code{font-size:12px}
