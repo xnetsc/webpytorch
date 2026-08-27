@@ -1598,6 +1598,18 @@ function setBlock(msg, n, text) {
   return true;
 }
 
+// Output is something the reader chose to produce, so they get to take it back -- a long
+// traceback or a figure sitting under the code is theirs to clear. A traceback lands in the
+// same panel as ordinary output (it is a result too), so one control covers both.
+function addRunoutClose(panel) {
+  if (panel.querySelector(':scope > .x')) return;
+  const x = document.createElement('button');
+  x.type = 'button'; x.className = 'x'; x.textContent = '\u2715';
+  x.title = 'Remove this output';
+  x.onclick = (e) => { e.stopPropagation(); panel.remove(); };
+  panel.appendChild(x);
+}
+
 async function runBlock(code, wrap, btn) {
   let panel = wrap.nextElementSibling;
   if (!panel || !panel.classList.contains('runout')) {
@@ -1627,7 +1639,10 @@ async function runBlock(code, wrap, btn) {
     if (!panel.childNodes.length) panel.textContent = '(no output)';
   } catch (e) {
     panel.classList.add('bad'); panel.textContent = String(e.message || e);
-  } finally { btn.disabled = pyState !== 'ready'; }
+  } finally {
+    btn.disabled = pyState !== 'ready';
+    addRunoutClose(panel);
+  }
 }
 
 // ---- reply rendering ----------------------------------------------------------------

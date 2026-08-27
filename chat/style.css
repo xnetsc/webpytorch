@@ -249,6 +249,13 @@ details.think.live summary{color:var(--accent)}
 .runout img{display:block;max-width:100%;margin:8px 0 0;border-radius:6px}
 .runout.bad{border-color:var(--danger)}
 .runout.bad pre{color:var(--danger)}
+/* the output belongs to whoever ran the code, so it can be taken back; the panel is the
+   positioning context so the control sits in its corner rather than the page's */
+.runout{position:relative}
+.runout > .x{position:absolute;top:4px;right:6px;border:0;background:none;color:var(--mut);
+  font-size:13px;line-height:1;padding:3px 5px;border-radius:5px;cursor:pointer;opacity:0}
+.runout:hover > .x,.runout > .x:focus-visible{opacity:1}
+.runout > .x:hover{background:var(--code);color:var(--fg)}
 
 /* ---- block-level editing --------------------------------------------------------------
    Each block of a finished message is its own container, so an edit touches one paragraph

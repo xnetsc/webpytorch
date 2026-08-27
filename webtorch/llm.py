@@ -563,6 +563,64 @@ class _ChunkRows(_RowTable):
         return out
 
 
+# Components a config can declare that this engine does not implement. Keyed off what the
+# config SAYS THE MODEL COMPUTES, never off a model name or an allowlist of architectures --
+# a name tells you nothing about whether the maths is covered, and an allowlist is wrong the
+# day after it is written.
+#
+# The failure this prevents is the quiet one. A missing quantization type raises on its own;
+# an unimplemented COMPONENT does not. The loader reads the weights it recognises, ignores
+# the ones it does not, and produces a model that runs and answers -- wrongly. Better to
+# refuse and say which piece is missing.
+#
+# This is necessarily incomplete: a component invented after this was written passes through
+# unnoticed. It covers what is known to exist and to matter.
+_UNIMPLEMENTED = [
+    ("indexer_budget",  lambda c: c.get("indexer_budget"),
+     "a sparse-attention indexer (a learned scorer that picks which cached keys to attend "
+     "to, under a token budget) -- this engine attends densely"),
+    ("ple_layer_ids",   lambda c: c.get("ple_layer_ids"),
+     "per-layer embeddings (an extra embedding table injected at specific layers)"),
+    ("ngram_size",      lambda c: c.get("ngram_size") and c.get("ngram_vocab_size_base"),
+     "n-gram input embeddings (a second, much larger embedding table indexed by token "
+     "n-grams)"),
+    ("hc_count",        lambda c: c.get("hc_count"),
+     "an `hc_*` low-rank component this engine has no implementation of"),
+    ("deepstack_visual_indexes",
+     lambda c: (c.get("vision_config") or {}).get("deepstack_visual_indexes"),
+     "deepstack visual injection (several vision-tower layers fed into the decoder at "
+     "different depths, not just the final one)"),
+]
+
+
+def unsupported_components(cfg):
+    """Which declared components this engine cannot run. `cfg` may be a nested config; the
+    text sub-config is searched too, since that is where a multimodal file puts them."""
+    seen = {}
+    for c in (cfg, cfg.get("text_config") or {}):
+        if not isinstance(c, dict):
+            continue
+        for key, probe, why in _UNIMPLEMENTED:
+            try:
+                if probe(c):
+                    seen[key] = why
+            except Exception:
+                pass
+    return [(k, seen[k]) for k in sorted(seen)]
+
+
+def check_supported(cfg, where="this model"):
+    """Raise before any weights are read, naming every component that is missing."""
+    bad = unsupported_components(cfg)
+    if not bad:
+        return
+    raise NotImplementedError(
+        "%s declares components this engine does not implement, so it would run and "
+        "produce wrong output rather than fail:\n%s\n"
+        "Nothing is silently skipped: each of these changes what the model computes."
+        % (where, "\n".join("  * %s: %s" % (k, why) for k, why in bad)))
+
+
 class CausalLM:
     """Quantized causal LM (qwen2 family) with capture-accelerated decode.
 
@@ -632,12 +690,18 @@ class CausalLM:
             "conv_kernel_dim": int(cfg.get("linear_conv_kernel_dim", 0) or 0),
             "hidden": self.H,
         }
-        # partial rope: only the first `partial_rotary_factor` of head_dim is rotated
-        rp = cfg.get("rope_parameters") or {}
+        # partial rope: only the first `partial_rotary_factor` of head_dim is rotated.
+        # Two spellings are in circulation for the same block; which one a file uses is a
+        # question about its vintage, not about which model it is, so both are read.
+        rp = cfg.get("rope_parameters") or cfg.get("rope_scaling") or {}
         self.theta = float(rp.get("rope_theta", self.theta))
         self.partial_rotary = float(cfg.get("partial_rotary_factor",
                                             rp.get("partial_rotary_factor", 1.0)) or 1.0)
         self.rope_dim = int(self.HD * self.partial_rotary) // 2 * 2 or self.HD
+        # Multi-axis rope, if the config asks for it.
+        _sec = (rp.get("mrope_section") if isinstance(rp, dict) else None)
+        if _sec:
+            self.rope_sections = [int(x) for x in _sec]
         self.attn_output_gate = bool(cfg.get("attn_output_gate", False))
         # resolved from the text sub-config (nested configs put it there, not at the top level)
         self.tie_embeddings = bool(cfg.get("tie_word_embeddings", False))
@@ -796,6 +860,7 @@ class CausalLM:
         self.lmax = lmax
         self._shard_hdr = {}
         cfg = await webio.read_json(self.base + "config.json")
+        check_supported(cfg, "this model's config.json")
         self._apply_cfg(cfg)
         self.lmax = self._auto_lmax(lmax, cfg.get("max_position_embeddings"))
         self.gs = cfg["quantization_config"]["group_size"]; self.bits = cfg["quantization_config"]["bits"]
@@ -1595,14 +1660,44 @@ class CausalLM:
         return self._rope_qk(t, self.cos_b, self.sin_b, 1)
 
     def _rope_np(self, pos, T=1):
-        """rope cos/sin of shape (T, HD). With `partial_rotary_factor < 1` (Qwen3.5/3.8 style)
-        only the first `rope_dim` dims are rotated: the tail gets cos=1, sin=0, which is the
-        identity under `x*cos + rot(x)*sin`, so the forward paths need no special case."""
+        """rope cos/sin of shape (T, HD).
+
+        `pos` is a scalar start position, or -- when the config gives `rope_sections` -- an
+        (axes, T) array of one position per axis per token. Multi-axis rope is what lets a
+        model place an image in two dimensions instead of flattening it into the text
+        sequence: each axis owns a contiguous slice of the rotary dims, and a text token
+        simply has the same position on every axis.
+
+        The sections come from the config and nothing else, so a two-axis or four-axis model
+        works by arithmetic rather than by being recognised. They cover `rope_dim`, NOT
+        `HD` -- with `partial_rotary_factor` below one those differ, and sizing them to HD
+        silently rotates the wrong dims.
+
+        With `partial_rotary_factor < 1` only the first `rope_dim` dims are rotated: the tail
+        gets cos=1, sin=0, which is the identity under `x*cos + rot(x)*sin`, so the forward
+        paths need no special case."""
         rd = getattr(self, "rope_dim", self.HD)
         inv = 1.0 / (self.theta ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
-        ang = np.arange(pos, pos + T, dtype=np.float64)[:, None] * inv[None, :]
-        emb = np.concatenate([ang, ang], -1)                  # (T, rd)
-        cos = np.cos(emb).astype(np.float32); sin = np.sin(emb).astype(np.float32)
+        sec = getattr(self, "rope_sections", None)
+        if sec:
+            n = len(sec)
+            p = np.asarray(pos, np.float64)
+            if p.ndim == 0:                        # text-only run: every axis moves together
+                p = np.repeat(np.arange(float(p), float(p) + T)[None, :], n, 0)
+            ang = p[:, :, None] * inv[None, None, :]          # (axes, T, rd/2)
+            emb = np.concatenate([ang, ang], -1)              # (axes, T, rd)
+            ec, es = np.cos(emb), np.sin(emb)
+            # `emb` is the half-frequencies twice over, so the widths repeat with it
+            widths = list(sec) * 2
+            cc, ss, st = [], [], 0
+            for i, w in enumerate(widths):
+                cc.append(ec[i % n, :, st:st + w]); ss.append(es[i % n, :, st:st + w]); st += w
+            cos = np.concatenate(cc, -1).astype(np.float32)
+            sin = np.concatenate(ss, -1).astype(np.float32)
+        else:
+            ang = np.arange(pos, pos + T, dtype=np.float64)[:, None] * inv[None, :]
+            emb = np.concatenate([ang, ang], -1)              # (T, rd)
+            cos = np.cos(emb).astype(np.float32); sin = np.sin(emb).astype(np.float32)
         if rd < self.HD:                                      # pad the un-rotated tail: identity
             pad = self.HD - rd
             cos = np.concatenate([cos, np.ones((cos.shape[0], pad), np.float32)], -1)
