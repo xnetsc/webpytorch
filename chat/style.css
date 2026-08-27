@@ -287,3 +287,20 @@ img.zoomable{cursor:zoom-in}
        color:#fff;border-radius:8px;padding:6px 14px;font:inherit;font-size:13px;
        text-decoration:none;cursor:pointer}
 .lbbtn:hover{background:rgba(255,255,255,.16)}
+
+/* ---- a cell edited according to what it holds ----------------------------------------
+   Words are typed over where they are. A formula or an image is not its own source, so
+   those open a small editor for that one cell, showing the result as it is typed. */
+.md td.cell-math,.md td.cell-image,.md td.cell-code,.md td.cell-link,
+.md th.cell-math,.md th.cell-image,.md th.cell-code,.md th.cell-link{cursor:pointer}
+.md td.cell-math:hover,.md td.cell-image:hover,.md td.cell-code:hover,.md td.cell-link:hover,
+.md th.cell-math:hover,.md th.cell-image:hover,.md th.cell-code:hover,.md th.cell-link:hover{
+  box-shadow:0 0 0 2px var(--line) inset;border-radius:3px}
+.cellpop{display:flex;flex-direction:column;gap:6px;min-width:220px}
+.cellhint{font-size:11px;color:var(--mut)}
+.celledit{width:100%;padding:6px 8px;border:1px solid var(--accent);border-radius:6px;
+          background:var(--panel);color:var(--fg);
+          font:0.95em/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.cellprev{min-height:1.6em;padding:4px 2px;border-top:1px dashed var(--line)}
+.cellpop .editbar{margin-top:2px}
+.cellpop .editbar button{padding:3px 10px;font-size:12px}

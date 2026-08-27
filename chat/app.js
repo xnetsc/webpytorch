@@ -1330,19 +1330,16 @@ function blockNode(msg, i, src) {
 // is no good direct gesture for those, so the block carries a button to the source, which is
 // the right tool for exactly that job and the wrong one for fixing a number.
 function wireTable(msg, i, node, table) {
-  table.querySelectorAll('th, td').forEach(cell => {
-    cell.setAttribute('contenteditable', 'plaintext-only');
-    cell.spellcheck = false;
-    cell.addEventListener('blur', () => {
-      const md = tableToMd(table, mdBlocks(msg.content)[i] || '');
-      if (md && setBlock(msg, i, md)) saveConvs();
-    });
-    cell.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') cell.blur();
-      // Enter inside a cell would add a line the Markdown cannot hold: a row is one line.
-      if (e.key === 'Enter') { e.preventDefault(); cell.blur(); }
-    });
-  });
+  const grid = tableCells(mdBlocks(msg.content)[i] || '');
+  const rows = [table.querySelector('thead tr')].concat([...table.querySelectorAll('tbody tr')])
+                                                .filter(Boolean);
+  rows.forEach((tr, r) => [...tr.children].forEach((cell, c) => {
+    // The cell's SOURCE, kept on the cell. Rebuilding the Markdown from what the cell
+    // displays cannot work: a cell holding $\phi^n$ renders to KaTeX, whose textContent is
+    // the MathML and the HTML one after the other, and writing that back destroys the row.
+    cell.dataset.src = (grid[r] && grid[r][c] != null) ? grid[r][c] : cell.textContent.trim();
+    wireCell(msg, i, table, cell);
+  }));
   const src = document.createElement('button');
   src.type = 'button'; src.className = 'srcbtn';
   src.textContent = '⌗'; src.title = 'Edit the source (add or remove rows and columns)';
@@ -1351,20 +1348,133 @@ function wireTable(msg, i, node, table) {
   node.appendChild(src);
 }
 
-// Rebuild a Markdown table from the DOM. The alignment row is taken from the original
-// source when the column count still matches -- alignment is not visible in the cells, and
-// regenerating it from scratch would quietly discard it.
+// What a cell holds decides how it is edited. Plain words are edited where they are; a
+// formula or an image is not something you can type over in place -- its rendering is not
+// its source -- so those get a small editor for that one cell, with the result shown as you
+// type. The kind is read from what was rendered, which is the honest signal.
+function cellKind(cell) {
+  if (cell.querySelector('.katex')) return 'math';
+  if (cell.querySelector('img')) return 'image';
+  if (cell.querySelector('code')) return 'code';
+  if (cell.querySelector('a')) return 'link';
+  return 'text';
+}
+
+function wireCell(msg, i, table, cell) {
+  const kind = cellKind(cell);
+  cell.dataset.kind = kind;
+  if (kind === 'text') {
+    cell.setAttribute('contenteditable', 'plaintext-only');
+    cell.spellcheck = false;
+    cell.title = 'Click to edit';
+    cell.addEventListener('blur', () => {
+      cell.dataset.src = cell.textContent.replace(/\s+/g, ' ').trim();
+      commitTable(msg, i, table);
+    });
+    cell.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') cell.blur();
+      if (e.key === 'Enter') { e.preventDefault(); cell.blur(); }   // a row is one line
+    });
+    return;
+  }
+  cell.title = 'Click to edit this ' + kind;
+  cell.classList.add('cell-' + kind);
+  cell.addEventListener('click', (e) => {
+    if (cell.querySelector('.celledit')) return;
+    e.preventDefault();
+    openCellEditor(msg, i, table, cell, kind);
+  });
+}
+
+// One cell, its source, and a preview of what that source becomes.
+function openCellEditor(msg, i, table, cell, kind) {
+  const was = cell.innerHTML;
+  const box = document.createElement('div'); box.className = 'cellpop';
+  const inp = document.createElement('input');
+  inp.type = 'text'; inp.className = 'celledit'; inp.value = cell.dataset.src || '';
+  inp.spellcheck = false;
+  const hint = document.createElement('div'); hint.className = 'cellhint';
+  hint.textContent = kind === 'math' ? 'LaTeX between $ … $'
+                   : kind === 'image' ? '![alt](url)'
+                   : kind === 'code' ? 'code between ` … `' : 'Markdown';
+  const prev = document.createElement('div'); prev.className = 'cellprev';
+  const draw = () => { prev.innerHTML = renderInline(inp.value); };
+  draw();
+  inp.addEventListener('input', draw);
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const ok = document.createElement('button'); ok.type = 'button';
+  ok.className = 'primary'; ok.textContent = 'Save';
+  const no = document.createElement('button'); no.type = 'button'; no.textContent = 'Cancel';
+  bar.append(ok, no);
+  box.append(hint, inp, prev, bar);
+  cell.textContent = ''; cell.appendChild(box);
+  inp.focus(); inp.select();
+  const close = (html) => {
+    cell.innerHTML = html;
+    wireCell(msg, i, table, cell);          // its kind may have changed
+  };
+  no.onclick = () => close(was);
+  ok.onclick = () => {
+    cell.dataset.src = inp.value.trim();
+    close(renderInline(cell.dataset.src));
+    commitTable(msg, i, table);
+  };
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close(was);
+    if (e.key === 'Enter') ok.click();
+  });
+}
+
+// Markdown for the inside of a cell: no paragraph wrapper, same sanitising as everything
+// else. Falls back to the text when the renderer is not here.
+function renderInline(src) {
+  const m = markdown();
+  if (!m) return String(src).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  try {
+    return DOMPurify.sanitize(m.parseInline(String(src)),
+                              { ADD_TAGS: MD_TAGS, ADD_ATTR: MD_ATTR });
+  } catch (e) { return String(src); }
+}
+
+function commitTable(msg, i, table) {
+  const md = tableToMd(table, mdBlocks(msg.content)[i] || '');
+  if (md && setBlock(msg, i, md)) saveConvs();
+}
+
+// The cells of a Markdown table, as source, row by row. The delimiter row is skipped: it is
+// alignment, not content.
+function tableCells(src) {
+  const lines = String(src).split('\n').map(l => l.trim()).filter(l => l.indexOf('|') >= 0);
+  return lines.filter(l => !/^\|?\s*:?-{1,}/.test(l)).map(splitRow);
+}
+
+// Split one row on its pipes, honouring \| inside a cell.
+function splitRow(line) {
+  const s = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const out = []; let cur = '';
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '\\' && s[k + 1] === '|') { cur += '|'; k++; continue; }
+    if (s[k] === '|') { out.push(cur.trim()); cur = ''; continue; }
+    cur += s[k];
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+// Rebuild the Markdown table from the cells' SOURCE. The alignment row is carried over from
+// the original when the column count still matches -- alignment is not visible in a cell,
+// so regenerating it would quietly discard it.
 function tableToMd(table, src) {
   const rowOf = (tr) => [...tr.children].map(c =>
-    c.textContent.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim());
+    String(c.dataset.src == null ? c.textContent : c.dataset.src)
+      .replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim());
   const head = table.querySelector('thead tr');
   const body = [...table.querySelectorAll('tbody tr')];
   if (!head) return null;
   const cols = head.children.length;
-  const srcDelim = (src.split('\n').find(l => /^\s*\|?\s*:?-{1,}/.test(l)) || '').trim();
+  const srcDelim = (String(src).split('\n').find(l => /^\s*\|?\s*:?-{1,}/.test(l)) || '').trim();
   const delimOk = srcDelim && srcDelim.split('|').filter(x => x.trim()).length === cols;
-  const delim = delimOk ? srcDelim
-                        : '| ' + Array(cols).fill('---').join(' | ') + ' |';
+  const delim = delimOk ? srcDelim : '| ' + Array(cols).fill('---').join(' | ') + ' |';
   const line = (cells) => '| ' + cells.join(' | ') + ' |';
   return [line(rowOf(head)), delim].concat(body.map(tr => line(rowOf(tr)))).join('\n');
 }
