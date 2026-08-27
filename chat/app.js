@@ -1737,6 +1737,37 @@ function flushLiveRender() {
   const el = liveRender.el;
   if (el && el.isConnected) setRendered(el, liveRender.text);
 }
+// Only what changed. A reply grows by appending, so each tick alters the LAST block and
+// leaves every earlier one final -- re-rendering the whole reply meant re-parsing, re-
+// sanitising, re-typesetting and re-highlighting text that had not moved, and doing it again
+// for every token after that. Splitting into blocks is a line scan; rendering one block is a
+// fraction of rendering the reply, and the fraction shrinks as the reply grows.
+//
+// The structure is the one a FINISHED message uses (`.blocks` > `.blk`), so nothing shifts
+// on screen when the stream ends; `.live` only suppresses the hover that marks a block as
+// editable, which it is not until then.
+//
+// An unterminated fence changes the split as it arrives -- `mdBlocks` yields one block while
+// it is open, and the same text may resolve differently once the closing fence lands. That
+// is why this compares SOURCES rather than trusting positions: a block whose source changed
+// is re-rendered wherever it sits.
+function setRenderedStream(el, text) {
+  const src = mdBlocks(text);
+  const prev = el.__blocks || null;
+  if (!prev) { el.textContent = ''; el.classList.add('blocks', 'live'); }
+  for (let i = 0; i < src.length; i++) {
+    if (prev && prev[i] === src[i] && el.childNodes[i]) continue;
+    const node = document.createElement('div');
+    node.className = 'blk';
+    node.innerHTML = renderMarkdown(src[i]) || '';
+    wireRunButtons(node, null);
+    if (el.childNodes[i]) el.replaceChild(node, el.childNodes[i]);
+    else el.appendChild(node);
+  }
+  while (el.childNodes.length > src.length) el.removeChild(el.lastChild);
+  el.__blocks = src;
+}
+
 function setRenderedLive(el, text) {
   liveRender.el = el; liveRender.text = text;
   const due = performance.now() - liveRender.t;
@@ -1745,6 +1776,7 @@ function setRenderedLive(el, text) {
 }
 function resetLiveRender() {
   if (liveRender.timer) { clearTimeout(liveRender.timer); liveRender.timer = 0; }
+  if (liveRender.el) { delete liveRender.el.__blocks; liveRender.el.classList.remove('live'); }
   liveRender.t = 0; liveRender.el = null; liveRender.text = '';
 }
 
@@ -1755,11 +1787,10 @@ function setRendered(el, text, msg) {
   }
   el.classList.add('md');
   if (!msg) {                                  // streaming
-    el.classList.remove('blocks');
-    el.innerHTML = renderMarkdown(text) || '';
-    wireRunButtons(el, null);
+    setRenderedStream(el, text);
     return;
   }
+  el.classList.remove('live');
   el.classList.add('blocks');
   el.textContent = '';
   mdBlocks(text).forEach((src, i) => el.appendChild(blockNode(msg, i, src)));

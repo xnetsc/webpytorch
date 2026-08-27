@@ -255,6 +255,9 @@ details.think.live summary{color:var(--accent)}
    or one code block and leaves the rest — including any output already on screen — alone. */
 .md.blocks > .blk{border-radius:8px;margin:0 -6px;padding:0 6px}
 .md.blocks > .blk:hover{background:var(--code)}
+/* while the reply is still arriving its blocks are not editable, so they must not
+   light up as if they were */
+.md.blocks.live > .blk:hover{background:none}
 .md.blocks > .blk:hover > :first-child{margin-top:0}
 .blockedit{width:100%;padding:9px 11px;border:1px solid var(--accent);border-radius:8px;
            background:var(--panel);color:var(--fg);resize:vertical;
