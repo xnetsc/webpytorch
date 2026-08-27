@@ -53,19 +53,49 @@ async function boot(packages) {
   return booting;
 }
 
-// Load whatever is asked for and not already here. A name Pyodide does not ship is reported
-// and skipped rather than failing the batch -- one bad entry in the settings box should not
-// leave the others unloaded.
+// Load whatever is asked for and not already here.
+//
+// Two sources, tried in that order, because they are not the same thing. `loadPackage` reads
+// the distribution that shipped with this Pyodide -- 260-odd prebuilt packages, fetched from
+// `indexURL`, which the service worker has cached, so it works with no network. micropip
+// reaches PyPI, which covers everything else that is a pure-Python wheel.
+//
+// The order is loadPackage first, not because it is faster (measured: comparable, 111 ms
+// against 86 ms for a package of similar size) but because it is the offline one. micropip
+// would serve both -- it resolves distribution names from the lockfile before going out --
+// but it would put a network dependency in front of packages that do not need one.
+//
+// A name is not a failure until BOTH have refused it. What comes back distinguishes the
+// three outcomes, because they mean different things to whoever typed the name: it is here,
+// it had to be fetched from PyPI, or nothing can supply it (typically a package with
+// compiled code, which has no pure-Python wheel to install).
 async function add(names) {
   const want = (names || []).map(s => String(s).trim()).filter(Boolean)
                             .filter(n => !loaded.has(n));
-  const bad = [];
+  const bad = [], fromPyPI = [];
   for (const n of want) {
-    try { await py.loadPackage(n); loaded.add(n); }
-    catch (e) { bad.push(n); }
+    try { await py.loadPackage(n); loaded.add(n); continue; }
+    catch (e) { /* not in the distribution -- try PyPI */ }
+    try {
+      if (!micropipReady) {
+        await py.loadPackage('micropip'); loaded.add('micropip'); micropipReady = true;
+      }
+      const mp = py.pyimport('micropip');
+      try { await mp.install(n); } finally { if (mp.destroy) { try { mp.destroy(); } catch (e2) {} } }
+      loaded.add(n); fromPyPI.push(n);
+    } catch (e) {
+      // The LAST meaningful line, not the first: a Python exception arrives here as a
+      // traceback, whose first line is the word "Traceback" and tells nobody anything. The
+      // reason is the exception line at the end.
+      const lines = String((e && e.message) || e).split('\n').map(x => x.trim()).filter(Boolean);
+      const msg = [...lines].reverse().find(x => /^[A-Za-z_.]+(Error|Exception):/.test(x))
+                || lines[lines.length - 1] || 'unknown error';
+      bad.push({ name: n, why: msg.slice(0, 220) });
+    }
   }
-  return bad;
+  return { unavailable: bad, fromPyPI };
 }
+let micropipReady = false;
 
 // Run one block. Returns everything the person needs to see: what it printed, what it
 // raised, the value of the last expression, and any figures it drew.
@@ -163,9 +193,9 @@ self.onmessage = async (e) => {
     if (cmd === 'boot') { await boot(args && args.packages); res = [...loaded]; }
     else if (cmd === 'packages') {
       await boot(args && args.packages);
-      const bad = await add(args && args.packages);
+      const r = await add(args && args.packages);
       send({ type: 'state', state: 'ready', packages: [...loaded] });
-      res = { loaded: [...loaded], unavailable: bad };
+      res = { loaded: [...loaded], unavailable: r.unavailable, fromPyPI: r.fromPyPI };
     }
     else if (cmd === 'run') res = await run(args && args.code);
     else if (cmd === 'install') res = await install(args || {});

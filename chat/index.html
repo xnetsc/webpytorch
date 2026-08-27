@@ -181,22 +181,20 @@
       </label>
       <p class="hint">Loaded when the page opens, not when you press Run — a first
         <code>import pandas</code> otherwise costs a long pause with nothing to look at.
-        Anything the Pyodide distribution ships can go here (scipy, sympy, scikit-learn,
-        pillow, networkx, …); a module you import without listing it still loads on demand,
-        just not instantly. Plots are captured and shown under the code.</p>
+        Any name works: what the Pyodide distribution ships (scipy, sympy, scikit-learn,
+        pillow, networkx, …) is taken from there, and anything else is fetched from PyPI if a
+        pure-Python wheel exists. A module you import without listing it still loads on
+        demand, just not instantly. Plots are captured and shown under the code.</p>
       <div class="row btns">
         <button id="pyApply" class="primary">Apply &amp; load</button>
         <button id="pyReset">Restart runtime</button>
       </div>
       <div id="pyResult" class="pyresult" hidden></div>
-      <h3>Add a library</h3>
-      <p class="hint">Anything the distribution does not ship: a wheel from this device, or
-        one by URL. A URL is fetched by the page, so the host has to allow it —
-        this page runs under COEP and cannot read a host that sends no CORS headers.</p>
-      <div class="row">
-        <input id="pyWheelUrl" type="text" placeholder="https://…/package-1.0-py3-none-any.whl" />
-        <button id="pyInstallUrl">Install</button>
-      </div>
+      <h3>Add a wheel from this device</h3>
+      <p class="hint">For a package that is neither in the distribution nor a pure-Python
+        wheel on PyPI — one you built for Pyodide yourself. Anything reachable by name is
+        already handled above: the box takes any name, and what the distribution does not
+        ship is fetched from PyPI.</p>
       <div class="row btns">
         <button id="pyWheelPick">Choose a .whl…</button>
         <input type="file" id="pyWheelFile" accept=".whl" hidden />

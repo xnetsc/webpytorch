@@ -2225,15 +2225,21 @@ function wirePython() {
       const r = await pyCall('packages', { packages: want });
       const missing = (r && r.unavailable) || [];
       const got = (r && r.loaded) || [];
-      // Named individually, and said as what it means: the distribution has no such module,
-      // so listing it here cannot make it appear. A wheel is the way in, and it is directly
-      // below.
+      const pypi = (r && r.fromPyPI) || [];
+      // Three outcomes, because they mean different things to whoever typed the name: it is
+      // here, it had to be fetched from PyPI, or nothing can supply it -- and in that last
+      // case the reason the runtime gave is worth more than any wording of mine.
       const parts = ['Ready: ' + (got.length ? nameList(got) : 'nothing')];
-      if (missing.length) {
-        parts.push('<span class="miss">Not in this Pyodide distribution: ' + nameList(missing)
-                 + ' — listing a name here cannot add it. Install a wheel below, '
-                 + 'or use a module the distribution ships.</span>');
-      }
+      if (pypi.length) parts.push('Installed from PyPI: ' + nameList(pypi));
+      missing.forEach(m => {
+        const nm = typeof m === 'string' ? m : m.name;
+        const why = (typeof m === 'string' ? '' : m.why) || '';
+        parts.push('<span class="miss">Could not load <code>' + esc(nm) + '</code>'
+                 + (why ? ' — ' + esc(why.replace(/\.$/, '')) : '')
+                 + '. Not in this Pyodide distribution and no pure-Python wheel on PyPI; '
+                 + 'a package with compiled code needs a wheel built for Pyodide, which you '
+                 + 'can add from this device below.</span>');
+      });
       pyResult(parts.join('<br>'), missing.length > 0);
     } catch (e) {
       st.textContent = 'failed';
@@ -2252,11 +2258,6 @@ function wirePython() {
       pyResult('<span class="miss">Could not install <code>' + esc(label) + '</code>: '
              + esc(e.message || e) + '</span>', true);
     }
-  };
-  $('#pyInstallUrl').onclick = () => {
-    const u = $('#pyWheelUrl').value.trim();
-    if (!u) return;
-    install({ url: u }, u.split('/').pop());
   };
   $('#pyWheelPick').onclick = () => $('#pyWheelFile').click();
   $('#pyWheelFile').onchange = async (e) => {
