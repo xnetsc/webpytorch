@@ -1679,11 +1679,35 @@ const MD_TAGS = ['math', 'semantics', 'annotation', 'mrow', 'mi', 'mo', 'mn', 'm
 const MD_ATTR = ['aria-hidden', 'style', 'class', 'encoding', 'displaystyle', 'scriptlevel',
                  'mathvariant', 'stretchy', 'width', 'height', 'viewBox', 'preserveAspectRatio',
                  'd', 'x1', 'x2', 'y1', 'y2'];
+// Two LaTeX forms the extension does not pick up, and models write both.
+//
+// `$$` on its own line with the formula under it is the common one -- and it fails BECAUSE
+// of `breaks: true`: without a blank line the paragraph tokenizer swallows the whole run and
+// turns the newlines into <br>, so the block-level `$$` rule never sees a block to match.
+// Putting the delimiters and the formula on one line is a form that does render, and says
+// the same thing.
+//
+// `\[ … \]` and `\( … \)` are not handled at all, and worse than not handled: marked
+// treats the backslash as an escape and drops it, so `\[ a^2 \]` reads as `[ a^2 ]`.
+//
+// Code is left exactly as written -- a fenced block or a span of inline code that happens to
+// contain `$$` means the characters, not a formula.
+function normalizeMath(src) {
+  const parts = String(src).split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g);
+  for (let i = 0; i < parts.length; i += 2) {          // odd indices are the code spans
+    parts[i] = parts[i]
+      .replace(/\\\[([\s\S]*?)\\\]/g, (_, f) => '$$' + f.trim() + '$$')
+      .replace(/\\\(([\s\S]*?)\\\)/g, (_, f) => '$' + f.trim() + '$')
+      .replace(/\$\$[ \t]*\n([\s\S]*?)\n[ \t]*\$\$/g, (_, f) => '$$' + f.trim() + '$$');
+  }
+  return parts.join('');
+}
+
 function renderMarkdown(text) {
   const m = markdown();
   if (!m) return null;
   try {
-    return DOMPurify.sanitize(m.parse(String(text)),
+    return DOMPurify.sanitize(m.parse(normalizeMath(text)),
                               { ADD_TAGS: MD_TAGS, ADD_ATTR: MD_ATTR });
   } catch (e) { return null; }
 }
