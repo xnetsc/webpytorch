@@ -27,7 +27,16 @@ if (window.__coiFileMode) {
 const worker = new Worker('worker.js');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
-const gpuInit = webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] })
+// `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
+// backend the reporter actually had. Without it, the best available wins.
+const BACKEND_ORDER = (() => {
+  const want = new URLSearchParams(location.search).get('backend');
+  if (want === 'webgl') return ['webgl'];
+  if (want === 'webgpu') return ['webgpu'];
+  if (want === 'cpu') return [];
+  return ['webgpu', 'webgl'];
+})();
+const gpuInit = webtorch.initMain(worker, { backendOrder: BACKEND_ORDER })
   .then(r => r.backend, () => 'cpu');
 let seq = 0; const pending = new Map();
 // Conversations live in IndexedDB so the sidebar survives a reload.
@@ -240,6 +249,7 @@ worker.onmessage = (e) => {
     $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
   }
   else if (m.type === 'progress') { if (m.total) expected = m.total;
+    if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
     showProgress(m.bytes, m.rate, m.dlRate); }
   else if (m.type === 'loaded') { modelLoaded = true; modelImage = !!m.image;
     setBar(1); syncButtons(); refreshCache(); }
@@ -292,7 +302,10 @@ worker.onmessage = (e) => {
     $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
       ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
       : ' — compute: ' + m.name);
-    if (m.name !== 'webgpu') warnCpuFallback(m.name, m.why);
+    // Only for no GPU at all. WebGL is a GPU backend -- slower than WebGPU, but a dialog
+    // headed "Running on the CPU" would be simply false, and the slow-reply note covers a
+    // backend that is working and still not fast enough.
+    if (m.name === 'cpu') warnCpuFallback(m.name, m.why);
   }
 };
 // No GPU backend. This is worth interrupting for: the difference is roughly three hundred
@@ -384,23 +397,33 @@ const SLOW_LIMITS = [
   { maxGB: 10, floor: 10, label: '1-10 GB' },
   { maxGB: Infinity, floor: 1, label: 'over 10 GB' },
 ];
+// Recorded as the load runs, not read back from the progress line afterwards -- that line
+// is cleared when the load finishes, so by the time a reply is slow there is nothing left
+// in it to parse, and the check silently never fired.
+let loadedGB = null;
 function modelSizeGB() {
+  if (loadedGB) return loadedGB;
   const chosen = PRESETS[+$('#preset').value];
-  if (chosen && chosen.gb) return chosen.gb;
-  const t = ($('#progressText').textContent || '').match(/loaded ([\d.]+) GB/);
-  return t ? parseFloat(t[1]) : null;
+  return (chosen && chosen.gb) || null;
 }
+// Held as state rather than as a node, because the note lives inside #messages and every
+// render() rebuilds that list -- an appended node was being wiped by the render on the very
+// next line, so the warning was computed correctly and then thrown away before anyone saw it.
+let slowState = null;
 function checkSlow(stats) {
   if (!stats || stats.tok_s == null) return;             // too short to have measured
   const gb = modelSizeGB();
   if (!gb) return;
   const lim = SLOW_LIMITS.find(l => gb <= l.maxGB);
-  if (!lim || stats.tok_s >= lim.floor) { hideSlowNote(); return; }
-  showSlowNote(stats.tok_s, gb, lim);
+  slowState = (!lim || stats.tok_s >= lim.floor) ? null : { rate: stats.tok_s, gb, lim };
+  paintSlowNote();
 }
-function hideSlowNote() { const el = $('#slowNote'); if (el) el.remove(); }
+function hideSlowNote() { slowState = null; const el = $('#slowNote'); if (el) el.remove(); }
+function paintSlowNote() {
+  const el = $('#slowNote'); if (el) el.remove();
+  if (slowState) showSlowNote(slowState.rate, slowState.gb, slowState.lim);
+}
 function showSlowNote(rate, gb, lim) {
-  hideSlowNote();
   const box = document.createElement('div');
   box.id = 'slowNote'; box.className = 'slownote';
   const t = document.createElement('div');
@@ -795,7 +818,7 @@ async function exportModel(g) {
     const n = await call('exportModel', { keys: g.keys, handle });
     note('Exported ' + name + ' (' + fmt(n) + ').');
   } catch (e) { note('Export failed: ' + e.message); }
-  setBar(0); $('#progressText').textContent = '';
+  setBar(0); $('#progressText').textContent = ''; loadedGB = null;
 }
 
 // Browser storage is capped by policy, not by the disk -- a few GB here while hundreds are
@@ -1191,6 +1214,7 @@ function render() {
     return;
   }
   messages.forEach(m => el.appendChild(messageNode(m)));
+  paintSlowNote();                       // lives in this list, so it is re-emitted with it
   el.scrollTop = el.scrollHeight;
 }
 

@@ -1,6 +1,7 @@
 {
  "modules": [
   "__init__.py",
+  "_wgsl2glsl.py",
   "_core.py",
   "_sdk.py",
   "audiofe.py",

@@ -819,7 +819,14 @@ class CausalLM:
         self.layers = [await self._build_layer(i, self._qlin) for i in range(self.L)]
         self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
+        # Two different questions, and they had one flag between them. `_gpu` is "can a
+        # decode step be captured and replayed", which needs the whole step on the device
+        # including the scatter KV cache -- WebGPU only, today. `_fused` is "does this
+        # backend have the small fused kernels", which WebGL now does. Sharing the flag
+        # left WebGL running rmsnorm and rope as expressions: about 400 dispatches a token
+        # that the fused forms do in two, on the backend where a dispatch costs the most.
         self._gpu = wt._adam_backend_ready()        # webgpu -> capture path available
+        self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
         return self
 
@@ -961,6 +968,13 @@ class CausalLM:
         if not (getattr(self, "_weights", "native") == "native"
                 and nm is not None and wt.ggml_native_supported(nm)
                 and in_d % wt._GGML_TYPES[nm][2] == 0):
+            return None
+        # WebGL cannot assemble the stack: a fragment writes its own fragment and the
+        # platform renders the whole texture, so transposing expert e into a slice would
+        # clear the experts already there. Falling back to one buffer per expert costs
+        # nothing -- stacking exists to keep a CAPTURED command list identical from token to
+        # token, and a non-stacked MoE is not capturable on either backend regardless.
+        if wt._webgl_ready() and not wt._adam_backend_ready():
             return None
         per = out_d * in_d
         nb = G.tensor_nbytes(t["type"], per)
@@ -1404,6 +1418,7 @@ class CausalLM:
         self.mtp = await self._gload_mtp()
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
+        self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
         return self
 
@@ -1473,8 +1488,8 @@ class CausalLM:
         c, sn = self._rope_np(pos, 1)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(sn)
         q, k, v = self._qkv(lay, x, 1)
-        q = q * cos_t + self._rot(q) * sin_t
-        k = k * cos_t + self._rot(k) * sin_t
+        q = self._rope_qk(q, cos_t, sin_t, 1)
+        k = self._rope_qk(k, cos_t, sin_t, 1)
         sc = 1.0 / math.sqrt(self.HD)
         h = h + self._attn_out(lay, cache.attn(0, q, k, v, pos, scale=sc), 1)
         if m["post_ln"] is not None:
@@ -1541,6 +1556,7 @@ class CausalLM:
         self.final_norm = wt.Tensor(await self._np("model.norm.weight"))
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
+        self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
         return self
 
@@ -1549,7 +1565,7 @@ class CausalLM:
         # One fused dispatch where the backend has it. Written as an expression this is six
         # kernels, and on this stack a dispatch costs about the same whatever its size, so
         # the two norms in every layer add up to a large share of a decode step.
-        if getattr(self, "_gpu", False) and wt._RMS_FUSED:   # _gpu is unset while building
+        if getattr(self, "_fused", False) and wt._RMS_FUSED:  # unset while building
             r = wt.rmsnorm(x, w, self.eps)
             if r is not None:
                 return r
@@ -1566,15 +1582,24 @@ class CausalLM:
             parts.append(wt._slice_last(x, rd, hd))
         return wt.cat(parts, axis=-1)
 
-    def _rope1(self, t):
-        """Rotary embedding for the single decode position, fused into one dispatch where
-        the backend allows it (see wt.rope_decode). The expression form is ~8 launches."""
-        if getattr(self, "_gpu", False) and wt._ROPE_FUSED:
-            r = wt.rope_decode(t, self.cos_b, self.sin_b, self.HD,
-                               getattr(self, "rope_dim", self.HD))
+    def _rope_qk(self, t, cos_t, sin_t, T):
+        """Rope for a (heads, T, HD) tensor against (T, HD) cos/sin.
+
+        Every rope site goes through here. They used to write `t * cos + self._rot(t) * sin`
+        inline -- three of the four did -- so the fused kernel was reachable from exactly one
+        of them, and the backend that needed it most never took it.
+        """
+        if getattr(self, "_fused", False) and wt._ROPE_FUSED:
+            r = wt.rope_decode(t, cos_t, sin_t, self.HD,
+                               getattr(self, "rope_dim", self.HD), T)
             if r is not None:
                 return r
-        return t * self.cos_b + self._rot(t) * self.sin_b
+        return t * cos_t + self._rot(t) * sin_t
+
+    def _rope1(self, t):
+        """Rotary embedding at the single decode position, against the persistent cos/sin
+        row the capture path keeps. The choice of fused or expression is `_rope_qk`'s."""
+        return self._rope_qk(t, self.cos_b, self.sin_b, 1)
 
     def _rope_np(self, pos, T=1):
         """rope cos/sin of shape (T, HD). With `partial_rotary_factor < 1` (Qwen3.5/3.8 style)
@@ -1973,7 +1998,7 @@ class CausalLM:
                 h = h + self._linear_mixer(i, lay, x, T)
             else:                                              # softmax attention layer
                 q, k, v = self._qkv(lay, x, T)
-                q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
+                q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
                 wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
                 wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
@@ -2038,7 +2063,7 @@ class CausalLM:
                 h = h + self._linear_mixer(i, lay, x, T)
             else:
                 q, k, v = self._qkv(lay, x, T)
-                q = q * cos_t + self._rot(q) * sin_t; k = k * cos_t + self._rot(k) * sin_t
+                q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
                 o = cache.attn(i, q, k, v, pos, scale=sc)
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])

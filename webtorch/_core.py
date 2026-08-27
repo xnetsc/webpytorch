@@ -6,6 +6,7 @@ gradients (computed on the GPU) match numerical finite differences. Conv2d /
 attention / more ops come later; the autograd core here is what everything else
 builds on.
 """
+import re
 import numpy as np
 
 # Why the GPU is not being used, when it is not. Every step that can fail writes its reason
@@ -395,6 +396,8 @@ def cat(tensors, axis=0):
         axis += nd
     if _adam_backend_ready():
         outdata = _cat_gpu_data([t.data for t in tensors], axis)   # GPU, capture-safe
+    elif _webgl_ready():
+        outdata = _webgl_cat([t.data for t in tensors], axis)
     else:
         outdata = xp.concatenate([t.data for t in tensors], axis=axis)
     out = Tensor(outdata, any(t.requires_grad for t in tensors), tuple(tensors), "cat")
@@ -2484,10 +2487,10 @@ def swiglu(gate, up=None):
     multiplies) plus a copy per slice, each of them a full pass over the tensor; a routed 30B
     spent 240 elementwise multiplies and 192 sigmoid fragments a token on it.
 
-    Returns None when there is no WebGPU backend, so callers keep their own expression.
+    Returns None when there is no GPU backend, so callers keep their own expression.
     Inference-only: no autograd node is built.
     """
-    if not _adam_backend_ready():
+    if not (_adam_backend_ready() or _webgl_ready()):
         return None
     gd = gate.data if isinstance(gate, Tensor) else gate
     shape = tuple(gd.shape)
@@ -2508,6 +2511,9 @@ def swiglu(gate, up=None):
         uoff = 0
     gd = _contig(gd)
     ud = gd if up is None else _contig(ud)
+    if _webgl_ready() and not _adam_backend_ready():
+        of = _webgl_swiglu(gd, ud, rows, half, gstride, ustride, uoff)
+        return Tensor(of.reshape(*(shape[:-1] + (half,))))
     plat = _adam_kernel["platform"]
     if not _swiglu_k["added"]:
         plat.addKernel("swiglu", {"source": _SWIGLU_WGSL,
@@ -2526,10 +2532,10 @@ def swiglu(gate, up=None):
 def rmsnorm(x, w, eps):
     """Fused RMS norm: `x * rsqrt(mean(x^2) + eps) * w`, one dispatch instead of six.
 
-    Returns None when there is no WebGPU backend, so callers keep their own expression.
+    Returns None when there is no GPU backend, so callers keep their own expression.
     Inference-only: no autograd node is built, which is why the graph path stays intact.
     """
-    if not _adam_backend_ready():
+    if not (_adam_backend_ready() or _webgl_ready()):
         return None
     xd = x.data if isinstance(x, Tensor) else x
     wd = w.data if isinstance(w, Tensor) else w
@@ -2538,6 +2544,9 @@ def rmsnorm(x, w, eps):
     T = 1
     for d in shape[:-1]:
         T *= int(d)
+    if _webgl_ready() and not _adam_backend_ready():
+        of = _webgl_rmsnorm(_contig(xd), _contig(wd), T, H, eps)
+        return Tensor(of.reshape(*shape))
     plat = _adam_kernel["platform"]
     if not _rms_k["added"]:
         plat.addKernel("rmsnorm", {"source": _RMS_WGSL,
@@ -2568,7 +2577,7 @@ var<storage,read> cosb: array<f32>;
 var<storage,read> sinb: array<f32>;
 @group(0) @binding(3)
 var<storage,read_write> outp: array<f32>;
-struct PMeta { n: u32, HD: u32, rd: u32, }
+struct PMeta { n: u32, HD: u32, rd: u32, T: u32, }
 @group(0) @binding(4)
 var<storage,read> pm: PMeta;
 @compute @workgroup_size(64)
@@ -2576,6 +2585,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= pm.n) { return; }
   let d = i % pm.HD;
+  // cos/sin are (T, HD) against an x of (heads, T, HD), so the row is the middle axis.
+  // At T = 1 this is the single-position form the kernel started as.
+  let trow = (i / pm.HD) % pm.T;
+  let ci = trow * pm.HD + d;
   let half = pm.rd / 2u;
   var rot: f32;
   if (d < half) {
@@ -2585,26 +2598,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   } else {
     rot = x[i];                      // pass-through tail: sin is 0 here, value is inert
   }
-  outp[i] = x[i] * cosb[d] + rot * sinb[d];
+  outp[i] = x[i] * cosb[ci] + rot * sinb[ci];
 }
 """
 _rope_k = {"added": False}
 
 
-def rope_decode(x, cos, sin, HD, rd):
-    """Fused rotary embedding for a single position: `x*cos + rotate_half(x)*sin`.
+def rope_decode(x, cos, sin, HD, rd, T=1):
+    """Fused rotary embedding: `x*cos + rotate_half(x)*sin`, in one dispatch.
 
-    Returns None without a WebGPU backend so callers keep their expression. `cos`/`sin` are
-    one row of length HD. `rd` is the rotated prefix for partial rope; the tail passes
-    through unchanged, matching the unfused form.
+    Returns None without a GPU backend so callers keep their expression. `cos`/`sin` hold
+    `T` rows of length HD, against an `x` of (heads, T, HD). `rd` is the rotated prefix for
+    partial rope; the tail passes through unchanged, matching the unfused form.
+
+    `T` above 1 is prefill, and it is worth having: the expression this replaces costs eight
+    dispatches per tensor per layer whatever T is, so prefill pays the same launch overhead
+    decode does, on top of doing more work.
     """
-    if not _adam_backend_ready():
+    if not (_adam_backend_ready() or _webgl_ready()):
         return None
     xd = _contig(x.data if isinstance(x, Tensor) else x)
     shape = tuple(xd.shape)
     n = 1
     for d in shape:
         n *= int(d)
+    if _webgl_ready() and not _adam_backend_ready():
+        cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+        sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+        return Tensor(_webgl_rope(xd, cd, sd, n, HD, rd, T).reshape(*shape))
     plat = _adam_kernel["platform"]
     if not _rope_k["added"]:
         plat.addKernel("rope", {"source": _ROPE_WGSL,
@@ -2614,7 +2635,7 @@ def rope_decode(x, cos, sin, HD, rd):
     cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
     sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
     of = _empty((n,))
-    meta = _adam_kernel["make_meta"]((n, int(HD), int(rd)), "u4,u4,u4")
+    meta = _adam_kernel["make_meta"]((n, int(HD), int(rd), int(T)), "u4,u4,u4,u4")
     plat.runKernel({"name": "rope",
                     "tensors": [xd.buffer.buffer_id, cd.buffer.buffer_id, sd.buffer.buffer_id,
                                 of.buffer.buffer_id, meta.buffer_id],
@@ -4268,7 +4289,8 @@ _NATIVE_GGUF = True          # default on; the loader's `weights=` overrides
 
 def ggml_native_supported(type_name):
     """Can this ggml type be multiplied straight out of the file, with no conversion?"""
-    return bool(_NATIVE_GGUF) and type_name in _GGML_TYPES and _adam_backend_ready()
+    return (bool(_NATIVE_GGUF) and type_name in _GGML_TYPES
+            and (_adam_backend_ready() or _webgl_ready()))
 
 
 # Below this many output rows, the decode kernel cannot fill the GPU: the dispatch is
@@ -4516,6 +4538,13 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
 
     With `small` left at `_AUTO` this checks EVERY thread shape the decode path can pick,
     not just the one some particular matmul happens to want."""
+    # WebGL has one kernel per format, not one per thread shape: without workgroup memory
+    # there is nothing for a shape to trade off, so the sweep below has nothing to sweep.
+    if _webgl_ready() and not _adam_backend_ready():
+        vals = _GGML_TYPES[type_name][2]
+        _selfcheck_one(type_name, mode, None, moe, *(_selfcheck_shape(None, vals)
+                                                     or (_SMALL_N + 64, 3)))
+        return
     if small is _AUTO and mode == 1:
         vals = _GGML_TYPES[type_name][2]
         for kind in ("narrow", "shortk", None):
@@ -4582,13 +4611,21 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
     # this only fires for a standalone call -- but a self-check you cannot run on its own is
     # not much of a self-check, and without it a sweep of every format reports every one of
     # them broken (the kernel is missing, so nothing runs and the output stays zero).
-    key = (type_name, mode, small, moe)
-    if key not in _ggml_k["added"]:
-        _ggml_add(type_name, mode, small, moe)
-        _ggml_k["added"].add(key)
-    raw_out = np.asarray(cp.asnumpy(_ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
-                                              K=K, N=N, small=small, eidx=eidx,
-                                              eslot=(eslot or 0), estride=estride)))
+    if _webgl_ready() and not _adam_backend_ready():
+        moedec = moe and M <= 2
+        if (type_name, moe, moedec) not in _ggml_gl["added"]:
+            _ggml_add_gl(type_name, moe, moedec)
+        out_t = _ggml_run_gl(xp.asarray(x), pk, type_name, K, N, eidx=eidx,
+                             eslot=(eslot or 0), estride=estride)
+    else:
+        key = (type_name, mode, small, moe)
+        if key not in _ggml_k["added"]:
+            _ggml_add(type_name, mode, small, moe)
+            _ggml_k["added"].add(key)
+        out_t = _ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
+                          K=K, N=N, small=small, eidx=eidx,
+                          eslot=(eslot or 0), estride=estride)
+    raw_out = np.asarray(cp.asnumpy(out_t))
     if moe and mode == 1:
         # One row per routed slot. Take the SECOND -- it must have read the second copy of
         # the weight, so a stride that is ignored or wrong shows up here.
@@ -4599,14 +4636,14 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
     err = float(np.abs(got - want).max() / (np.abs(want).max() + 1e-30))
     if not (err < 1e-4):
         raise RuntimeError("native ggml %s kernel for %s at N=%d K=%d is wrong (rel err %.3g)"
-                           " -- check the console for a WGSL compile error"
+                           " -- check the console for a shader compile error"
                            % ({0: "gemm", 1: "gemv", 2: "gemv2"}.get(mode, "mode%d" % mode)
                               + ("(%s)" % small if small else "") + ("(moe)" if moe else ""),
                               type_name, N, K, err))
 
 
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
-                xper=False):
+                xper=False, bias=None):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
 
     `packed` must be in the transposed (word, row) layout that `ggml_transpose` produces --
@@ -4634,6 +4671,16 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     # Prefill is 61% MLP and runs at about 0.6 GB/s against the decode path's 100+. The fix
     # is a GEMM that tiles K into workgroup memory and keeps its accumulators in registers,
     # not a different way to call the one that exists.
+    if _webgl_ready() and not _adam_backend_ready():
+        moe = eidx is not None
+        moedec = moe and m <= 2
+        hb = bias is not None
+        if (type_name, moe, moedec, hb) not in _ggml_gl["added"]:
+            _ggml_add_gl(type_name, moe, moedec, hb)
+            if not hb:                      # the bias variant differs only in a final fetch
+                _ggml_selfcheck(type_name, m if m <= 2 else 0, None, moe)
+        return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
+                            estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
     small = _shape_kind(N, K, _GGML_TYPES[type_name][2]) if mode == 1 else None
     moe = eidx is not None
@@ -4642,8 +4689,9 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         _ggml_add(type_name, mode, small, moe)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
         _ggml_selfcheck(type_name, mode, small, moe)
-    return _ggml_run(xf, packed, type_name, K, N, small=small,
-                     eidx=eidx, eslot=eslot, estride=estride, xper=xper)
+    of = _ggml_run(xf, packed, type_name, K, N, small=small,
+                   eidx=eidx, eslot=eslot, estride=estride, xper=xper)
+    return of if bias is None else of + bias
 
 
 def _ggml_grid(type_name):
@@ -4682,6 +4730,473 @@ def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
                                 "" if o <= 1 else "_r%d" % o,
                                 "_%s" % small if small else "",
                                 "_e" if moe else "")
+
+
+# ==== the small fused decode kernels, on WebGL ==========================================
+#
+# These are what the quantized matmul is NOT: pure elementwise or one-row-reduce work, a few
+# hundred KB a piece. They matter anyway, and on this backend they matter more than on the
+# other one. A decode step through the unfused expressions costs about 2700 GPU dispatches
+# on a 3B, and a dispatch here is worth roughly 50us of host time even when everything it
+# touches is already resident -- so the step is bounded by how many there are, not by how
+# much memory they move. Each fusion below removes five to eight of them per layer.
+
+_gl_kernels = set()
+
+# One float per texel, addressed linearly; `textureSize` recovers the row width, which the
+# platform picks rather than the caller.
+_GL_FETCH2 = """float %(fn)s(int i) { ivec2 s = textureSize(%(tex)s, 0);
+  if (s.y == 1) { return texelFetch(%(tex)s, ivec2(i, 0), 0).r; }
+  int y = i / s.x;
+  return texelFetch(%(tex)s, ivec2(i - y * s.x, y), 0).r; }"""
+
+
+def _gl_head(samplers, ints=(), floats=()):
+    return ("#version 300 es\nprecision highp float; precision highp int;\n"
+            "precision highp sampler2D;\nuniform int _ka_tex_output_texture_w;\n"
+            + "".join("uniform sampler2D %s;\n" % t for t, _ in samplers)
+            + "".join("uniform int %s;\n" % k for k in ints)
+            + "".join("uniform float %s;\n" % k for k in floats)
+            + "out float fragColor;\n"
+            + "\n".join(_GL_FETCH2 % {"fn": f, "tex": t} for t, f in samplers)
+            + "\nint _idx() { return int(gl_FragCoord.x) + int(gl_FragCoord.y)"
+              " * _ka_tex_output_texture_w; }\n")
+
+
+def _gl_run(name, source, inputs, out, uniforms):
+    """Add (once) and dispatch one GLSL kernel. `out` is the destination buffer."""
+    plat = _copy_kernel["plat"]
+    if name not in _gl_kernels:
+        plat.addKernel(name, {"source": source})
+        _gl_kernels.add(name)
+    u = [{"name": "_ka_tex_output_texture_w",
+          "value": int(out.buffer.texture_shape.width), "type": "int"}]
+    for k, v in uniforms:
+        u.append({"name": k, "value": v,
+                  "type": "float" if isinstance(v, float) else "int"})
+    plat.runKernel({"name": name,
+                    "inputs": [{"name": n, "id": b.buffer.buffer_id} for n, b in inputs],
+                    "output": out.buffer.buffer_id, "uniforms": u})
+    return out
+
+
+_SWIGLU_GLSL = _gl_head([("tex_g", "Gf"), ("tex_u", "Uf")],
+                        ("u_half", "u_gstride", "u_ustride", "u_uoff", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int r = i / u_half; int c = i - r * u_half;
+  float x = Gf(r * u_gstride + c);
+  // silu(x) * y as the division rather than x * sigmoid(x), for the same reason as the
+  // WGSL: one reciprocal against neg, exp, add, div and mul as five separate passes.
+  fragColor = (x / (1.0 + exp(-x))) * Uf(r * u_ustride + u_uoff + c);
+}
+"""
+
+# Two passes, not one. A fragment owns one output element, so a single-pass form would make
+# every element of a row re-sum the whole row -- fine at T=1 and quadratic at prefill.
+_RMS_SUM_GLSL = _gl_head([("tex_x", "Xf")], ("u_T", "u_H")) + """
+void main() {
+  int r = _idx();
+  if (r >= u_T) { fragColor = 0.0; return; }
+  int base = r * u_H;
+  float s = 0.0;
+  for (int i = 0; i < u_H; i = i + 1) { float v = Xf(base + i); s += v * v; }
+  fragColor = s;
+}
+"""
+_RMS_APPLY_GLSL = _gl_head([("tex_x", "Xf"), ("tex_w", "Wf"), ("tex_s", "Sf")],
+                           ("u_H", "u_n"), ("u_eps",)) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int r = i / u_H; int c = i - r * u_H;
+  fragColor = Xf(i) * inversesqrt(Sf(r) / float(u_H) + u_eps) * Wf(c);
+}
+"""
+
+_ROPE_GLSL = _gl_head([("tex_x", "Xf"), ("tex_c", "Cf"), ("tex_s", "Sf")],
+                      ("u_n", "u_HD", "u_rd", "u_T")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int d = i % u_HD;
+  int ci = ((i / u_HD) % u_T) * u_HD + d;      // cos/sin are (T, HD); x is (heads, T, HD)
+  int h = u_rd / 2;
+  float rot;
+  if (d < h) { rot = -Xf(i + h); }
+  else if (d < u_rd) { rot = Xf(i - h); }
+  else { rot = Xf(i); }              // pass-through tail: sin is 0 here, the value is inert
+  fragColor = Xf(i) * Cf(ci) + rot * Sf(ci);
+}
+"""
+
+
+# Concatenate, as a gather. The WGSL form runs one dispatch per input, each writing its own
+# slice of a shared output -- which is exactly what a fragment shader cannot do: an
+# invocation writes its own fragment, and the platform renders the whole texture, so the
+# second input's pass would clear the first one's rows. Written the other way round, with
+# every input bound at once and each fragment choosing where its value comes from, it is one
+# pass and no sub-rectangle write.
+#
+# This is not a nicety. The growing KV cache appends through `cat` twice a layer, and without
+# a device kernel `xp.concatenate` takes the round trip: read the cache back to the host,
+# concatenate there, upload it again. That was 144 read-backs per token on a 36-layer model
+# -- and a read-back drains the whole command queue -- which came to 87% of a decode step.
+_CAT2_GLSL = _gl_head([("tex_a", "Af"), ("tex_b", "Bf")],
+                      ("u_pre", "u_n1", "u_n2", "u_post", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int W = u_n1 + u_n2;
+  int q = i / u_post;
+  int t = i - q * u_post;              // index within the trailing block
+  int w = q % W;                       // position along the concatenated axis
+  int p = q / W;                       // index over the leading axes
+  fragColor = (w < u_n1) ? Af((p * u_n1 + w) * u_post + t)
+                         : Bf((p * u_n2 + (w - u_n1)) * u_post + t);
+}
+"""
+
+
+def _webgl_cat2(a, b, axis):
+    """`a` and `b` concatenated along `axis`, in one pass."""
+    sh = list(a.shape)
+    n1, n2 = int(a.shape[axis]), int(b.shape[axis])
+    sh[axis] = n1 + n2
+    pre = 1
+    for d in sh[:axis]:
+        pre *= int(d)
+    post = 1
+    for d in sh[axis + 1:]:
+        post *= int(d)
+    of = _empty(tuple(sh))
+    _gl_run("cat2_gl", _CAT2_GLSL, [("tex_a", _contig(a)), ("tex_b", _contig(b))], of,
+            [("u_pre", pre), ("u_n1", n1), ("u_n2", n2), ("u_post", post),
+             ("u_n", pre * (n1 + n2) * post)])
+    return of
+
+
+def _webgl_cat(datas, axis):
+    """Left-fold of the two-input pass. The decode path always passes two; the folded form
+    keeps the general case working rather than falling back to the host round trip."""
+    out = datas[0]
+    for d in datas[1:]:
+        out = _webgl_cat2(out, d, axis)
+    return out
+
+
+def _webgl_swiglu(gd, ud, rows, half, gstride, ustride, uoff):
+    of = _empty((rows, half))
+    return _gl_run("swiglu_gl", _SWIGLU_GLSL, [("tex_g", gd), ("tex_u", ud)], of,
+                   [("u_half", half), ("u_gstride", gstride), ("u_ustride", ustride),
+                    ("u_uoff", uoff), ("u_n", rows * half)])
+
+
+# The two-pass form has a problem at decode: pass one is one fragment per ROW, so at T = 1
+# the whole reduction is a single invocation walking H dependent fetches while the rest of
+# the GPU idles. The one-pass form has every output element re-derive the sum -- H times the
+# arithmetic -- but spread across H fragments that run at once, and it is one launch instead
+# of two. That trade inverts as T grows (the redundant work is O(T*H^2)), so the row count
+# picks between them.
+_RMS_ONE_GLSL = _gl_head([("tex_x", "Xf"), ("tex_w", "Wf")],
+                         ("u_H", "u_n"), ("u_eps",)) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int r = i / u_H; int c = i - r * u_H;
+  int base = r * u_H;
+  float s = 0.0;
+  for (int j = 0; j < u_H; j = j + 1) { float v = Xf(base + j); s += v * v; }
+  fragColor = Xf(i) * inversesqrt(s / float(u_H) + u_eps) * Wf(c);
+}
+"""
+_RMS_ONE_PASS_ROWS = 4     # measured: see the note above
+
+
+def _webgl_rmsnorm(xd, wd, T, H, eps):
+    if T <= _RMS_ONE_PASS_ROWS:
+        of = _empty((T, H))
+        return _gl_run("rms_one_gl", _RMS_ONE_GLSL, [("tex_x", xd), ("tex_w", wd)], of,
+                       [("u_H", H), ("u_n", T * H), ("u_eps", float(eps))])
+    ss = _empty((T,))
+    _gl_run("rms_sum_gl", _RMS_SUM_GLSL, [("tex_x", xd)], ss, [("u_T", T), ("u_H", H)])
+    of = _empty((T, H))
+    return _gl_run("rms_apply_gl", _RMS_APPLY_GLSL,
+                   [("tex_x", xd), ("tex_w", wd), ("tex_s", ss)], of,
+                   [("u_H", H), ("u_n", T * H), ("u_eps", float(eps))])
+
+
+def _webgl_rope(xd, cd, sd, n, HD, rd, T):
+    of = _empty((n,))
+    return _gl_run("rope_gl", _ROPE_GLSL,
+                   [("tex_x", xd), ("tex_c", cd), ("tex_s", sd)], of,
+                   [("u_n", n), ("u_HD", int(HD)), ("u_rd", int(rd)), ("u_T", int(T))])
+
+
+# ==== the same quantized matmul, on WebGL ===============================================
+#
+# WebGL2 has no compute stage: every "kernel" is a fragment shader, one invocation per
+# output element, with no shared memory between invocations and no way to write anywhere
+# but its own fragment. The WGSL decode path is built around exactly the two things that
+# removes -- a workgroup that stages the activation window in shared memory, and a split-K
+# reduction across the threads of that workgroup -- so the shape here is different on
+# purpose rather than a port that gave up.
+#
+# What survives unchanged is the part that matters: the weight layout. `ggml_transpose`
+# lays a tensor out as (words, N), so the threads of a WGSL workgroup read adjacent words;
+# adjacent FRAGMENTS read those same adjacent words, so the layout that makes the WebGPU
+# kernel coalesce makes this one coalesce too, with nothing to change.
+#
+# What is different:
+#   * one fragment owns one whole output row and runs the entire K loop itself. There is no
+#     split-K because there is nowhere to reduce it. The parallelism comes from N instead,
+#     which for a projection is 1024-5120 fragments -- enough to fill the machine.
+#   * activations are read from a texture per value instead of from a staged window. Every
+#     fragment reads the same ones in the same order, which is the case a texture cache is
+#     built for.
+#   * the three WGSL variants (one row, two rows, batched) collapse into one shader. They
+#     exist there to divide work between the threads of a workgroup; here the output row
+#     just falls out of the fragment index.
+#
+# The decode arithmetic itself is NOT duplicated -- `_wgsl2glsl` translates the same decoder
+# bodies. Two hand-written copies would diverge at the first format added, and the copy
+# nobody ran would be the broken one.
+
+_GL_HEAD = """#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2D; precision highp isampler2D;
+uniform int _ka_tex_output_texture_w;
+uniform sampler2D tex_x;
+uniform isampler2D tex_w;
+BIASUNIFORM
+uniform int u_M; uniform int u_N; uniform int u_K; uniform int u_rowb;
+uniform int u_estride; uniform int u_eslot; uniform int u_xper;
+EXTRAUNIFORMS
+out float fragColor;
+
+struct GM { uint M; uint N; uint K; uint rowb; uint estride; uint eslot; uint xper; uint pad; };
+GM gm;
+uint nrow; uint woff; uint xrow; float acc0;
+int _xw; int _ww; int _gw; int _ew; int _xh;
+
+// The activation is a (1, K) row, so its texture is K wide and one tall for any hidden size
+// up to the 16384 texel limit -- and then the row index is always zero, and the divide that
+// computes it is dead. It is not free: this is the innermost read in the kernel, run once
+// per weight VALUE rather than once per weight word, and a GPU has no integer divide.
+// Measured over a 3B's weights, dropping it took the whole matmul sweep from 32.0 to
+// 34.9 GB/s. The test is on the texture rather than on an assumption about K, and every
+// fragment agrees on it, so it resolves once rather than per lane.
+//
+// A LOT more was tried here, because this read is where the fragment form loses to the
+// compute one: a fragment owns an output row and reads the entire activation itself, so the
+// eight kilobytes of activation cost 2.9 billion texture ops over a 3B's weights -- 44ms
+// against 25ms to read all 1.67 GB of the weights. Packing four activations to an RGBA texel
+// and keeping the last texel in the fragment cuts that count fourfold and is MUCH SLOWER:
+// 16.3 GB/s against 34.9 for the matmul sweep with the packing free (done once, outside the
+// timing), and 6.0 with the repack where it would really be. The branch is uniform, so this
+// is not divergence -- a texelFetch is simply cheaper than a compare and a dynamically
+// indexed vec4, and the fetches were already overlapping with the weight reads. Do not
+// retry it without a measurement that says otherwise.
+float Xf(int i) {
+  if (_xh == 1) { return texelFetch(tex_x, ivec2(i, 0), 0).r; }
+  int y = i / _xw; return texelFetch(tex_x, ivec2(i - y * _xw, y), 0).r;
+}
+// `woff` is a FLAT word offset, not a row-relative one: the WGSL this mirrors expands to
+// `w[woff + wo * N + nrow]`, and `estride` is a whole expert's words. Bracketing it as
+// `(woff + wo) * N` instead agrees for expert 0 and reads off the end of the buffer for
+// every other one -- which is zeros, so slot 0 was exact and every other slot was empty.
+uint  W(uint wo) { int i = int(woff) + int(wo) * int(gm.N) + int(nrow);
+                   int y = i / _ww; return uint(texelFetch(tex_w, ivec2(i - y * _ww, y), 0).r); }
+uint  B(uint o) { return (W(o >> 2u) >> ((o & 3u) * 8u)) & 255u; }
+float I8(uint o) { uint v = B(o); return float(v) - ((v >= 128u) ? 256.0 : 0.0); }
+// Four consecutive bytes in one fetch when the offset is word-aligned and two when it is
+// not -- the same reason as the WGSL `B4`: most ggml blocks are not a multiple of four
+// bytes, so a field read a byte at a time costs four fetches for four bytes that share a
+// word, thousands of times per block.
+uint  B4(uint o) { uint wo = o >> 2u; uint sh = (o & 3u) * 8u; uint lo = W(wo);
+                   if (sh == 0u) { return lo; }
+                   return (lo >> sh) | (W(wo + 1u) << (32u - sh)); }
+uint  U16(uint o) { return B4(o) & 65535u; }
+uint  U32(uint o) { return B4(o); }
+float HF(uint h) {
+  uint m = h & 1023u; uint e = (h >> 10u) & 31u; float v;
+  if (e == 0u) { v = float(m) * 5.9604644775390625e-8; }
+  else if (e == 31u) { v = 65504.0; }
+  else { v = exp2(float(int(e) - 15)) * (1.0 + float(m) * 0.0009765625); }
+  return ((h & 32768u) != 0u) ? -v : v;
+}
+float F16(uint o) { return HF(U16(o)); }
+vec4 unpack4x8unorm(uint v) {
+  return vec4(float(v & 255u), float((v >> 8u) & 255u),
+              float((v >> 16u) & 255u), float((v >> 24u) & 255u)) * 0.00392156862745098;
+}
+void ACC(uint k, float v) { acc0 += Xf(int(xrow + k)) * v; }
+void ACC4(uint k, vec4 v) { int i = int(xrow + k);
+  acc0 += dot(vec4(Xf(i), Xf(i + 1), Xf(i + 2), Xf(i + 3)), v); }
+GRIDFETCH
+EIDXFETCH
+"""
+
+# The IQ4 codebook. On WebGPU it is staged in workgroup memory because computing it per
+# value costs about ten instructions; here there is no workgroup memory, and a `const`
+# array indexed dynamically is legal in GLSL ES 3.00 (the ES 2.0 restriction that made the
+# WGSL side pack it into words does not apply), so it is just a lookup.
+_KV_GLSL = """const float KVTAB[16] = float[16](
+  -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+     1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0);
+float kv(uint i) { return KVTAB[i]; }
+"""
+
+_GL_MAIN = """
+void main() {
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  gm.M = uint(u_M); gm.N = uint(u_N); gm.K = uint(u_K); gm.rowb = uint(u_rowb);
+  gm.estride = uint(u_estride); gm.eslot = uint(u_eslot); gm.xper = uint(u_xper);
+  gm.pad = 0u;
+  _xw = textureSize(tex_x, 0).x; _xh = textureSize(tex_x, 0).y;
+  _ww = textureSize(tex_w, 0).x;
+  GWINIT
+  int r = idx / u_N;
+  nrow = uint(idx - r * u_N);
+  if (r >= u_ROWS) { fragColor = 0.0; return; }
+  ROWINIT
+  acc0 = 0.0;
+  uint base = 0u;
+  uint nb = gm.K / BLKVALS;
+  for (uint b = 0u; b < nb; b = b + 1u) {
+DECODE
+  }
+  fragColor = acc0 BIASADD;
+}
+"""
+
+# `gr` is the i-quant codebook and `eidx` the routed expert; both are int32 textures.
+_GL_GRIDFETCH = """uniform isampler2D tex_gr;
+uint Gf(int i) { int y = i / _gw; return uint(texelFetch(tex_gr, ivec2(i - y * _gw, y), 0).r); }
+"""
+_GL_EIDXFETCH = """uniform isampler2D tex_e;
+int Ef(int i) { int y = i / _ew; return texelFetch(tex_e, ivec2(i - y * _ew, y), 0).r; }
+"""
+
+
+def _ggml_src_gl(type_name, moe, moedec, bias=False):
+    """GLSL ES 3.00 for one (format, routing, bias) combination.
+
+    The bias is a compile-time variant rather than a second dispatch. It is one fetch at the
+    end of a fragment that has already read a whole row of the weight, and it removes three
+    launches per layer on the backend where a launch is worth the most -- a 36-layer model
+    was spending more than a hundred of them a token on `out = out + bias`."""
+    from . import _wgsl2glsl as w2g
+    dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    ng = _grid_u32(type_name)
+    # Substitutions that inject WGSL text run BEFORE translation, for the same reason they
+    # run first on the WebGPU side: what they expand to contains further placeholders.
+    def prep(t):
+        return (t.replace("GRIDSTAGE", "").replace("GSRC", "gr")
+                 .replace("BLKVALS", "%uu" % vals).replace("MASKBLK", "%uu" % (vals - 1))
+                 .replace("WOFS", "").replace("XBAS", "").replace("OSLT", "")
+                 .replace("GBIND", "0"))
+    # The two helpers that ARE about workgroup memory rather than about decoding get a GLSL
+    # form here. That is the line: the arithmetic is shared, the staging strategy cannot be.
+    h = helpers
+    kv_gl = ""
+    if "var<workgroup> kvtab" in h:
+        h = re.sub(r"//[^\n]*\n(?=.*?var<workgroup> kvtab)|var<workgroup> kvtab.*?"
+                   r"fn kv\(i: u32\) -> f32 \{ return kvtab\[i\]; \}", "", h, flags=re.S)
+        kv_gl = _KV_GLSL
+    ty = w2g._Types()
+    ty.fn.update({"W": "uint", "B": "uint", "B4": "uint", "I8": "float", "U16": "uint",
+                  "U32": "uint", "F16": "float", "HF": "float", "ACC": "void",
+                  "ACC4": "void", "kv": "float", "Gf": "uint", "Ef": "int"})
+    ty.var.update({"base": "uint", "b": "uint", "nb": "uint", "nrow": "uint",
+                   "acc0": "float", "gm": "GM", "xrow": "uint", "woff": "uint"})
+    bufs = {"gr": "Gf", "eidx": "Ef"}
+    glsl_h = w2g.translate(prep(h), ty, buffers=bufs) if h.strip() else ""
+    glsl_d = w2g.translate(prep(dec), ty, buffers=bufs)
+    head = (_GL_HEAD
+            .replace("BIASUNIFORM", "uniform sampler2D tex_bias;" if bias else "")
+            .replace("GRIDFETCH", _GL_GRIDFETCH if ng else "")
+            .replace("EIDXFETCH", _GL_EIDXFETCH if moe else "")
+            .replace("EXTRAUNIFORMS", "uniform int u_ROWS;"))
+    main = (_GL_MAIN
+            .replace("GWINIT", ("_gw = textureSize(tex_gr, 0).x;" if ng else "")
+                     + ("\n  _ew = textureSize(tex_e, 0).x;" if moe else ""))
+            .replace("ROWINIT", _gl_rowinit(moe, moedec))
+            .replace("BLKVALS", "%uu" % vals)
+            .replace("BIASADD", " + Bf(int(nrow))" if bias else "")
+            .replace("DECODE", glsl_d))
+    if bias:
+        head += ("float Bf(int i) { ivec2 s = textureSize(tex_bias, 0); int y = i / s.x;\n"
+                 "  return texelFetch(tex_bias, ivec2(i - y * s.x, y), 0).r; }\n")
+    return head + kv_gl + glsl_h + main
+
+
+def _gl_rowinit(moe, moedec):
+    """Which expert this fragment reads and which activation row it multiplies.
+
+    Three cases, and they are the same three the WGSL kernel has -- it just gets them from
+    `gid.z` and a workgroup id instead of from the fragment index."""
+    if moedec:
+        # decode: the output row IS the routed slot, and each slot has its own expert
+        return ("  woff = uint(Ef(r)) * gm.estride;\n"
+                "  xrow = (gm.xper == 1u) ? uint(r) * gm.K : 0u;")
+    if moe:
+        # batched: one expert for the whole dispatch, output rows are batch rows
+        return ("  woff = uint(Ef(int(gm.eslot))) * gm.estride;\n"
+                "  xrow = uint(r) * gm.K;")
+    return "  woff = 0u;\n  xrow = uint(r) * gm.K;"
+
+
+_ggml_gl = {"added": set()}
+
+
+def _ggml_name_gl(type_name, moe, moedec, bias=False):
+    return "ggml_gl_%s_%s%s" % (type_name.lower().replace("-", "_"),
+                                "md" if moedec else ("mb" if moe else "d"),
+                                "_b" if bias else "")
+
+
+def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False):
+    key = (type_name, moe, moedec, bias)
+    if key in _ggml_gl["added"]:
+        return
+    plat = _copy_kernel["plat"]
+    plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias),
+                   {"source": _ggml_src_gl(type_name, moe, moedec, bias)})
+    _ggml_gl["added"].add(key)
+
+
+def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xper=False,
+                 bias=None):
+    """The WebGL dispatch. One fragment per output element; no workgroup shape to choose."""
+    _, _, vals, blk, _ = _GGML_TYPES[type_name]
+    moe = eidx is not None
+    M = 1 if (moe and xper) else int(xf.shape[0])
+    moedec = moe and M <= 2
+    slots = int(eidx.size) if moedec else 1
+    rows = slots * M
+    _ggml_add_gl(type_name, moe, moedec, bias is not None)
+    of = _empty((rows, N))
+    grid = _ggml_grid(type_name)
+    inputs = [{"name": "tex_x", "id": _contig(xf).buffer.buffer_id},
+              {"name": "tex_w", "id": packed.buffer.buffer_id}]
+    if moe:
+        inputs.append({"name": "tex_e", "id": eidx.buffer.buffer_id})
+    if grid is not None:
+        inputs.append({"name": "tex_gr", "id": grid.buffer.buffer_id})
+    if bias is not None:
+        inputs.append({"name": "tex_bias", "id": _contig(bias).buffer.buffer_id})
+    U = lambda n, v: {"name": n, "value": int(v), "type": "int"}
+    plat = _copy_kernel["plat"]
+    plat.runKernel({"name": _ggml_name_gl(type_name, moe, moedec, bias is not None),
+                    "inputs": inputs, "output": of.buffer.buffer_id,
+                    "uniforms": [U("_ka_tex_output_texture_w", of.buffer.texture_shape.width),
+                                 U("u_M", M), U("u_N", N), U("u_K", K),
+                                 U("u_rowb", (K // vals) * blk), U("u_estride", estride),
+                                 U("u_eslot", eslot), U("u_xper", 1 if xper else 0),
+                                 U("u_ROWS", rows)]})
+    return of
 
 
 def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
@@ -5296,6 +5811,65 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 _tr_k = {"added": False}
 
 
+_TRANSPOSE_GLSL = """#version 300 es
+precision highp float; precision highp int; precision highp isampler2D;
+uniform int _ka_tex_output_texture_w;
+uniform isampler2D tex_src;
+uniform int u_n; uniform int u_words; uniform int u_rowb; uniform int u_total;
+out int fragColor;
+int _sw;
+uint sw_(int i) { int y = i / _sw; return uint(texelFetch(tex_src, ivec2(i - y * _sw, y), 0).r); }
+uint sb(uint o) { return (sw_(int(o >> 2u)) >> ((o & 3u) * 8u)) & 255u; }
+void main() {
+  int i = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (i >= u_total) { fragColor = 0; return; }
+  _sw = textureSize(tex_src, 0).x;
+  uint wo = uint(i) / uint(u_n);
+  uint row = uint(i) - wo * uint(u_n);
+  uint b = row * uint(u_rowb) + wo * 4u;
+  uint end = (row + 1u) * uint(u_rowb);
+  uint v = 0u;
+  if (b + 3u < end) {
+    v = sb(b) | (sb(b + 1u) << 8u) | (sb(b + 2u) << 16u) | (sb(b + 3u) << 24u);
+  } else {
+    for (uint k = 0u; k < 4u; k = k + 1u) {
+      if (b + k >= end) { break; }
+      v = v | (sb(b + k) << (8u * k));
+    }
+  }
+  fragColor = int(v);
+}
+"""
+_tr_gl = {"added": False}
+
+
+def _ggml_transpose_gl(src, n, rowb):
+    """(n, rowb bytes) -> (words, n) int32, as a fragment pass.
+
+    Only the whole-buffer form. Writing into a slice of a larger destination -- how a stack
+    of MoE experts is assembled on WebGPU -- has no fragment-shader equivalent: an
+    invocation writes its own fragment and nothing else, and the platform renders the whole
+    texture rather than a sub-rectangle, so the experts already written would be cleared.
+    WebGL therefore keeps one buffer per expert (see `GGMLMoELinear`), which costs nothing:
+    stacking exists to keep a captured command list identical from token to token, and a
+    non-stacked MoE is not capturable on either backend anyway."""
+    words = (rowb + 3) // 4
+    total = words * n
+    plat = _copy_kernel["plat"]
+    if not _tr_gl["added"]:
+        plat.addKernel("ggml_tr_gl", {"source": _TRANSPOSE_GLSL})
+        _tr_gl["added"] = True
+    dst = _empty_i32((total,))
+    U = lambda k, v: {"name": k, "value": int(v), "type": "int"}
+    plat.runKernel({"name": "ggml_tr_gl",
+                    "inputs": [{"name": "tex_src", "id": src.buffer.buffer_id}],
+                    "output": dst.buffer.buffer_id,
+                    "uniforms": [U("_ka_tex_output_texture_w", dst.buffer.texture_shape.width),
+                                 U("u_n", n), U("u_words", words), U("u_rowb", rowb),
+                                 U("u_total", total)]})
+    return dst
+
+
 def ggml_transpose(src, n, rowb, dst=None, dstoff=0):
     """(n, rowb bytes) -> (words, n) u32, so a matmul's threads read adjacent words.
 
@@ -5303,6 +5877,11 @@ def ggml_transpose(src, n, rowb, dst=None, dstoff=0):
     stack of MoE experts is assembled: each is transposed straight into its slice. Assigning
     into a slice from the host instead would read the whole destination back -- and at a
     hundred-odd megabytes the backend refuses to stage it."""
+    if _webgl_ready() and not _adam_backend_ready():
+        if dst is not None:
+            raise RuntimeError("ggml_transpose: WebGL has no sliced write -- keep experts "
+                               "in their own buffers on this backend")
+        return _ggml_transpose_gl(src, n, rowb)
     words = (rowb + 3) // 4
     plat = _adam_kernel["platform"]
     if not _tr_k["added"]:
@@ -5392,9 +5971,7 @@ class GGMLLinear(Module):
         xd = x.data
         lead = xd.shape[:-1]
         of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed,
-                         self.type_name, self.Kt, self.Nt)
-        if self.bias is not None:
-            of = of + self.bias
+                         self.type_name, self.Kt, self.Nt, bias=self.bias)
         return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
 
 
