@@ -249,3 +249,41 @@ details.think.live summary{color:var(--accent)}
 .runout img{display:block;max-width:100%;margin:8px 0 0;border-radius:6px}
 .runout.bad{border-color:var(--danger)}
 .runout.bad pre{color:var(--danger)}
+
+/* ---- block-level editing --------------------------------------------------------------
+   Each block of a finished message is its own container, so an edit touches one paragraph
+   or one code block and leaves the rest — including any output already on screen — alone. */
+.md.blocks > .blk{border-radius:8px;margin:0 -6px;padding:0 6px}
+.md.blocks > .blk:hover{background:var(--code)}
+.md.blocks > .blk:hover > :first-child{margin-top:0}
+.blockedit{width:100%;padding:9px 11px;border:1px solid var(--accent);border-radius:8px;
+           background:var(--panel);color:var(--fg);resize:vertical;
+           font:0.95em/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.md.blocks > .blk:has(.blockedit){background:none}
+
+/* ---- a table edited as a table --------------------------------------------------------
+   Cells take the text directly; the ⌗ control opens the source, which is where structure
+   (a column, a row, the alignment) is changed. */
+.tblblk{position:relative}
+.tblblk .srcbtn{position:absolute;top:2px;right:2px;border:1px solid var(--line);
+                background:var(--panel);color:var(--mut);border-radius:6px;
+                padding:1px 7px;font-size:12px;line-height:1.5;cursor:pointer;opacity:0}
+.tblblk:hover .srcbtn{opacity:.75}
+.tblblk .srcbtn:hover{opacity:1;color:var(--fg)}
+.md th[contenteditable],.md td[contenteditable]{outline:none}
+.md th[contenteditable]:focus,.md td[contenteditable]:focus{
+  box-shadow:0 0 0 2px var(--accent) inset;border-radius:3px}
+
+/* ---- an image at full size ------------------------------------------------------------
+   A plot rendered into the conversation column is too small to read the axes of. */
+img.zoomable{cursor:zoom-in}
+.lightbox{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.72);
+          display:flex;flex-direction:column;align-items:center;justify-content:center;
+          gap:12px;padding:24px}
+.lbimg{max-width:96vw;max-height:82vh;background:#fff;border-radius:8px;
+       box-shadow:0 8px 40px rgba(0,0,0,.4)}
+.lbbar{display:flex;gap:8px}
+.lbbtn{display:inline-block;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.35);
+       color:#fff;border-radius:8px;padding:6px 14px;font:inherit;font-size:13px;
+       text-decoration:none;cursor:pointer}
+.lbbtn:hover{background:rgba(255,255,255,.16)}

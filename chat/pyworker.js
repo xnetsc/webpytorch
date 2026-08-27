@@ -8,7 +8,27 @@
  * when the settings say so rather than when the person presses Run — the first `import
  * pandas` otherwise costs a ten-second pause with nothing to look at.
  */
-const PYODIDE_URL = self.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+// Where Python comes from. The local distribution if this checkout has one, the CDN if not.
+//
+// Pyodide has NO package cache of its own: `loadPackage` fetches from `indexURL` every time,
+// and what saves a reload from re-downloading is only the browser's HTTP cache, which is
+// evictable. A copy served from this origin is not a cache, it is the source -- no network,
+// no eviction, and it works with the machine offline.
+//
+// docs/BUILD.md puts the distribution in lib/, which is not in git, so a fresh clone falls
+// back to the CDN and still runs. A synchronous probe is fine here: it happens once, before
+// anything else, in a worker.
+function pyodideBase() {
+  const local = '../lib/pyodide/';
+  try {
+    const r = new XMLHttpRequest();
+    r.open('HEAD', local + 'pyodide-lock.json', false);
+    r.send();
+    if (r.status >= 200 && r.status < 300) return local;
+  } catch (e) { /* not served here */ }
+  return 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+}
+const PYODIDE_URL = self.PYODIDE_URL || pyodideBase();
 importScripts(PYODIDE_URL + 'pyodide.js');
 
 let py = null;                 // the interpreter, once booted
@@ -95,6 +115,47 @@ __wt_figs()
   return { out, value, error, images };
 }
 
+// Install a wheel: from a URL, or from a file the person picked. micropip handles both --
+// a local one is written into the interpreter's filesystem first and installed from there,
+// because micropip installs from a location and a File is not one.
+//
+// A URL is fetched by the page, not by micropip: this page runs under
+// Cross-Origin-Embedder-Policy, so a host that does not send CORS headers cannot be read at
+// all, and saying which host refused is more use than a Python traceback about it.
+async function install(spec) {
+  await boot();
+  if (!loaded.has('micropip')) { await py.loadPackage('micropip'); loaded.add('micropip'); }
+  const micropip = py.pyimport('micropip');
+  let where = spec.url;
+  try {
+    if (spec.bytes) {
+      const dir = '/wheels';
+      try { py.FS.mkdir(dir); } catch (e) { /* already there */ }
+      const path = dir + '/' + (spec.name || 'package.whl');
+      py.FS.writeFile(path, new Uint8Array(spec.bytes));
+      where = 'emfs:' + path;
+    } else {
+      // Fetched here so a CORS failure is reported as one.
+      const r = await fetch(spec.url);
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + spec.url);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const dir = '/wheels';
+      try { py.FS.mkdir(dir); } catch (e) {}
+      const name = (spec.url.split('/').pop() || 'package.whl').split('?')[0];
+      const path = dir + '/' + name;
+      py.FS.writeFile(path, buf);
+      where = 'emfs:' + path;
+    }
+    await micropip.install(where);
+    const mod = (spec.name || where).split('/').pop().split('-')[0].replace(/_/g, '-');
+    loaded.add(mod);
+    send({ type: 'state', state: 'ready', packages: [...loaded] });
+    return { installed: mod };
+  } finally {
+    if (micropip && micropip.destroy) { try { micropip.destroy(); } catch (e) {} }
+  }
+}
+
 self.onmessage = async (e) => {
   const { id, cmd, args } = e.data || {};
   try {
@@ -107,6 +168,7 @@ self.onmessage = async (e) => {
       res = { loaded: [...loaded], unavailable: bad };
     }
     else if (cmd === 'run') res = await run(args && args.code);
+    else if (cmd === 'install') res = await install(args || {});
     else if (cmd === 'reset') {                       // drop the interpreter and start over
       py = null; booting = null; loaded.clear();
       send({ type: 'state', state: 'idle' });

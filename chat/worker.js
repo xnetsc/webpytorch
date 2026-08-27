@@ -1,7 +1,27 @@
 /* Chat worker: boots Pyodide + the webtorch package, loads models from ModelScope with
    progress, generates, and exposes the SDK's cache-management calls. */
 // Pyodide from a CDN unless told otherwise, so this page works on a plain static host.
-const PYODIDE_URL = self.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+// Where Python comes from. The local distribution if this checkout has one, the CDN if not.
+//
+// Pyodide has NO package cache of its own: `loadPackage` fetches from `indexURL` every time,
+// and what saves a reload from re-downloading is only the browser's HTTP cache, which is
+// evictable. A copy served from this origin is not a cache, it is the source -- no network,
+// no eviction, and it works with the machine offline.
+//
+// docs/BUILD.md puts the distribution in lib/, which is not in git, so a fresh clone falls
+// back to the CDN and still runs. A synchronous probe is fine here: it happens once, before
+// anything else, in a worker.
+function pyodideBase() {
+  const local = '../lib/pyodide/';
+  try {
+    const r = new XMLHttpRequest();
+    r.open('HEAD', local + 'pyodide-lock.json', false);
+    r.send();
+    if (r.status >= 200 && r.status < 300) return local;
+  } catch (e) { /* not served here */ }
+  return 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/';
+}
+const PYODIDE_URL = self.PYODIDE_URL || pyodideBase();
 importScripts(PYODIDE_URL + 'pyodide.js');
 importScripts('../dist/wgpy-worker.js');
 importScripts('../webtorch/js/webtorch-worker.js');

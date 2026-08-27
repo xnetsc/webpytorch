@@ -187,6 +187,18 @@
         <button id="pyApply" class="primary">Apply &amp; load</button>
         <button id="pyReset">Restart runtime</button>
       </div>
+      <h3>Add a library</h3>
+      <p class="hint">Anything the distribution does not ship: a wheel from this device, or
+        one by URL. A URL is fetched by the page, so the host has to allow it —
+        this page runs under COEP and cannot read a host that sends no CORS headers.</p>
+      <div class="row">
+        <input id="pyWheelUrl" type="text" placeholder="https://…/package-1.0-py3-none-any.whl" />
+        <button id="pyInstallUrl">Install</button>
+      </div>
+      <div class="row btns">
+        <button id="pyWheelPick">Choose a .whl…</button>
+        <input type="file" id="pyWheelFile" accept=".whl" hidden />
+      </div>
       <div class="hint">status: <span id="pyState">off</span></div>
     </div>
   </section>

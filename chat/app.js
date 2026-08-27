@@ -945,7 +945,8 @@ function messageNode(m, live) {
     editMessage(m, b);
   });
   (m.attachments || []).forEach(a => {
-    if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl; b.appendChild(im); }
+    if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl;
+                     wireImage(im, a.name || 'image.png'); b.appendChild(im); }
     else { const p = document.createElement('div'); p.className = 'hint'; p.textContent = a.kind + ': ' + a.name; b.appendChild(p); }
   });
   // finished replies keep their final decode stats as a quiet footer (the same line that
@@ -980,6 +981,37 @@ function splitThink(txt) {
 // detail/text nodes are updated in place, so a person who opened the thinking box while the
 // reply streams keeps it open — the DOM is never rebuilt under their cursor.
 // `live` shape: {det, sum, pre, ans, touched, collapsed}
+// ---- looking at an image properly ----------------------------------------------------
+// A plot comes out at whatever size fits the conversation column, which for anything with
+// axis labels is too small to read. Double-click opens it at full size; the overlay also
+// offers to save it, because a chart someone just generated is usually wanted elsewhere.
+function wireImage(img, name) {
+  img.classList.add('zoomable');
+  img.title = 'Double-click to open';
+  img.addEventListener('dblclick', () => openLightbox(img.src, name));
+}
+
+function openLightbox(src, name) {
+  const box = document.createElement('div');
+  box.className = 'lightbox';
+  const big = new Image(); big.src = src; big.className = 'lbimg';
+  const bar = document.createElement('div'); bar.className = 'lbbar';
+  const dl = document.createElement('a');
+  dl.href = src; dl.download = name || ('plot-' + Date.now() + '.png');
+  dl.textContent = '⤓ Save'; dl.className = 'lbbtn';
+  const close = document.createElement('button');
+  close.type = 'button'; close.className = 'lbbtn'; close.textContent = '✕ Close';
+  bar.append(dl, close);
+  box.append(bar, big);
+  document.body.appendChild(box);
+  const shut = () => { box.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') shut(); };
+  close.onclick = shut;
+  // Clicking the backdrop closes; clicking the image or the bar does not.
+  box.addEventListener('click', (e) => { if (e.target === box) shut(); });
+  document.addEventListener('keydown', onKey);
+}
+
 // ---- running the Python in a reply ---------------------------------------------------
 // A model that answers with code should let you press it. The code runs in its OWN Pyodide,
 // in its own worker: the model's runtime is holding gigabytes of weights and is busy
@@ -1062,14 +1094,21 @@ function wireRunButtons(root, msg) {
     // they are already looking at. `plaintext-only` keeps pasted rich text from arriving as
     // markup, and the edit is written back into the message's own fence on blur.
     if (msg) {
-      const n = idx;
       code.setAttribute('contenteditable', 'plaintext-only');
       code.spellcheck = false;
       code.title = 'Click to edit';
       code.addEventListener('focus', () => wrap.classList.add('editing'));
       code.addEventListener('blur', () => {
         wrap.classList.remove('editing');
-        if (replaceFence(msg, n, code.textContent)) { saveConvs(); }
+        const blk = wrap.closest('.blk');
+        if (blk) {
+          // The block IS the fence, so its new source is the fence rebuilt around the code.
+          const src = mdBlocks(msg.content)[+blk.dataset.i] || '';
+          const open = (src.match(/^\s*(?:`{3,}|~{3,})[^\n]*/) || [''])[0];
+          const close = (open.match(/`{3,}|~{3,}/) || ['```'])[0];
+          const body = code.textContent.replace(/\n+$/, '');
+          if (setBlock(msg, +blk.dataset.i, open + '\n' + body + '\n' + close)) saveConvs();
+        }
         rehighlight(code);
       });
       // Enter must not end the edit and Tab must indent -- this is a code box, not a form.
@@ -1104,21 +1143,42 @@ function rehighlight(code) {
   } catch (e) { code.textContent = text; }
 }
 
-// Put `body` into the n-th fenced block of the message's Markdown. Counting fences in the
-// source the same way the renderer emits them is what keeps the two in step; a message
-// whose fences cannot be counted is left alone rather than rewritten wrongly.
-function replaceFence(msg, n, body) {
-  const src = msg.content || '';
-  const re = /^([ \t]*)(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)^[ \t]*\2[ \t]*$/gm;
-  let i = 0, found = false;
-  const out = src.replace(re, (whole, ind, fence, info, inner) => {
-    if (i++ !== n) return whole;
-    found = true;
-    const b = body.replace(/\n+$/, '');
-    return ind + fence + info + '\n' + b + '\n' + ind + fence;
-  });
-  if (!found || out === src) return false;
-  msg.content = out;
+// Split Markdown into top-level blocks, source and all. This is the unit the person edits:
+// one paragraph, one list, one table, one fenced block. A fence is a block whatever is
+// inside it (blank lines included); everything else is separated by blank lines.
+//
+// Splitting the SOURCE rather than walking the rendered DOM is what lets an edit be written
+// back: block n of the render is block n of the Markdown, so saving is an array assignment
+// and a join, with no counting and no guessing which fence was which.
+function mdBlocks(src) {
+  const lines = String(src == null ? '' : src).split('\n');
+  const out = [];
+  let buf = [], fence = null;
+  const flush = () => { if (buf.join('\n').trim()) out.push(buf.join('\n')); buf = []; };
+  for (const line of lines) {
+    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fence !== null) {
+      buf.push(line);
+      if (f && line.trim().indexOf(fence) === 0) { out.push(buf.join('\n')); buf = []; fence = null; }
+      continue;
+    }
+    if (f) { flush(); fence = f[1]; buf.push(line); continue; }
+    if (!line.trim()) { flush(); continue; }
+    buf.push(line);
+  }
+  // An unterminated fence is still a block -- a reply can be cut off mid-code.
+  if (fence !== null) out.push(buf.join('\n')); else flush();
+  return out;
+}
+
+// Write block `n` back and rebuild the message. Blocks are rejoined with a blank line,
+// which is what separated them in the first place.
+function setBlock(msg, n, text) {
+  const bl = mdBlocks(msg.content);
+  if (n < 0 || n >= bl.length) return false;
+  if (bl[n] === text) return false;
+  bl[n] = text;
+  msg.content = bl.join('\n\n');
   return true;
 }
 
@@ -1139,8 +1199,10 @@ async function runBlock(code, wrap, btn) {
     if (r.value != null && r.value !== 'None') {
       const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.value; panel.appendChild(p);
     }
-    (r.images || []).forEach(b64 => {
-      const im = new Image(); im.src = 'data:image/png;base64,' + b64; panel.appendChild(im);
+    (r.images || []).forEach((b64, k) => {
+      const im = new Image(); im.src = 'data:image/png;base64,' + b64;
+      wireImage(im, 'figure-' + (k + 1) + '.png');
+      panel.appendChild(im);
     });
     if (r.error) {
       panel.classList.add('bad');
@@ -1216,12 +1278,130 @@ function renderMarkdown(text) {
   } catch (e) { return null; }
 }
 // Put `text` into `el` as rendered Markdown, or as plain text when rendering is unavailable.
+// A finished message is rendered BLOCK BY BLOCK, each in its own container that can be
+// edited on its own. A reply still streaming is rendered as one piece: it changes every
+// token, nothing in it is editable yet, and re-splitting it per token buys nothing.
 function setRendered(el, text, msg) {
-  const html = renderMarkdown(text);
-  if (html == null) { el.textContent = text; el.classList.remove('md'); return; }
-  el.innerHTML = html;
+  if (renderMarkdown('') == null) {            // no renderer: plain text, as before
+    el.textContent = text; el.classList.remove('md'); el.classList.remove('blocks');
+    return;
+  }
   el.classList.add('md');
-  wireRunButtons(el, msg);
+  if (!msg) {                                  // streaming
+    el.classList.remove('blocks');
+    el.innerHTML = renderMarkdown(text) || '';
+    wireRunButtons(el, null);
+    return;
+  }
+  el.classList.add('blocks');
+  el.textContent = '';
+  mdBlocks(text).forEach((src, i) => el.appendChild(blockNode(msg, i, src)));
+  el.querySelectorAll('img').forEach(im => wireImage(im, 'image.png'));
+  if (!el.childNodes.length) el.appendChild(blockNode(msg, 0, ''));
+}
+
+// One block: its rendering, and the means to change it. Code is edited in the block itself
+// (see wireRunButtons); everything else opens as the few lines of Markdown that produced
+// it -- which is the block's own source, not the whole message.
+function blockNode(msg, i, src) {
+  const d = document.createElement('div');
+  d.className = 'blk'; d.dataset.i = String(i);
+  d.innerHTML = renderMarkdown(src) || '';
+  wireRunButtons(d, msg);
+  const isCode = !!d.querySelector('pre > code');
+  const table = d.querySelector('table');
+  if (table) {
+    wireTable(msg, i, d, table);
+  } else if (!isCode) {
+    d.title = 'Double-click to edit';
+    d.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.runout, .blockedit')) return;
+      editBlock(msg, i, d);
+    });
+  }
+  return d;
+}
+
+// A table is edited AS A TABLE. Double-clicking one and being handed a row of pipes is not
+// editing a table, it is editing a description of one -- so the cells themselves take the
+// text, and the Markdown is rebuilt from them.
+//
+// Structure is the exception: adding a column, removing a row, changing the alignment. There
+// is no good direct gesture for those, so the block carries a button to the source, which is
+// the right tool for exactly that job and the wrong one for fixing a number.
+function wireTable(msg, i, node, table) {
+  table.querySelectorAll('th, td').forEach(cell => {
+    cell.setAttribute('contenteditable', 'plaintext-only');
+    cell.spellcheck = false;
+    cell.addEventListener('blur', () => {
+      const md = tableToMd(table, mdBlocks(msg.content)[i] || '');
+      if (md && setBlock(msg, i, md)) saveConvs();
+    });
+    cell.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') cell.blur();
+      // Enter inside a cell would add a line the Markdown cannot hold: a row is one line.
+      if (e.key === 'Enter') { e.preventDefault(); cell.blur(); }
+    });
+  });
+  const src = document.createElement('button');
+  src.type = 'button'; src.className = 'srcbtn';
+  src.textContent = '⌗'; src.title = 'Edit the source (add or remove rows and columns)';
+  src.onclick = () => editBlock(msg, i, node);
+  node.classList.add('tblblk');
+  node.appendChild(src);
+}
+
+// Rebuild a Markdown table from the DOM. The alignment row is taken from the original
+// source when the column count still matches -- alignment is not visible in the cells, and
+// regenerating it from scratch would quietly discard it.
+function tableToMd(table, src) {
+  const rowOf = (tr) => [...tr.children].map(c =>
+    c.textContent.replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim());
+  const head = table.querySelector('thead tr');
+  const body = [...table.querySelectorAll('tbody tr')];
+  if (!head) return null;
+  const cols = head.children.length;
+  const srcDelim = (src.split('\n').find(l => /^\s*\|?\s*:?-{1,}/.test(l)) || '').trim();
+  const delimOk = srcDelim && srcDelim.split('|').filter(x => x.trim()).length === cols;
+  const delim = delimOk ? srcDelim
+                        : '| ' + Array(cols).fill('---').join(' | ') + ' |';
+  const line = (cells) => '| ' + cells.join(' | ') + ' |';
+  return [line(rowOf(head)), delim].concat(body.map(tr => line(rowOf(tr)))).join('\n');
+}
+
+// Edit one block in place. Saving rebuilds only this block, so the rest of the message --
+// including any code output already on screen -- is left where it is.
+function editBlock(msg, i, node) {
+  if (node.querySelector('.blockedit')) return;
+  const src = mdBlocks(msg.content)[i] || '';
+  const ta = document.createElement('textarea');
+  ta.className = 'blockedit'; ta.value = src;
+  ta.rows = Math.min(18, Math.max(2, src.split('\n').length + 1));
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const ok = document.createElement('button'); ok.type = 'button';
+  ok.className = 'primary'; ok.textContent = 'Save';
+  const no = document.createElement('button'); no.type = 'button'; no.textContent = 'Cancel';
+  const del = document.createElement('button'); del.type = 'button';
+  del.className = 'danger'; del.textContent = 'Delete block';
+  bar.append(ok, no, del);
+  node.textContent = ''; node.append(ta, bar);
+  ta.focus();
+  const redraw = () => {
+    const fresh = blockNode(msg, i, mdBlocks(msg.content)[i] || '');
+    node.replaceWith(fresh);
+  };
+  no.onclick = redraw;
+  ok.onclick = () => { if (setBlock(msg, i, ta.value)) saveConvs(); redraw(); };
+  del.onclick = () => {
+    const bl = mdBlocks(msg.content);
+    bl.splice(i, 1);
+    msg.content = bl.join('\n\n');
+    saveConvs(); render();
+  };
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Escape') redraw();
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
+  });
 }
 
 function fillBody(b, msg, live) {
@@ -1395,6 +1575,32 @@ function wirePython() {
         note('Not in this Pyodide build: ' + r.unavailable.join(', '));
       }
     } catch (e) { st.textContent = 'failed: ' + e.message; }
+  };
+  const install = async (args, label) => {
+    st.textContent = 'installing ' + label + '…';
+    if (!pyWorker) pyStart();
+    try {
+      const r = await pyCall('install', args);
+      note('Installed ' + (r && r.installed ? r.installed : label) + '.');
+    } catch (e) {
+      st.textContent = 'install failed';
+      note('Could not install ' + label + ': ' + e.message);
+    }
+  };
+  $('#pyInstallUrl').onclick = () => {
+    const u = $('#pyWheelUrl').value.trim();
+    if (!u) return;
+    install({ url: u }, u.split('/').pop());
+  };
+  $('#pyWheelPick').onclick = () => $('#pyWheelFile').click();
+  $('#pyWheelFile').onchange = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    // Sent as bytes: the worker has no access to the page's File objects, and a wheel is
+    // small enough that copying it is not worth a stream.
+    const bytes = await f.arrayBuffer();
+    install({ bytes, name: f.name }, f.name);
   };
   $('#pyReset').onclick = async () => {
     if (!pyWorker) { pyStart(); return; }
