@@ -37,6 +37,13 @@ _IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
 _FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.float32)
 
 
+
+# Kept as float32 scalars so `np.where` returns float32. A bare 0.0 is a Python float,
+# which makes the result float64 and doubles every dequantised block behind it.
+_F0 = np.float32(0.0)
+_F4 = np.float32(4.0)
+_F16 = np.float32(16.0)
+
 def _e8m0_half(e):
     """MXFP4's shared exponent: 0.5 * 2^(e-127), with denormal patterns below 2."""
     e = np.asarray(e, np.uint32)
@@ -242,8 +249,11 @@ def dequant(ttype, raw, n):
             ql = qs[:, g * 32:(g + 1) * 32]
             i0 = 2 * g
             u1 = np.uint8(1 << i0); u2 = np.uint8(1 << (i0 + 1))
-            lo = (ql & 0x0F).astype(np.float32) + np.where(qh & u1, 16.0, 0.0)
-            hi = (ql >> 4).astype(np.float32) + np.where(qh & u2, 16.0, 0.0)
+            # np.float32, not 16.0: two Python floats make `np.where` return a float64
+            # array, and float32 + float64 promotes the whole dequantised block to eight
+            # bytes a value on its way to being stored as four.
+            lo = (ql & 0x0F).astype(np.float32) + np.where(qh & u1, _F16, _F0)
+            hi = (ql >> 4).astype(np.float32) + np.where(qh & u2, _F16, _F0)
             out[:, i0 * 32:(i0 + 1) * 32] = d * sc[:, i0:i0+1] * lo - dmin * m[:, i0:i0+1]
             out[:, (i0+1) * 32:(i0+2) * 32] = d * sc[:, i0+1:i0+2] * hi - dmin * m[:, i0+1:i0+2]
         return out.reshape(-1)[:n]
@@ -270,7 +280,7 @@ def dequant(ttype, raw, n):
                 for half in range(2):        # 16 low + 16 high values
                     ql = q[:, half * 16:(half + 1) * 16]
                     hmm = hm[:, half * 16:(half + 1) * 16]
-                    v = ((ql >> shift) & 3).astype(np.float32) - np.where(hmm & mbit, 0.0, 4.0)
+                    v = ((ql >> shift) & 3).astype(np.float32) - np.where(hmm & mbit, _F0, _F4)
                     out[:, o:o + 16] = (d_all * sc[:, is_:is_ + 1]) * v
                     o += 16; is_ += 1
         return out.reshape(-1)[:n]

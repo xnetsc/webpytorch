@@ -89,8 +89,12 @@ class CosyVoice2TTS:
     def _relpos(self, T, D=512):
         pos = np.arange(T)[:, None].astype(np.float64)
         div = np.exp(np.arange(0, D, 2) * -(math.log(10000.0) / D))
-        pep = np.zeros((T, D)); pep[:, 0::2] = np.sin(pos * div); pep[:, 1::2] = np.cos(pos * div)
-        pen = np.zeros((T, D)); pen[:, 0::2] = np.sin(-pos * div); pen[:, 1::2] = np.cos(-pos * div)
+        # float32: np.zeros defaults to float64, which is two bytes a value too many for a
+        # table that is only ever multiplied into float32 activations.
+        pep = np.zeros((T, D), np.float32)
+        pep[:, 0::2] = np.sin(pos * div); pep[:, 1::2] = np.cos(pos * div)
+        pen = np.zeros((T, D), np.float32)
+        pen[:, 0::2] = np.sin(-pos * div); pen[:, 1::2] = np.cos(-pos * div)
         return np.concatenate([pep[::-1], pen[1:]], 0).astype(np.float32)
     def _rel_shift(self, x):
         Hh, T, P = x.shape

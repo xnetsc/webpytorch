@@ -712,12 +712,24 @@ def bce_loss(pred, target):
     return -(target * (pred + eps).log() + (1.0 - target) * (1.0 - pred + eps).log()).mean()
 
 
+def _onehot(targets, N, C):
+    """(N, C) float32 with a single 1 per row, WITHOUT building an identity matrix.
+
+    `np.eye(C)[targets]` reads well and allocates C x C to select N rows of it. C here is the
+    number of classes, which for a language model is the vocabulary: 151936 classes is 92 TB
+    before a single row is taken. This is the same array the identity would have produced.
+    """
+    oh = np.zeros((int(N), int(C)), np.float32)
+    oh[np.arange(int(N)), np.asarray(targets).astype(np.int64).reshape(-1)] = 1.0
+    return oh
+
+
 def nll_loss(log_probs, targets):
     """Negative log-likelihood. log_probs: (N, C); targets: numpy int (N,).
     cross_entropy == nll_loss(log_softmax(x))."""
     ld = log_probs.data
     N, C = ld.shape
-    onehot = Tensor(xp.asarray(np.eye(C, dtype=np.float32)[np.asarray(targets).astype(np.int64)]))
+    onehot = Tensor(xp.asarray(_onehot(targets, N, C)))
     return -(onehot * log_probs).sum() * (1.0 / N)
 
 
@@ -2790,7 +2802,7 @@ def cross_entropy(logits, targets):
         m = xd.max(axis=-1, keepdims=True)
         e = xp.exp(xd - m)
         s = e / e.sum(axis=-1, keepdims=True)
-        onehot = xp.asarray(np.eye(Cls, dtype=np.float32)[np.asarray(targets).astype(np.int64)])
+        onehot = xp.asarray(_onehot(targets, N, Cls))
         loss_val = (-(onehot * xp.log(s + 1e-12)).sum()) * (1.0 / N)
         out = Tensor(loss_val.reshape(()), logits.requires_grad, (logits,), "cross_entropy")
 
@@ -4942,20 +4954,30 @@ def _gptq_matmul_np(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0, block
     Kp = int(qw.shape[0]) * per
     g = np.arange(Kp) // gs                       # group index per contracted row
     out = np.empty((int(x.shape[0]), N), np.float32)
+    # The zero points do not depend on the column block, so they are unpacked ONCE. Rebuilding
+    # this (groups, N) array inside the loop re-did the same work for every block and held a
+    # second copy of it while doing so.
+    z_all = np.empty((int(qz.shape[0]), N), np.int32)
+    for r in range(per):
+        z_all[:, r::per] = (qz >> (bits * r)) & qmax
+    zo = np.float32(zoff)
     for c0 in range(0, N, block):                 # column blocks bound the temporary
         c1 = min(N, c0 + block)
         qwb = qw[:, c0:c1]
         q = np.empty((Kp, c1 - c0), np.int32)
         for r in range(per):
             q[r::per] = (qwb >> (bits * r)) & qmax
-        # zeros are packed along N (per column), unpack the columns this block needs
-        z_full = np.empty((int(qz.shape[0]), N), np.int32)
-        for r in range(per):
-            z_full[:, r::per] = (qz >> (bits * r)) & qmax
-        z = z_full[:, c0:c1]; del z_full
-        w = (sc[g, c0:c1] * (q - (z[g] + zoff))).astype(np.float32)
+        # float32 the whole way. `q - (z + zoff)` with a Python float for `zoff` promoted the
+        # difference to float64, so the scaled weight was built at eight bytes a value and
+        # then thrown away at four: a (1024, 2048) block asked for 16 MiB it did not need,
+        # which is precisely the allocation that failed on a real machine.
+        q -= z_all[g, c0:c1]                      # int32 - int32, in place
+        w = q.astype(np.float32)
+        if zoff:
+            w -= zo
+        w *= sc[g, c0:c1]
         out[:, c0:c1] = x @ w
-        del q, z, w
+        del q, w
     return out
 
 
