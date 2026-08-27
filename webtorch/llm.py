@@ -969,13 +969,6 @@ class CausalLM:
                 and nm is not None and wt.ggml_native_supported(nm)
                 and in_d % wt._GGML_TYPES[nm][2] == 0):
             return None
-        # WebGL cannot assemble the stack: a fragment writes its own fragment and the
-        # platform renders the whole texture, so transposing expert e into a slice would
-        # clear the experts already there. Falling back to one buffer per expert costs
-        # nothing -- stacking exists to keep a CAPTURED command list identical from token to
-        # token, and a non-stacked MoE is not capturable on either backend regardless.
-        if wt._webgl_ready() and not wt._adam_backend_ready():
-            return None
         per = out_d * in_d
         nb = G.tensor_nbytes(t["type"], per)
         off = self._gds + t["offset"]

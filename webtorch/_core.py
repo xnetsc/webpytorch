@@ -859,6 +859,8 @@ def moe_route(logits, eidx, ew, ne, k, norm=True):
     at 48 layers is most of a decode step -- and it is a tiny amount of data, so the cost is
     all round-trip. Keeping it here also keeps the step capturable: the indices land in a
     buffer the expert matmuls already read, and no command depends on their value."""
+    if _webgl_ready() and not _adam_backend_ready():
+        return _webgl_moe_route(logits, eidx, ew, ne, k, norm)
     plat = _adam_kernel["platform"]
     if not _moe_r["added"]:
         plat.addKernel("moe_route", {"source": _MOE_ROUTE_WGSL,
@@ -5061,6 +5063,89 @@ def _webgl_silu(x):
     return Tensor(of)
 
 
+# Router scores -> the chosen experts and their weights.
+#
+# Two dispatches rather than one, because a fragment writes one value and the indices are
+# int32 while the weights are float. Each fragment finds its own rank independently: fragment
+# s runs s+1 argmax passes over the scores, skipping what the earlier passes took. That is
+# O(k^2 * ne) against the workgroup version's O(k * ne), and at k=8 over 128 experts it is a
+# few thousand comparisons in a kernel that runs once per layer -- against a read-back of the
+# router's scores, which is what the host path costs and which drains the command queue.
+_MOE_TOPK = 32           # fragments hold their picks in a local array, so this is a bound
+
+_MOE_IDX_GL = """#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+uniform int _ka_tex_output_texture_w;
+uniform sampler2D tex_lg;
+uniform int u_ne; uniform int u_k;
+out int fragColor;
+float Lf(int i) { ivec2 t = textureSize(tex_lg, 0);
+  if (t.y == 1) { return texelFetch(tex_lg, ivec2(i, 0), 0).r; }
+  int y = i / t.x; return texelFetch(tex_lg, ivec2(i - y * t.x, y), 0).r; }
+void main() {
+  int s = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (s >= u_k) { fragColor = 0; return; }
+  int chosen[%d];
+  for (int t = 0; t <= s; t = t + 1) {
+    float best = -1e30; int bi = 0;
+    for (int e = 0; e < u_ne; e = e + 1) {
+      bool taken = false;
+      for (int j = 0; j < t; j = j + 1) { if (chosen[j] == e) { taken = true; } }
+      float v = Lf(e);
+      if (!taken && v > best) { best = v; bi = e; }
+    }
+    chosen[t] = bi;
+  }
+  fragColor = chosen[s];
+}
+""" % _MOE_TOPK
+
+_MOE_W_GL = """#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2D; precision highp isampler2D;
+uniform int _ka_tex_output_texture_w;
+uniform sampler2D tex_lg;
+uniform isampler2D tex_idx;
+uniform int u_ne; uniform int u_k; uniform int u_norm;
+out float fragColor;
+float Lf(int i) { ivec2 t = textureSize(tex_lg, 0);
+  if (t.y == 1) { return texelFetch(tex_lg, ivec2(i, 0), 0).r; }
+  int y = i / t.x; return texelFetch(tex_lg, ivec2(i - y * t.x, y), 0).r; }
+int If(int i) { ivec2 t = textureSize(tex_idx, 0);
+  if (t.y == 1) { return texelFetch(tex_idx, ivec2(i, 0), 0).r; }
+  int y = i / t.x; return texelFetch(tex_idx, ivec2(i - y * t.x, y), 0).r; }
+void main() {
+  int s = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (s >= u_k) { fragColor = 0.0; return; }
+  // softmax over ALL experts, then renormalised across the chosen ones (the Qwen
+  // convention); with u_norm == 0 the raw softmax weights are kept.
+  float mx = -1e30;
+  for (int e = 0; e < u_ne; e = e + 1) { mx = max(mx, Lf(e)); }
+  float den = 0.0;
+  for (int e = 0; e < u_ne; e = e + 1) { den += exp(Lf(e) - mx); }
+  float p = exp(Lf(If(s)) - mx) / den;
+  if (u_norm == 1) {
+    float tot = 0.0;
+    for (int j = 0; j < u_k; j = j + 1) { tot += exp(Lf(If(j)) - mx) / den; }
+    if (tot > 0.0) { p = p / tot; }
+  }
+  fragColor = p;
+}
+"""
+
+
+def _webgl_moe_route(logits, eidx, ew, ne, k, norm):
+    # A fragment holds its picks in a fixed local array, so a larger k would index past it
+    # and route to whatever was in that slot -- a wrong expert, silently. Loud instead.
+    if int(k) > _MOE_TOPK:
+        raise RuntimeError("WebGL MoE routing is built for up to %d experts per token, "
+                           "not %d -- raise _MOE_TOPK" % (_MOE_TOPK, int(k)))
+    _gl_run("moe_idx_gl", _MOE_IDX_GL, [("tex_lg", logits)], eidx,
+            [("u_ne", int(ne)), ("u_k", int(k))])
+    _gl_run("moe_w_gl", _MOE_W_GL, [("tex_lg", logits), ("tex_idx", eidx)], ew,
+            [("u_ne", int(ne)), ("u_k", int(k)), ("u_norm", 1 if norm else 0)])
+
+
 def _webgl_swiglu(gd, ud, rows, half, gstride, ustride, uoff):
     of = _empty((rows, half))
     return _gl_run("swiglu_gl", _SWIGLU_GLSL, [("tex_g", gd), ("tex_u", ud)], of,
@@ -5993,6 +6078,66 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 _tr_k = {"added": False}
 
 
+_TRANSPOSE_STACK_GLSL = """#version 300 es
+precision highp float; precision highp int; precision highp isampler2D;
+uniform int _ka_tex_output_texture_w;
+uniform isampler2D tex_src;
+uniform int u_n; uniform int u_words; uniform int u_rowb; uniform int u_perw; uniform int u_total;
+out int fragColor;
+int _sw;
+uint sw_(int i) { int y = i / _sw; return uint(texelFetch(tex_src, ivec2(i - y * _sw, y), 0).r); }
+uint sb(uint o) { return (sw_(int(o >> 2u)) >> ((o & 3u) * 8u)) & 255u; }
+void main() {
+  int i = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (i >= u_total) { fragColor = 0; return; }
+  _sw = textureSize(tex_src, 0).x;
+  int per = u_words * u_n;
+  int e = i / per; int rem = i - e * per;
+  int wo = rem / u_n; int row = rem - wo * u_n;
+  uint b = uint(e) * uint(u_perw) * 4u + uint(row) * uint(u_rowb) + uint(wo) * 4u;
+  uint end = uint(e) * uint(u_perw) * 4u + uint(row + 1) * uint(u_rowb);
+  uint v = 0u;
+  if (b + 3u < end) {
+    v = sb(b) | (sb(b + 1u) << 8u) | (sb(b + 2u) << 16u) | (sb(b + 3u) << 24u);
+  } else {
+    for (uint k = 0u; k < 4u; k = k + 1u) {
+      if (b + k >= end) { break; }
+      v = v | (sb(b + k) << (8u * k));
+    }
+  }
+  fragColor = int(v);
+}
+"""
+_tr_gls = {"added": False}
+
+
+def _ggml_transpose_gl_stack(src, n, rowb, ne, perw):
+    """Every expert of a stacked MoE weight transposed in ONE pass.
+
+    A fragment writes its own fragment and the platform renders the whole texture, so the
+    per-expert form the WebGPU path uses -- transpose expert e into its slice of a shared
+    destination -- would clear the experts already written. Adding the expert to the index
+    arithmetic instead makes it a single pass, and the whole layer's expert bytes are in host
+    memory at once anyway: the loader fetches them in one range request and slices.
+
+    `perw` is the padded words per expert in the SOURCE; `rowb` its bytes per row."""
+    words = (rowb + 3) // 4
+    total = words * n * ne
+    plat = _copy_kernel["plat"]
+    if not _tr_gls["added"]:
+        plat.addKernel("ggml_tr_stack_gl", {"source": _TRANSPOSE_STACK_GLSL})
+        _tr_gls["added"] = True
+    dst = _empty_i32((total,))
+    U = lambda k, v: {"name": k, "value": int(v), "type": "int"}
+    plat.runKernel({"name": "ggml_tr_stack_gl",
+                    "inputs": [{"name": "tex_src", "id": src.buffer.buffer_id}],
+                    "output": dst.buffer.buffer_id,
+                    "uniforms": [U("_ka_tex_output_texture_w", dst.buffer.texture_shape.width),
+                                 U("u_n", n), U("u_words", words), U("u_rowb", rowb),
+                                 U("u_perw", perw), U("u_total", total)]})
+    return dst
+
+
 _TRANSPOSE_GLSL = """#version 300 es
 precision highp float; precision highp int; precision highp isampler2D;
 uniform int _ka_tex_output_texture_w;
@@ -6179,6 +6324,25 @@ class GGMLMoELinear(Module):
         words = (rowb + 3) // 4
         self.estride = words * int(N)
         ne = len(chunks)
+        if _webgl_ready() and not _adam_backend_ready():
+            # One upload and one pass. Per-expert transposes into slices of a shared
+            # destination have no fragment-shader form (see `_ggml_transpose_gl_stack`), and
+            # the alternative -- one buffer per expert -- costs the routed kernel and, with
+            # it, the device-side router: the host would have to read the router's scores
+            # back to decide which expert's buffer to bind, once per layer per token.
+            nb = max(len(c) for c in chunks)
+            perb = nb + (-nb) % 4
+            buf = np.zeros(perb * ne, np.uint8)
+            for e, raw in enumerate(chunks):
+                b = np.frombuffer(raw, np.uint8)
+                buf[e * perb:e * perb + b.size] = b
+            up = xp.asarray(buf.view(np.int32))
+            del buf
+            self.packed = _ggml_transpose_gl_stack(up, int(N), rowb, ne, perb // 4)
+            del up
+            self.type_name = type_name
+            self.Kt = int(K); self.Nt = int(N); self.n_experts = ne
+            return
         dst = _empty((self.estride * ne,))
         for e, raw in enumerate(chunks):
             b = np.frombuffer(raw, np.uint8)
