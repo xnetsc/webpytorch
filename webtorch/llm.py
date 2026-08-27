@@ -386,6 +386,30 @@ class _Channels:
         return out
 
 
+def _decode_rate(t_first, steps):
+    """Tokens per second of the decode loop, or None when there is nothing to measure.
+
+    Timed from the moment the FIRST token existed, over the steps after it. Two costs are
+    deliberately outside this window:
+
+      * prefill, which is reported separately as `ttft_s` -- it is paid once and scales with
+        the prompt, so folding it in makes a long prompt look like a slow model.
+      * the first decode step, which on the GPU path also builds the pipeline for the
+        captured command list. It made the first reply after a load read 10.6 tok/s against
+        31.4 for the next one on the same model.
+
+    Below two steps there is no interval to divide by. Reporting `1226.99 tok/s` for a
+    two-token reply, which is what dividing by an almost-zero denominator produced, is worse
+    than reporting nothing.
+    """
+    if steps < 2 or t_first is None:
+        return None
+    dt = time.perf_counter() - t_first
+    if dt <= 0:
+        return None
+    return round((steps - 1) / dt, 2)
+
+
 class GenResult:
     def __init__(self, text, tokens, ttft_s, decode_tok_s):
         self.text = text; self.tokens = tokens
@@ -2096,11 +2120,10 @@ class CausalLM:
                            frequency_penalty=frequency_penalty, stop=stop)
         t0 = time.perf_counter()
 
-        def _stats(n, truncated, steps, td):
-            dec = time.perf_counter() - td
+        def _stats(n, truncated, steps, t_first):
             self.last_stream = {"n": n, "truncated": bool(truncated),
-                                "ttft_s": round(getattr(self, "_stream_ttft", dec), 3),
-                                "tok_s": round(steps / max(dec, 1e-9), 2)}
+                                "ttft_s": round(getattr(self, "_stream_ttft", 0.0), 3),
+                                "tok_s": _decode_rate(t_first, steps)}
             return self.last_stream
 
         # Same capture condition as `generate` -- see `_capturable`.
@@ -2110,7 +2133,7 @@ class CausalLM:
             self._stream_ttft = time.perf_counter() - t0
             pos = P; n = 0; steps = 0
             dec = self.tok.stream_decoder()
-            td = time.perf_counter()
+            t_first = time.perf_counter()
             while n < max_new and nxt != eot:
                 piece = dec.push([nxt]); n += 1; steps += 1
                 if piece:
@@ -2121,7 +2144,7 @@ class CausalLM:
             tail = dec.flush()
             if tail:
                 yield tail
-            _stats(n, n >= max_new and nxt != eot, steps, td)
+            _stats(n, n >= max_new and nxt != eot, steps, t_first)
             return
         for c in self.Kc: c.data[:] = 0.0
         for v in self.Vc: v.data[:] = 0.0
@@ -2131,7 +2154,7 @@ class CausalLM:
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
         dec = self.tok.stream_decoder()
-        td = time.perf_counter()
+        t_first = time.perf_counter()
         while n < max_new and nxt != eot:
             piece = dec.push([nxt]); n += 1; steps += 1
             if piece:
@@ -2143,7 +2166,7 @@ class CausalLM:
         tail = dec.flush()
         if tail:
             yield tail
-        _stats(n, n >= max_new and nxt != eot, steps, td)
+        _stats(n, n >= max_new and nxt != eot, steps, t_first)
 
     def release(self):
         """Free this model's weights (layers, embeddings, head, KV cache). The object must not
@@ -2247,15 +2270,15 @@ class CausalLM:
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
             t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
             ttft = time.perf_counter() - t0
-            gen = [g0]; nxt = g0; pos = P; steps = 0; td = time.perf_counter()
+            gen = [g0]; nxt = g0; pos = P; steps = 0
+            t_first = time.perf_counter()      # the first token exists as of here
             while len(gen) < max_new and not self._stop_now():
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1; steps += 1
                 if nxt == eot:
                     break
                 gen.append(nxt)
-            dec = time.perf_counter() - td
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
-                             round(ttft, 3), round(steps / max(dec, 1e-9), 2))
+                             round(ttft, 3), _decode_rate(t_first, steps))
 
         # WebGPU capture path
         for c in self.Kc:
@@ -2273,7 +2296,7 @@ class CausalLM:
         # it with the same inputs would be harmless for attention -- the KV write is
         # idempotent -- but would advance a recurrent state a second time, so consume the
         # captured result and start replaying from the next position.
-        td = time.perf_counter()
+        t_first = time.perf_counter()          # the first token exists as of here
         gen = [g0]; steps = 1
         nxt = self._pick(logits_t.numpy()[0]); pos = P + 1
         while nxt != eot and len(gen) < max_new:
@@ -2283,6 +2306,5 @@ class CausalLM:
             self._set_inputs(nxt, pos)
             plat.replay("decode")
             nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
-        dec = time.perf_counter() - td
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
-                         round(ttft, 3), round(steps / max(dec, 1e-9), 2))
+                         round(ttft, 3), _decode_rate(t_first, steps))

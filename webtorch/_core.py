@@ -8,13 +8,38 @@ builds on.
 """
 import numpy as np
 
+# Why the GPU is not being used, when it is not. Every step that can fail writes its reason
+# here instead of discarding it, because "it fell back to the CPU" is a symptom and the
+# reason is what anyone can act on -- and the difference is roughly three hundred times, so
+# somebody always ends up asking.
+_backend_why = {"gpu_import": None, "backend_name": None, "platform": None}
+
 try:
     import cupy as cp
     xp = cp
     GPU = True
-except Exception:  # no GPU backend -> fall back to numpy CPU
+except Exception as _e:  # no GPU backend -> fall back to numpy CPU
     xp = np
     GPU = False
+    _backend_why["gpu_import"] = "%s: %s" % (type(_e).__name__, _e)
+
+
+def backend_reason():
+    """What is stopping the GPU path, as a sentence, or None when nothing is.
+
+    Reading this is the supported way to find out why a machine that should be fast is not.
+    """
+    if _adam_kernel.get("platform") is not None:
+        return None
+    if _backend_why["gpu_import"]:
+        return ("the GPU array backend could not be imported (" + _backend_why["gpu_import"]
+                + ") -- in a browser this is normally a page that is not cross-origin "
+                  "isolated, so SharedArrayBuffer is unavailable")
+    if _backend_why["backend_name"]:
+        return "the array backend in use is '%s', not 'webgpu'" % _backend_why["backend_name"]
+    if _backend_why["platform"]:
+        return "the WebGPU platform failed to start (" + _backend_why["platform"] + ")"
+    return "the GPU backend has not been initialised yet"
 
 
 def _to_xp(x):
@@ -2910,14 +2935,20 @@ def _adam_backend_ready():
     if not GPU:
         return False
     try:
-        if cp.get_backend_name() != "webgpu":
+        name = cp.get_backend_name()
+        if name != "webgpu":
+            _backend_why["backend_name"] = str(name)
             return False
         from wgpy_backends.webgpu.platform import get_platform
         from wgpy_backends.webgpu.webgpu_buffer import create_meta_buffer_from_structure
         _adam_kernel["platform"] = get_platform()
         _adam_kernel["make_meta"] = create_meta_buffer_from_structure
         return True
-    except Exception:
+    except Exception as e:
+        # Kept, not swallowed. This except used to return False and lose the reason, which
+        # is why a report of 0.5 tok/s on a machine that should manage hundreds could not be
+        # diagnosed from anything the page knew.
+        _backend_why["platform"] = "%s: %s" % (type(e).__name__, e)
         return False
 
 

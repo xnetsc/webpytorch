@@ -33,6 +33,7 @@ __version__ = "0.1.0"
 from . import _core
 from ._core import *                                  # Tensor, Module, Linear, Conv2d, ... (public names)
 from . import _core as core                           # full core (incl. kernels) if needed
+from ._core import backend_reason                     # why the GPU path is not in use
 
 # ---- high-level SDK surface (transformers/torch style) ----
 from ._sdk import (install_torch, load, Model, release, loaded_models, release_all, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
@@ -82,7 +83,7 @@ __all__ = [
     "prefetch_whole_file",
     "throttle_reads",
     "set_download_progress", "get_download_progress",
-    "cancel_requested",
+    "cancel_requested", "backend_reason",
     "set_read_progress", "get_read_progress",
     "export_model", "import_model", "model_groups",
     "backend", "has_gpu", "require_gpu",
