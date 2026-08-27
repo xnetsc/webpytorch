@@ -938,12 +938,16 @@ function messageNode(m, live) {
     fillBody(b, m, live);
   }
   if (live) tools.style.display = 'none';        // nothing to edit or delete mid-stream
-  // Double-click the message to edit it — except inside a code block, which is its own
-  // editor already and where a double-click is how you select a word.
-  else b.addEventListener('dblclick', (e) => {
-    if (e.target.closest('pre, .runout, .editbox')) return;
-    editMessage(m, b);
-  });
+  // Double-click to edit -- but ONLY on a message that has no blocks of its own.
+  //
+  // A reply is rendered as blocks, and each of those handles its own double-click: a
+  // paragraph opens as text, a table cell as whatever that cell holds. A handler here as
+  // well would fire on the same double-click and replace the whole body with a textarea,
+  // taking the block editor with it -- which is exactly what happened, and looked like the
+  // cell editor's Save and Cancel doing nothing.
+  //
+  // What the person typed has no blocks: it is one piece of text, and this is its editor.
+  else if (m.role === 'user') b.addEventListener('dblclick', () => editMessage(m, b));
   (m.attachments || []).forEach(a => {
     if (a.dataUrl) { const im = new Image(); im.src = a.dataUrl;
                      wireImage(im, a.name || 'image.png'); b.appendChild(im); }
@@ -1315,7 +1319,7 @@ function blockNode(msg, i, src) {
   } else if (!isCode) {
     d.title = 'Double-click to edit';
     d.addEventListener('dblclick', (e) => {
-      if (e.target.closest('.runout, .blockedit')) return;
+      if (e.target.closest('.runout, .blockedit, .cellpop')) return;
       editBlock(msg, i, d);
     });
   }
@@ -1380,6 +1384,10 @@ function wireCell(msg, i, table, cell) {
   cell.title = 'Click to edit this ' + kind;
   cell.classList.add('cell-' + kind);
   cell.addEventListener('click', (e) => {
+    // A click from inside the editor is the editor's, not an invitation to open another.
+    // Without this, Save re-opened it: the handler tears the editor down and re-wires the
+    // cell, and the very same click then reaches the fresh listener with nothing to stop it.
+    if (e.target.closest('.cellpop')) return;
     if (cell.querySelector('.celledit')) return;
     e.preventDefault();
     openCellEditor(msg, i, table, cell, kind);
@@ -1413,12 +1421,14 @@ function openCellEditor(msg, i, table, cell, kind) {
     cell.innerHTML = html;
     wireCell(msg, i, table, cell);          // its kind may have changed
   };
-  no.onclick = () => close(was);
-  ok.onclick = () => {
+  no.onclick = (e) => { e.stopPropagation(); close(was); };
+  ok.onclick = (e) => {
+    e.stopPropagation();
     cell.dataset.src = inp.value.trim();
     close(renderInline(cell.dataset.src));
     commitTable(msg, i, table);
   };
+  box.addEventListener('click', (e) => e.stopPropagation());
   inp.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') close(was);
     if (e.key === 'Enter') ok.click();
