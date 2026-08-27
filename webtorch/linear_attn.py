@@ -223,12 +223,17 @@ class LinearAttention:
         flags = ((1 if self._has_conv else 0) | (2 if self.w.get("dt_bias") is not None else 0)
                  | (4 if self.w.get("A") is not None else 0) | (8 if braw is not None else 0)
                  | (16 if self.w.get("conv_b") is not None else 0))
-        wt.gdn_prepare(wt._contig(qkv.data), (zero if braw is None else wt._contig(braw.data)),
-                       (zero if araw is None else wt._contig(araw.data)),
-                       g[1] if g[1] is not None else zero, self._konst(), packed,
-                       self.hk, self.hv, self.dk, self.dv,
-                       max(1, self.conv_width), flags)
-        out = wt.gdn_step(g[0], packed, self.hv, self.dk, self.dv, self.rep)
+        # Both kernels hand the state back: in place on a backend that can write it that
+        # way, and as a new buffer on one that cannot. Storing what comes back is what makes
+        # the second case free -- the alternative is a copy over the whole state per layer.
+        packed, cnew = wt.gdn_prepare(
+            wt._contig(qkv.data), (zero if braw is None else wt._contig(braw.data)),
+            (zero if araw is None else wt._contig(araw.data)),
+            g[1] if g[1] is not None else zero, self._konst(), packed,
+            self.hk, self.hv, self.dk, self.dv, max(1, self.conv_width), flags)
+        if g[1] is not None:
+            g[1] = cnew
+        out, g[0] = wt.gdn_step(g[0], packed, self.hv, self.dk, self.dv, self.rep)
         if self.w.get("norm") is not None:
             gw = self._norm_t()
             rows = self.hv if self._norm_per_head else 1
@@ -311,7 +316,7 @@ class LinearAttention:
 
     def _gpu_step_ok(self):
         """Is every piece this layer uses available on the device?"""
-        if not self._GDN_GPU or not wt._adam_backend_ready():
+        if not self._GDN_GPU or not (wt._adam_backend_ready() or wt._webgl_ready()):
             return False
         return all(not callable(self.w.get(n)) or hasattr(self.w.get(n), "forward")
                    for n in ("qkv", "q", "k", "v", "beta", "alpha", "g", "o")

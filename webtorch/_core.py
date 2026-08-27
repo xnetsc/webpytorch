@@ -529,6 +529,17 @@ def gelu(x):
 
 
 def silu(x):
+    """x * sigmoid(x).
+
+    Fused where the backend has it and the value carries no autograd node. Written out it
+    is five dispatches -- negate, exp, add, divide, multiply -- each reading and writing the
+    whole tensor, and the recurrent layers call it once per layer per token.
+    """
+    if (isinstance(x, Tensor) and not x.requires_grad
+            and _webgl_ready() and not _adam_backend_ready()):
+        r = _webgl_silu(x)
+        if r is not None:
+            return r
     return x * x.sigmoid()
 
 
@@ -4886,6 +4897,170 @@ def _webgl_cat(datas, axis):
     return out
 
 
+# Gated DeltaNet, on WebGL.
+#
+# The hybrid models put a recurrent layer between the attention ones, and without these the
+# layer runs on the HOST: the activations come off the device and the whole block is done in
+# numpy. On a 64-layer hybrid that is six read-backs per layer per token -- 347 a token on a
+# 27B -- and a read-back drains the command queue, so it costs far more than the arithmetic
+# it avoids.
+#
+# Two things differ from the WGSL. There is no workgroup reduction, so a fragment that needs
+# a head's L2 norm recomputes the head rather than sharing one; the head is `dk` wide and the
+# fragments run at once, which is the same trade the one-pass rmsnorm makes. And the state
+# and the conv ring buffer are updated OUT of place and copied back: a fragment shader cannot
+# read the texture it is writing, so `S[i] = S[i] * decay + ...` has to become a new buffer
+# and a copy. That copy is one pass over a few megabytes, against the read-back it replaces.
+
+_GDN_PRE_GL = _gl_head([("tex_qkv", "Qf"), ("tex_b", "Bf"), ("tex_a", "Af"),
+                        ("tex_cst", "Cf"), ("tex_k", "Kf")],
+                       ("u_hk", "u_hv", "u_dk", "u_dv", "u_W", "u_flags", "u_n")) + """
+int C_;
+float convval(int c) {
+  float raw = Qf(c);
+  if ((u_flags & 1) == 0) { return raw; }
+  float acc = 0.0;
+  for (int j = 0; j + 1 < u_W; j = j + 1) { acc += Cf(j * C_ + c) * Kf(j * C_ + c); }
+  acc += raw * Kf((u_W - 1) * C_ + c);
+  if ((u_flags & 16) != 0) { acc += Kf(u_W * C_ + c); }
+  return acc / (1.0 + exp(-acc));            // SiLU
+}
+void main() {
+  int i = _idx();
+  int nq = u_hk * u_dk; int nv = u_hv * u_dv;
+  C_ = 2 * nq + nv;
+  if (i >= u_n) { fragColor = 0.0; return; }
+  if (i >= C_) {                              // the decay and beta gates
+    int t = i - C_;
+    int ko = u_W * C_ + C_;                   // conv_w, conv_b, then A, dt_bias
+    if (t < u_hv) {
+      float a = Af(t);
+      if ((u_flags & 2) != 0) { a += Kf(ko + u_hv + t); }
+      float sp = max(a, 0.0) + log(1.0 + exp(-abs(a)));
+      float d = ((u_flags & 4) != 0) ? sp * Kf(ko + t) : sp;
+      fragColor = exp(min(d, 0.0));
+    } else {
+      int h = t - u_hv;
+      fragColor = ((u_flags & 8) != 0) ? 1.0 / (1.0 + exp(-Bf(h))) : 1.0;
+    }
+    return;
+  }
+  float val = convval(i);
+  if (i < 2 * nq) {                           // a q or k channel: L2-normalised per head
+    int g = i / u_dk;
+    int c0 = g * u_dk;
+    float s = 0.0;
+    for (int t = 0; t < u_dk; t = t + 1) { float v = convval(c0 + t); s += v * v; }
+    float v = val * inversesqrt(s + 1e-6);
+    if (g < u_hk) { v *= inversesqrt(float(u_dk)); }   // q also carries 1/sqrt(dk)
+    fragColor = v;
+  } else {
+    fragColor = val;
+  }
+}
+"""
+
+# The ring buffer holds INPUTS, so it shifts in the raw projection rather than the conv
+# output. Out of place, then copied back.
+_GDN_CST_GL = _gl_head([("tex_qkv", "Qf"), ("tex_cst", "Cf")], ("u_C", "u_W", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int j = i / u_C; int c = i - j * u_C;
+  fragColor = (j + 2 < u_W) ? Cf((j + 1) * u_C + c) : Qf(c);
+}
+"""
+
+_GDN_STEP_GL = _gl_head([("tex_S", "Sf"), ("tex_qkv", "Qf")],
+                        ("u_hv", "u_dk", "u_dv", "u_rep", "u_n")) + """
+void main() {
+  int i = _idx();
+  int n = u_hv * u_dv;
+  if (i >= 2 * n) { fragColor = 0.0; return; }
+  int e = (i < n) ? i : (i - n);
+  int h = e / u_dv; int vi = e - h * u_dv;
+  // q and k are stored per KEY head and the key heads CYCLE across the value heads
+  // (ggml: iq1 = iv1 % n_q_heads), so this is a modulo rather than a divide.
+  int hk = u_hv / u_rep;
+  int nq = hk * u_dk;
+  int qo = (h % hk) * u_dk;
+  int ko = nq + qo;
+  int sbase = h * u_dk * u_dv + vi;
+  float pred = 0.0; float qs = 0.0; float qk = 0.0;
+  for (int d = 0; d < u_dk; d = d + 1) {
+    float sv = Sf(sbase + d * u_dv);
+    float kd = Qf(ko + d);
+    float qd = Qf(qo + d);
+    pred += kd * sv; qs += qd * sv; qk += qd * kd;
+  }
+  float dcy = Qf(2 * nq + n + h);
+  float bta = Qf(2 * nq + n + u_hv + h);
+  float delta = (Qf(2 * nq + h * u_dv + vi) - dcy * pred) * bta;
+  fragColor = (i < n) ? (dcy * qs + delta * qk) : delta;
+}
+"""
+
+_GDN_UPD_GL = _gl_head([("tex_S", "Sf"), ("tex_qkv", "Qf"), ("tex_od", "Of")],
+                       ("u_hv", "u_dk", "u_dv", "u_rep", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int h = i / (u_dk * u_dv); int rem = i - h * (u_dk * u_dv);
+  int d = rem / u_dv; int vi = rem - d * u_dv;
+  int hk = u_hv / u_rep;
+  int nq = hk * u_dk;
+  float dcy = Qf(2 * nq + u_hv * u_dv + h);
+  fragColor = Sf(i) * dcy + Qf(nq + (h % hk) * u_dk + d) * Of(u_hv * u_dv + h * u_dv + vi);
+}
+"""
+
+
+def _webgl_gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
+    nq, nv = hk * dk, hv * dv
+    C = 2 * nq + nv
+    _gl_run("gdn_pre_gl", _GDN_PRE_GL,
+            [("tex_qkv", qkv), ("tex_b", braw), ("tex_a", araw),
+             ("tex_cst", cst), ("tex_k", konst)], out,
+            [("u_hk", hk), ("u_hv", hv), ("u_dk", dk), ("u_dv", dv),
+             ("u_W", W), ("u_flags", flags), ("u_n", C + 2 * hv)])
+    if (flags & 1) and W > 1:
+        cst = _gl_run("gdn_cst_gl", _GDN_CST_GL, [("tex_qkv", qkv), ("tex_cst", cst)],
+                      _empty((int(cst.size),)),
+                      [("u_C", C), ("u_W", W), ("u_n", int(cst.size))])
+    return out, cst
+
+
+def _webgl_gdn_step(S, qkv, hv, dk, dv, rep):
+    n = hv * dv
+    od = _empty((2 * n,))
+    _gl_run("gdn_step_gl", _GDN_STEP_GL, [("tex_S", S), ("tex_qkv", qkv)], od,
+            [("u_hv", hv), ("u_dk", dk), ("u_dv", dv), ("u_rep", max(1, rep)), ("u_n", n)])
+    tot = hv * dk * dv
+    S_next = _gl_run("gdn_upd_gl", _GDN_UPD_GL,
+                     [("tex_S", S), ("tex_qkv", qkv), ("tex_od", od)], _empty((tot,)),
+                     [("u_hv", hv), ("u_dk", dk), ("u_dv", dv),
+                      ("u_rep", max(1, rep)), ("u_n", tot)])
+    return Tensor(od[:n]), S_next
+
+
+_SILU_GL = _gl_head([("tex_x", "Xf")], ("u_n",)) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  float v = Xf(i);
+  fragColor = v / (1.0 + exp(-v));
+}
+"""
+
+
+def _webgl_silu(x):
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    n = int(xd.size)
+    of = _empty(tuple(xd.shape))
+    _gl_run("silu_gl", _SILU_GL, [("tex_x", xd)], of, [("u_n", n)])
+    return Tensor(of)
+
+
 def _webgl_swiglu(gd, ud, rows, half, gstride, ustride, uoff):
     of = _empty((rows, half))
     return _gl_run("swiglu_gl", _SWIGLU_GLSL, [("tex_g", gd), ("tex_u", ud)], of,
@@ -5750,8 +5925,15 @@ _gdnp_k = {"added": False}
 def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
     """Conv + SiLU + L2 norm + gates, writing the packed q|k|v|decay|beta the step wants.
 
-    `cst` (the conv ring buffer) is updated in place. `flags` bits: 1 conv, 2 dt_bias,
-    4 A, 8 beta projection, 16 conv bias."""
+    Returns `(out, cst_next)`. `cst_next` is `cst` itself where the backend updates the
+    ring buffer in place, and a NEW buffer where it cannot -- a fragment shader may not read
+    the texture it writes, so WebGL shifts the ring into a fresh one. The caller stores what
+    comes back rather than assuming which happened; copying it into the original instead
+    costs a full pass over the buffer per layer per token.
+
+    `flags` bits: 1 conv, 2 dt_bias, 4 A, 8 beta projection, 16 conv bias."""
+    if _webgl_ready() and not _adam_backend_ready():
+        return _webgl_gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags)
     plat = _adam_kernel["platform"]
     if not _gdnp_k["added"]:
         ro, rw = "read-only-storage", "storage"
@@ -5765,7 +5947,7 @@ def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
                                 konst.buffer.buffer_id, out.buffer.buffer_id,
                                 meta.buffer_id],
                     "workGroups": {"x": 2 * hk + hv + 1, "y": 1, "z": 1}})
-    return out
+    return out, cst
 
 
 # Weights are stored one row after another, so in a matmul the threads of a workgroup --
@@ -5923,7 +6105,9 @@ def gdn_step(S, qkv, hv, dk, dv, rep=1):
 
     `S` is the (hv, dk, dv) state, updated in place; `qkv` packs q | k | v | decay | beta
     for this token, with q and k stored per KEY head (`rep` value heads share each).
-    Returns the (hv*dv,) output."""
+    Returns `(output, S_next)` -- see `gdn_prepare` for why the state comes back."""
+    if _webgl_ready() and not _adam_backend_ready():
+        return _webgl_gdn_step(S, qkv, hv, dk, dv, rep)
     plat = _adam_kernel["platform"]
     if not _gdn_k["added"]:
         ro, rw = "read-only-storage", "storage"
@@ -5942,7 +6126,7 @@ def gdn_step(S, qkv, hv, dk, dv, rep=1):
                     "tensors": [S.buffer.buffer_id, qkv.buffer.buffer_id,
                                 od.buffer.buffer_id, meta.buffer_id],
                     "workGroups": {"x": (tot + 63) // 64, "y": 1, "z": 1}})
-    return Tensor(od[:n])
+    return Tensor(od[:n]), S
 
 
 class GGMLLinear(Module):
