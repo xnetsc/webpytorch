@@ -502,7 +502,7 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
     if not cache:
         set_io_read(default_io_read); return
     cdir = cache_dir or _default_hub_cache()
-    known, served = {}, {}
+    known = {}
 
     async def size(name):
         try: return await http_size(name)
@@ -525,21 +525,18 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
         h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:                                    # a file the person pointed at
             data = await _read_local_file(h, offset, length)
-            served[name] = served.get(name, 0) + len(data)
-            _report(name, served[name], None)
+            _report(name, len(data), None)
             return data
         # Ask the cache; if it has not got them, that is this callback's problem to solve.
         hit = await read_cache(name, offset, length, cdir)
         if hit is not None and (length is None or len(hit) >= length):
-            served[name] = served.get(name, 0) + len(hit)
-            _report(name, served[name], known.get(name))
+            _report(name, len(hit), known.get(name))
             return hit
         got = len(hit) if hit else 0
         if await await_inflight(name, offset + got, chunk_mb << 20):
             again = await read_cache(name, offset, length, cdir)
             if again is not None and (length is None or len(again) >= length):
-                served[name] = served.get(name, 0) + len(again)
-                _report(name, served[name], known.get(name))
+                _report(name, len(again), known.get(name))
                 return again
             hit = again if again is not None else hit
             got = len(hit) if hit else 0
@@ -553,8 +550,7 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
             known[name] = total
         await write_cache(name, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
         out = (hit or b"") + data
-        served[name] = served.get(name, 0) + len(out)
-        _report(name, served[name], total)
+        _report(name, len(out), total)
         return out
 
     set_io_read(read)
@@ -1040,23 +1036,33 @@ def _prog_state(key):
     if st is None:
         import time
         now = time.monotonic()
-        st = _progress["state"][key] = {"t0": now, "t": now, "done": 0, "rate": 0.0}
+        st = _progress["state"][key] = {"t0": now, "t": now, "done": 0, "mark": 0,
+                                        "rate": 0.0}
     return st
 
 
-def _report(key, done, total):
+def _report(key, delta, total):
+    """Add `delta` freshly-served bytes for `key` and report the running total.
+
+    The total lives HERE, not in the reader, because the reader is installed once and stays
+    installed while any number of loads come and go -- so a counter it owned would keep
+    climbing. Loading a 13 GB file, releasing it and loading it again reported 26 GB. This
+    state is cleared by `set_read_progress`, which is called at the start of every load.
+    """
     _check_cancel()      # every served chunk is a stop checkpoint, progress hook or not
     cb = _progress["cb"]
     if cb is None:
         return
     import time
     st = _prog_state(key)
+    st["done"] += delta
+    done = st["done"]
     now = time.monotonic()
     dt = now - st["t"]
     if dt >= 0.2:                             # smooth over a window, not per read
         a = 0.4                               # recent enough to feel live, steady enough to read
-        st["rate"] = a * ((done - st["done"]) / dt) + (1 - a) * st["rate"]
-        st["t"] = now; st["done"] = done
+        st["rate"] = a * ((done - st["mark"]) / dt) + (1 - a) * st["rate"]
+        st["t"] = now; st["mark"] = done
     el = now - st["t0"]
     # Until the window has produced a figure, the average since the first read is the honest
     # answer -- but only once enough time has passed to divide by. Clamping the elapsed time
@@ -1910,7 +1916,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     """
     hdr = {"Authorization": "Bearer " + token} if token else None
     cdir = (cache_dir or _default_hub_cache()) if cache else None
-    known, served = {}, {}
+    known = {}
 
     async def size(url):
         return await http_size(url, hdr)
@@ -1939,28 +1945,24 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:
             data = await _read_local_file(h, offset, length)
-            served[name] = served.get(name, 0) + len(data)
-            _report(name, served[name], None)
+            _report(name, len(data), None)
             return data
         # A same-origin path ("/models/…", "./x.gguf") is a location, not a repo id: fetch it
         # where it is served and do NOT copy it into the hub cache — it is already local, so
         # caching it would burn quota for nothing. Only repo ids and full URLs map to the hub.
         if str(name).startswith(("/", "./")):
             data = await http_get(name, offset, length)
-            served[name] = served.get(name, 0) + len(data)
-            _report(name, served[name], None)
+            _report(name, len(data), None)
             return data
         url = to_key(name)
         if cdir is None:                               # caching off: straight to HTTP
             data = await get(url, offset, length)
-            served[url] = served.get(url, 0) + len(data)
-            _report(url, served[url], None)
+            _report(url, len(data), None)
             return data
 
         hit = await read_cache(url, offset, length, cdir)
         if hit is not None and (length is None or len(hit) >= length):
-            served[url] = served.get(url, 0) + len(hit)  # cached bytes are loaded bytes too
-            _report(url, served[url], known.get(url))
+            _report(url, len(hit), known.get(url))   # cached bytes are loaded bytes too
             return hit
 
         # A miss, or a short answer that ran into a gap. If the read-ahead is already
@@ -1971,8 +1973,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         if await await_inflight(url, offset + got, chunk_mb << 20):
             again = await read_cache(url, offset, length, cdir)
             if again is not None and (length is None or len(again) >= length):
-                served[url] = served.get(url, 0) + len(again)
-                _report(url, served[url], known.get(url))
+                _report(url, len(again), known.get(url))
                 return again
             hit = again if again is not None else hit
             got = len(hit) if hit else 0
@@ -1989,8 +1990,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             known[url] = total
         await write_cache(url, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
         out = (hit or b"") + data
-        served[url] = served.get(url, 0) + len(out)
-        _report(url, served[url], total)
+        _report(url, len(out), total)
         return out
 
     return read
