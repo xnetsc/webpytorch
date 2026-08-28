@@ -119,6 +119,37 @@ async function decodeImages(urls) {
   return out;
 }
 
+// Can this model be told about tools at all?
+//
+// Rendered twice, with and without. A template that does not take tools either raises or --
+// worse, because it is silent -- produces the very same prompt, and in both cases telling
+// the model about tools is at best pointless and at worst a broken prompt. Comparing the
+// two outputs is the only answer that does not depend on knowing the model.
+async function toolsSupported() {
+  if (!ready || !pyodide) return false;
+  try {
+    // The result must be the last TOP-LEVEL expression: a value produced inside an `if`
+    // body is not what Pyodide hands back, so this assigns and ends with the name.
+    return await pyodide.runPythonAsync(`
+_ok = False
+_m = _MODEL["m"]
+_t = getattr(getattr(_m, "impl", _m), "tok", None) if _m is not None else None
+if _t is not None:
+    _msgs = [{"role": "user", "content": "hi"}]
+    _probe = [{"type": "function", "function": {
+        "name": "_probe_tool", "description": "probe",
+        "parameters": {"type": "object", "properties": {}}}}]
+    try:
+        _a = _t.encode_chat(None, None, messages=_msgs)
+        _b = _t.encode_chat(None, None, messages=_msgs, tools=_probe)
+        _ok = bool(_a != _b)
+    except Exception:
+        _ok = False
+_ok
+`);
+  } catch (e) { return false; }
+}
+
 async function generate(prompt, opts) {
   // A stop asked for during the LAST reply must not end this one before it starts.
   await pyodide.runPythonAsync('import webtorch; webtorch.cancel(False)');
@@ -150,8 +181,12 @@ _msgs = _o.get("messages") or None        # full conversation; falls back to the
 # Every generation option the SDK takes is forwarded by name, so adding a control to the
 # page needs no change here -- and an option the page does not set stays at the model's own
 # default rather than being overridden with a guess.
+# "tools" rides here too: the SDK hands it to the model's own chat template, so which
+# models can be told about tools is a question about their template, not about this list.
+# (No backticks in this block -- it is inside a JS template literal.)
 _PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
-         "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop")
+         "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop",
+         "tools")
 _kw = dict(max_new=_n or None, stream=True, channels=True, enable_thinking=_think)
 for _k in _PASS:
     _v = _o.get(_k)
@@ -250,15 +285,41 @@ json.dumps(await webtorch.import_model(_h, _n or None))
 `);
 }
 
+let exportTotal = 0;
 async function exportModel(keys, handle) {
   await boot();
-  const w = await handle.createWritable();
+  // How much there is to write, so the meter is a fraction rather than a rising number.
+  try {
+    pyodide.globals.set('_ekeys', keys);
+    exportTotal = Number(await pyodide.runPythonAsync(`
+import webtorch
+_items = await webtorch.list_cache()
+_want = set(_ekeys)
+sum(int(i.get("size") or 0) for i in _items if i.get("key") in _want)
+`)) || 0;
+  } catch (e) { exportTotal = 0; }
+  let w;
+  try {
+    w = await handle.createWritable();
+  } catch (e) {
+    // Say which failure this was. "Failed to execute 'createWritable'" on its own sends
+    // whoever reads it looking in the wrong place -- the usual cause is the write permission
+    // on the picked file, which only the page can obtain.
+    throw new Error('cannot write to the chosen file (' + (e && e.name || 'error') + ': '
+      + String((e && e.message) || e).slice(0, 160) + '). If the browser asked for permission '
+      + 'and it was dismissed, choose the file again and allow it.');
+  }
   let done = 0;
   self.__sink = async (bytes) => {
     const u8 = bytes.toJs ? bytes.toJs() : bytes;
     await w.write(u8);
     done += u8.length;
-    send({ type: 'progress', bytes: done });
+    // Its own message type. Reported as `progress` it was rendered as "loaded …", which
+    // reads as a model being loaded -- and an export of a few hundred megabytes takes long
+    // enough (81 s measured for 400 MB) that the only other thing to look at is the file
+    // itself, which stays at ZERO until `close()`: the browser writes a temporary file and
+    // swaps it in at the end. Nothing wrong, nothing to see, and no way to tell.
+    send({ type: 'exporting', bytes: done, total: exportTotal });
   };
   try {
     pyodide.globals.set('_keys', keys);
@@ -296,9 +357,24 @@ if _MODEL["m"] is not None:
 
 // Sets the SDK's one-shot stop flag; the load in flight raises at its next IO checkpoint
 // and its own error path reports the cancellation. Nothing to stop before boot finishes.
-async function stopLoad() {
-  if (!ready) return;
-  await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
+// Setting a flag must not queue behind the thing it is meant to stop.
+//
+// This used to be `runPythonAsync('webtorch.cancel()')`, which is scheduled like any other
+// Python job -- so the cancel waited for the load it was cancelling to yield, and on a slow
+// network that is many seconds. Pressing Stop did nothing visible, then everything at once.
+//
+// Calling the function directly is not the same thing: while the load is suspended on a
+// fetch, control is in the JS event loop and the interpreter is free, so this sets the flag
+// now and the load sees it at its next checkpoint.
+function stopLoad() {
+  if (!ready || !pyodide) return;
+  try {
+    const wt = pyodide.pyimport('webtorch');
+    try { wt.cancel(); } finally { if (wt.destroy) wt.destroy(); }
+  } catch (e) {
+    // Falls back to the queued form rather than not cancelling at all.
+    try { pyodide.runPythonAsync('import webtorch; webtorch.cancel()'); } catch (e2) {}
+  }
 }
 
 onmessage = async (e) => {
@@ -307,7 +383,7 @@ onmessage = async (e) => {
     let res = null;
     if (cmd === 'boot') await boot();
     else if (cmd === 'load') await loadModel(args.repo, args.file, args.lmax);
-    else if (cmd === 'stopLoad') await stopLoad();
+    else if (cmd === 'stopLoad') stopLoad();
     // Stop a reply mid-flight. The same flag the loader uses, read (not raised on) between
     // tokens, so `generate` returns the part of the answer that already exists.
     else if (cmd === 'stopGen') {
@@ -315,6 +391,7 @@ onmessage = async (e) => {
       res = true;
     }
     else if (cmd === 'generate') res = await generate(args.prompt, args);
+  else if (cmd === 'toolsSupported') res = await toolsSupported();
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'cacheList') res = await cacheList();
     else if (cmd === 'cacheDelete') await cacheDelete(args.key);

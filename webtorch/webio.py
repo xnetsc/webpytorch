@@ -401,6 +401,63 @@ async def _pyfetch(url, **kw):
         _INFLIGHT.pop(fid, None)
 
 
+async def _read_streaming(r, url):
+    """The response body, reported as it arrives rather than when it is complete.
+
+    `r.bytes()` waits for the whole chunk, and a chunk here is 16 MiB. On a slow link that is
+    one progress update every sixteen seconds -- during which a download that is working
+    looks exactly like one that has hung, which is what it was taken for. Reading the stream
+    reports every piece the network hands over, so the meter moves at the speed the bytes do.
+
+    Falls back to `r.bytes()` wherever the stream is not reachable (a host runtime, an older
+    response object), because a progress meter is not worth failing a read over.
+    """
+    try:
+        body = r.js_response.body
+        reader = body.getReader()
+    except Exception:
+        return bytes(await r.bytes())
+    # What the response says it will deliver, so a body that ends early can be told from one
+    # that ended. Reading a stream makes that failure reachable in a way `r.bytes()` did not:
+    # a connection dropped mid-chunk closes the stream cleanly, and the bytes gathered so far
+    # would otherwise be returned as a whole chunk and cached as one -- a silently truncated
+    # model, which is the worst outcome available here.
+    want = None
+    try:
+        cr = r.js_response.headers.get("content-range")
+        if cr and "/" in cr and "-" in cr:
+            span = cr.split(" ")[-1].split("/")[0]
+            a, b = span.split("-")
+            want = int(b) - int(a) + 1
+        else:
+            cl = r.js_response.headers.get("content-length")
+            if cl:
+                want = int(cl)
+    except Exception:
+        want = None
+    parts, total = [], 0
+    try:
+        while True:
+            res = await reader.read()
+            if res.done:
+                break
+            buf = res.value.to_py().tobytes()
+            parts.append(buf)
+            total += len(buf)
+            _note_download(url, len(buf))     # the rate line, at the rate it is happening
+    except Exception:
+        # An abort lands here. Nothing partial escapes: the accumulated pieces go with the
+        # stack, and the caller sees the failure rather than a short read.
+        raise
+    finally:
+        try: reader.releaseLock()
+        except Exception: pass
+    if want is not None and total != want:
+        raise HttpError(0, "truncated response: got %d of %d bytes from %s"
+                           % (total, want, url))
+    return b"".join(parts)
+
+
 async def _fetch_once(url, rng, headers):
     _check_cancel()      # a retry loop's next attempt is a checkpoint too, not just the first
     try:
@@ -413,7 +470,7 @@ async def _fetch_once(url, rng, headers):
         if rng: h["Range"] = rng
         try:
             r = await _pyfetch(url, headers=h)
-            data = bytes(await r.bytes())
+            data = await _read_streaming(r, url)
         except Exception:
             # Aborted because a stop fired while it ran -> the stop, not a transport fault.
             # Decided by the stop counter (not the flag), so it stays right whichever of
@@ -1566,7 +1623,8 @@ async def http_get(url, offset=0, length=None, headers=None):
     on a non-2xx status. A ready-made `fetch` building block for a read callback."""
     rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
     data = await _fetch_once(url, rng, headers)
-    _note_download(url, len(data))            # this transport IS HTTP, so it has a speed
+    # No `_note_download` here: the streaming reader already reported these bytes as they
+    # arrived, and counting them again would double the rate it shows.
     return data
 
 async def http_size(url, headers=None):

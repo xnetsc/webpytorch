@@ -176,6 +176,14 @@
         disturb a conversation.</p>
       <label class="check"><input type="checkbox" id="pyEnabled" checked />
         Enable running code</label>
+      <label class="check"><input type="checkbox" id="pyTools" />
+        Let the model use this runtime itself</label>
+      <p class="hint">With this on, the model is told the runtime exists and can run code,
+        add modules or restart it in the middle of an answer — and is asked again with what
+        came back, so it can compute instead of guessing. Every call and its result is shown
+        in the reply. Off by default: a model acting on its own initiative is a different
+        thing from one that answers, and only models whose chat template documents tools can
+        use it at all.</p>
       <label class="fld">Modules to have ready
         <input id="pyPackages" type="text" placeholder="numpy, pandas, matplotlib" />
       </label>

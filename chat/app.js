@@ -248,10 +248,24 @@ worker.onmessage = (e) => {
     $('#modelStatus').textContent = m.text;
     $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
   }
-  else if (m.type === 'progress') { if (m.total) expected = m.total;
+  else if (m.type === 'exporting') {
+    // Said as what it is. The file on disk stays at zero bytes until the export closes --
+    // the browser writes a temporary and swaps it in -- so this line is the only sign it is
+    // working, and it must not be mistaken for a model load.
+    const pct = m.total ? ' of ' + fmt(m.total) : '';
+    $('#progressText').textContent = 'writing ' + fmt(m.bytes) + pct
+      + ' — the file appears when this finishes';
+    if (m.total) setBar(m.bytes / m.total);
+  }
+  else if (m.type === 'progress') { if (m.total) { expected = m.total; expectedIsReal = true; }
     if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
     showProgress(m.bytes, m.rate, m.dlRate); }
-  else if (m.type === 'loaded') { modelLoaded = true; modelImage = !!m.image;
+  else if (m.type === 'loaded') {
+    probeTools();            // asked once per model, before any reply needs the answer
+    modelLoaded = true; modelImage = !!m.image;
+    // Done is done: leaving the last mid-load fraction on screen reads as a load that
+    // stalled just short of the end.
+    if (lastLoadedBytes) $('#progressText').textContent = 'loaded ' + fmt(lastLoadedBytes);
     setBar(1); syncButtons(); refreshCache(); }
   else if (m.type === 'chunk') {
     // One decoded token. Append it to the message being streamed and update that message's
@@ -739,12 +753,20 @@ function syncButtons() {
   $('#composer').classList.toggle('locked', off);
 }
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
-let expected = 0;
+let expected = 0, expectedIsReal = false;
+let lastLoadedBytes = 0;
 function showProgress(bytes, rate, dlRate) {
+  lastLoadedBytes = bytes;
   // "loaded", not "downloaded": the same meter covers a load served entirely from cache.
   // The download figure is shown only while bytes are actually coming over the wire --
   // it comes from the HTTP reader, and a cached load has none.
-  const parts = ['loaded ' + fmt(bytes) + (expected ? ' of ' + fmt(expected) : '')];
+  //
+  // "of" only against a total the LOADER reported. The preset's size is a rounded label for
+  // a human choosing a model, not a byte count: comparing real bytes against it leaves a
+  // finished load reading "397.2 MB of 400.0 MB", which says something false about a file
+  // that arrived whole. It seeds the bar so there is something to watch, and the moment a
+  // real total arrives it is replaced.
+  const parts = ['loaded ' + fmt(bytes) + (expectedIsReal ? ' of ' + fmt(expected) : '')];
   if (rate) parts.push(fmt(rate) + '/s');
   if (dlRate) parts.push('↓ ' + fmt(dlRate) + '/s');
   $('#progressText').textContent = parts.join(' · ');
@@ -828,17 +850,25 @@ function fillPresets() {
 // multi-GB download — and everything reverts to the initial state once it stops.
 let loading = false;
 $('#loadBtn').onclick = async () => {
-  if (loading) { call('stopLoad'); return; }
+  if (loading) {
+    // Say so at once. The flag is set immediately now, but the load still has to reach its
+    // next checkpoint, and a button that does not change reads as a button that did nothing.
+    $('#loadBtn').textContent = 'Stopping…';
+    $('#loadBtn').disabled = true;
+    call('stopLoad');
+    return;
+  }
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
   const id = $('#modelId').value.trim();
   if (!id) return alert('Enter a model as org/repo/file.gguf (or org/repo).');
   const repo = id, file = '';
   loading = true;
+  $('#loadBtn').disabled = false;
   $('#loadBtn').textContent = 'Stop loading';
   $('#loadBtn').title = 'Stop this load — what is already loaded stays cached';
-  setBar(0); expected = 0;
+  setBar(0); expected = 0; expectedIsReal = false; lastLoadedBytes = 0;
   const chosen = PRESETS[$('#preset').value];
-  if (chosen && chosen.gb) expected = chosen.gb * 1e9;
+  if (chosen && chosen.gb) expected = chosen.gb * 1e9;   // a label, not a byte count
   // Checked BEFORE the download, not after it. Without a GPU the weights go into the WASM
   // heap and a large model runs out of memory at the end of a multi-gigabyte transfer --
   // which is a long way to travel to be told it was never going to work.
@@ -922,10 +952,27 @@ async function exportModel(g) {
   try {
     handle = await window.showSaveFilePicker({ suggestedName: name });
   } catch (e) { return; }                       // the person cancelled
+  // Settle the write permission HERE, in the page, while the click that opened the picker
+  // still counts as activation. The writing happens in the worker, and a worker can never
+  // ask: `requestPermission` needs user activation and a worker has none, so a handle that
+  // arrives there unpermitted fails at `createWritable` with nothing able to fix it.
+  try {
+    if (handle.queryPermission) {
+      let p = await handle.queryPermission({ mode: 'readwrite' });
+      if (p !== 'granted' && handle.requestPermission)
+        p = await handle.requestPermission({ mode: 'readwrite' });
+      if (p !== 'granted') {
+        note('Export needs permission to write that file, and it was not granted.');
+        return;
+      }
+    }
+  } catch (e) { /* older browsers have no permission API; let the write speak for itself */ }
   note('Exporting ' + name + ' …');
   try {
     const n = await call('exportModel', { keys: g.keys, handle });
-    note('Exported ' + name + ' (' + fmt(n) + ').');
+    $('#progressText').textContent = '';
+    setBar(0);
+    note('Exported ' + name + ' — ' + fmt(n) + ' written.');
   } catch (e) { note('Export failed: ' + e.message); }
   setBar(0); $('#progressText').textContent = ''; loadedGB = null;
 }
@@ -2156,8 +2203,46 @@ $('#composer').onsubmit = async (e) => {
     // note that a picture existed.
     const imgs = (msg.attachments || []).filter(a => a.kind === 'image' && a.dataUrl)
                                         .map(a => a.dataUrl);
-    const r = await call('generate', Object.assign(
-      { messages: msgs, images: imgs, prompt: promptFor(msg) }, genOpts()));
+    // A reply may ask to run something, and then be asked again with what came back. The
+    // loop is here rather than in the SDK because the tools live here: the sandbox is the
+    // page's, and so is the decision to let a model reach it.
+    let r = null;
+    for (let round = 0; ; round++) {
+      const opts = Object.assign({ messages: msgs, images: imgs, prompt: promptFor(msg) },
+                                 genOpts());
+      const withTools = toolsEnabled();
+      if (withTools) opts.tools = toolDefs();
+      try {
+        r = await call('generate', opts);
+      } catch (err) {
+        // The probe says this model takes tools; if sending them fails anyway, that is the
+        // template disagreeing with the probe. Drop them and answer -- a turn lost to a
+        // tool definition is worse than a turn without tools -- and stop offering them to
+        // this model rather than failing the same way on every message after it.
+        if (!withTools) throw err;
+        modelTakesTools = false;
+        delete opts.tools;
+        console.warn('webtorch: this model rejected tool definitions, continuing without:',
+                     err && err.message);
+        r = await call('generate', opts);
+      }
+      if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) break;
+      const calls = parseToolCalls(reply.content);
+      if (!calls.length) break;
+      const results = [];
+      for (const c of calls) results.push(await runToolCall(c));
+      // The conversation the model sees next: what it said, then what each call returned.
+      // It keeps its own markup here -- that is the format its template speaks.
+      msgs.push({ role: 'assistant', content: reply.content });
+      calls.forEach((c, i) => msgs.push({ role: 'tool', name: c.name, content: results[i] }));
+      // What the reader sees keeps the prose and loses the protocol.
+      reply.content = stripToolCalls(reply.content);
+      // And what the READER sees: the call and its result, in the reply itself. A tool round
+      // that only the model could see would leave the answer resting on something invisible.
+      reply.content += '\n\n' + toolTrace(calls, results) + '\n\n';
+      setRendered(body.querySelector('.ans') || body, reply.content);
+      if (_stopRequested()) break;
+    }
     if (r && r.truncated) {
       reply.content += '\n\n[stopped at ' + r.n + ' tokens — raise “Max reply length”'
                      + ' in ⚙ Settings, or leave it empty for no limit]';
@@ -2186,6 +2271,220 @@ $('#input').addEventListener('keydown', e => {
 });
 $('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv();
                                 toggleSidebar(false); };
+// ---- tools the model can call ---------------------------------------------------------
+//
+// A registry, not a list of Python functions. What a tool IS here is a definition the model
+// is shown and something to run when it asks -- so a second kind of tool (a fetch, a
+// calculator, whatever a host wants) is a `registerTool` call rather than an edit to the
+// generate loop. The Python runtime is the first client of that, not the shape of it.
+//
+// The definitions go to the model through the SDK's `tools=`, which hands them to the
+// MODEL'S OWN chat template. So which models can be told about tools is a question about
+// their template, and nothing here needs to know the answer.
+const TOOLS = [];
+function registerTool(def, run) { TOOLS.push({ def, run }); }
+function toolDefs() { return TOOLS.map(t => t.def); }
+function findTool(name) { return TOOLS.find(t => t.def.function.name === name); }
+
+const TOOLS_KEY = 'webtorch.toolsOn';
+// Whether the LOADED model can be told about tools -- asked once per model, never guessed.
+// null = not asked yet, so the first reply after a load does not race the probe.
+let modelTakesTools = null;
+async function probeTools() {
+  modelTakesTools = null;
+  try { modelTakesTools = !!(await call('toolsSupported')); }
+  catch (e) { modelTakesTools = false; }
+  return modelTakesTools;
+}
+function toolsEnabled() {
+  // Off unless asked for: a model that can run code on its own initiative is a different
+  // thing from one that answers, and that should be a decision rather than a default.
+  return localStorage.getItem(TOOLS_KEY) === '1' && pyEnabled() && TOOLS.length > 0
+         && modelTakesTools === true;
+}
+
+// How many times a reply may call a tool and be asked again. A bound, because a model that
+// answers every result with another call would otherwise never finish.
+const MAX_TOOL_ROUNDS = 4;
+
+// Tool calls out of a finished reply.
+//
+// `<tool_call>{…}</tool_call>` is what a ChatML template emits, and a bare JSON object is
+// what a model without one tends to produce. Both are read, and anything else is simply not
+// a tool call -- a reply that merely talks about JSON is left alone, because the object has
+// to carry a name that is actually registered before it is run.
+const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+function parseToolCalls(text) {
+  const out = [];
+  // A name that is not registered is still A CALL -- it is kept, and the loop answers it
+  // with "no such tool, here are the ones there are". A small model gets the name wrong
+  // (`python_2` for `python_run`), and dropping that silently leaves the raw protocol
+  // sitting in the reply with nothing having run and nothing said about why. Guessing which
+  // tool was meant would be worse: it would run something the model did not ask for.
+  const push = (o) => {
+    if (o && typeof o.name === 'string') {
+      out.push({ name: o.name, args: o.arguments || o.parameters || {},
+                 known: !!findTool(o.name) });
+    }
+  };
+  let m;
+  TOOL_CALL_RE.lastIndex = 0;
+  while ((m = TOOL_CALL_RE.exec(text))) {
+    try { push(JSON.parse(m[1])); } catch (e) { /* not JSON: not a call */ }
+  }
+  if (!out.length) {
+    const t = String(text).trim();
+    if (t.startsWith('{') && t.endsWith('}')) { try { push(JSON.parse(t)); } catch (e) {} }
+  }
+  return out;
+}
+
+// The markup is protocol, not prose. It is removed from what the reader sees whether or not
+// it named a real tool -- a reply is not improved by showing the wire format.
+function stripToolCalls(text) {
+  let t = String(text).replace(TOOL_CALL_RE, '');
+  const trimmed = t.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try { if (typeof JSON.parse(trimmed).name === 'string') t = ''; } catch (e) {}
+  }
+  return t.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function runToolCall(c) {
+  const t = findTool(c.name);
+  if (!t) {
+    // The correction is the CALLER'S OWN call with the name fixed -- not a specimen call of
+    // mine. A generic example gets copied literally, arguments and all: a small model asked
+    // to multiply two numbers called a tool that does not exist, was shown `print(2 + 2)` as
+    // the shape of a valid call, ran exactly that, and reported 4 as its answer. The example
+    // has to be the thing the model actually wanted, so copying it does what it meant.
+    const listed = TOOLS.map(x => {
+      const f = x.def.function;
+      const req = (f.parameters && f.parameters.required) || [];
+      const props = Object.keys((f.parameters && f.parameters.properties) || {});
+      return '  ' + f.name + '(' + props.map(k => k + (req.includes(k) ? '' : '?')).join(', ') + ')';
+    }).join('\n');
+    // Which real tool it most likely meant: the one whose argument names its call already
+    // fits. That is a fact about the call, not a guess at intent -- and it is only used to
+    // address the correction to it, never to run anything.
+    const given = Object.keys((typeof c.args === 'object' && c.args) || {});
+    const guess = TOOLS.find(x => {
+      const props = Object.keys((x.def.function.parameters || {}).properties || {});
+      return given.length && given.every(k => props.includes(k));
+    }) || TOOLS[0];
+    const fixed = guess
+      ? '<tool_call>\n' + JSON.stringify({ name: guess.def.function.name,
+                                           arguments: c.args || {} }) + '\n</tool_call>'
+      : '';
+    return 'there is no tool called "' + c.name + '". These exist, with their arguments:\n'
+         + listed + '\n\nYour call again, with the name corrected — send this:\n' + fixed;
+  }
+  try {
+    const args = typeof c.args === 'string' ? JSON.parse(c.args) : (c.args || {});
+    const r = await t.run(args);
+    return typeof r === 'string' ? r : JSON.stringify(r);
+  } catch (e) {
+    // The failure goes BACK to the model rather than ending the turn: "that raised, here is
+    // what it said" is something it can act on, and is usually what it needs.
+    return 'the tool failed: ' + String((e && e.message) || e);
+  }
+}
+
+// What the reader sees of a tool round. The model's own reply already says what it means to
+// do; this is the record of what actually ran and what came back, which is the part the
+// model could otherwise report inaccurately.
+function _stopRequested() { return streaming === null; }
+
+function toolTrace(calls, results) {
+  return calls.map((c, i) => {
+    const a = c.args || {};
+    const body = a.code != null ? String(a.code)
+               : Object.keys(a).length ? JSON.stringify(a, null, 2) : '';
+    return '**' + c.name + '**\n\n'
+         + (body ? '```' + (a.code != null ? 'python' : 'json') + '\n' + body + '\n```\n\n' : '')
+         + '```\n' + String(results[i]).slice(0, 4000) + '\n```';
+  }).join('\n\n');
+}
+
+// ---- the Python runtime, as tools -----------------------------------------------------
+registerTool({
+  type: 'function',
+  function: {
+    name: 'run_python',
+    description: 'Run Python and get back what it printed, the value of the last expression, '
+      + 'and the traceback if it raised. The interpreter is separate from the one holding '
+      + 'the model and keeps its state between calls, so a name defined in one call is still '
+      + 'there in the next. Use it to compute rather than to guess: arithmetic, parsing, '
+      + 'checking a library actually does what you are about to claim.',
+    parameters: {
+      type: 'object',
+      properties: { code: { type: 'string', description: 'The Python source to run.' } },
+      required: ['code'],
+    },
+  },
+}, async ({ code }) => {
+  if (!code) return 'no code given';
+  const r = await pyCall('run', { code: String(code) });
+  const parts = [];
+  if (r.out) parts.push(String(r.out).replace(/\n$/, ''));
+  if (r.value != null && r.value !== 'None') parts.push('value: ' + r.value);
+  if (r.error) parts.push(String(r.error));
+  if (r.images && r.images.length) parts.push('(' + r.images.length + ' figure(s) drawn — '
+    + 'they are shown to the reader, and you cannot see them)');
+  return parts.length ? parts.join('\n') : '(no output)';
+});
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'install_python_packages',
+    description: 'Make Python modules importable, by name. Anything the Pyodide distribution '
+      + 'ships comes from there; anything else is fetched from PyPI if it has a pure-Python '
+      + 'wheel. A package with compiled code cannot be added this way and will be reported '
+      + 'as unavailable. Call with no names to ask what is already loaded.',
+    parameters: {
+      type: 'object',
+      properties: {
+        names: { type: 'array', items: { type: 'string' },
+                 description: 'Module names, e.g. ["sympy", "networkx"].' },
+      },
+    },
+  },
+}, async ({ names }) => {
+  const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
+  const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
+                                                             : pyPackages() });
+  const parts = ['ready: ' + ((r.loaded || []).join(', ') || 'nothing')];
+  if (r.fromPyPI && r.fromPyPI.length) parts.push('installed from PyPI: ' + r.fromPyPI.join(', '));
+  (r.unavailable || []).forEach(u => {
+    const n = typeof u === 'string' ? u : u.name;
+    const w = typeof u === 'string' ? '' : (u.why || '');
+    parts.push('unavailable: ' + n + (w ? ' — ' + w : ''));
+  });
+  return parts.join('\n');
+});
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'restart_python',
+    description: 'Throw away the Python interpreter and start a fresh one. Everything defined '
+      + 'so far is lost and the configured modules are loaded again. Use it when the state '
+      + 'has become confusing or something is wedged — not to recover from an ordinary '
+      + 'traceback, which loses work for nothing.',
+    parameters: { type: 'object', properties: {} },
+  },
+}, async () => {
+  try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
+  pyStop(); pyStart();
+  for (let i = 0; i < 240 && pyState !== 'ready'; i++)
+    await new Promise(r => setTimeout(r, 250));
+  return pyState === 'ready' ? 'restarted; ready with ' + pyPackages().join(', ')
+                             : 'restarted, but the runtime is ' + pyState;
+});
+
+
 // ---- the Python-environment settings -------------------------------------------------
 function wirePython() {
   const box = $('#pyPackages'), on = $('#pyEnabled'), st = $('#pyState');
@@ -2193,6 +2492,11 @@ function wirePython() {
   const saved = localStorage.getItem(PYPKG_KEY);
   box.value = saved === null ? PY_DEFAULT : saved;
   on.checked = pyEnabled();
+  const tools = $('#pyTools');
+  if (tools) {
+    tools.checked = localStorage.getItem(TOOLS_KEY) === '1';
+    tools.onchange = () => localStorage.setItem(TOOLS_KEY, tools.checked ? '1' : '0');
+  }
   st.textContent = pyEnabled() ? 'starting…' : 'off';
   // What "Apply & load" did, said in the panel rather than on the hint bar under the
   // composer -- the settings dialog covers that, so a name that could not be loaded was
