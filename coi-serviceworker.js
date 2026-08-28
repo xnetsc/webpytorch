@@ -8,11 +8,17 @@
  * GitHub Pages cannot send them, so a service worker adds them to every response it
  * proxies. Without this the page silently falls back to running the whole model on the CPU.
  *
- * COEP is `credentialless` rather than `require-corp`: model weights come from ModelScope
- * and Pyodide from a CDN, and neither sets Cross-Origin-Resource-Policy. `credentialless`
- * fetches those without credentials instead of blocking them outright. Headers are only
- * ADDED when the response has none -- a server that sets its own is the authority, and
- * overriding a stricter `require-corp` with `credentialless` would weaken it.
+ * COEP is `require-corp` because that is the one value every engine that implements the
+ * policy implements. `credentialless` asks for the same isolation without checking the
+ * cross-origin fetches, which sounded better -- model weights come from ModelScope and
+ * Pyodide from a CDN -- but WebKit does not know the value at all: the header is ignored,
+ * the document is not isolated, and every iPhone and Safari lands on the CPU fallback
+ * without a warning (measured: `credentialless` served straight or through this worker
+ * leaves WebKit un-isolated, while `require-corp` isolates it). require-corp blocks
+ * nothing this page loads: jsdelivr answers with CORS and CORP, ModelScope and PyPI with
+ * CORS, and the CDN script and stylesheet tags already ask for it with `crossorigin`.
+ * Headers are only ADDED when the response has none -- a server that sets its own is the
+ * authority.
  *
  * The cache is for Python. Pyodide has none of its own: `loadPackage` fetches the wheel from
  * `indexURL` every time, and the only thing between a reload and downloading numpy again is
@@ -58,7 +64,15 @@ if (typeof window === 'undefined') {
     if (res.status === 0) return res;                    // opaque: nothing to re-wrap
     if (res.headers.get('Cross-Origin-Embedder-Policy')) return res;   // the server decided
     const headers = new Headers(res.headers);
-    headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+    // require-corp, not credentialless. The two isolate identically where both are known,
+    // but WebKit -- and therefore EVERY browser on an iPhone -- implements only
+    // require-corp; handed credentialless it behaves as if the header were absent. Measured
+    // on WebKit with a plain server response and with this worker supplying the headers:
+    //   Cross-Origin-Embedder-Policy: require-corp    -> crossOriginIsolated = true
+    //   Cross-Origin-Embedder-Policy: credentialless  -> crossOriginIsolated = false
+    // The cost of require-corp -- every cross-origin response must carry CORS or CORP --
+    // is paid already: see the file header for why nothing this page loads is blocked.
+    headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
     headers.set('Cross-Origin-Opener-Policy', 'same-origin');
     return new Response(res.body, {
       status: res.status, statusText: res.statusText, headers: headers,
@@ -157,9 +171,11 @@ if (typeof window === 'undefined') {
       // send the headers, so the worker is the only thing providing them.)
       //
       // If the SERVER supplies them, a worker left over from somewhere that did not keeps
-      // proxying, and its `credentialless` overrides the server's stricter `require-corp` --
-      // breaking the isolation it was added to provide. (Seen for real: a fall back to the
-      // CPU on a server whose headers were correct.)
+      // proxying -- which once mattered: an older version of this worker answered with
+      // `credentialless`, an overwrite that breaks isolation in WebKit outright and
+      // weakens the policy elsewhere. (Seen for real: a fall back to the CPU on a server
+      // whose headers were correct.) Today `isolate` refuses to touch a response that
+      // already carries COEP, and the value it would add is the strict one anyway.
       //
       // So stand down only when the isolation is not ours to hold.
       // Isolated already -- so no reload is needed and nothing is urgent. Register anyway,
