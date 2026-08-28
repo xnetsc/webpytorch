@@ -180,6 +180,7 @@ if (typeof window === 'undefined') {
       // So stand down only when the isolation is not ours to hold.
       // Isolated already -- so no reload is needed and nothing is urgent. Register anyway,
       // for the cache; it will control the next load.
+      try { sessionStorage.removeItem('__coi_reloaded'); } catch (e) { /* private mode */ }
       if (navigator.serviceWorker) navigator.serviceWorker.register(src).then(null, function () {});
       return;
     }
@@ -201,11 +202,35 @@ if (typeof window === 'undefined') {
       console.warn('coi: no service worker support; SharedArrayBuffer stays unavailable');
       return;
     }
+    // Read BEFORE registering. The moment the worker activates, its `clients.claim()` sets
+    // `navigator.serviceWorker.controller` -- so reading it after registration says only that
+    // a worker EXISTS, not whether it served THIS document. That race decides everything:
+    // the document response of this load already went out without isolation headers, and no
+    // amount of claiming changes that. If claim wins, a check that reads the controller
+    // skips the reload, and the first visit stays on the CPU until somebody refreshes by
+    // hand. (Seen for real: a phone reporting `serviceWorker: true` and
+    // `crossOriginIsolated: false` at the same time.)
+    var hadController = !!navigator.serviceWorker.controller;
     navigator.serviceWorker.register(src).then(
       function (reg) {
-        // The worker only controls pages loaded after it took over, so the first visit
-        // needs one reload before SharedArrayBuffer exists.
-        if (reg.active && !navigator.serviceWorker.controller) window.location.reload();
+        if (hadController) return;   // this load was served by a worker already
+        // A reload helps at most once. If it did not produce isolation, reloading again
+        // never will, and without this guard a broken setup reloads forever.
+        var reloaded = false;
+        try { reloaded = !!sessionStorage.getItem('__coi_reloaded'); } catch (e) { /* private mode */ }
+        if (window.crossOriginIsolated) return;      // meanwhile, nothing left to do
+        if (reloaded) {
+          window.__coiStillNotIsolated = true;
+          console.warn('coi: worker active but the page is still not isolated after a reload');
+          return;
+        }
+        try { sessionStorage.setItem('__coi_reloaded', '1'); } catch (e) { /* private mode */ }
+        if (reg.active) { window.location.reload(); return; }
+        // Still installing: wait for activation rather than racing it.
+        var sw = reg.installing || reg.waiting;
+        if (sw) sw.addEventListener('statechange', function (e) {
+          if (e.target.state === 'activated') window.location.reload();
+        });
       },
       function (err) { window.__coiSWFailed = String(err); console.warn('coi: registration failed:', err); }
     );
