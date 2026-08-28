@@ -1716,6 +1716,10 @@ async function runBlock(code, wrap, btn) {
     // Output first, then the value of the last expression, then whatever it drew. Errors
     // are shown in the same place: a traceback is a result too.
     if (r.out) { const p = document.createElement('pre'); p.textContent = r.out.replace(/\n$/, ''); panel.appendChild(p); }
+    if (r.err) {
+      const p = document.createElement('pre'); p.className = 'stderr';
+      p.textContent = r.err.replace(/\n$/, ''); panel.appendChild(p);
+    }
     if (r.value != null && r.value !== 'None') {
       const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.value; panel.appendChild(p);
     }
@@ -2327,17 +2331,32 @@ $('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv()
 // their template, and nothing here needs to know the answer.
 const TOOLS = [];
 function registerTool(def, run) { TOOLS.push({ def, run }); }
-function toolDefs() { return TOOLS.map(t => t.def); }
+// Written in the shape THIS model's template was shown to read. The registry holds one
+// canonical form; which one goes over the wire is a fact about the model, discovered by
+// `toolsSupported`, not a convention picked here.
+function toolDefs() {
+  return TOOLS.map(t => {
+    const f = t.def.function;
+    if (modelToolShape === 'flat') {
+      return { name: f.name, description: f.description, parameters: f.parameters };
+    }
+    return t.def;                       // nested {type:"function", function:{…}}
+  });
+}
 function findTool(name) { return TOOLS.find(t => t.def.function.name === name); }
 
 const TOOLS_KEY = 'webtorch.toolsOn';
 // Whether the LOADED model can be told about tools -- asked once per model, never guessed.
 // null = not asked yet, so the first reply after a load does not race the probe.
-let modelTakesTools = null;
+let modelTakesTools = null;      // null = not asked yet
+let modelToolShape = null;       // which definition shape its template actually reads
 async function probeTools() {
-  modelTakesTools = null;
-  try { modelTakesTools = !!(await call('toolsSupported')); }
-  catch (e) { modelTakesTools = false; }
+  modelTakesTools = null; modelToolShape = null;
+  try {
+    const r = await call('toolsSupported');
+    modelTakesTools = !!(r && r.ok);
+    modelToolShape = (r && r.shape) || null;
+  } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
 }
 function toolsEnabled() {
@@ -2359,40 +2378,69 @@ const MAX_TOOL_ROUNDS = 4;
 // to carry a name that is actually registered before it is run.
 const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 
-function parseToolCalls(text) {
-  const out = [];
-  // A name that is not registered is still A CALL -- it is kept, and the loop answers it
-  // with "no such tool, here are the ones there are". A small model gets the name wrong
-  // (`python_2` for `python_run`), and dropping that silently leaves the raw protocol
-  // sitting in the reply with nothing having run and nothing said about why. Guessing which
-  // tool was meant would be worse: it would run something the model did not ask for.
-  const push = (o) => {
-    if (o && typeof o.name === 'string') {
-      out.push({ name: o.name, args: o.arguments || o.parameters || {},
-                 known: !!findTool(o.name) });
-    }
+// ONE scan, used for both running the calls and removing them from what is shown. Two
+// separate readers drift: the reply ends up with a call the loop did not run, printed raw as
+// prose, which is exactly what happened -- a bare call at the end of a message was neither
+// executed nor hidden.
+//
+// A span counts as a call when it is inside <tool_call> markup (that is protocol, whatever
+// name it carries) or when it is a bare JSON object naming a tool that ACTUALLY EXISTS here.
+// Bare JSON with an unknown name is left alone: a reply may legitimately show a JSON object,
+// and guessing would eat the answer.
+function scanToolCalls(text) {
+  const src = String(text);
+  const found = [];
+  const asCall = (o, wrapped) => {
+    if (!o || typeof o.name !== 'string') return null;
+    const known = !!findTool(o.name);
+    if (!known && !wrapped) return null;
+    return { name: o.name, args: o.arguments || o.parameters || {}, known };
   };
-  let m;
   TOOL_CALL_RE.lastIndex = 0;
-  while ((m = TOOL_CALL_RE.exec(text))) {
-    try { push(JSON.parse(m[1])); } catch (e) { /* not JSON: not a call */ }
+  let m;
+  while ((m = TOOL_CALL_RE.exec(src))) {
+    let c = null;
+    try { c = asCall(JSON.parse(m[1]), true); } catch (e) {}
+    if (c) found.push({ start: m.index, end: m.index + m[0].length, call: c });
   }
-  if (!out.length) {
-    const t = String(text).trim();
-    if (t.startsWith('{') && t.endsWith('}')) { try { push(JSON.parse(t)); } catch (e) {} }
+  // Bare objects, wherever they sit. Brace-matched rather than regexed: the arguments are
+  // themselves an object, and a pattern stopping at the first `}` would cut a call in half.
+  for (let k = 0; k < src.length; k++) {
+    if (src[k] !== '{') continue;
+    if (found.some(f => k >= f.start && k < f.end)) continue;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let q = k; q < src.length; q++) {
+      const ch = src[q];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = q + 1; break; } }
+    }
+    if (end < 0) break;
+    let c = null;
+    try { c = asCall(JSON.parse(src.slice(k, end)), false); } catch (e) {}
+    if (c) { found.push({ start: k, end, call: c }); k = end - 1; }
   }
-  return out;
+  found.sort((a, b) => a.start - b.start);
+  return found;
 }
 
-// The markup is protocol, not prose. It is removed from what the reader sees whether or not
-// it named a real tool -- a reply is not improved by showing the wire format.
+function parseToolCalls(text) { return scanToolCalls(text).map(f => f.call); }
+
+// The markup is protocol, not prose, and so is a bare call to a tool that exists here.
 function stripToolCalls(text) {
-  let t = String(text).replace(TOOL_CALL_RE, '');
-  const trimmed = t.trim();
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    try { if (typeof JSON.parse(trimmed).name === 'string') t = ''; } catch (e) {}
-  }
-  return t.replace(/\n{3,}/g, '\n\n').trim();
+  const src = String(text);
+  const spans = scanToolCalls(src);
+  if (!spans.length) return src.trim();
+  let out = '', at = 0;
+  spans.forEach(f => { out += src.slice(at, f.start); at = f.end; });
+  out += src.slice(at);
+  return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 async function runToolCall(c) {
@@ -2456,11 +2504,26 @@ registerTool({
   type: 'function',
   function: {
     name: 'run_python',
-    description: 'Run Python and get back what it printed, the value of the last expression, '
-      + 'and the traceback if it raised. The interpreter is separate from the one holding '
-      + 'the model and keeps its state between calls, so a name defined in one call is still '
-      + 'there in the next. Use it to compute rather than to guess: arithmetic, parsing, '
-      + 'checking a library actually does what you are about to claim.',
+    // The RETURN SHAPE is part of the contract, so it is stated here rather than left to be
+    // inferred from whatever came back. JSON with named fields rather than prose: a model
+    // that cannot tell stderr from stdout reports one as the other, and the first import of
+    // a plotting library writes a notice to stderr that has been answered with as the result.
+    description: 'Run Python. The interpreter is separate from the one holding the model and '
+      + 'keeps its state between calls, so a name defined in one call is still there in the '
+      + 'next. Use it to compute rather than to guess: arithmetic, parsing, checking that a '
+      + 'library does what you are about to claim.\n\n'
+      + 'Returns a JSON object:\n'
+      + '  {"stdout": string, "stderr": string, "result": string|null, '
+      + '"traceback": string|null, "figures": number}\n'
+      + '  stdout    - what the code printed.\n'
+      + '  stderr    - notices written by LIBRARIES, not by the code (a plotting package '
+      + 'building its font cache, say). Never the answer.\n'
+      + '  result    - the value of the last expression, or null if it had none. This is what '
+      + 'to report when the task was to compute something.\n'
+      + '  traceback - non-null means the code raised and there is NO result; fix it and call '
+      + 'again.\n'
+      + '  figures   - how many plots were drawn. They are shown to the reader; you cannot '
+      + 'see them, so do not describe them.',
     parameters: {
       type: 'object',
       properties: { code: { type: 'string', description: 'The Python source to run.' } },
@@ -2468,15 +2531,19 @@ registerTool({
     },
   },
 }, async ({ code }) => {
-  if (!code) return 'no code given';
+  if (!code) return { stdout: '', stderr: '', result: null,
+                      traceback: 'no code was given', figures: 0 };
   const r = await pyCall('run', { code: String(code) });
-  const parts = [];
-  if (r.out) parts.push(String(r.out).replace(/\n$/, ''));
-  if (r.value != null && r.value !== 'None') parts.push('value: ' + r.value);
-  if (r.error) parts.push(String(r.error));
-  if (r.images && r.images.length) parts.push('(' + r.images.length + ' figure(s) drawn — '
-    + 'they are shown to the reader, and you cannot see them)');
-  return parts.length ? parts.join('\n') : '(no output)';
+  const clean = (x) => (x ? String(x).replace(/\n+$/, '') : '');
+  return {
+    stdout: clean(r.out),
+    stderr: clean(r.err),
+    // A run that raised HAS no result. Reporting the last value alongside a traceback invites
+    // it to be quoted as the answer.
+    result: r.error ? null : (r.value != null && r.value !== 'None' ? String(r.value) : null),
+    traceback: r.error ? String(r.error) : null,
+    figures: (r.images || []).length,
+  };
 });
 
 registerTool({
@@ -2485,8 +2552,15 @@ registerTool({
     name: 'install_python_packages',
     description: 'Make Python modules importable, by name. Anything the Pyodide distribution '
       + 'ships comes from there; anything else is fetched from PyPI if it has a pure-Python '
-      + 'wheel. A package with compiled code cannot be added this way and will be reported '
-      + 'as unavailable. Call with no names to ask what is already loaded.',
+      + 'wheel. A package with compiled code cannot be added this way. Call with no names to '
+      + 'ask what is already loaded.\n\n'
+      + 'Returns a JSON object:\n'
+      + '  {"ready": string[], "installed_from_pypi": string[], '
+      + '"unavailable": [{"name": string, "why": string}]}\n'
+      + '  ready               - every module importable now.\n'
+      + '  installed_from_pypi - the ones that had to be fetched.\n'
+      + '  unavailable         - could not be supplied, with the reason. Do not ask again '
+      + 'for the same name; use a different library or say it cannot be done.',
     parameters: {
       type: 'object',
       properties: {
@@ -2499,14 +2573,12 @@ registerTool({
   const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
   const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
                                                              : pyPackages() });
-  const parts = ['ready: ' + ((r.loaded || []).join(', ') || 'nothing')];
-  if (r.fromPyPI && r.fromPyPI.length) parts.push('installed from PyPI: ' + r.fromPyPI.join(', '));
-  (r.unavailable || []).forEach(u => {
-    const n = typeof u === 'string' ? u : u.name;
-    const w = typeof u === 'string' ? '' : (u.why || '');
-    parts.push('unavailable: ' + n + (w ? ' — ' + w : ''));
-  });
-  return parts.join('\n');
+  return {
+    ready: r.loaded || [],
+    installed_from_pypi: r.fromPyPI || [],
+    unavailable: (r.unavailable || []).map(u => (typeof u === 'string'
+      ? { name: u, why: '' } : { name: u.name, why: u.why || '' })),
+  };
 });
 
 registerTool({
@@ -2515,17 +2587,22 @@ registerTool({
     name: 'restart_python',
     description: 'Throw away the Python interpreter and start a fresh one. Everything defined '
       + 'so far is lost and the configured modules are loaded again. Use it when the state '
-      + 'has become confusing or something is wedged — not to recover from an ordinary '
-      + 'traceback, which loses work for nothing.',
-    parameters: { type: 'object', properties: {} },
+      + 'has become confusing or something is wedged - not to recover from an ordinary '
+      + 'traceback, which loses work for nothing.\n\n'
+      + 'Returns a JSON object:\n'
+      + '  {"restarted": true, "state": string, "ready": string[]}\n'
+      + '  state - "ready" when the new interpreter is usable; anything else means it is not '
+      + 'yet, and running code will fail.\n'
+      + '  ready - the modules importable in the fresh interpreter.',
+      parameters: { type: 'object', properties: {} },
   },
 }, async () => {
   try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
   pyStop(); pyStart();
   for (let i = 0; i < 240 && pyState !== 'ready'; i++)
     await new Promise(r => setTimeout(r, 250));
-  return pyState === 'ready' ? 'restarted; ready with ' + pyPackages().join(', ')
-                             : 'restarted, but the runtime is ' + pyState;
+  return { restarted: true, state: pyState,
+           ready: pyState === 'ready' ? pyPackages() : [] };
 });
 
 

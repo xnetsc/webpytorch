@@ -90,12 +90,19 @@ let micropipReady = false;
 // raised, the value of the last expression, and any figures it drew.
 async function run(code) {
   await boot();
-  let out = '';
-  py.setStdout({ batched: (s) => { out += s + '\n'; } });
-  py.setStderr({ batched: (s) => { out += s + '\n'; } });
+  let out = '', err = '';
   // Imports the code needs that are not loaded yet — Pyodide can find them from the import
   // statements, so `import numpy` works on the first run without anyone configuring it.
+  //
+  // BEFORE the redirect, not after: the package loader narrates what it is doing
+  // ("matplotlib already loaded from default channel"), and captured as stdout that reads as
+  // something the code printed. It is the runtime talking about itself.
   try { await py.loadPackagesFromImports(code); } catch (e) { /* reported by the run itself */ }
+  // Kept apart. A library that writes a notice on first use -- matplotlib building its font
+  // cache is the one everybody meets -- lands in stderr, and mixed into stdout it reads as
+  // part of what the code produced. The model then reports it as such.
+  py.setStdout({ batched: (s) => { out += s + '\n'; } });
+  py.setStderr({ batched: (s) => { err += s + '\n'; } });
   let value = null, error = null, images = [];
   try {
     const r = await py.runPythonAsync(code);
@@ -131,7 +138,7 @@ __wt_figs()
     }
   } catch (e) { /* a broken plot must not hide the output */ }
   py.setStdout({}); py.setStderr({});
-  return { out, value, error, images };
+  return { out, err, value, error, images };
 }
 
 // Install a wheel: from a URL, or from a file the person picked. micropip handles both --

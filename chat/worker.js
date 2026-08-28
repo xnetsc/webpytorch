@@ -119,35 +119,62 @@ async function decodeImages(urls) {
   return out;
 }
 
-// Can this model be told about tools at all?
+// Which shape of tool definition does THIS model's template actually consume?
 //
-// Rendered twice, with and without. A template that does not take tools either raises or --
-// worse, because it is silent -- produces the very same prompt, and in both cases telling
-// the model about tools is at best pointless and at worst a broken prompt. Comparing the
-// two outputs is the only answer that does not depend on knowing the model.
+// There is no universal one. The nested {type:"function", function:{...}} form is what most
+// templates written against the OpenAI convention expect; others take the flat
+// {name, description, parameters}. Handing over the wrong one is not an error -- a Jinja
+// template quietly renders nothing for a field it does not know, so the model is told about
+// a tool it never sees, and then never calls it. Silent, and indistinguishable from a model
+// that simply chose not to.
+//
+// So the shapes are TRIED, not assumed: render the same chat with each and keep the one whose
+// rendering actually contains the tool's name AND its parameter's name. That is evidence the
+// template read the definition rather than skipped it. If none does, the model cannot be told
+// about tools in any form this knows how to write, and it is not offered any.
 async function toolsSupported() {
-  if (!ready || !pyodide) return false;
+  if (!ready || !pyodide) return { ok: false, shape: null };
   try {
-    // The result must be the last TOP-LEVEL expression: a value produced inside an `if`
-    // body is not what Pyodide hands back, so this assigns and ends with the name.
-    return await pyodide.runPythonAsync(`
-_ok = False
+    const r = await pyodide.runPythonAsync(`
+import json
+_shape = None
 _m = _MODEL["m"]
 _t = getattr(getattr(_m, "impl", _m), "tok", None) if _m is not None else None
 if _t is not None:
     _msgs = [{"role": "user", "content": "hi"}]
-    _probe = [{"type": "function", "function": {
-        "name": "_probe_tool", "description": "probe",
-        "parameters": {"type": "object", "properties": {}}}}]
+    _NAME = "zzprobetoolzz"
+    _ARG = "zzprobeargzz"
+    _fn = {"name": _NAME, "description": "probe",
+           "parameters": {"type": "object",
+                          "properties": {_ARG: {"type": "string", "description": "probe"}},
+                          "required": [_ARG]}}
+    _cands = [("nested", [{"type": "function", "function": _fn}]),
+              ("flat", [dict(_fn)])]
     try:
-        _a = _t.encode_chat(None, None, messages=_msgs)
-        _b = _t.encode_chat(None, None, messages=_msgs, tools=_probe)
-        _ok = bool(_a != _b)
+        _plain = _t.encode_chat(None, None, messages=_msgs)
     except Exception:
-        _ok = False
-_ok
+        _plain = None
+    if _plain is not None:
+        for _label, _tools in _cands:
+            try:
+                _ids = _t.encode_chat(None, None, messages=_msgs, tools=_tools)
+            except Exception:
+                continue
+            if _ids == _plain:
+                continue                      # the template ignored them entirely
+            try:
+                _txt = _t.decode(_ids)
+            except Exception:
+                _txt = ""
+            # The NAME alone is not enough: a template can mention a tool and drop its
+            # arguments, which produces calls with no parameters.
+            if _NAME in _txt and _ARG in _txt:
+                _shape = _label
+                break
+json.dumps({"ok": _shape is not None, "shape": _shape})
 `);
-  } catch (e) { return false; }
+    return JSON.parse(r);
+  } catch (e) { return { ok: false, shape: null }; }
 }
 
 async function generate(prompt, opts) {

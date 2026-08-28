@@ -366,3 +366,7 @@ dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-rad
 .pyresult.bad{border-color:var(--danger)}
 .pyresult .miss{color:var(--danger)}
 .pyresult code{font-size:12px}
+
+/* What a library said on the way, not what the code produced. Present, and visibly not the
+   answer -- merged into stdout it has been reported as the result. */
+.runout pre.stderr{color:var(--mut);font-style:italic}
