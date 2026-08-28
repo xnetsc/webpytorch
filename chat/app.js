@@ -2282,7 +2282,7 @@ $('#composer').onsubmit = async (e) => {
       // The conversation the model sees next: what it said, then what each call returned.
       // It keeps its own markup here -- that is the format its template speaks.
       msgs.push({ role: 'assistant', content: reply.content });
-      calls.forEach((c, i) => msgs.push({ role: 'tool', name: c.name, content: results[i] }));
+      calls.forEach((c, i) => msgs.push(toolResultMessage(c.name, results[i])));
       // What the reader sees keeps the prose and loses the protocol.
       reply.content = stripToolCalls(reply.content);
       // And what the READER sees: the call and its result, in the reply itself. A tool round
@@ -2350,14 +2350,45 @@ const TOOLS_KEY = 'webtorch.toolsOn';
 // null = not asked yet, so the first reply after a load does not race the probe.
 let modelTakesTools = null;      // null = not asked yet
 let modelToolShape = null;       // which definition shape its template actually reads
+let modelResultVia = null;       // 'tool' | 'user' | null -- how a RESULT reaches it
+let modelResultKeepsName = false;
 async function probeTools() {
   modelTakesTools = null; modelToolShape = null;
+  modelResultVia = null; modelResultKeepsName = false;
   try {
     const r = await call('toolsSupported');
     modelTakesTools = !!(r && r.ok);
     modelToolShape = (r && r.shape) || null;
+    modelResultVia = (r && r.result_via) || null;
+    modelResultKeepsName = !!(r && r.result_keeps_name);
   } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
+}
+
+// A tool result as a message THIS model will actually receive.
+//
+// Not assumed to be an ordinary turn: a template may define its own structure for one (Qwen
+// wraps it in <tool_response>), and a template that does not know the `tool` role drops it
+// silently -- the model then answers without ever having seen what the tool returned. The
+// probe says which; an ordinary user turn is the fallback, never the assumption.
+//
+// The NAME is folded into the content wherever the template does not carry it. Qwen's does
+// not, so two calls in one round arrive as two anonymous blocks with no way to tell which
+// tool produced which -- and the model has to guess, which is the whole thing to avoid.
+function toolResultMessage(name, content) {
+  const body = modelResultKeepsName ? content
+             : JSON.stringify({ tool: name, result: safeJson(content) });
+  if (modelResultVia === 'user') {
+    return { role: 'user', content: 'Result of the tool you called:\n' + body };
+  }
+  return { role: 'tool', name, content: body };
+}
+
+// Keep the result an object when it is one, so folding the name in does not bury JSON
+// inside a JSON string.
+function safeJson(v) {
+  if (typeof v !== 'string') return v;
+  try { return JSON.parse(v); } catch (e) { return v; }
 }
 function toolsEnabled() {
   // Off unless asked for: a model that can run code on its own initiative is a different

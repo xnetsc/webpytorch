@@ -171,10 +171,36 @@ if _t is not None:
             if _NAME in _txt and _ARG in _txt:
                 _shape = _label
                 break
-json.dumps({"ok": _shape is not None, "shape": _shape})
+# How a tool RESULT reaches this model, discovered the same way. A template may define its
+# own structure for one (Qwen wraps it in <tool_response>), may render it as an ordinary
+# turn, or may drop a role it does not know -- and a dropped result is silent: the model
+# answers without ever seeing what the tool returned.
+_result_via = None
+_keeps_name = False
+if _t is not None:
+    _MK = "zzresultmarkzz"; _TN = "zztoolnamezz"
+    _base = [{"role": "user", "content": "hi"},
+             {"role": "assistant", "content": "calling"}]
+    def _renders(_msgs):
+        try:
+            return _t.decode(_t.encode_chat(None, None, messages=_msgs))
+        except Exception:
+            return ""
+    _as_tool = _renders(_base + [{"role": "tool", "name": _TN, "content": _MK}])
+    if _MK in _as_tool:
+        _result_via = "tool"
+        _keeps_name = _TN in _as_tool
+    else:
+        _as_user = _renders(_base + [{"role": "user", "content": _MK}])
+        if _MK in _as_user:
+            _result_via = "user"
+json.dumps({"ok": _shape is not None, "shape": _shape,
+            "result_via": _result_via, "result_keeps_name": bool(_keeps_name)})
 `);
     return JSON.parse(r);
-  } catch (e) { return { ok: false, shape: null }; }
+  } catch (e) {
+    return { ok: false, shape: null, result_via: null, result_keeps_name: false };
+  }
 }
 
 async function generate(prompt, opts) {
