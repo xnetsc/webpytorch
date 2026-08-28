@@ -293,6 +293,72 @@ class VLVisionTower:
 
 
 # ============================ VL causal LM =================================
+class VisionEncoder:
+    """A patch-based vision tower behind the generic ENCODER protocol.
+
+    The tower knows how to turn pixels into embeddings and nothing else. What the generic
+    path additionally needs is the placeholder token those embeddings replace, how many there
+    will be before they are computed, and -- for a decoder using multi-axis rope -- where the
+    patches sit relative to each other. All three are properties of THIS encoder rather than
+    of whichever decoder it is paired with, which is why they live here.
+
+    With this, `MultimodalLM(any_decoder, VisionEncoder(tower, token_id))` is a working
+    vision-language model with no model-specific branch in the decode path.
+    """
+
+    def __init__(self, tower, token_id, max_pixels=None, temporal_patch=2):
+        self.tower = tower
+        self.token_id = int(token_id)          # the ENCODER protocol's placeholder
+        self.patch = tower.patch
+        self.merge = tower.merge
+        self.temporal_patch = temporal_patch
+        self.max_pixels = max_pixels
+        self._cache = (None, None)             # one media object's preprocessing, reused
+
+    def _prep(self, media, **kw):
+        """(pixel_values, grid), computed once per media object.
+
+        `n_tokens`, `positions` and `encode` are all called for the same image while building
+        one prompt; preprocessing it three times would resize and repatch it three times."""
+        if self._cache[0] is media:
+            return self._cache[1]
+        kwargs = {"patch": self.patch, "merge": self.merge,
+                  "temporal_patch": self.temporal_patch}
+        mp = kw.get("max_pixels", self.max_pixels)
+        if mp:
+            kwargs["max_pixels"] = mp
+        out = preprocess_image(media, **kwargs)
+        self._cache = (media, out)
+        return out
+
+    def _grid(self, media, **kw):
+        _, grid = self._prep(media, **kw)
+        gh, gw = int(grid[0][1]), int(grid[0][2])
+        return gh // self.merge, gw // self.merge
+
+    def n_tokens(self, media, **kw):
+        lh, lw = self._grid(media, **kw)
+        return lh * lw
+
+    def encode(self, media, **kw):
+        pv, grid = self._prep(media, **kw)
+        return self.tower.forward(pv, grid).numpy()
+
+    def positions(self, media, **kw):
+        """(3, n) rotary positions for this image's tokens, relative to zero.
+
+        Time is flat across a still image; height and width are the patch's row and column.
+        So the block advances the running position by its longer side, not by its token
+        count -- which is what multi-axis rope buys: a 16-patch image costs 4 positions
+        rather than 16, and the text after it sits that much closer.
+        """
+        lh, lw = self._grid(media, **kw)
+        n = lh * lw
+        return np.stack([np.zeros(n, np.int64),
+                         np.repeat(np.arange(lh, dtype=np.int64), lw),
+                         np.tile(np.arange(lw, dtype=np.int64), lh)])
+
+
 class VLCausalLM(CausalLM):
     """Qwen2.5-VL: quantized ViT vision tower + Qwen2 LM with M-RoPE.
 
@@ -320,7 +386,13 @@ class VLCausalLM(CausalLM):
         self.HD = self.H // self.NH; self.VOCAB = tc["vocab_size"]
         self.eps = tc["rms_norm_eps"]
         self.theta = tc.get("rope_theta") or tc["rope_scaling"].get("rope_theta", 1000000.0)
-        self.mrope = tc["rope_scaling"]["mrope_section"]
+        # ONE attribute, under the name the generic decoder reads. This class reads the
+        # config by hand rather than through `_apply_cfg`, which is how it came to have its
+        # own name for a value the shared rope path was already looking for -- and why a
+        # generic improvement to that path did not reach this model. `mrope` is kept as the
+        # same list, not a second copy, so they cannot drift.
+        self.rope_sections = tc["rope_scaling"]["mrope_section"]
+        self.mrope = self.rope_sections
         # An image costs hundreds of prompt tokens, so a fixed small context is the difference
         # between working and refusing. Take it from the model, capped by KV memory, exactly
         # as the text path does.

@@ -2139,9 +2139,15 @@ class CausalLM:
         return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
 
     # ---- WebGL path: growing KVCache, fresh forward (no in-place capture) ----
-    def _kv_forward(self, ids, pos, cache, embeds=None):
+    def _kv_forward(self, ids, pos, cache, embeds=None, rope_pos=None):
+        """`pos` is the cache position -- how many tokens are already stored -- and is what
+        the attention mask is built from. `rope_pos`, when given, is the ROTARY position:
+        with multi-axis rope the two are not the same number. An image of 4x4 patches is 16
+        tokens but advances the position by 4, because its patches sit beside each other in
+        two dimensions rather than one after another. Conflating them puts the text after an
+        image at the wrong distance from it."""
         T = len(ids); H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
-        c, s = self._rope_np(pos, T)
+        c, s = self._rope_np(pos if rope_pos is None else rope_pos, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
         h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
@@ -2306,7 +2312,7 @@ class CausalLM:
             raise RuntimeError("this model has been released; load it again to use it")
 
     def generate(self, prompt=None, max_new=None, system="You are a helpful assistant.",
-                 messages=None, tools=None, ids=None, embeds=None,
+                 messages=None, tools=None, ids=None, embeds=None, rope_pos=None,
                  temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
                  repetition_penalty=None, min_p=None, constraint=None,
                  max_length=None, min_new_tokens=None, truncate=True,
@@ -2381,12 +2387,18 @@ class CausalLM:
         # and fall back to the growing-cache forward when one cannot.
         if not self._capturable():                     # WebGL, host-side mixer, or sparse MoE
             cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
-            t0 = time.perf_counter(); g0 = self._kv_forward(ids, 0, cache, embeds=embeds)
+            t0 = time.perf_counter()
+            g0 = self._kv_forward(ids, 0, cache, embeds=embeds, rope_pos=rope_pos)
             ttft = time.perf_counter() - t0
             gen = [g0]; nxt = g0; pos = P; steps = 0
+            # Where rope carries on from. Without media the two counters agree and this is
+            # just P; with it, the prompt's rotary positions ran ahead of, or behind, its
+            # token count, and the reply has to continue from where THEY ended.
+            rnext = P if rope_pos is None else int(np.asarray(rope_pos).max()) + 1
             t_first = time.perf_counter()      # the first token exists as of here
             while len(gen) < max_new and not self._stop_now():
-                nxt = self._kv_forward([nxt], pos, cache); pos += 1; steps += 1
+                nxt = self._kv_forward([nxt], pos, cache, rope_pos=rnext)
+                pos += 1; rnext += 1; steps += 1
                 if nxt == eot:
                     break
                 gen.append(nxt)

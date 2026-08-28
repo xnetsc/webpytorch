@@ -1449,7 +1449,7 @@ const UI_SYSTEM = [
 const PYPKG_KEY = 'webtorch.pyPackages';
 const PYON_KEY = 'webtorch.pyEnabled';
 const PY_DEFAULT = 'numpy, pandas, matplotlib';
-let pyWorker = null, pySeq = 0, pyState = 'off';
+let pyWorker = null, pySeq = 0, pyState = 'off', pyVersion = null;
 const pyPending = new Map();
 
 function pyPackages() {
@@ -1477,6 +1477,7 @@ function pyStart() {
       if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
     } else if (m.type === 'state') {
       pyState = m.state;
+      if (m.version) pyVersion = m.version;
       const el = $('#pyState');
       if (el) el.textContent = m.state === 'ready'
         ? 'ready · ' + (m.packages || []).join(', ') : m.state + '…';
@@ -2235,10 +2236,13 @@ function wirePython() {
         const nm = typeof m === 'string' ? m : m.name;
         const why = (typeof m === 'string' ? '' : m.why) || '';
         parts.push('<span class="miss">Could not load <code>' + esc(nm) + '</code>'
-                 + (why ? ' — ' + esc(why.replace(/\.$/, '')) : '')
-                 + '. Not in this Pyodide distribution and no pure-Python wheel on PyPI; '
-                 + 'a package with compiled code needs a wheel built for Pyodide, which you '
-                 + 'can add from this device below.</span>');
+                 + (why ? ' — ' + esc(why.replace(/[.\s]+$/, '')) : '')
+                 + '. Not in the Pyodide '
+                 + (pyVersion ? esc(pyVersion) + ' ' : '')
+                 + 'distribution, and no wheel on PyPI built for it. Which packages the '
+                 + 'distribution carries changes between Pyodide releases, so a name missing '
+                 + 'here may exist in another one. A wheel built for Pyodide can be added '
+                 + 'from this device below.</span>');
       });
       pyResult(parts.join('<br>'), missing.length > 0);
     } catch (e) {

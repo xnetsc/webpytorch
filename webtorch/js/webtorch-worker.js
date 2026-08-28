@@ -89,9 +89,25 @@
 
     say('loading webtorch…');
     try { pyodide.FS.mkdir('webtorch'); } catch (e) { /* already there */ }
+    // A module that does not arrive is fatal, not a warning to step over.
+    //
+    // Skipping leaves the directory there with modules missing from it, and Python treats a
+    // directory with no `__init__` as a NAMESPACE PACKAGE: `import webtorch` then succeeds
+    // and the module has nothing on it. The failure surfaces dozens of steps later as
+    // "module 'webtorch' has no attribute 'set_io_read'", which says nothing about the
+    // fetch that actually failed -- and if even one module is missing the SDK is not
+    // whatever the caller thinks it is anyway.
+    const missing = [];
     for (const m of await moduleList(base)) {
       try { pyodide.FS.writeFile('webtorch/' + m, await text(base + 'webtorch/' + m)); }
-      catch (e) { console.warn('webtorch: skipped ' + m + ': ' + e.message); }
+      catch (e) { missing.push(m + ' (' + (e && e.message || e) + ')'); }
+    }
+    if (missing.length) {
+      throw new Error('webtorch: ' + missing.length + ' module(s) could not be loaded from '
+        + base + 'webtorch/ — ' + missing.slice(0, 5).join(', ')
+        + (missing.length > 5 ? ', …' : '')
+        + '. The SDK is incomplete, so this stops here rather than importing a package with '
+        + 'nothing in it.');
     }
     await pyodide.runPythonAsync('import sys; sys.path.insert(0, "/")');
 

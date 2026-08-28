@@ -15,13 +15,17 @@ thing a new modality has to supply:
         token_id = 151655                  # placeholder token spliced over (or .placeholder)
         def encode(self, media, **kw): ...  # -> (n, H) ndarray of embeddings
         def n_tokens(self, media, **kw): ...# optional: count before encoding
+        def positions(self, media, **kw):   # optional: (axes, n) rotary layout for its own
+            ...                             # tokens, relative to 0 -- see `rope_positions`
 
     webtorch.register_encoder("my-vision", loader)      # loader(**kw) -> encoder (async)
 
 `MultimodalLM` then pairs ANY CausalLM (the whole generic decoder family — Llama/Qwen2/Qwen3,
 dense or MoE, int4/int8/fp16) with ANY registered encoder, so multimodality is not tied to one
-model family. Models needing extra positional handling (e.g. M-RoPE) supply it in the encoder
-or subclass; the splice + decode path is shared.
+model family. Multi-axis rope is part of the shared path rather than a reason to subclass: the
+decoder reads its `rope_sections` from its own config, and the encoder — which is the only
+thing that knows how its media is laid out in space — supplies the positions for the tokens
+it produced. Neither of them needs to know which model the other is.
 """
 import numpy as np
 
@@ -111,6 +115,43 @@ class MultimodalLM:
         media_embeds = np.asarray(self.encoder.encode(media, **kw), np.float32)
         return splice_embeddings(emb, ids, media_embeds, self.placeholder_id)
 
+    def rope_positions(self, ids, media=None, **kw):
+        """(axes, T) rotary positions for `ids`, or None when the decoder does not use them.
+
+        Text advances every axis together, one per token -- which is ordinary rope written
+        as several copies. A media block does not: the encoder returns the layout for its own
+        tokens, relative to zero, and it is placed at the running position and advances it by
+        its own extent rather than by its token count. That is the whole point of multi-axis
+        rope: a grid of patches sits beside itself in two dimensions instead of stretching
+        the sequence.
+
+        The encoder supplies the layout because it is the only thing that knows it. An
+        encoder without `positions` still works: its tokens then advance one at a time, which
+        is what a decoder without `rope_sections` would have done anyway.
+        """
+        sec = getattr(self.lm, "rope_sections", None)
+        if not sec:
+            return None
+        n_ax = len(sec)
+        ids = np.asarray(ids)
+        lay = None
+        if media is not None and self.encoder is not None:
+            f = getattr(self.encoder, "positions", None)
+            if f is not None:
+                lay = np.asarray(f(media, **kw), np.int64)
+                if lay.ndim != 2 or lay.shape[0] != n_ax:
+                    raise ValueError("encoder.positions must return (%d, n); got %r"
+                                     % (n_ax, getattr(lay, "shape", None)))
+        out, cur, i, ph = [], 0, 0, self.placeholder_id
+        while i < len(ids):
+            if lay is not None and ph is not None and ids[i] == ph:
+                out.append(lay + cur)
+                i += lay.shape[1]
+                cur += int(lay.max()) + 1
+            else:
+                out.append(np.full((n_ax, 1), cur, np.int64)); i += 1; cur += 1
+        return np.concatenate(out, 1) if out else None
+
     def build_prompt(self, prompt, media=None, system="You are a helpful assistant.", **kw):
         """(ids, embeds) for a prompt that may contain media. The encoder decides how many
         placeholder tokens the media needs (`n_tokens`, else the encoded length), and they are
@@ -136,8 +177,10 @@ class MultimodalLM:
         into the input embeddings and the SAME decode path runs (no model-specific branch)."""
         if media is None:
             return self.lm.generate(prompt, max_new=max_new, system=system)
-        gen = getattr(self.lm, "generate_multimodal", None)
-        if gen is not None:                       # decoder with its own richer path (e.g. M-RoPE)
-            return gen(prompt, media=media, max_new=max_new, system=system, **kw)
         ids, embeds = self.build_prompt(prompt, media, system=system, **kw)
-        return self.lm.generate(prompt, max_new=max_new, system=system, ids=ids, embeds=embeds)
+        # Multi-axis rope is handled here rather than by delegating to a method on the
+        # decoder: the decoder knows the sections, the encoder knows the layout, and this is
+        # the only place that has both.
+        rope_pos = self.rope_positions(ids, media, **kw)
+        return self.lm.generate(prompt, max_new=max_new, system=system, ids=ids,
+                                embeds=embeds, rope_pos=rope_pos)
