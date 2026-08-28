@@ -172,9 +172,9 @@ if _t is not None:
                 _shape = _label
                 break
 # How a tool RESULT reaches this model, discovered the same way. A template may define its
-# own structure for one (Qwen wraps it in <tool_response>), may render it as an ordinary
-# turn, or may drop a role it does not know -- and a dropped result is silent: the model
-# answers without ever seeing what the tool returned.
+# own structure for one, may render it as an ordinary turn, or may drop a role it does not
+# know -- and a dropped result is silent: the model answers without ever seeing what the
+# tool returned.
 _result_via = None
 _keeps_name = False
 if _t is not None:
@@ -194,12 +194,43 @@ if _t is not None:
         _as_user = _renders(_base + [{"role": "user", "content": _MK}])
         if _MK in _as_user:
             _result_via = "user"
+# How a RESULT is tied to the CALL it answers, discovered the same way. Some templates
+# carry an id both ways -- one rendered on the assistant's call, one read back on the
+# result -- and then a reply with several calls needs no other hint about which answer
+# belongs to which. Two probes, because the two halves are independent facts: does the
+# template RENDER an id given on the call (and in which of the shapes it takes there),
+# and does it READ an id field on the result message (and which name does it read).
+# A template that does neither ties results to calls by order alone.
+_call_id_shape = None
+_result_id_field = None
+if _t is not None and _result_via == "tool":
+    _CID = "zzcallidzz"
+    _amsg = {"role": "assistant", "content": "calling"}
+    for _s, _calls in (("nested", [{"id": _CID, "type": "function",
+                                    "function": {"name": _TN, "arguments": {}}}]),
+                       ("flat", [{"id": _CID, "name": _TN, "arguments": {}}])):
+        _c = dict(_amsg); _c["tool_calls"] = _calls
+        if _CID in _renders(_base[:-1] + [_c]):
+            _call_id_shape = _s
+            break
+    if _call_id_shape is not None:
+        _ids = (("tool_call_id", "zzidtczz"), ("call_id", "zzidcizz"), ("id", "zzididzz"))
+        _rm = {"role": "tool", "content": _MK}
+        for _f, _v in _ids:
+            _rm[_f] = _v
+        _r = _renders(_base + [_rm])
+        for _f, _v in _ids:
+            if _v in _r:
+                _result_id_field = _f
+                break
 json.dumps({"ok": _shape is not None, "shape": _shape,
-            "result_via": _result_via, "result_keeps_name": bool(_keeps_name)})
+            "result_via": _result_via, "result_keeps_name": bool(_keeps_name),
+            "call_id_shape": _call_id_shape, "result_id_field": _result_id_field})
 `);
     return JSON.parse(r);
   } catch (e) {
-    return { ok: false, shape: null, result_via: null, result_keeps_name: false };
+    return { ok: false, shape: null, result_via: null, result_keeps_name: false,
+             call_id_shape: null, result_id_field: null };
   }
 }
 

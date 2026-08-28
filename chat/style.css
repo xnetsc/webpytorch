@@ -128,6 +128,18 @@ details.think pre{white-space:pre-wrap;word-wrap:break-word;font:inherit;font-st
                   border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
 details.think.live summary{color:var(--accent)}
 
+/* tool log: the same folded panel as thinking, for what the model ran. The answer text
+   itself never carries the trace — a model that sees traces in its own history starts
+   imitating them as content, forged results and all. */
+details.toollog{margin:2px 0 8px;color:var(--mut);font-size:13px}
+details.toollog summary{cursor:pointer;font-style:normal;color:var(--mut);user-select:none;
+                        list-style:none;display:flex;align-items:center;gap:6px}
+details.toollog summary::-webkit-details-marker{display:none}
+details.toollog summary::before{content:"▸";font-size:10px;transition:transform .15s}
+details.toollog[open] summary::before{transform:rotate(90deg)}
+details.toollog pre{white-space:pre-wrap;word-wrap:break-word;font-size:12px;
+                    border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
+
 /* waiting for the first token: a pulsing · → ·· → ··· so a long prefill reads as working,
    not frozen; and the live/final decode speed under the reply text */
 .msg .body .dots{color:var(--mut);letter-spacing:2px;animation:blink 1.2s ease-in-out infinite}

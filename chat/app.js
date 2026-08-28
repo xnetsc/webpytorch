@@ -2151,6 +2151,7 @@ function fillBody(b, msg, live) {
         live.det.open = false; live.collapsed = true;                // auto-fold once the answer starts
       }
     }
+    if (msg.toollog && msg.toollog.length) setToollogLive(live, msg.toollog);
     setRenderedLive(live.ans, rest);      // no msg: a reply still arriving is not editable
     return;
   }
@@ -2162,6 +2163,7 @@ function fillBody(b, msg, live) {
     det.append(sum, pre); b.appendChild(det);
     det.open = open;                                                 // mid-think: watch it; done: folded
   }
+  if (msg && msg.toollog && msg.toollog.length) b.appendChild(toollogNode(msg.toollog));
   const ans = document.createElement('div');
   ans.className = 'ans';
   setRendered(ans, rest, live ? null : msg);
@@ -2254,7 +2256,12 @@ $('#composer').onsubmit = async (e) => {
     // A reply may ask to run something, and then be asked again with what came back. The
     // loop is here rather than in the SDK because the tools live here: the sandbox is the
     // page's, and so is the decision to let a model reach it.
+    //
+    // Every round reads only the tokens THAT round produced. Scanning everything streamed
+    // so far finds round 1's call again in round 2's reply -- the same call re-run every
+    // round, and its trace appended to what the reader sees once per round.
     let r = null;
+    let streamedLen = reply.content.length;
     for (let round = 0; ; round++) {
       const opts = Object.assign({ messages: msgs, images: imgs, prompt: promptFor(msg) },
                                  genOpts());
@@ -2274,23 +2281,50 @@ $('#composer').onsubmit = async (e) => {
                      err && err.message);
         r = await call('generate', opts);
       }
-      if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) break;
-      const calls = parseToolCalls(reply.content);
-      if (!calls.length) break;
+      const raw = reply.content.slice(streamedLen);      // this round's reply, nothing else
+      streamedLen = reply.content.length;
+      const prefix = reply.content.slice(0, streamedLen - raw.length);
+      const shown = stripToolCalls(raw);                 // prose kept, protocol removed
+      if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) {
+        // No round comes back around to tidy this one, so it tidies itself.
+        reply.content = prefix + shown;
+        break;
+      }
+      const calls = parseToolCalls(raw);
+      if (!calls.length) { reply.content = prefix + shown; break; }
+      // An id the template can answer a result with. The model's own call may already carry
+      // one -- keep it; making another would tie the result to an id the model never said.
+      calls.forEach((c, i) => { if (!c.id) c.id = 'wt_' + round + '_' + i; });
       const results = [];
       for (const c of calls) results.push(await runToolCall(c));
       // The conversation the model sees next: what it said, then what each call returned.
-      // It keeps its own markup here -- that is the format its template speaks.
-      msgs.push({ role: 'assistant', content: reply.content });
-      calls.forEach((c, i) => msgs.push(toolResultMessage(c.name, results[i])));
-      // What the reader sees keeps the prose and loses the protocol.
-      reply.content = stripToolCalls(reply.content);
-      // And what the READER sees: the call and its result, in the reply itself. A tool round
-      // that only the model could see would leave the answer resting on something invisible.
-      reply.content += '\n\n' + toolTrace(calls, results) + '\n\n';
+      if (modelCallIdShape) {
+        // The template ties results to calls by id, so the calls go back as structured
+        // tool_calls for it to render in ITS format, with the ids kept; the prose stays,
+        // the protocol markup goes -- the structured calls carry it now, and leaving both
+        // would show the model every call twice.
+        msgs.push({ role: 'assistant', content: shown,
+                    tool_calls: calls.map(c => ({ id: c.id, type: 'function',
+                                                  function: { name: c.name, arguments: c.args } })) });
+      } else {
+        // Its call format is content, so its own text goes back verbatim.
+        msgs.push({ role: 'assistant', content: raw });
+      }
+      calls.forEach((c, i) => msgs.push(toolResultMessage(c, results[i])));
+      // The call and its result go to a folded side panel, NOT into the answer text.
+      // Putting the trace in the answer taught the model to imitate it as content: with a
+      // real trace in its history it next "called" a tool by writing a forged one --
+      // invalid JSON and all -- and answered from the forgery. The answer stays the
+      // answer; the record of what ran stays beside it, and out of the model's context.
+      reply.toollog = (reply.toollog || [])
+        .concat(calls.map((c, i) => ({ name: c.name, args: c.args, result: results[i] })));
+      reply.content = prefix + shown;
+      streamedLen = reply.content.length;
       setRendered(body.querySelector('.ans') || body, reply.content);
+      setToollogLive(live, reply.toollog);
       if (_stopRequested()) break;
     }
+    if (live.tdet) live.tdet.open = false;          // the run is over; the panel folds
     if (r && r.truncated) {
       reply.content += '\n\n[stopped at ' + r.n + ' tokens — raise “Max reply length”'
                      + ' in ⚙ Settings, or leave it empty for no limit]';
@@ -2343,7 +2377,15 @@ function toolDefs() {
     return t.def;                       // nested {type:"function", function:{…}}
   });
 }
-function findTool(name) { return TOOLS.find(t => t.def.function.name === name); }
+// Whitespace, punctuation and case carry no meaning in a tool name: "run_ Python" is
+// "run_python" with noise in it. Exact match first; a name that is identical once the
+// noise is stripped is the model's intent stated plainly, so it runs — that is reading
+// what it said, not guessing what it meant.
+const normName = s => String(s || '').toLowerCase().replace(/[\s_\-.]+/g, '');
+function findTool(name) {
+  return TOOLS.find(t => t.def.function.name === name)
+      || TOOLS.find(t => normName(t.def.function.name) === normName(name));
+}
 
 const TOOLS_KEY = 'webtorch.toolsOn';
 // Whether the LOADED model can be told about tools -- asked once per model, never guessed.
@@ -2352,36 +2394,44 @@ let modelTakesTools = null;      // null = not asked yet
 let modelToolShape = null;       // which definition shape its template actually reads
 let modelResultVia = null;       // 'tool' | 'user' | null -- how a RESULT reaches it
 let modelResultKeepsName = false;
+let modelCallIdShape = null;     // 'nested' | 'flat' | null -- renders an id on a call
+let modelResultIdField = null;   // which id field it reads back on the result, if any
 async function probeTools() {
   modelTakesTools = null; modelToolShape = null;
   modelResultVia = null; modelResultKeepsName = false;
+  modelCallIdShape = null; modelResultIdField = null;
   try {
     const r = await call('toolsSupported');
     modelTakesTools = !!(r && r.ok);
     modelToolShape = (r && r.shape) || null;
     modelResultVia = (r && r.result_via) || null;
     modelResultKeepsName = !!(r && r.result_keeps_name);
+    modelCallIdShape = (r && r.call_id_shape) || null;
+    modelResultIdField = (r && r.result_id_field) || null;
   } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
 }
 
 // A tool result as a message THIS model will actually receive.
 //
-// Not assumed to be an ordinary turn: a template may define its own structure for one (Qwen
-// wraps it in <tool_response>), and a template that does not know the `tool` role drops it
-// silently -- the model then answers without ever having seen what the tool returned. The
-// probe says which; an ordinary user turn is the fallback, never the assumption.
-//
-// The NAME is folded into the content wherever the template does not carry it. Qwen's does
-// not, so two calls in one round arrive as two anonymous blocks with no way to tell which
-// tool produced which -- and the model has to guess, which is the whole thing to avoid.
-function toolResultMessage(name, content) {
-  const body = modelResultKeepsName ? content
-             : JSON.stringify({ tool: name, result: safeJson(content) });
+// Not assumed to be an ordinary turn: a template may define its own structure for one, and
+// a template that does not know the `tool` role drops it silently -- the model then answers
+// without ever having seen what the tool returned. The probe says which is the case; an
+// ordinary user turn is the fallback, never the assumption.
+// The NAME travels with the result only when nothing else carries it. A template that
+// renders the name itself, or ties the result to the call by id, needs no extra hint; one
+// that carries neither leaves two calls in a round as anonymous blocks the model can only
+// guess at -- so then the name is folded into the content itself.
+function toolResultMessage(call, content) {
+  const carries = modelResultKeepsName || (modelCallIdShape && modelResultIdField);
+  const body = carries ? content
+             : JSON.stringify({ tool: call.name, result: safeJson(content) });
   if (modelResultVia === 'user') {
     return { role: 'user', content: 'Result of the tool you called:\n' + body };
   }
-  return { role: 'tool', name, content: body };
+  const msg = { role: 'tool', name: call.name, content: body };
+  if (modelResultIdField) msg[modelResultIdField] = call.id;
+  return msg;
 }
 
 // Keep the result an object when it is one, so folding the name in does not bury JSON
@@ -2425,7 +2475,11 @@ function scanToolCalls(text) {
     if (!o || typeof o.name !== 'string') return null;
     const known = !!findTool(o.name);
     if (!known && !wrapped) return null;
-    return { name: o.name, args: o.arguments || o.parameters || {}, known };
+    // An id a model gives its own call is kept: a template that ties results to calls by
+    // id must see the SAME one back, not one invented here.
+    const id = ['id', 'tool_call_id', 'call_id'].map(k => o[k])
+                 .find(v => typeof v === 'string' && v) || null;
+    return { name: o.name, args: o.arguments || o.parameters || {}, known, id };
   };
   TOOL_CALL_RE.lastIndex = 0;
   let m;
@@ -2488,17 +2542,33 @@ async function runToolCall(c) {
       const props = Object.keys((f.parameters && f.parameters.properties) || {});
       return '  ' + f.name + '(' + props.map(k => k + (req.includes(k) ? '' : '?')).join(', ') + ')';
     }).join('\n');
-    // Which real tool it most likely meant: the one whose argument names its call already
-    // fits. That is a fact about the call, not a guess at intent -- and it is only used to
-    // address the correction to it, never to run anything.
+    // Which real tool it most likely meant. A call with the wrong name is usually a real
+    // name misspelled, so name similarity is the first evidence -- whitespace and
+    // punctuation carry no meaning ("run_ Python" is "runpython"); matching argument names
+    // decide where the name is no resemblance at all. It is only used to address the
+    // correction -- nothing runs on a guess.
+    const sim = (a, b) => {
+      let hits = 0; const pool = b.split('');
+      for (const ch of a) { const i = pool.indexOf(ch); if (i >= 0) { hits++; pool.splice(i, 1); } }
+      return (2 * hits) / ((a.length + b.length) || 1);
+    };
+    const cn = normName(c.name);
+    const ranked = TOOLS.map(x => ({ x, s: sim(cn, normName(x.def.function.name)) }))
+                        .sort((p, q) => q.s - p.s);
     const given = Object.keys((typeof c.args === 'object' && c.args) || {});
-    const guess = TOOLS.find(x => {
-      const props = Object.keys((x.def.function.parameters || {}).properties || {});
-      return given.length && given.every(k => props.includes(k));
-    }) || TOOLS[0];
+    const guess = (ranked.length && ranked[0].s >= 0.5 && ranked[0].x)
+      || TOOLS.find(x => {
+           const props = Object.keys((x.def.function.parameters || {}).properties || {});
+           return given.length && given.every(k => props.includes(k));
+         }) || TOOLS[0];
+    // The corrected call is shown in the shape this model's template actually reads -- the
+    // same shape its definitions went out in -- with the model's OWN arguments.
     const fixed = guess
-      ? '<tool_call>\n' + JSON.stringify({ name: guess.def.function.name,
-                                           arguments: c.args || {} }) + '\n</tool_call>'
+      ? JSON.stringify(modelToolShape === 'flat'
+          ? { name: guess.def.function.name, arguments: c.args || {} }
+          : { type: 'function',
+              function: { name: guess.def.function.name, arguments: c.args || {} } },
+          null, 2)
       : '';
     return 'there is no tool called "' + c.name + '". These exist, with their arguments:\n'
          + listed + '\n\nYour call again, with the name corrected — send this:\n' + fixed;
@@ -2528,6 +2598,31 @@ function toolTrace(calls, results) {
          + (body ? '```' + (a.code != null ? 'python' : 'json') + '\n' + body + '\n```\n\n' : '')
          + '```\n' + String(results[i]).slice(0, 4000) + '\n```';
   }).join('\n\n');
+}
+
+// The folded panel that records a reply's tool calls: what was asked for, what came back.
+// Kept OUT of the message content on purpose -- the answer is the answer, and a trace
+// sitting in the answer text gets imitated by the model as content on the next turn.
+function toollogNode(log) {
+  const det = document.createElement('details'); det.className = 'toollog';
+  const sum = document.createElement('summary');
+  sum.textContent = log.length === 1 ? 'Used a tool' : 'Used ' + log.length + ' tool calls';
+  const pre = document.createElement('pre');
+  pre.textContent = toolTrace(log, log.map(e => e.result));
+  det.append(sum, pre);
+  return det;
+}
+// Live update while the reply is still streaming: the panel appears as soon as the first
+// call returns, open so the work is visible; the loop folds it when the reply finishes.
+function setToollogLive(live, log) {
+  if (!live) return;
+  if (!live.tdet) {
+    live.tdet = toollogNode(log);
+    live.tdet.open = true;
+    live.ans.parentNode && live.ans.parentNode.insertBefore(live.tdet, live.ans);
+  } else {
+    live.tdet.querySelector('pre').textContent = toolTrace(log, log.map(e => e.result));
+  }
 }
 
 // ---- the Python runtime, as tools -----------------------------------------------------
