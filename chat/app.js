@@ -249,13 +249,14 @@ worker.onmessage = (e) => {
     $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
   }
   else if (m.type === 'exporting') {
-    // Said as what it is. The file on disk stays at zero bytes until the export closes --
-    // the browser writes a temporary and swaps it in -- so this line is the only sign it is
-    // working, and it must not be mistaken for a model load.
+    // Reported WHERE THE EXPORT WAS STARTED. `#progressText` lives in the Model panel and
+    // the export button in the Storage one, so an export watched from Storage showed
+    // nothing at all -- and since the picked file stays at zero bytes until close (the
+    // browser writes a temporary and swaps it in), there was no sign anywhere that it was
+    // working. Eighty seconds of that reads as a failure.
     const pct = m.total ? ' of ' + fmt(m.total) : '';
-    $('#progressText').textContent = 'writing ' + fmt(m.bytes) + pct
-      + ' — the file appears when this finishes';
-    if (m.total) setBar(m.bytes / m.total);
+    storeStatus('Writing ' + fmt(m.bytes) + pct
+              + ' — the file appears on disk when this finishes.');
   }
   else if (m.type === 'progress') { if (m.total) { expected = m.total; expectedIsReal = true; }
     if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
@@ -903,6 +904,7 @@ $('#releaseBtn').onclick = async () => {
 // ---- cache ----
 async function refreshCache() {
   try {
+    if (storeBusy) return;          // rebuilding the list mid-export would re-enable it
     const c = await call('cacheList');
     const el = $('#cacheList'); el.innerHTML = '';
     if (!(c.groups || []).length) { el.innerHTML = '<p class="hint">nothing cached yet</p>'; return; }
@@ -924,23 +926,59 @@ async function refreshCache() {
                                                     + '% of ' + fmt(g.total) + ')' : '') : '');
       if (partial) k.classList.add('partial');
       const ex = document.createElement('button'); ex.textContent = 'export';
-      ex.disabled = partial;
-      ex.title = partial ? 'Finish downloading before exporting'
-                         : (g.files > 1 ? 'Save as a .zip' : 'Save the file itself');
+      ex.dataset.blocked = partial ? '1' : '0';            // its own reason, not the busy one
+      ex.dataset.title0 = partial ? 'Finish downloading before exporting'
+                                  : (g.files > 1 ? 'Save as a .zip' : 'Save the file itself');
       ex.onclick = () => exportModel(g);
       const del = document.createElement('button'); del.textContent = 'delete';
+      del.dataset.blocked = '0';
+      del.dataset.title0 = 'Remove these files from the cache';
       del.onclick = async () => {
+        if (storeBusy) return;
         for (const key of g.keys) await call('cacheDelete', { key });
         refreshCache();
       };
       d.append(k, ex, del); el.appendChild(d);
     });
+    applyStoreState();          // a freshly built list starts in the state that is true now
   } catch (e) { $('#cacheList').innerHTML = '<p class="hint">cache unavailable: ' + e.message + '</p>'; }
 }
 
 // A single-file model is saved as itself, so the exported file IS the model and any other
 // tool reads it; several files become one .zip. The bytes stream from the SDK straight to
 // disk through the picked handle, so a 12 GB model never becomes a Blob.
+// While an export runs, nothing else in this panel may touch the cache: deleting the very
+// bytes being read would leave a half-written file with no sign of why. `disabled` is set
+// rather than the handlers removed, so the reason is visible -- a button that cannot be
+// pressed says "not now", a button that does nothing says "broken".
+let storeBusy = false;
+const STORE_BUSY_WHY = 'An export is running — the cache cannot change until it finishes';
+
+// Derived from what is true now, never restored from what was true before. A remembered
+// "was it disabled" goes stale the moment the list re-renders, and then a button comes back
+// enabled that should not be. Busy or not, an incomplete model still cannot be exported --
+// that fact lives on the element, and this reads it every time.
+function applyStoreState() {
+  document.querySelectorAll('#cacheList button').forEach(b => {
+    const own = b.dataset.blocked === '1';                 // its own reason, independent of us
+    b.disabled = storeBusy || own;
+    b.title = storeBusy ? STORE_BUSY_WHY : (b.dataset.title0 || '');
+  });
+  const clr = $('#clearCache');
+  if (clr) { clr.disabled = storeBusy; clr.title = storeBusy ? STORE_BUSY_WHY : ''; }
+}
+
+function setStoreBusy(on) { storeBusy = !!on; applyStoreState(); }
+
+// The Storage panel's own status line, for the things started from it.
+function storeStatus(html, bad) {
+  const el = $('#storeStatus');
+  if (!el) return;
+  if (html == null) { el.hidden = true; el.textContent = ''; return; }
+  el.hidden = false; el.innerHTML = html;
+  el.classList.toggle('bad', !!bad);
+}
+
 async function exportModel(g) {
   if (!window.showSaveFilePicker) {
     note('This browser cannot save large files directly (no File System Access API).');
@@ -968,12 +1006,18 @@ async function exportModel(g) {
     }
   } catch (e) { /* older browsers have no permission API; let the write speak for itself */ }
   note('Exporting ' + name + ' …');
+  setStoreBusy(true);
+  storeStatus('Preparing to write <code>' + name.replace(/[&<>]/g, '') + '</code>…');
   try {
     const n = await call('exportModel', { keys: g.keys, handle });
-    $('#progressText').textContent = '';
-    setBar(0);
+    storeStatus('Exported <code>' + name.replace(/[&<>]/g, '') + '</code> — ' + fmt(n)
+              + ' written.');
     note('Exported ' + name + ' — ' + fmt(n) + ' written.');
-  } catch (e) { note('Export failed: ' + e.message); }
+  } catch (e) {
+    storeStatus('<span class="miss">Export failed: '
+              + String(e.message || e).replace(/[&<>]/g, '') + '</span>', true);
+    note('Export failed: ' + e.message);
+  } finally { setStoreBusy(false); }
   setBar(0); $('#progressText').textContent = ''; loadedGB = null;
 }
 
