@@ -50,6 +50,14 @@ class WebGLPlatform:
         end_capture_pin()
         return gl.endCapture()
 
+    def resetCaptures(self):
+        """Drop every recorded capture graph and its pins, JS side included.
+        Sent at model release, BEFORE the buffered disposeBuffer messages, so
+        those are no longer refused by the JS-side pin set."""
+        from wgpy_backends.webgl.webgl_buffer import reset_capture_pins
+        reset_capture_pins()
+        return gl.resetCaptures()
+
     def replay(self, name):
         return gl.replay(name)
 

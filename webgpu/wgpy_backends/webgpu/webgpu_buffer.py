@@ -44,9 +44,11 @@ added_kernels = set()
 
 # --- graph capture: while capturing, buffer ids must stay stable (not recycled
 # into the pool), because JS replays the recorded kernel sequence against these
-# exact ids. Python only holds ids; the buffers themselves live in JS. ---
+# exact ids. Python only holds ids; the buffers themselves live in JS.
+# id -> byte length, so a release can destroy them AND keep the size accounting
+# straight. ---
 _capture_depth = 0
-_pinned_ids = set()
+_pinned_ids = {}
 
 
 def begin_capture_pin():
@@ -60,9 +62,16 @@ def end_capture_pin():
         _capture_depth -= 1
 
 
-def _maybe_pin(buffer_id: int):
+def reset_capture_pins():
+    """Abandon any pin state (a model is being released; captures go with it).
+    Does NOT dispose anything — the ids still need to be read off first."""
+    global _capture_depth
+    _capture_depth = 0
+
+
+def _maybe_pin(buffer_id: int, byte_length: int):
     if _capture_depth > 0:
-        _pinned_ids.add(buffer_id)
+        _pinned_ids[buffer_id] = byte_length
 
 
 def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
@@ -75,6 +84,50 @@ def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
     if len(_pool[texture_shape]) > 0:
         return _pool[texture_shape].pop()
     return None
+
+
+def release_capture_buffers():
+    """Destroy every buffer a recorded capture pinned.
+
+    Pinned buffers never enter the reuse pool when their Python object dies —
+    `__del__` drops them — so without this they stay allocated on the GPU
+    forever, and JS refuses their disposeBuffer while pinned too. Called at
+    model release, after the JS side has been told to drop its captures and
+    pins (so the disposeBuffer messages actually land)."""
+    plat = get_platform()
+    for buffer_id, byte_length in list(_pinned_ids.items()):
+        plat.disposeBuffer(buffer_id)
+        performance_metrics["webgpu.buffer.delete"] += 1
+        performance_metrics["webgpu.buffer.buffer_count"] -= 1
+        performance_metrics["webgpu.buffer.buffer_size"] -= byte_length
+    _pinned_ids.clear()
+
+
+def release_pooled_buffers():
+    """Destroy everything the reuse pools hold and empty them.
+
+    The pools exist to skip createBuffer when the next tensor has a matching
+    shape. When a model is released and a DIFFERENT one loads, most shapes
+    will not match, so pooled buffers would just sit on the GPU next to the
+    new model's allocations until the device runs out. Called at model
+    release, after `release_capture_buffers`."""
+    plat = get_platform()
+    for texture_shape, ids in list(_pool.items()):
+        for buffer_id in ids:
+            plat.disposeBuffer(buffer_id)
+            performance_metrics["webgpu.buffer.delete"] += 1
+            performance_metrics["webgpu.buffer.buffer_count"] -= 1
+            performance_metrics["webgpu.buffer.buffer_size"] -= (
+                texture_shape.byte_length
+            )
+    _pool.clear()
+    for data, ids in list(_meta_pool.items()):
+        for buffer_id in ids:
+            plat.disposeBuffer(buffer_id)
+            performance_metrics["webgpu.buffer.delete"] += 1
+            performance_metrics["webgpu.buffer.buffer_count"] -= 1
+            performance_metrics["webgpu.buffer.buffer_size"] -= len(data)
+    _meta_pool.clear()
 
 
 def _get_comm_buf(byte_size: int) -> np.ndarray:
@@ -129,7 +182,7 @@ class WebGPUBuffer(WebGPUBufferBase):
                 performance_metrics["webgpu.buffer.buffer_size_max"],
                 performance_metrics["webgpu.buffer.buffer_size"],
             )
-        _maybe_pin(self.buffer_id)
+        _maybe_pin(self.buffer_id, self.texture_shape.byte_length)
 
     def __del__(self):
         # TODO: limit pooled size
@@ -201,7 +254,7 @@ class WebGPUMetaBuffer(WebGPUBufferBase):
                 performance_metrics["webgpu.buffer.buffer_size_max"],
                 performance_metrics["webgpu.buffer.buffer_size"],
             )
-        _maybe_pin(self.buffer_id)
+        _maybe_pin(self.buffer_id, len(data))
 
     @property
     def data(self):

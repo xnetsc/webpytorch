@@ -72,6 +72,10 @@ export interface ComputeContextGLMessageReplay {
   name: string;
 }
 
+export interface ComputeContextGLMessageResetCaptures {
+  method: 'gl.resetCaptures';
+}
+
 export type ComputeContextGLMessage =
   | ComputeContextGLMessageAddKernel
   | ComputeContextGLMessageCreateBuffer
@@ -81,7 +85,8 @@ export type ComputeContextGLMessage =
   | ComputeContextGLMessageSetData
   | ComputeContextGLMessageBeginCapture
   | ComputeContextGLMessageEndCapture
-  | ComputeContextGLMessageReplay;
+  | ComputeContextGLMessageReplay
+  | ComputeContextGLMessageResetCaptures;
 
 export class ComputeContextGL {
   tensorBuffers: Map<number, WebGLTensorBuffer> = new Map();
@@ -128,6 +133,18 @@ export class ComputeContextGL {
 
   endCapture() {
     this.capturing = null;
+  }
+
+  // Drop every recorded graph and unpin all of their buffers. Sent when a model is
+  // released: without it the pins live forever, disposeBuffer keeps refusing every
+  // buffer the captured step ever touched, and the freed model's memory is never
+  // returned — so the next model allocates on top of it. Safe because a capture is
+  // re-recorded on every generate() call; the disposeBuffer messages that follow
+  // this one (same FIFO channel) then actually reach the buffers.
+  resetCaptures() {
+    this.capturing = null;
+    this.captures.clear();
+    this.pinned.clear();
   }
 
   replay(name: string) {
@@ -238,6 +255,9 @@ export class ComputeContextGL {
         break;
       case 'gl.replay':
         this.replay((message as ComputeContextGLMessageReplay).name);
+        break;
+      case 'gl.resetCaptures':
+        this.resetCaptures();
         break;
     }
   }

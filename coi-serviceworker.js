@@ -39,7 +39,14 @@
 //            is gone, never a reason to keep serving yesterday's code.
 //
 // Bump the suffix to abandon both; `activate` deletes anything that is not current.
-var CACHE_V = 'v2';
+//
+// One hole in FIXED's "version is in the name" assumption: the wheels ship as
+// wgpy_webgpu-1.0.0-py3-none-any.whl / wgpy_webgl-1.0.0-py3-none-any.whl and that
+// name never changes even when the bytes do. Once a client has cached one, cache-first
+// would serve it forever. So: bump CACHE_V whenever a wheel's CONTENT changes — the
+// browser byte-diffs this SW script on the user's next visit, the new copy installs
+// (skipWaiting), activate deletes the old caches, and everything is refetched fresh.
+var CACHE_V = 'v3';
 var FIXED = 'webtorch-fixed-' + CACHE_V;
 var APP = 'webtorch-app-' + CACHE_V;
 

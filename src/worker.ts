@@ -156,6 +156,9 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
     replay: (name: string) => {
       postToMain({ method: 'gl.replay', name });
     },
+    resetCaptures: () => {
+      postToMain({ method: 'gl.resetCaptures' });
+    },
   };
 }
 
@@ -304,6 +307,9 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     },
     replay: (name: string) => {
       postToMain({ method: 'gpu.replay', name });
+    },
+    resetCaptures: () => {
+      postToMain({ method: 'gpu.resetCaptures' });
     },
   };
 }

@@ -3053,6 +3053,41 @@ def _webgl_ready():
         return False
 
 
+def _gpu_release_memory():
+    """Give the device back every byte a released model was still holding.
+
+    Called from the release path AFTER the heavy attributes were nulled, i.e. the
+    buffer finalizers have already run. Two classes of memory never come back on
+    their own: buffers pinned by a captured decode graph (their finalizer drops
+    them instead of pooling, and JS refuses their disposeBuffer while pinned), and
+    the reuse pool itself, which only pays off when the NEXT model wants the same
+    shapes. Left alone, a released model keeps its whole GPU footprint, and the
+    next model allocates on top of it until the device dies (seen for real:
+    releasing a 0.6B, then loading a 30B-A3B loses the device mid-load)."""
+    try:
+        if _adam_backend_ready():
+            from wgpy_backends.webgpu import webgpu_buffer as _wb
+            plat = _adam_kernel["platform"]
+        elif _webgl_ready():
+            from wgpy_backends.webgl import webgl_buffer as _wb
+            plat = _copy_kernel["plat"]
+        else:
+            return
+    except Exception:
+        return
+    try:
+        import gc
+        gc.collect()   # buffers caught in reference cycles only reach the pools once collected
+        # Order matters, and the worker->main channel is FIFO: resetCaptures must
+        # clear the JS-side pin set before the disposeBuffer messages below arrive,
+        # or every pinned buffer is refused and never freed.
+        plat.resetCaptures()
+        _wb.release_capture_buffers()
+        _wb.release_pooled_buffers()
+    except Exception:
+        pass
+
+
 def _webgl_copy_into(dst, src):
     """dst[:] = src, writing dst's existing texture in place (capture-safe)."""
     plat = _copy_kernel["plat"]

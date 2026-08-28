@@ -57,7 +57,10 @@ export interface ComputeContextGPUMessageReplay {
     method: 'gpu.replay';
     name: string;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay;
+export interface ComputeContextGPUMessageResetCaptures {
+    method: 'gpu.resetCaptures';
+}
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private capturing;
@@ -69,6 +72,7 @@ export declare class ComputeContextGPU {
     disposeBuffer(id: number): void;
     beginCapture(name: string): void;
     endCapture(): void;
+    resetCaptures(): void;
     replay(name: string): void;
     setData(id: number, data: Uint8Array): void;
     getData(id: number): Promise<Uint8Array>;

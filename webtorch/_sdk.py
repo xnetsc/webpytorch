@@ -621,25 +621,42 @@ _HEAVY = ("layers", "embed", "head", "final_norm", "mtp", "Kc", "Vc", "h_in", "c
           "_shard_hdr", "conv_state", "rec_state", "_state", "impl", "_impl", "lm", "encoder")
 
 
+# Recursion guard for the GPU-memory cleanup: `_drop_heavy` reaches the GPU release only
+# from its OUTERMOST call that actually dropped something — nested calls (wrappers freeing
+# what they wrap) would fire it while buffers are still being dropped into the pools.
+_drop_depth = 0
+
+
 def _drop_heavy(obj, _seen=None):
     """Null out an object's heavy attributes (recursively through wrappers), so the GPU/host
     buffers they hold become collectable. Returns True if anything was dropped."""
+    global _drop_depth
     if obj is None:
         return False
     _seen = _seen if _seen is not None else set()
     if id(obj) in _seen:
         return False
     _seen.add(id(obj))
+    _drop_depth += 1
     freed = False
-    for name in _HEAVY:
-        if name in getattr(obj, "__dict__", {}):
-            inner = obj.__dict__[name]
-            if hasattr(inner, "__dict__") and not isinstance(inner, (list, dict, tuple)):
-                _free(inner, _seen)              # wrapper -> free what it wraps
-            obj.__dict__[name] = None
-            freed = True
+    try:
+        for name in _HEAVY:
+            if name in getattr(obj, "__dict__", {}):
+                inner = obj.__dict__[name]
+                if hasattr(inner, "__dict__") and not isinstance(inner, (list, dict, tuple)):
+                    _free(inner, _seen)              # wrapper -> free what it wraps
+                obj.__dict__[name] = None
+                freed = True
+    finally:
+        _drop_depth -= 1
     if freed:
         obj.__dict__["_released"] = True     # so using it afterwards gives a clear error
+        if _drop_depth == 0:
+            # All finalizers the drop set off have run (CPython refcounting runs them
+            # synchronously), so the pools now hold what the model was sitting on. Give
+            # it back to the device — otherwise the next model allocates on top of it.
+            from . import _core
+            _core._gpu_release_memory()
     return freed
 
 

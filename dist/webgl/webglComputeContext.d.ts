@@ -60,7 +60,10 @@ export interface ComputeContextGLMessageReplay {
     method: 'gl.replay';
     name: string;
 }
-export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay;
+export interface ComputeContextGLMessageResetCaptures {
+    method: 'gl.resetCaptures';
+}
+export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures;
 export declare class ComputeContextGL {
     tensorBuffers: Map<number, WebGLTensorBuffer>;
     private capturing;
@@ -78,6 +81,7 @@ export declare class ComputeContextGL {
     disposeBuffer(id: number): void;
     beginCapture(name: string): void;
     endCapture(): void;
+    resetCaptures(): void;
     replay(name: string): void;
     setData(id: number, data: ArrayBufferView): void;
     getData(id: number): Promise<Uint16Array>;
