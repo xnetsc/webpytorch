@@ -1023,9 +1023,28 @@ class _IdbStore(_Store):
         try:
             buf = Uint8Array.new(len(data))
             buf.assign(data)                   # one copy into the JS heap
-        except Exception:
+        except Exception as e:
+            # Out of room in the JS heap, not a type problem. A chunk is 16 MiB and the
+            # allocation can simply fail ("RangeError: Array buffer allocation failed") while
+            # a model is resident. Falling through to `to_js` hid that behind a
+            # ConversionError -- a memory failure wearing a type failure's face, which is a
+            # long way to look in the wrong direction.
+            #
+            # And it must not end the load. The cache is an OPTIMISATION: the bytes are in
+            # hand, the model can be built from them, and the only thing lost is not having
+            # to fetch them again. Treated like being over quota -- stop caching, keep
+            # loading -- which is what the quota path next to this already does.
+            if "allocation failed" in str(e) or isinstance(e, MemoryError):
+                self.full = True
+                _note_full(key)
+                return False
             from pyodide.ffi import to_js
-            buf = to_js(data)
+            try:
+                buf = to_js(data)
+            except Exception:
+                self.full = True
+                _note_full(key)
+                return False
         try:
             await _idb_req(self._store(self.CHUNKS, "readwrite").put(buf, self._ck(key, i)))
         except Exception as e:
