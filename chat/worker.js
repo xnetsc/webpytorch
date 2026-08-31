@@ -223,14 +223,67 @@ if _t is not None and _result_via == "tool":
             if _v in _r:
                 _result_id_field = _f
                 break
+# How this model WRITES a call, taken from the template rather than assumed. The template
+# is what turns "tool_calls" into text, so rendering one with known markers and reading back
+# what surrounds it gives the exact delimiters this model emits -- no guessing that everyone
+# uses <tool_call>, which is one family's convention and not a standard.
+_call_open = None
+_call_close = None
+_call_payload = None
+if _t is not None and _shape is not None:
+    _N = "zzprobenamezz"; _A = "zzprobeargzz"; _V = "zzprobevalzz"
+    _rc = _renders([{"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "",
+                     "tool_calls": [{"id": "zzprobeidzz", "type": "function",
+                                     "function": {"name": _N, "arguments": {_A: _V}}}]}])
+    _i = _rc.find(_N)
+    if _i >= 0:
+        # The payload is the innermost object containing the name; walk out to its opening
+        # brace, then match to its close.
+        _st = _rc.rfind("{", 0, _i)
+        while _st > 0 and _rc[:_st].rstrip().endswith("{"):
+            _st = _rc.rfind("{", 0, _st)
+        _d = 0; _en = -1
+        for _q in range(_st, len(_rc)):
+            if _rc[_q] == "{": _d += 1
+            elif _rc[_q] == "}":
+                _d -= 1
+                if _d == 0: _en = _q + 1; break
+        if _en > 0:
+            _pre = _rc[:_st]
+            _post = _rc[_en:]
+            # chr(10), never a backslash-n literal: this whole block lives inside a JS
+            # template literal, so JS turns the escape into a real newline before Python ever
+            # sees it and the string is left unterminated. It compiled fine when read from
+            # the FILE and failed only when run -- which is why testing the file's text is
+            # not testing what runs.
+            _NL = chr(10)
+            # The LAST NON-EMPTY line before the payload is the opener. A template that puts
+            # its tag on its own line leaves an empty remainder after the final newline, and
+            # taking that reports "this model uses no delimiters" about one that does.
+            _lines = [x for x in _pre.split(_NL) if x.strip()]
+            _call_open = _lines[-1] if _lines else ""
+            _after = [x for x in _post.split(_NL) if x.strip()]
+            _call_close = _after[0] if _after else ""
+            try:
+                _obj = json.loads(_rc[_st:_en])
+                _call_payload = "nested" if ("function" in _obj and "name" not in _obj) else "flat"
+            except Exception:
+                _call_payload = None
 json.dumps({"ok": _shape is not None, "shape": _shape,
             "result_via": _result_via, "result_keeps_name": bool(_keeps_name),
-            "call_id_shape": _call_id_shape, "result_id_field": _result_id_field})
+            "call_id_shape": _call_id_shape, "result_id_field": _result_id_field,
+            "call_open": _call_open, "call_close": _call_close,
+            "call_payload": _call_payload})
 `);
     return JSON.parse(r);
   } catch (e) {
+    // The reason travels with the answer. A probe that fails silently is indistinguishable
+    // from a model that takes no tools, and that ambiguity cost an hour.
     return { ok: false, shape: null, result_via: null, result_keeps_name: false,
-             call_id_shape: null, result_id_field: null };
+             call_id_shape: null, result_id_field: null,
+             call_open: null, call_close: null, call_payload: null,
+             error: String((e && e.message) || e).slice(-400) };
   }
 }
 

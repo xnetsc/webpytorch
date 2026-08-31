@@ -2396,10 +2396,14 @@ let modelResultVia = null;       // 'tool' | 'user' | null -- how a RESULT reach
 let modelResultKeepsName = false;
 let modelCallIdShape = null;     // 'nested' | 'flat' | null -- renders an id on a call
 let modelResultIdField = null;   // which id field it reads back on the result, if any
+// How THIS model WRITES a call, read off its own template by the probe. An empty opener is
+// an answer too: it means the model writes a bare object with no delimiters at all.
+let modelCallOpen = null, modelCallClose = null, modelCallPayload = null;
 async function probeTools() {
   modelTakesTools = null; modelToolShape = null;
   modelResultVia = null; modelResultKeepsName = false;
   modelCallIdShape = null; modelResultIdField = null;
+  modelCallOpen = null; modelCallClose = null; modelCallPayload = null;
   try {
     const r = await call('toolsSupported');
     modelTakesTools = !!(r && r.ok);
@@ -2408,6 +2412,9 @@ async function probeTools() {
     modelResultKeepsName = !!(r && r.result_keeps_name);
     modelCallIdShape = (r && r.call_id_shape) || null;
     modelResultIdField = (r && r.result_id_field) || null;
+    modelCallOpen = (r && typeof r.call_open === 'string') ? r.call_open : null;
+    modelCallClose = (r && typeof r.call_close === 'string') ? r.call_close : null;
+    modelCallPayload = (r && r.call_payload) || null;
   } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
 }
@@ -2457,7 +2464,22 @@ const MAX_TOOL_ROUNDS = 4;
 // what a model without one tends to produce. Both are read, and anything else is simply not
 // a tool call -- a reply that merely talks about JSON is left alone, because the object has
 // to carry a name that is actually registered before it is run.
-const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+// The delimiters a model wraps a call in are ITS convention, not a standard, so they are
+// read off its own template by the probe. The list below is only what to try when a template
+// could not be read at all -- a last resort, never the rule.
+const FALLBACK_CALL_DELIMS = [['<tool_call>', '</tool_call>'],
+                              ['<|tool_call|>', '<|/tool_call|>'],
+                              ['[TOOL_CALLS]', '']];
+function callDelimiters() {
+  if (typeof modelCallOpen === 'string' && modelCallOpen)
+    return [[modelCallOpen, modelCallClose || '']];
+  return FALLBACK_CALL_DELIMS;
+}
+const reEsc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function callRegexes() {
+  return callDelimiters().map(([o, c]) => new RegExp(
+    reEsc(o) + '\\s*([\\s\\S]*?)\\s*' + (c ? reEsc(c) : '(?=\\n|$)'), 'g'));
+}
 
 // ONE scan, used for both running the calls and removing them from what is shown. Two
 // separate readers drift: the reply ends up with a call the loop did not run, printed raw as
@@ -2472,22 +2494,35 @@ function scanToolCalls(text) {
   const src = String(text);
   const found = [];
   const asCall = (o, wrapped) => {
-    if (!o || typeof o.name !== 'string') return null;
-    const known = !!findTool(o.name);
+    if (!o) return null;
+    // The nested form is recognised HERE, at the outer object, not left to be found as the
+    // inner one. Both are calls and both parsed -- but the span differs, and the span is
+    // what gets removed: matching the inner object stripped it out of the middle of its
+    // wrapper and left `{"type":"function","function":}` in the reply. Parse and strip have
+    // to agree on the same characters, which is the whole reason they share one scan.
+    const inner = (o.type === 'function' && o.function && typeof o.function === 'object')
+                ? o.function : o;
+    if (typeof inner.name !== 'string') return null;
+    const known = !!findTool(inner.name);
     if (!known && !wrapped) return null;
     // An id a model gives its own call is kept: a template that ties results to calls by
-    // id must see the SAME one back, not one invented here.
-    const id = ['id', 'tool_call_id', 'call_id'].map(k => o[k])
+    // id must see the SAME one back, not one invented here. It sits on the wrapper when
+    // there is one, so both are looked at.
+    const id = ['id', 'tool_call_id', 'call_id']
+                 .map(k => (o[k] !== undefined ? o[k] : inner[k]))
                  .find(v => typeof v === 'string' && v) || null;
-    return { name: o.name, args: o.arguments || o.parameters || {}, known, id };
+    return { name: inner.name, args: inner.arguments || inner.parameters || {}, known, id };
   };
-  TOOL_CALL_RE.lastIndex = 0;
-  let m;
-  while ((m = TOOL_CALL_RE.exec(src))) {
-    let c = null;
-    try { c = asCall(JSON.parse(m[1]), true); } catch (e) {}
-    if (c) found.push({ start: m.index, end: m.index + m[0].length, call: c });
-  }
+  callRegexes().forEach((re) => {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(src))) {
+      let c = null;
+      try { c = asCall(JSON.parse(m[1]), true); } catch (e) { /* not JSON: not a call */ }
+      if (c && !found.some(f => m.index < f.end && f.start < m.index + m[0].length))
+        found.push({ start: m.index, end: m.index + m[0].length, call: c });
+    }
+  });
   // Bare objects, wherever they sit. Brace-matched rather than regexed: the arguments are
   // themselves an object, and a pattern stopping at the first `}` would cut a call in half.
   for (let k = 0; k < src.length; k++) {
@@ -2630,26 +2665,16 @@ registerTool({
   type: 'function',
   function: {
     name: 'run_python',
-    // The RETURN SHAPE is part of the contract, so it is stated here rather than left to be
-    // inferred from whatever came back. JSON with named fields rather than prose: a model
-    // that cannot tell stderr from stdout reports one as the other, and the first import of
-    // a plotting library writes a notice to stderr that has been answered with as the result.
-    description: 'Run Python. The interpreter is separate from the one holding the model and '
-      + 'keeps its state between calls, so a name defined in one call is still there in the '
-      + 'next. Use it to compute rather than to guess: arithmetic, parsing, checking that a '
-      + 'library does what you are about to claim.\n\n'
-      + 'Returns a JSON object:\n'
-      + '  {"stdout": string, "stderr": string, "result": string|null, '
-      + '"traceback": string|null, "figures": number}\n'
-      + '  stdout    - what the code printed.\n'
-      + '  stderr    - notices written by LIBRARIES, not by the code (a plotting package '
-      + 'building its font cache, say). Never the answer.\n'
-      + '  result    - the value of the last expression, or null if it had none. This is what '
-      + 'to report when the task was to compute something.\n'
-      + '  traceback - non-null means the code raised and there is NO result; fix it and call '
-      + 'again.\n'
-      + '  figures   - how many plots were drawn. They are shown to the reader; you cannot '
-      + 'see them, so do not describe them.',
+    // Terse on purpose. A definition is re-sent with EVERY request, so its prose is paid
+    // for on every prompt and every decode step after it: written out at length these three
+    // cost 781 tokens, which took a 0.6B from 110 tok/s to 64 and its first token from 0.3 s
+    // to 3.4. The contract still has to be exact -- it just has to be a signature, not an
+    // essay. What the model must NOT confuse is stated; the rest is left out.
+    description: 'Run Python, get the output back. Separate interpreter from the model; '
+      + 'state persists across calls. Use it instead of computing in your head.\n'
+      + 'Returns {"stdout":str,"stderr":str,"result":str|null,"traceback":str|null,'
+      + '"figures":int}. stderr is library noise, not the answer. traceback non-null means it '
+      + 'failed and result is null. figures are shown to the reader, not to you.',
     parameters: {
       type: 'object',
       properties: { code: { type: 'string', description: 'The Python source to run.' } },
@@ -2676,17 +2701,10 @@ registerTool({
   type: 'function',
   function: {
     name: 'install_python_packages',
-    description: 'Make Python modules importable, by name. Anything the Pyodide distribution '
-      + 'ships comes from there; anything else is fetched from PyPI if it has a pure-Python '
-      + 'wheel. A package with compiled code cannot be added this way. Call with no names to '
-      + 'ask what is already loaded.\n\n'
-      + 'Returns a JSON object:\n'
-      + '  {"ready": string[], "installed_from_pypi": string[], '
-      + '"unavailable": [{"name": string, "why": string}]}\n'
-      + '  ready               - every module importable now.\n'
-      + '  installed_from_pypi - the ones that had to be fetched.\n'
-      + '  unavailable         - could not be supplied, with the reason. Do not ask again '
-      + 'for the same name; use a different library or say it cannot be done.',
+    description: 'Make modules importable by name (distribution first, else a pure-Python '
+      + 'wheel from PyPI). No names asks what is loaded.\n'
+      + 'Returns {"ready":[str],"installed_from_pypi":[str],'
+      + '"unavailable":[{"name":str,"why":str}]}. Do not re-request an unavailable name.',
     parameters: {
       type: 'object',
       properties: {
@@ -2711,15 +2729,9 @@ registerTool({
   type: 'function',
   function: {
     name: 'restart_python',
-    description: 'Throw away the Python interpreter and start a fresh one. Everything defined '
-      + 'so far is lost and the configured modules are loaded again. Use it when the state '
-      + 'has become confusing or something is wedged - not to recover from an ordinary '
-      + 'traceback, which loses work for nothing.\n\n'
-      + 'Returns a JSON object:\n'
-      + '  {"restarted": true, "state": string, "ready": string[]}\n'
-      + '  state - "ready" when the new interpreter is usable; anything else means it is not '
-      + 'yet, and running code will fail.\n'
-      + '  ready - the modules importable in the fresh interpreter.',
+    description: 'Discard the interpreter and start a fresh one; everything defined so far '
+      + 'is lost. For a wedged runtime, not for an ordinary traceback.\n'
+      + 'Returns {"restarted":true,"state":str,"ready":[str]}. state "ready" means usable.',
       parameters: { type: 'object', properties: {} },
   },
 }, async () => {
