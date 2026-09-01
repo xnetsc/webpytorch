@@ -94,7 +94,8 @@ class AutoModelForCausalLM:
         fut = asyncio.get_event_loop().create_future()
         _IMPL_LOADING[key] = fut
         try:
-            impl = await AutoModelForCausalLM._load_raw(p, dtype, bits, lmax, weights)
+            impl = await AutoModelForCausalLM._load_raw(
+                p, dtype, bits, lmax, weights, kw.get("expert_weights_norm"))
         except BaseException as exc:
             _IMPL_LOADING.pop(key, None)
             if not fut.done(): fut.set_exception(exc)
@@ -105,7 +106,7 @@ class AutoModelForCausalLM:
         return _apply_gen_defaults(impl, kw)
 
     @staticmethod
-    async def _load_raw(p, dtype, bits, lmax, weights):
+    async def _load_raw(p, dtype, bits, lmax, weights, expert_weights_norm=None):
         from . import llm as _llm, webio
         if p.endswith(".gguf"):
             # "auto" means the same here as for an AutoGPTQ dir: keep the stored
@@ -113,8 +114,9 @@ class AutoModelForCausalLM:
             gb = 8 if dtype == "int8" else (4 if dtype == "int4" else bits)
             # dtype="fp16" runs a GGUF unquantized (works without a GPU; the int kernel is
             # GPU-only). "auto"/int4/int8 requantize to the int engine as before.
-            return await _llm.CausalLM.from_gguf(p, lmax=lmax, bits=gb,
-                                                 quantize=(dtype != "fp16"), weights=weights)
+            return await _llm.CausalLM.from_gguf(
+                p, lmax=lmax, bits=gb, quantize=(dtype != "fp16"), weights=weights,
+                expert_weights_norm=expert_weights_norm)
         cfg = await webio.read_json(p + "/config.json")
         if "quantization_config" in cfg:                     # already-quantized AutoGPTQ (int4/int8)
             return await _llm.CausalLM.from_gptq(p, lmax=lmax)

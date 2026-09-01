@@ -893,6 +893,8 @@ class CausalLM:
         self._gpu = wt._adam_backend_ready()        # webgpu -> capture path available
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
+        self._audit()               # weights must agree with the file
+        self._smoke()               # and the first forward must be usable
         return self
 
     # ---- GGUF (llama.cpp) loading: dequant -> requant to int4 -> same engine ----
@@ -1180,7 +1182,8 @@ class CausalLM:
         return wt.QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, self.gs, self.bits)
 
     @classmethod
-    async def from_gguf(cls, url, lmax=None, bits=None, quantize=True, weights="native"):
+    async def from_gguf(cls, url, lmax=None, bits=None, quantize=True, weights="native",
+                        expert_weights_norm=None):
         """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
         they run on the same capture-accelerated engine. `url` is the served .gguf file.
 
@@ -1203,13 +1206,16 @@ class CausalLM:
         SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error."""
         self = cls(None)
         try:
-            return await self._from_gguf(url, lmax, bits, quantize, weights)
+            return await self._from_gguf(url, lmax, bits, quantize, weights,
+                                         expert_weights_norm)
         except BaseException:
             self._abort_build()      # a dead load must not strand half a model in GPU memory
             raise
 
-    async def _from_gguf(self, url, lmax=None, bits=None, quantize=True, weights="native"):
+    async def _from_gguf(self, url, lmax=None, bits=None, quantize=True, weights="native",
+                         expert_weights_norm=None):
         from . import ggufload as G
+        self._expert_norm_default = expert_weights_norm
         self.lmax = lmax; self._gguf = url
         size = 12 << 20
         while True:
@@ -1259,6 +1265,7 @@ class CausalLM:
         # MoE (0 => dense), same contract as the safetensors path
         self.n_experts = int(m("expert_count", default=0, required=False) or 0)
         self.top_k = int(m("expert_used_count", default=0, required=False) or 0)
+        self._arch = arch
         self.norm_topk = self._expert_norm(arch, m)
         self.sparse_step = 1; self.mlp_only = set()
         self.has_shared_expert = False
@@ -1487,6 +1494,8 @@ class CausalLM:
         self._gpu = wt._adam_backend_ready()
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
+        self._audit()               # weights must agree with the file
+        self._smoke()               # and the first forward must be usable
         return self
 
     async def _gload_mtp(self):
@@ -1625,6 +1634,8 @@ class CausalLM:
         self._gpu = wt._adam_backend_ready()
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         self._init_state()
+        self._audit()               # weights must agree with the file
+        self._smoke()               # and the first forward must be usable
         return self
 
     # ---- math ----
@@ -1638,6 +1649,100 @@ class CausalLM:
                 return r
         return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
 
+    def _audit(self):
+        """Refuse a model whose weights do not agree with what its own file declares.
+
+        An architecture this has not seen before does not announce itself. It loads, decodes
+        at full speed, and answers fluent nonsense -- OLMoE did exactly that through two
+        separate assumptions, and neither raised anything. What CAN be established is
+        agreement: a norm weight is either one head wide or the whole projection and nothing
+        else; a router emits one score per expert; a projection's width is what the head
+        counts say. Where the numbers disagree the load is wrong, so it stops here rather
+        than at the point someone notices the answers are strange.
+
+        This checks facts, never conventions. Whether routed weights are renormalised cannot
+        be read off any weight -- see `_expert_norm`, which reports what it assumed instead.
+        """
+        H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        bad = []
+
+        def width(lin, attr="Nt"):
+            v = getattr(lin, attr, None)
+            return int(v) if v is not None else None
+
+        for i, lay in enumerate(getattr(self, "layers", [])):
+            if self._is_linear_layer(i):
+                continue
+            for nm, w, nheads in (("attn_q_norm", lay.get("qn"), NH),
+                                  ("attn_k_norm", lay.get("kn"), NKV)):
+                if w is None:
+                    continue
+                n = int(getattr(getattr(w, "data", w), "size", 0))
+                if n not in (HD, nheads * HD):
+                    bad.append("blk.%d.%s is %d wide, which is neither one head (%d) nor the "
+                               "whole projection (%d)" % (i, nm, n, HD, nheads * HD))
+            q = width(lay.get("q"))
+            if q is not None and q not in (NH * HD, 2 * NH * HD):
+                bad.append("blk.%d.attn_q emits %d, not %d (or %d with a fused gate)"
+                           % (i, q, NH * HD, 2 * NH * HD))
+            for nm in ("k", "v"):
+                got = width(lay.get(nm))
+                if got is not None and got != NKV * HD:
+                    bad.append("blk.%d.attn_%s emits %d, not %d"
+                               % (i, nm, got, NKV * HD))
+            o_in = width(lay.get("o"), "Kt")
+            if o_in is not None and o_in != NH * HD:
+                bad.append("blk.%d.attn_output takes %d, not %d" % (i, o_in, NH * HD))
+            moe = lay.get("moe")
+            if moe:
+                ne = int(moe.get("n_experts") or 0)
+                g = width(moe.get("gate"))
+                if g is not None and ne and g != ne:
+                    bad.append("blk.%d router emits %d scores for %d experts" % (i, g, ne))
+                k = int(moe.get("top_k") or 0)
+                if ne and k > ne:
+                    bad.append("blk.%d routes to %d of %d experts" % (i, k, ne))
+                st = moe.get("stacked")
+                if st and ne:
+                    held = int(getattr(st.get("gate_up"), "n_experts", ne) or ne)
+                    if held != ne:
+                        bad.append("blk.%d holds %d stacked experts, not %d" % (i, held, ne))
+            if bad and len(bad) >= 6:
+                break                                   # enough to name the problem
+        if bad:
+            raise ValueError(
+                "this model's weights do not match what its file declares, so it would run "
+                "and answer wrongly rather than fail:\n  " + "\n  ".join(bad[:6])
+                + "\nThis is a gap in webtorch's support for architecture %r, not a broken "
+                  "file." % getattr(self, "_arch", "?"))
+
+    def _smoke(self):
+        """One forward pass, required to produce usable logits.
+
+        A shader that fails to compile is not an exception here: the platform runs nothing
+        and the output buffer is left as it was, which reads as a numerically wrong model
+        rather than a broken one. So a freshly loaded model answers once before anyone can
+        ask it anything, and that answer has to be finite and to distinguish between tokens
+        at all -- the two things every real forward pass does and a kernel that never ran
+        does not."""
+        ids = [1, 2, 3, 4]
+        vsz = int(getattr(self.tok, "vocab_size", 0) or 0)
+        if vsz:
+            ids = [i % vsz for i in ids]
+        self._prefill(ids)
+        lg = np.asarray(self._logits(self._last_prefill_hidden), np.float32)
+        if lg.size == 0:
+            raise ValueError("this model produced no logits on its first forward pass")
+        if not np.all(np.isfinite(lg)):
+            raise ValueError("this model produced non-finite logits on its first forward "
+                             "pass, so the load is wrong rather than the prompt")
+        if float(lg.max() - lg.min()) == 0.0:
+            raise ValueError("this model gave every token in the vocabulary the same score "
+                             "on its first forward pass, which is what a kernel that did "
+                             "not run looks like, not a model")
+        self._kv_drop()               # those rows were the test's, not a conversation's
+        return True
+
     def _expert_norm(self, arch, m):
         """Whether this file's routed layers renormalise their top-k weights.
 
@@ -1650,9 +1755,13 @@ class CausalLM:
             return bool(said)
         if arch in self._EXPERT_WEIGHTS_NORM:
             return self._EXPERT_WEIGHTS_NORM[arch]
+        caller = self.__dict__.get("_expert_norm_default")
+        if caller is not None:
+            return bool(caller)
         print("webtorch: %r does not say whether routed weights are renormalised and this "
-              "build has no record for it; assuming they are. If the replies are fluent but "
-              "wrong, that is the first thing to try the other way." % arch)
+              "build has no record for it; assuming they are. Pass "
+              "`expert_weights_norm=False` to load() if the replies are fluent but wrong."
+              % arch)
         return True
 
     def _qk_norm(self, t, w, T, nheads):
@@ -2309,7 +2418,11 @@ class CausalLM:
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
-        return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
+        # Kept, not just passed on: the load-time smoke test needs the logits this produced,
+        # and the tensor is built here either way.
+        self._last_prefill_hidden = wt.Tensor(wt._contig(
+            self._rms(h, self.final_norm).data[-1:]))
+        return self._head_argmax(self._last_prefill_hidden)
 
     def _set_inputs(self, token, pos):
         NKV, HD, LMAX = self.NKV, self.HD, self.kv_cap
