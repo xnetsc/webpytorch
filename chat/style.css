@@ -140,8 +140,10 @@ details.toollog summary{cursor:pointer;font-style:normal;color:var(--mut);user-s
 details.toollog summary::-webkit-details-marker{display:none}
 details.toollog summary::before{content:"▸";font-size:10px;transition:transform .15s}
 details.toollog[open] summary::before{transform:rotate(90deg)}
-details.toollog pre{white-space:pre-wrap;word-wrap:break-word;font-size:12px;
-                    border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
+/* The trace is markdown -- a fenced block per call and per result -- so this styles what
+   the renderer produced, the same way the thinking pane does. */
+details.toollog > .ans{font-size:12px;
+                       border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
 
 /* waiting for the first token: a pulsing · → ·· → ··· so a long prefill reads as working,
    not frozen; and the live/final decode speed under the reply text */

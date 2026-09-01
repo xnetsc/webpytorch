@@ -2708,9 +2708,12 @@ function toollogNode(log) {
   const det = document.createElement('details'); det.className = 'toollog';
   const sum = document.createElement('summary');
   sum.textContent = log.length === 1 ? 'Used a tool' : 'Used ' + log.length + ' tool calls';
-  const pre = document.createElement('pre');
-  pre.textContent = toolTrace(log, log.map(e => e.result));
-  det.append(sum, pre);
+  // `toolTrace` writes markdown -- the call's name in bold, its arguments as a fenced
+  // python or json block, what came back as another fence -- and it was being put on the
+  // page as plain text, so the reader saw the backticks instead of the code.
+  const body = document.createElement('div'); body.className = 'ans';
+  setRendered(body, toolTrace(log, log.map(e => e.result)), null);
+  det.append(sum, body);
   return det;
 }
 // Live update while the reply is still streaming: the panel appears as soon as the first
@@ -2722,7 +2725,8 @@ function setToollogLive(live, log) {
     live.tdet.open = true;
     live.ans.parentNode && live.ans.parentNode.insertBefore(live.tdet, live.ans);
   } else {
-    live.tdet.querySelector('pre').textContent = toolTrace(log, log.map(e => e.result));
+    setRenderedLive(live.tdet.querySelector('.ans'),
+                    toolTrace(log, log.map(e => e.result)));
   }
 }
 
@@ -2730,26 +2734,72 @@ function setToollogLive(live, log) {
 registerTool({
   type: 'function',
   function: {
-    name: 'run_python',
-    // Terse on purpose. A definition is re-sent with EVERY request, so its prose is paid
-    // for on every prompt and every decode step after it: written out at length these three
-    // cost 781 tokens, which took a 0.6B from 110 tok/s to 64 and its first token from 0.3 s
-    // to 3.4. The contract still has to be exact -- it just has to be a signature, not an
-    // essay. What the model must NOT confuse is stated; the rest is left out.
-    description: 'Run Python, get the output back. Separate interpreter from the model; '
-      + 'state persists across calls. Use it instead of computing in your head.\n'
-      + 'Returns {"stdout":str,"stderr":str,"result":str|null,"traceback":str|null,'
-      + '"figures":int}. stderr is library noise, not the answer. traceback non-null means it '
-      + 'failed and result is null. figures are shown to the reader, not to you.',
+    name: 'python',
+    // ONE tool with a mode rather than three tools.
+    //
+    // A definition is re-sent with every request, so its prose is paid for on every prompt
+    // and every decode step after it. Three of these cost 781 tokens written out at length,
+    // which took a 0.6B from 110 tok/s to 64 and its first token from 0.3s to 3.4; trimmed
+    // to signatures they were 360, of which two were the name/description/parameters frame
+    // repeated for tools the model reaches for far less often than the first. Folding them
+    // into one mode parameter pays that frame once.
+    //
+    // The contract still has to be exact -- it is a signature, not an essay. What the model
+    // must not confuse is stated; the rest is left out.
+    description: 'Python in a separate interpreter from the model; state persists across '
+      + 'calls. Use it instead of computing in your head.\n'
+      + 'action "run": needs code. -> {"stdout":str,"stderr":str,"result":str|null,'
+      + '"traceback":str|null,"figures":int}. stderr is library noise, not the answer. '
+      + 'traceback non-null means it failed and result is null. figures are shown to the '
+      + 'reader, not to you.\n'
+      + 'action "install": names makes modules importable (distribution first, else a '
+      + 'pure-Python wheel from PyPI); no names asks what is loaded. -> {"ready":[str],'
+      + '"installed_from_pypi":[str],"unavailable":[{"name":str,"why":str}]}. Do not '
+      + 're-request an unavailable name.\n'
+      + 'action "restart": discards the interpreter, losing everything defined so far. For a '
+      + 'wedged runtime, not for an ordinary traceback. -> {"restarted":true,"state":str,'
+      + '"ready":[str]}.',
     parameters: {
       type: 'object',
-      properties: { code: { type: 'string', description: 'The Python source to run.' } },
-      required: ['code'],
+      properties: {
+        action: { type: 'string', enum: ['run', 'install', 'restart'],
+                  description: 'Which of the three to do.' },
+        code: { type: 'string', description: 'The Python source, for action "run".' },
+        names: { type: 'array', items: { type: 'string' },
+                 description: 'Module names for action "install", e.g. ["sympy"].' },
+      },
+      required: ['action'],
     },
   },
-}, async ({ code }) => {
+}, async ({ action, code, names }) => {
+  const act = String(action || '').toLowerCase().trim();
+  if (act === 'install') {
+    const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
+    const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
+                                                               : pyPackages() });
+    return {
+      ready: r.loaded || [],
+      installed_from_pypi: r.fromPyPI || [],
+      unavailable: (r.unavailable || []).map(u => (typeof u === 'string'
+        ? { name: u, why: '' } : { name: u.name, why: u.why || '' })),
+    };
+  }
+  if (act === 'restart') {
+    try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
+    pyStop(); pyStart();
+    for (let i = 0; i < 240 && pyState !== 'ready'; i++)
+      await new Promise(r => setTimeout(r, 250));
+    return { restarted: true, state: pyState,
+             ready: pyState === 'ready' ? pyPackages() : [] };
+  }
+  // "run", and anything unrecognised: the mode a model reaching for this almost always
+  // wants, and it fails visibly (a traceback) rather than silently doing nothing.
   if (!code) return { stdout: '', stderr: '', result: null,
-                      traceback: 'no code was given', figures: 0 };
+                      traceback: act && act !== 'run'
+                        ? ('unknown action ' + JSON.stringify(action)
+                           + '; use "run", "install" or "restart"')
+                        : 'no code was given',
+                      figures: 0 };
   const r = await pyCall('run', { code: String(code) });
   const clean = (x) => (x ? String(x).replace(/\n+$/, '') : '');
   return {
@@ -2761,52 +2811,6 @@ registerTool({
     traceback: r.error ? String(r.error) : null,
     figures: (r.images || []).length,
   };
-});
-
-registerTool({
-  type: 'function',
-  function: {
-    name: 'install_python_packages',
-    description: 'Make modules importable by name (distribution first, else a pure-Python '
-      + 'wheel from PyPI). No names asks what is loaded.\n'
-      + 'Returns {"ready":[str],"installed_from_pypi":[str],'
-      + '"unavailable":[{"name":str,"why":str}]}. Do not re-request an unavailable name.',
-    parameters: {
-      type: 'object',
-      properties: {
-        names: { type: 'array', items: { type: 'string' },
-                 description: 'Module names, e.g. ["sympy", "networkx"].' },
-      },
-    },
-  },
-}, async ({ names }) => {
-  const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
-  const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
-                                                             : pyPackages() });
-  return {
-    ready: r.loaded || [],
-    installed_from_pypi: r.fromPyPI || [],
-    unavailable: (r.unavailable || []).map(u => (typeof u === 'string'
-      ? { name: u, why: '' } : { name: u.name, why: u.why || '' })),
-  };
-});
-
-registerTool({
-  type: 'function',
-  function: {
-    name: 'restart_python',
-    description: 'Discard the interpreter and start a fresh one; everything defined so far '
-      + 'is lost. For a wedged runtime, not for an ordinary traceback.\n'
-      + 'Returns {"restarted":true,"state":str,"ready":[str]}. state "ready" means usable.',
-      parameters: { type: 'object', properties: {} },
-  },
-}, async () => {
-  try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
-  pyStop(); pyStart();
-  for (let i = 0; i < 240 && pyState !== 'ready'; i++)
-    await new Promise(r => setTimeout(r, 250));
-  return { restarted: true, state: pyState,
-           ready: pyState === 'ready' ? pyPackages() : [] };
 });
 
 
