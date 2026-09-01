@@ -248,6 +248,10 @@ _IOW = None       # write callback — None until the integrator installs one
 # the flag. `_INFLIGHT` holds those fetches' abort controllers, which is how a stop
 # interrupts them at once instead of waiting for each to finish on its own.
 _CANCEL = {"on": False, "n": 0, "probe": None}
+# Keys written since the last load began. A stop has to be able to tidy up after
+# itself, and only this layer knows which cache entries a load touched -- the caller
+# asked for a model, not for a set of URLs.
+_WROTE = set()
 _INFLIGHT = {}             # fetch id -> (controller, stop-count): the id is the key because
                            # the controller is a JS proxy — unhashable, and equality there is
                            # not ours to rely on
@@ -314,6 +318,8 @@ def cancel(flag=True):
     tokens (see `cancel_requested`) and returns the reply as far as it got, because half an
     answer is worth keeping and a half-finished load is not."""
     _CANCEL["on"] = bool(flag)
+    if not flag:
+        _WROTE.clear()                    # a new load: what the last one wrote is its own
     if flag:
         _CANCEL["n"] += 1
         for _fid, (ctl, _gen) in list(_INFLIGHT.items()):
@@ -1957,6 +1963,7 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
                 await store.put(key, i, data[i * chunk:(i + 1) * chunk])
             return
 
+        _WROTE.add(key)
         meta = await store.meta(key)
         chunk = meta["chunk"] or ((chunk_mb << 20) if chunk_mb else _CHUNK_DEFAULT)
         if meta["chunk"] is None or (meta["size"] is None and total is not None):
@@ -2001,6 +2008,70 @@ async def write_cache(key, data, cache_dir=None, offset=None, complete=None, tot
             cov = meta["covered"]
             if len(cov) == 1 and cov[0][0] <= 0 and cov[0][1] >= meta["size"]:
                 await store.set_meta(key, complete=True)   # one span covering it all
+
+
+async def trim_partial(key, cache_dir=None):
+    """Drop every chunk of `key` that is not fully present. -> bytes dropped.
+
+    A stopped download leaves whole chunks and, at the point it stopped, one that is only
+    part-written. The part-written ones are not wrong -- `covered` records byte for byte what
+    is there, and a read never asks outside it -- but they are dead weight: nothing can be
+    served from them until the rest of the chunk arrives, and they are what makes a stopped
+    load look like a cache entry that is "there" without being usable.
+
+    Whole chunks are kept, so a stopped load still resumes from where it got to; only the
+    ragged edge goes. `covered` is trimmed to match, so what the entry claims and what it
+    holds stay the same thing.
+    """
+    root = cache_dir or _default_hub_cache()
+    store = _make_store(root)
+    await store.open()
+    meta = await store.meta(key)
+    chunk = meta["chunk"]
+    if not chunk or not meta["covered"]:
+        return 0
+    size = meta["size"]
+    kept, dropped, freed = [], [], 0
+    for lo, hi in meta["covered"]:
+        first, last = lo // chunk, (hi - 1) // chunk
+        for i in range(first, last + 1):
+            base = i * chunk
+            end = base + chunk if size is None else min(base + chunk, size)
+            if lo <= base and hi >= end:                 # this chunk is entirely present
+                kept.append((max(lo, base), min(hi, end)))
+            else:
+                dropped.append(i)
+                freed += min(hi, end) - max(lo, base)
+    if not dropped:
+        return 0
+    for i in sorted(set(dropped)):
+        await store.put(key, i, b"")                     # the bytes go; the slot may remain
+    spans = []
+    for lo, hi in sorted(kept):
+        spans = _merge(spans, lo, hi)
+    await store.set_meta(key, covered=spans)
+    if size is not None:
+        whole = bool(spans) and spans[0][0] <= 0 and spans[0][1] >= size
+        await store.set_meta(key, complete=whole)
+    return freed
+
+
+async def trim_stopped(cache_dir=None):
+    """Trim every entry the load that just stopped had written. -> bytes dropped.
+
+    The stop itself cannot do this: `cancel` is called from wherever the person pressed the
+    button, often while the load is mid-chunk, and the tidying has to happen after the load
+    has actually unwound. So the loader's caller calls this once the `Cancelled` has come
+    back to it, and each entry keeps its whole chunks and loses its ragged edge.
+    """
+    freed = 0
+    for key in sorted(_WROTE):
+        try:
+            freed += await trim_partial(key, cache_dir)
+        except Exception:
+            pass                          # tidying must not turn a stop into a failure
+    _WROTE.clear()
+    return freed
 
 
 async def delete_cache(key, cache_dir=None):

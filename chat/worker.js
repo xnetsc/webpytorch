@@ -111,6 +111,14 @@ try:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
     m = await webtorch.load(src, **({"lmax": lmax} if lmax else {}))
     _MODEL["m"] = m; _MODEL["id"] = src
+except webtorch.Cancelled:
+    # A stop leaves whole chunks plus the one it landed in the middle of. Drop the ragged
+    # edge here, once the load has actually unwound: what stays is usable and resumes, and
+    # the cache no longer reports bytes it cannot serve.
+    _freed = await webtorch.trim_stopped()
+    if _freed:
+        js.console.log("stopped load: dropped " + str(_freed) + " partial bytes")
+    raise
 finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
