@@ -1827,6 +1827,11 @@ class CausalLM:
     # evaluated sampled, and greedy is where the degenerate repeats live.
     _DEFAULT_TEMPERATURE = 0.6
 
+    # Rows the KV cache starts with, and the step it grows by. The floor is small enough that
+    # loading a model costs almost nothing in cache, and doubling means a long conversation
+    # reallocates a handful of times rather than once per turn.
+    _KV_FLOOR = 512
+
     # Decode cost used to scale with the context because a step scanned the whole KV buffer
     # and re-uploaded a full-length mask every token. Both are gone -- the fused attention
     # reads the live length from the step control block, and the mask is only built for the
@@ -1960,8 +1965,17 @@ class CausalLM:
         return base
 
     def _init_state(self):
-        L, NKV, HD, LMAX, H = self.L, self.NKV, self.HD, self.lmax, self.H
+        L, NKV, HD, H = self.L, self.NKV, self.HD, self.H
         NH = self.NH
+        # `lmax` is the CONTEXT this model may run to -- the contract `_plan_length` holds a
+        # prompt to. `kv_cap` is how many rows are actually on the device right now, and it
+        # starts at the floor and grows to meet what a generation asks for. They used to be
+        # the same number, which meant the whole context was paid for the moment the model
+        # loaded: a 30B at a 10922-token context took 2GB of KV before a word was typed, and
+        # a 0.6B took the same 2GB -- five times the model itself -- for a chat that uses a
+        # few hundred tokens. On a machine already holding 13GB of weights that is the
+        # difference between fitting and swapping.
+        LMAX = self.kv_cap = min(int(self.lmax), self._KV_FLOOR)
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
@@ -2117,6 +2131,44 @@ class CausalLM:
             n += 1
         return n
 
+    def _kv_reserve(self, need):
+        """Make sure the KV cache holds at least `need` rows, growing it if it does not.
+
+        The cache is sized to the conversation rather than to the context the model COULD
+        run to. Loading a model no longer costs the whole context up front -- which on a 30B
+        was 2GB before a word was typed, and the same 2GB on a 0.6B whose weights are 0.4GB
+        -- and a chat that stays short never pays for one that does not.
+
+        Growth copies the rows already written, so the prefix a conversation has built up
+        survives it: reallocating is exactly when a conversation is getting long, and
+        throwing the cache away there would re-prefill the whole history.
+        """
+        need = int(need)
+        cap = int(getattr(self, "kv_cap", 0))
+        if need <= cap or not getattr(self, "_gpu", False):
+            return
+        # Double until it fits, so a long conversation reallocates a handful of times rather
+        # than once a turn, and never past what the model may actually run to.
+        new = max(cap * 2, self._KV_FLOOR)
+        while new < need:
+            new *= 2
+        new = min(new, int(self.lmax))
+        if new <= cap:
+            return
+        NKV, HD = self.NKV, self.HD
+        live = min(len(self.__dict__.get("_kv_ids") or []), cap)
+        for box in (self.Kc, self.Vc):
+            for i, old in enumerate(box):
+                grown = wt.Tensor(wt._zeros((NKV, new, HD)))
+                if live:
+                    grown.data[:, :live, :] = old.data[:, :live, :]
+                box[i] = grown
+        self.mask_b = wt.Tensor(np.zeros((1, 1, new), np.float32))
+        self.ctl.buffer.set_data(np.array([0, 1, NKV, HD, new], np.int32))
+        self.kv_cap = new
+        # Every kernel was captured against the old buffers and the old stride.
+        self.capture_ready = False
+
     def _kv_drop(self):
         """Forget what the cache holds. Anything that makes the cached rows unusable --
         releasing the model, resizing the cache, a run that wrote rows it did not track --
@@ -2131,7 +2183,8 @@ class CausalLM:
         `_kv_prefix`. The new tokens then carry rotary positions `start..start+T-1` and
         attend back over everything from 0, so the result is identical to prefilling the
         whole sequence; only the work already done is skipped."""
-        T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
+        T = len(ids); H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        LMAX = self.kv_cap                    # the rows on the device, not the context
         end = start + T
         c, s = self._rope_np(start, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
@@ -2166,7 +2219,7 @@ class CausalLM:
         return self._head_argmax(wt.Tensor(wt._contig(self._rms(h, self.final_norm).data[-1:])))
 
     def _set_inputs(self, token, pos):
-        NKV, HD, LMAX = self.NKV, self.HD, self.lmax
+        NKV, HD, LMAX = self.NKV, self.HD, self.kv_cap
         self.h_in.data.buffer.set_data(np.asarray(self.embed[token], np.float32))
         c, s = self._rope_np(pos)
         self.cos_b.data.buffer.set_data(c.reshape(-1)); self.sin_b.data.buffer.set_data(s.reshape(-1))
@@ -2176,7 +2229,7 @@ class CausalLM:
         self.ctl.buffer.set_data(np.array([pos, 1, NKV, HD, LMAX], np.int32))
 
     def _decode_fwd(self):
-        H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
+        H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.kv_cap
         sc = 1.0 / math.sqrt(HD); h = self.h_in
         for i, lay in enumerate(self.layers):
             x = self._rms(h, lay["in_ln"])
@@ -2314,7 +2367,9 @@ class CausalLM:
 
         # Same capture condition as `generate` -- see `_capturable`.
         if not self._capturable():
-            cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+            # Sized to this generation -- see the same line in `generate`.
+            cache = wt.KVCache(self.L, self.NKV, self.HD,
+                               min(int(self.lmax), P + max_new))
             nxt = self._kv_forward(ids, 0, cache)
             self._stream_ttft = time.perf_counter() - t0
             pos = P; n = 0; steps = 0
@@ -2334,6 +2389,7 @@ class CausalLM:
             return
         # Continue from whatever of this prompt the cache already holds, and do not clear it
         # first -- the same two points as in `generate`.
+        self._kv_reserve(P + max_new)                   # rows this generation can reach
         keep = self._kv_prefix(ids)
         g0 = self._prefill(ids[keep:], start=keep); self._stream_ttft = time.perf_counter() - t0
         held = list(ids)
@@ -2458,7 +2514,11 @@ class CausalLM:
         # written in place. So hybrids are captured when every recurrent layer can do that,
         # and fall back to the growing-cache forward when one cannot.
         if not self._capturable():                     # WebGL, host-side mixer, or sparse MoE
-            cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+            # Sized to this generation, not to the context the model may reach: this
+            # cache is built fresh every call, so the full context would be allocated
+            # and thrown away once per reply.
+            cache = wt.KVCache(self.L, self.NKV, self.HD,
+                               min(int(self.lmax), P + max_new))
             t0 = time.perf_counter()
             g0 = self._kv_forward(ids, 0, cache, embeds=embeds, rope_pos=rope_pos)
             ttft = time.perf_counter() - t0
@@ -2484,6 +2544,7 @@ class CausalLM:
         # not write -- clearing was defensive, and on a 30B (2GB of KV) it cost 738ms of
         # every single generation. It is also what made continuing from a cached prefix
         # impossible, which is the far bigger saving: see `_kv_prefix`.
+        self._kv_reserve(P + max_new)                   # rows this generation can reach
         keep = self._kv_prefix(ids, embeds, rope_pos)
         t0 = time.perf_counter(); g0 = self._prefill(ids[keep:], embeds=embeds, start=keep)
         ttft = time.perf_counter() - t0
