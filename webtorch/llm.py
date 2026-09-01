@@ -1393,7 +1393,15 @@ class CausalLM:
                     self.head.append(self._head_block(
                         ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow], b1 - b0, H))
         self.layers = []
+        from . import webio as _wio
         for i in range(self.L):
+            # A stop has to be able to land HERE. Building the layers is the phase that runs
+            # without awaiting anything the caller can interrupt -- bytes already in the cache
+            # are dequantized and uploaded straight through -- and on a 1.7B that was measured
+            # as a 19-second window in which the worker answered nothing at all and a stop
+            # waited for the whole phase to end. One checkpoint per layer bounds the wait by
+            # one layer instead.
+            _wio._check_cancel()
             p = "blk.%d." % i
             async def qb(nm, _p=p):                            # weight + optional bias -> QuantizedLinear
                 b = (await self._gload(_p + nm + ".bias")) if (_p + nm + ".bias") in self._ginfo else None

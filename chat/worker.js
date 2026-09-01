@@ -16,6 +16,22 @@ importScripts('../webtorch/js/webtorch-worker.js');
 
 let pyodide = null, ready = false;
 const send = (m) => postMessage(m);
+
+// A stop that does not queue.
+//
+// A generation is a plain Python loop inside ONE runPythonAsync call, so this worker's
+// thread is inside that call from the first token to the last. A stop sent as a message is
+// not queued behind the work -- `onmessage` never runs at all until the work ends -- and the
+// button reads as dead. Same for a load: its checkpoints are between reads, not between
+// messages. So the stop travels through memory instead: the page stores a 1 here and the
+// SDK sees it at its very next checkpoint, with no message, no queue and no interpreter.
+//
+// SharedArrayBuffer needs cross-origin isolation, which this page already requires for
+// everything else. Where it is missing the message path still works as it did.
+let STOP = null;
+try { STOP = new Int32Array(new SharedArrayBuffer(4)); } catch (e) { STOP = null; }
+function stopFlagRaise() { if (STOP) Atomics.store(STOP, 0, 1); }
+function stopFlagClear() { if (STOP) Atomics.store(STOP, 0, 0); }
 const log = (t) => send({ type: 'log', text: t });
 
 
@@ -36,6 +52,17 @@ webtorch.set_io_read(webtorch.modelscope_read())
 webtorch.set_io_write(webtorch.default_io_write)
 _MODEL = {"m": None, "id": None}
 `);
+  // Point the SDK at the shared flag, so a stop is seen at the next checkpoint rather than
+  // at the next message. Reading it is one index into shared memory, which is what lets this
+  // sit in a per-token loop.
+  if (STOP) {
+    pyodide.globals.set('_STOPFLAG', STOP);
+    await pyodide.runPythonAsync(`
+import webtorch
+webtorch.set_cancel_probe(lambda: _STOPFLAG[0] != 0)
+`);
+    send({ type: 'stopbuf', buf: STOP.buffer });
+  }
   // When it is not the GPU, ask the SDK why. The reason is recorded at the point of failure
   // rather than inferred here, which is the only way to tell a missing WebGPU from a page
   // that is simply not cross-origin isolated.
@@ -71,6 +98,7 @@ async function loadModel(repo, file, lmax) {
            rate, dlRate: self.__dlRate });
   };
   self.__dl = (rate) => { self.__dlRate = rate; };
+  stopFlagClear();                       // the Python flag is cleared below; this is its twin
   const out = await pyodide.runPythonAsync(`
 import js, webtorch
 src = _src
@@ -289,6 +317,7 @@ json.dumps({"ok": _shape is not None, "shape": _shape,
 
 async function generate(prompt, opts) {
   // A stop asked for during the LAST reply must not end this one before it starts.
+  stopFlagClear();
   await pyodide.runPythonAsync('import webtorch; webtorch.cancel(False)');
   if (!ready || !pyodide) throw new Error('no runtime');
   const imgs = await decodeImages((opts || {}).images);
@@ -504,6 +533,7 @@ if _MODEL["m"] is not None:
 // fetch, control is in the JS event loop and the interpreter is free, so this sets the flag
 // now and the load sees it at its next checkpoint.
 function stopLoad() {
+  stopFlagRaise();                       // lands at the next checkpoint, message or not
   if (!ready || !pyodide) return;
   try {
     const wt = pyodide.pyimport('webtorch');
@@ -523,8 +553,15 @@ onmessage = async (e) => {
     else if (cmd === 'stopLoad') stopLoad();
     // Stop a reply mid-flight. The same flag the loader uses, read (not raised on) between
     // tokens, so `generate` returns the part of the answer that already exists.
+    //
+    // The shared flag is the stop. This message cannot be what does it -- while a generation
+    // runs, this handler does not get to run at all -- so by the time we are here the page
+    // has already stored into shared memory and the decode loop has already seen it. The
+    // Python call below is only for a page with no SharedArrayBuffer, where the message is
+    // all there is.
     else if (cmd === 'stopGen') {
-      await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
+      stopFlagRaise();
+      if (!STOP) await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
       res = true;
     }
     else if (cmd === 'generate') res = await generate(args.prompt, args);

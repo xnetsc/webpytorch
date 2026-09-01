@@ -239,8 +239,18 @@ function call(cmd, args) {
   gpuInit.then(() => worker.postMessage({ id, cmd, args }));
   return p;
 }
+// The worker's stop flag, shared memory rather than a message. See `stopFlagRaise` there:
+// while a generation or a load is running, the worker's thread is inside one call and does
+// not reach `onmessage` at all, so a stop that travels as a message cannot arrive until the
+// thing it is stopping has finished. Storing into this is seen at the SDK's next checkpoint.
+let stopFlag = null;
+function askStop() {
+  if (stopFlag) Atomics.store(stopFlag, 0, 1);
+}
+
 worker.onmessage = (e) => {
   const m = e.data;
+  if (m.type === 'stopbuf') { stopFlag = new Int32Array(m.buf); return; }
   if (m.type === 'result') {
     const p = pending.get(m.id); pending.delete(m.id);
     if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
@@ -856,6 +866,7 @@ $('#loadBtn').onclick = async () => {
     // next checkpoint, and a button that does not change reads as a button that did nothing.
     $('#loadBtn').textContent = 'Stopping…';
     $('#loadBtn').disabled = true;
+    askStop();                                  // shared memory, so a busy worker still sees it
     call('stopLoad');
     return;
   }
@@ -2345,6 +2356,7 @@ $('#composer').onsubmit = async (e) => {
 $('#send').addEventListener('click', e => {
   if (!streaming) return;                       // idle: let the form submit as usual
   e.preventDefault();
+  askStop();                                    // takes effect now, not when the worker is free
   call('stopGen').catch(() => {});
   note('Stopping…');
 });
@@ -2448,9 +2460,13 @@ function safeJson(v) {
   try { return JSON.parse(v); } catch (e) { return v; }
 }
 function toolsEnabled() {
-  // Off unless asked for: a model that can run code on its own initiative is a different
-  // thing from one that answers, and that should be a decision rather than a default.
-  return localStorage.getItem(TOOLS_KEY) === '1' && pyEnabled() && TOOLS.length > 0
+  // On unless turned off. The reason it used to default off was that a model which can run
+  // code on its own initiative is a different thing from one that only answers -- but the
+  // runtime it reaches is already sandboxed away from the conversation, and the failure the
+  // default was avoiding is smaller than the one it caused: asked for a product of two large
+  // numbers, a model with no tool has to invent an answer, and does. The switch is still
+  // there, and an explicit '0' still wins; only "never touched it" changed sides.
+  return localStorage.getItem(TOOLS_KEY) !== '0' && pyEnabled() && TOOLS.length > 0
          && modelTakesTools === true;
 }
 
@@ -2753,7 +2769,7 @@ function wirePython() {
   on.checked = pyEnabled();
   const tools = $('#pyTools');
   if (tools) {
-    tools.checked = localStorage.getItem(TOOLS_KEY) === '1';
+    tools.checked = localStorage.getItem(TOOLS_KEY) !== '0';
     tools.onchange = () => localStorage.setItem(TOOLS_KEY, tools.checked ? '1' : '0');
   }
   st.textContent = pyEnabled() ? 'starting…' : 'off';

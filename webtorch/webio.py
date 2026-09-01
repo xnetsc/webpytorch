@@ -247,7 +247,7 @@ _IOW = None       # write callback — None until the integrator installs one
 # so a fetch in flight when a stop fires reports Cancelled by generation, independent of
 # the flag. `_INFLIGHT` holds those fetches' abort controllers, which is how a stop
 # interrupts them at once instead of waiting for each to finish on its own.
-_CANCEL = {"on": False, "n": 0}
+_CANCEL = {"on": False, "n": 0, "probe": None}
 _INFLIGHT = {}             # fetch id -> (controller, stop-count): the id is the key because
                            # the controller is a JS proxy — unhashable, and equality there is
                            # not ours to rely on
@@ -268,7 +268,35 @@ def cancel_requested():
     Reading the flag rather than raising on it is what a decode loop needs: a generation is
     not IO, has no checkpoint to raise at, and should hand back the tokens it already has
     instead of losing them to an exception."""
-    return bool(_CANCEL["on"])
+    if _CANCEL["on"]:
+        return True
+    probe = _CANCEL["probe"]
+    if probe is not None:
+        try:
+            if probe():
+                # Go through `cancel` rather than setting the flag: a stop is not only a flag,
+                # it also aborts the reads already in flight. Without that a load waits for
+                # its current chunk to finish before it can notice -- measured at 987ms, where
+                # aborting the fetch ends it at once.
+                cancel(True)
+                return True
+        except Exception:
+            pass                              # a probe that breaks must not break the run
+    return False
+
+
+def set_cancel_probe(fn):
+    """Install `fn()` as a second source of "stop was asked for". `None` clears it.
+
+    A stop has to be able to arrive while the interpreter is BUSY. In the browser the
+    decode loop is a plain Python loop inside one `runPythonAsync` call, so the worker
+    thread is inside that call for the whole generation: a stop sent as a message is not
+    queued behind the work, it is not received at all until the work ends, and the button
+    reads as dead. The flag has to come from somewhere the caller can write without the
+    interpreter's help -- a `SharedArrayBuffer` the page stores into directly -- and this is
+    where the SDK reads it. Called between tokens and at every IO checkpoint, so it must be
+    cheap; it is a single index into shared memory."""
+    _CANCEL["probe"] = fn
 
 
 def cancel(flag=True):
@@ -294,7 +322,9 @@ def cancel(flag=True):
 
 
 def _check_cancel():
-    if _CANCEL["on"]:
+    # Through `cancel_requested`, so an out-of-band stop (see `set_cancel_probe`) reaches the
+    # IO checkpoints too, not only the decode loop.
+    if cancel_requested():
         raise Cancelled("load cancelled")
 
 _UNSET_READ = ("webtorch IO is not configured: install a global read callback with "
