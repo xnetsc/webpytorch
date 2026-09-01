@@ -1816,6 +1816,37 @@ class KVCache:
         else:
             self.K = [None] * n_layers; self.V = [None] * n_layers
 
+    def length(self):
+        """Positions currently held. A growing cache is as long as it grew; a scatter cache
+        has fixed capacity and its live length is the caller's `pos`, not a property of the
+        buffers, so it reports None."""
+        if self.scatter:
+            return None
+        k = self.K[0]
+        return 0 if k is None else int(k.shape[1])
+
+    def truncate(self, n):
+        """Drop everything after position `n`, keeping the first `n`.
+
+        What makes a growing cache reusable across turns: turn N's prompt shares a prefix
+        with turn N-1's, and the rows past that prefix -- the last reply, the markup that
+        closed it -- have to go before the new tail is appended. Slicing is the whole
+        operation; the mask this cache builds is aligned to its end, so a shorter cache is
+        simply a cache at an earlier position."""
+        if self.scatter:
+            return
+        for i in range(self.L):
+            if self.K[i] is None:
+                continue
+            if int(self.K[i].shape[1]) <= n:
+                continue
+            if n <= 0:
+                self.K[i] = None; self.V[i] = None
+            else:
+                self.K[i] = Tensor(_contig(self.K[i].data[:, :n, :]))
+                self.V[i] = Tensor(_contig(self.V[i].data[:, :n, :]))
+        self._mkey = None                       # the mask is keyed on (pos, T); both changed
+
     def _gpu_mask(self, pos, T):
         if self._mkey != (pos, T):
             m = np.zeros((T, self.lmax), np.float32)

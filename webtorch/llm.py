@@ -2139,6 +2139,28 @@ class CausalLM:
             n += 1
         return n
 
+    def _kv_growing(self, ids, embeds=None, rope_pos=None):
+        """The growing cache to continue from, and how many of `ids` it already holds.
+
+        The counterpart of `_kv_prefix` for the path that cannot capture -- WebGL, a
+        host-side mixer, an unstacked MoE. That path built a whole new cache for every
+        generation and prefilled the prompt from zero, so a chat re-paid for its entire
+        history on every turn exactly as the capture path used to. The cache lives on the
+        model instead, and a new turn keeps the rows its prompt still agrees with.
+
+        Returns `(cache, keep)`. A cache that cannot be continued is replaced, not repaired.
+        """
+        keep = self._kv_prefix(ids, embeds, rope_pos)
+        cache = self.__dict__.get("_gcache")
+        if cache is not None and keep:
+            have = cache.length()
+            if have is not None and have >= keep:
+                cache.truncate(keep)              # drop the last reply, keep the shared head
+                return cache, keep
+        cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+        self._gcache = cache
+        return cache, 0
+
     def _kv_reserve(self, need):
         """Make sure the KV cache holds at least `need` rows, growing it if it does not.
 
@@ -2182,6 +2204,7 @@ class CausalLM:
         releasing the model, resizing the cache, a run that wrote rows it did not track --
         calls this, and the next generation prefills from zero."""
         self.__dict__.pop("_kv_ids", None)
+        self.__dict__.pop("_gcache", None)      # the growing cache is named by those ids too
 
     def _prefill(self, ids, embeds=None, start=0):
         """Run `ids` through the model, writing their keys and values into the cache at
@@ -2375,11 +2398,11 @@ class CausalLM:
 
         # Same capture condition as `generate` -- see `_capturable`.
         if not self._capturable():
-            # Sized to this generation -- see the same line in `generate`.
-            cache = wt.KVCache(self.L, self.NKV, self.HD,
-                               min(int(self.lmax), P + max_new))
-            nxt = self._kv_forward(ids, 0, cache)
+            # Continue from what this cache already holds -- see `_kv_growing`.
+            cache, keep = self._kv_growing(ids)
+            nxt = self._kv_forward(ids[keep:], keep, cache)
             self._stream_ttft = time.perf_counter() - t0
+            held = list(ids)
             pos = P; n = 0; steps = 0
             dec = self.tok.stream_decoder()
             t_first = time.perf_counter()
@@ -2389,7 +2412,9 @@ class CausalLM:
                     yield piece
                 if self._stop_now():
                     break                       # just-yielded text satisfies the constraint
+                held.append(nxt)                # its row is written by the call below
                 nxt = self._kv_forward([nxt], pos, cache); pos += 1
+            self._kv_ids = held
             tail = dec.flush()
             if tail:
                 yield tail
@@ -2522,14 +2547,11 @@ class CausalLM:
         # written in place. So hybrids are captured when every recurrent layer can do that,
         # and fall back to the growing-cache forward when one cannot.
         if not self._capturable():                     # WebGL, host-side mixer, or sparse MoE
-            # Sized to this generation, not to the context the model may reach: this
-            # cache is built fresh every call, so the full context would be allocated
-            # and thrown away once per reply.
-            cache = wt.KVCache(self.L, self.NKV, self.HD,
-                               min(int(self.lmax), P + max_new))
+            cache, keep = self._kv_growing(ids, embeds, rope_pos)
             t0 = time.perf_counter()
-            g0 = self._kv_forward(ids, 0, cache, embeds=embeds, rope_pos=rope_pos)
+            g0 = self._kv_forward(ids[keep:], keep, cache, embeds=embeds, rope_pos=rope_pos)
             ttft = time.perf_counter() - t0
+            held = list(ids)
             gen = [g0]; nxt = g0; pos = P; steps = 0
             # Where rope carries on from. Without media the two counters agree and this is
             # just P; with it, the prompt's rotary positions ran ahead of, or behind, its
@@ -2537,11 +2559,16 @@ class CausalLM:
             rnext = P if rope_pos is None else int(np.asarray(rope_pos).max()) + 1
             t_first = time.perf_counter()      # the first token exists as of here
             while len(gen) < max_new and not self._stop_now():
+                held.append(nxt)                    # its row is written by the call below
                 nxt = self._kv_forward([nxt], pos, cache, rope_pos=rnext)
                 pos += 1; rnext += 1; steps += 1
                 if nxt == eot:
                     break
                 gen.append(nxt)
+            if embeds is None and rope_pos is None:
+                self._kv_ids = held
+            else:
+                self._kv_drop()
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                              round(ttft, 3), _decode_rate(t_first, steps))
 
