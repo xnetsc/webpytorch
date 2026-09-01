@@ -340,8 +340,10 @@ worker.onmessage = (e) => {
       }
     }
     if (live && live.ans.isConnected) {
+      const el = $('#messages');
+      const follow = atBottom(el);          // asked before the reply grows under us
       fillBody(streaming.body, reply, streaming.live);
-      const el = $('#messages'); el.scrollTop = el.scrollHeight;
+      keepAtBottom(el, follow);
     }
   }
   else if (m.type === 'log') { console.log('[py]', m.text); }
@@ -1208,7 +1210,9 @@ function genOpts() {
 (() => {
   $('#maxNew').value = localStorage.getItem(MAXNEW_KEY) || '';
   $('#lmax').value = localStorage.getItem(LMAX_KEY) || '';
-  $('#thinking').checked = localStorage.getItem(THINK_KEY) === '1';
+  // On unless turned off: a model that reasons is worth watching reason, and the pane
+  // folds itself once the answer starts. An explicit '0' still wins.
+  $('#thinking').checked = localStorage.getItem(THINK_KEY) !== '0';
   $('#maxNew').onchange = () => {
     const v = maxNewValue();
     $('#maxNew').value = v ? String(v) : '';
@@ -1458,6 +1462,19 @@ function render() {
 
 // One message as DOM. The body is either rendered fresh (finished message) or driven
 // incrementally by `live` while a reply is being streamed.
+// Following a reply is for someone who is AT the reply. Scrolling to the bottom on every
+// token took the page back the moment anyone scrolled up to read something earlier -- during
+// a long answer that is every 20ms, so it was not a jump but a wall. This asks first: within
+// a screen's tail counts as following, and anywhere else counts as reading, which is left
+// alone until the person comes back down on their own.
+const FOLLOW_SLACK_PX = 80;
+function atBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX;
+}
+function keepAtBottom(el, wasFollowing) {
+  if (wasFollowing) el.scrollTop = el.scrollHeight;
+}
+
 function messageNode(m, live) {
   const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
   const w = document.createElement('div'); w.className = 'who'; w.textContent = m.role === 'user' ? 'You' : 'AI';
@@ -1475,9 +1492,14 @@ function messageNode(m, live) {
   d.append(w, b, tools);
   if (m.role === 'user') {
     b.textContent = m.content;
-  } else {
+  } else if (!live) {
     fillBody(b, m, live);
   }
+  // `live` here is a FLAG, not the live object: a reply that is about to stream gets its
+  // body from the caller, which owns the pieces it will keep updating. Calling fillBody
+  // with the flag built a second answer element -- `live.det` on a boolean is undefined, so
+  // it took the path that creates one -- and the reply then had two, the visible text going
+  // into the one appended last.
   if (live) tools.style.display = 'none';        // nothing to edit or delete mid-stream
   // Double-click to edit -- but ONLY on a message that has no blocks of its own.
   //
@@ -2182,7 +2204,7 @@ function fillBody(b, msg, live) {
       live.det.open = true;
     }
     if (live.det.parentNode) {
-      live.pre.textContent = think === null ? '' : think;
+      setRenderedLive(live.pre, think === null ? '' : think);
       live.det.classList.toggle('live', rest === '');
       live.sum.textContent = rest === '' ? 'Thinking…' : 'Thought before answering';
       if (rest !== '' && !live.collapsed && !live.touched) {
@@ -2197,7 +2219,8 @@ function fillBody(b, msg, live) {
     const det = document.createElement('details'); det.className = 'think';
     const sum = document.createElement('summary');
     sum.textContent = open ? 'Thinking…' : 'Thought before answering';
-    const pre = document.createElement('pre'); pre.textContent = think;
+    const pre = document.createElement('div'); pre.className = 'ans';
+    setRendered(pre, think, null);          // reasoning is prose too: lists, code, formulae
     det.append(sum, pre); b.appendChild(det);
     det.open = open;                                                 // mid-think: watch it; done: folded
   }
@@ -2270,7 +2293,7 @@ $('#composer').onsubmit = async (e) => {
   const body = node.querySelector('.body');
   const det = document.createElement('details'); det.className = 'think';
   const sum = document.createElement('summary'); sum.textContent = 'Thinking…';
-  const pre = document.createElement('pre');
+  const pre = document.createElement('div'); pre.className = 'ans';
   det.append(sum, pre);
   det.ontoggle = () => { if (streaming) streaming.live.touched = true; };
   const ansEl = document.createElement('div'); ansEl.className = 'ans';

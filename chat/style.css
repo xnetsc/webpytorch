@@ -124,8 +124,11 @@ details.think summary{cursor:pointer;font-style:normal;color:var(--mut);user-sel
 details.think summary::-webkit-details-marker{display:none}
 details.think summary::before{content:"▸";font-size:10px;transition:transform .15s}
 details.think[open] summary::before{transform:rotate(90deg)}
-details.think pre{white-space:pre-wrap;word-wrap:break-word;font:inherit;font-style:italic;
-                  border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
+/* The reasoning is rendered like the answer -- it is prose, with lists and code and
+   formulae in it -- so this styles whatever the renderer produced, not a <pre>. */
+details.think > .ans{font:inherit;font-style:italic;
+                     border-left:2px solid var(--line);padding-left:9px;margin:6px 0 0}
+details.think > .ans pre, details.think > .ans code{font-style:normal}
 details.think.live summary{color:var(--accent)}
 
 /* tool log: the same folded panel as thinking, for what the model ran. The answer text
