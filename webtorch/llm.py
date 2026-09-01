@@ -1259,7 +1259,8 @@ class CausalLM:
         # MoE (0 => dense), same contract as the safetensors path
         self.n_experts = int(m("expert_count", default=0, required=False) or 0)
         self.top_k = int(m("expert_used_count", default=0, required=False) or 0)
-        self.norm_topk = True; self.sparse_step = 1; self.mlp_only = set()
+        self.norm_topk = self._expert_norm(arch, m)
+        self.sparse_step = 1; self.mlp_only = set()
         self.has_shared_expert = False
         # ---- hybrid / state-space blocks, read from the file's own metadata ----
         # A GGUF declares these under its arch namespace whenever some blocks are recurrent
@@ -1473,7 +1474,7 @@ class CausalLM:
                         async for lin in self._gexperts(p + nm + ".weight"):
                             experts[e][key] = lin; e += 1
                 lay["moe"] = {"gate": await self._gload_quant(p + "ffn_gate_inp.weight"),
-                              "top_k": self.top_k or 2, "norm_topk": True,
+                              "top_k": self.top_k or 2, "norm_topk": self.norm_topk,
                               "experts": experts, "stacked": stacked or None,
                               "n_experts": ne}
             else:
@@ -1636,6 +1637,33 @@ class CausalLM:
             if r is not None:
                 return r
         return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
+
+    def _expert_norm(self, arch, m):
+        """Whether this file's routed layers renormalise their top-k weights.
+
+        The file first: `{arch}.expert_weights_norm` is the answer whenever it is written.
+        Then what the architecture is known to do (`_EXPERT_WEIGHTS_NORM`). Only if neither
+        says anything is a value assumed, and that is reported rather than taken silently --
+        the wrong choice here does not fail, it degrades the answer."""
+        said = m("expert_weights_norm", default=None, required=False)
+        if said is not None:
+            return bool(said)
+        if arch in self._EXPERT_WEIGHTS_NORM:
+            return self._EXPERT_WEIGHTS_NORM[arch]
+        print("webtorch: %r does not say whether routed weights are renormalised and this "
+              "build has no record for it; assuming they are. If the replies are fluent but "
+              "wrong, that is the first thing to try the other way." % arch)
+        return True
+
+    def _qk_norm(self, t, w, T, nheads):
+        """Apply a QK-norm whose width decides how it is applied. `t` is (T, nheads, HD)."""
+        if w is None:
+            return t
+        n = int(getattr(getattr(w, "data", w), "size", 0))
+        if n == nheads * self.HD and n != self.HD:
+            # Full-width: normalise across the flattened projection, then split heads again.
+            return self._rms(t.reshape(T, nheads * self.HD), w).reshape(T, nheads, self.HD)
+        return self._rms(t, w)
 
     def _rot(self, x):
         """rotate_half. With partial rope the swap happens WITHIN the rotated prefix
@@ -1845,6 +1873,27 @@ class CausalLM:
     # remaining context -- reserving that up front is exactly the eager allocation this
     # replaced. The decode loop grows the cache when it actually reaches the end.
     _KV_HEADROOM = 256
+
+    # Does a routed layer renormalise its top-k weights to sum to 1?
+    #
+    # Both conventions exist and they compute different numbers, so a model run under the
+    # wrong one answers fluently and wrongly -- the failure that is hardest to notice. A
+    # GGUF may say (`{arch}.expert_weights_norm`) and then the file wins; most files do not
+    # say, including every one tested here, so where it is silent this records what the
+    # architecture's own implementation does. Two measured cases, same code, same prompt:
+    # OLMoE renormalised answers "The answer 1 "The Sky's the Earth the (Sydney-)#athy-o's"";
+    # not renormalised it answers "The sky appears blue because the Earth's atmosphere
+    # scatters sunlight in all directions".
+    #
+    # An architecture that is not listed keeps the commoner convention and SAYS so, because
+    # a silent guess is the thing this exists to prevent.
+    _EXPERT_WEIGHTS_NORM = {
+        "qwen3moe": True,          # config norm_topk_prob=true
+        "qwen2moe": False,         # config default norm_topk_prob=false
+        "olmoe": False,            # OlmoeConfig norm_topk_prob=false
+        "llama": True,             # Mixtral converts to this arch; it divides by the sum
+        "deepseek2": True,
+    }
 
     # Decode cost used to scale with the context because a step scanned the whole KV buffer
     # and re-uploaded a full-length mask every token. Both are gone -- the fused attention
@@ -2071,8 +2120,15 @@ class CausalLM:
             q = qraw.reshape(T, self.NH, self.HD)
             lay["_gate"] = None
         k = lay["k"](x).reshape(T, self.NKV, self.HD)
-        if lay.get("qn") is not None: q = self._rms(q, lay["qn"])
-        if lay.get("kn") is not None: k = self._rms(k, lay["kn"])
+        # QK-norm comes in two widths and the WEIGHT says which. One head_dim of weight is
+        # the per-head form (Qwen3): each head is normalised over its own dims. A weight as
+        # wide as the whole projection is the other form (OLMoE): the normalisation runs over
+        # every head at once, which is a different denominator, not just a differently shaped
+        # scale. Reading it off the weight is what keeps this generic -- applying the per-head
+        # form to a full-width weight raises nothing, it silently divides by the wrong number,
+        # and the model answers with fluent nonsense.
+        q = self._qk_norm(q, lay.get("qn"), T, self.NH)
+        k = self._qk_norm(k, lay.get("kn"), T, self.NKV)
         v = lay["v"](x).reshape(T, self.NKV, self.HD).permute(1, 0, 2)
         return q.permute(1, 0, 2), k.permute(1, 0, 2), v
 
