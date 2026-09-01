@@ -1829,6 +1829,13 @@ function addRunoutClose(panel) {
   panel.appendChild(x);
 }
 
+// Pressing Run produces a panel and NOTHING else. What it printed, what it returned, what
+// it drew: all of it lives in this one DOM node next to the block, and none of it is
+// written to the message, to storage, or to the history the model is sent -- a redraw
+// wipes it, which is the whole of its lifetime. It is the reader trying something out, not
+// a turn in the conversation, and the model has its own tools for when it wants to run
+// something and keep the answer. (Editing the block IS written back, but that is the code,
+// not the run.) Anything added here goes in the panel; nothing goes in `msg`.
 async function runBlock(code, wrap, btn, lang) {
   const runner = langRunner(lang) || 'python';
   let panel = wrap.nextElementSibling;
