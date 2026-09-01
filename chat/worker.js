@@ -355,17 +355,36 @@ if _t is not None and _shape is not None:
                                      "function": {"name": _N, "arguments": {_A: _V}}}]}])
     _i = _rc.find(_N)
     if _i >= 0:
-        # The payload is the innermost object containing the name; walk out to its opening
-        # brace, then match to its close.
-        _st = _rc.rfind("{", 0, _i)
-        while _st > 0 and _rc[:_st].rstrip().endswith("{"):
-            _st = _rc.rfind("{", 0, _st)
-        _d = 0; _en = -1
-        for _q in range(_st, len(_rc)):
-            if _rc[_q] == "{": _d += 1
-            elif _rc[_q] == "}":
-                _d -= 1
-                if _d == 0: _en = _q + 1; break
+        # The payload is the object that CONTAINS the name. Walking back to the nearest
+        # brace and matching it forward is not that: on a template whose tool definitions
+        # are rendered as JSON earlier in the prompt, the nearest brace before the call is
+        # inside those definitions, and it closes before the call even begins. That parsed,
+        # so the probe reported the definition's shape as the call's and handed back a
+        # fragment of the tools block as the delimiters -- after which nothing the model
+        # wrote could ever match, and its calls were neither run nor removed.
+        #
+        # So: walk candidate braces outward from the name and keep the WIDEST one that both
+        # contains the name and parses as JSON on its own. Widest, not nearest, because the
+        # nested form wraps the call -- {"type":"function","function":{"name":...}} -- and
+        # stopping at the first container reports the inner object as the payload and the
+        # wrapper text as the delimiter. Parsing is what stops it going too far: a span that
+        # reached back into the tools block would have prose in it and would not parse.
+        _st = -1; _en = -1
+        _cand = _rc.rfind("{", 0, _i)
+        while _cand >= 0:
+            _d = 0; _e = -1
+            for _q in range(_cand, len(_rc)):
+                if _rc[_q] == "{": _d += 1
+                elif _rc[_q] == "}":
+                    _d -= 1
+                    if _d == 0: _e = _q + 1; break
+            if _e > _i:
+                try:
+                    json.loads(_rc[_cand:_e])
+                    _st = _cand; _en = _e
+                except Exception:
+                    pass
+            _cand = _rc.rfind("{", 0, _cand)
         if _en > 0:
             _pre = _rc[:_st]
             _post = _rc[_en:]
@@ -387,6 +406,22 @@ if _t is not None and _shape is not None:
                 _call_payload = "nested" if ("function" in _obj and "name" not in _obj) else "flat"
             except Exception:
                 _call_payload = None
+    # No JSON payload found: several templates write the call as XML instead --
+    #   <tool_call>{nl}<function=NAME>{nl}<parameter=KEY>{nl}value{nl}</parameter>{nl}</function>
+    # -- and looking only for a brace reported "this model has no call format" about a model
+    # whose format is spelled out in its own system prompt. The name IS present in that form,
+    # so this cannot hang off "name not found"; it hangs off "no payload was read".
+    if _call_payload is None:
+        _fx = _rc.find("<function=")
+        if _fx >= 0:
+            _NL = chr(10)
+            _lines = [x for x in _rc[:_fx].split(_NL) if x.strip()]
+            _call_open = _lines[-1] if _lines else ""
+            _fe = _rc.find("</function>", _fx)
+            _post = _rc[_fe + len("</function>"):] if _fe >= 0 else ""
+            _after = [x for x in _post.split(_NL) if x.strip()]
+            _call_close = _after[0] if _after else ""
+            _call_payload = "xml"
 json.dumps({"ok": _shape is not None, "shape": _shape,
             "result_via": _result_via, "result_keeps_name": bool(_keeps_name),
             "call_id_shape": _call_id_shape, "result_id_field": _result_id_field,

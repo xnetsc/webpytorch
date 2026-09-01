@@ -2794,6 +2794,79 @@ function callRegexes() {
 // name it carries) or when it is a bare JSON object naming a tool that ACTUALLY EXISTS here.
 // Bare JSON with an unknown name is left alone: a reply may legitimately show a JSON object,
 // and guessing would eat the answer.
+// The other payload form, and it is not a fringe one: several templates ship it as THE
+// format, spelled out in their own system prompt --
+//
+//     <tool_call>
+//     <function=run_python>
+//     <parameter=code>
+//     print(6 * 7)
+//     </parameter>
+//     </function>
+//     </tool_call>
+//
+// A parser that only knows JSON reads that as prose. Worse than useless: the tags look like
+// HTML, the sanitiser drops them as unknown elements, and what reaches the reader is the
+// argument text alone -- a line of Python where an answer should be, with nothing to say a
+// tool was meant to run.
+//
+// Supporting it is not a special case for one model. It is a second wire format, the way
+// `nested` and `flat` definitions are two shapes of the same thing.
+const reXmlCall = /<function=([^>\s]+)\s*>([\s\S]*?)<\/function\s*>/g;
+const reXmlParam = /<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter\s*>/g;
+
+// How a value was encoded is stated by the templates that write this form:
+//
+//     args_value | string if args_value is string else args_value | tojson
+//
+// so a string went in as itself and everything else went in as JSON. Read back the same
+// way, using the tool's own schema to say which -- guessing from the text would turn the
+// string "12" into a number, and a code argument that happens to be `[1, 2]` into a list.
+function xmlParamValue(toolName, key, raw) {
+  const body = String(raw).replace(/^\n/, '').replace(/\n$/, '');
+  const t = findTool(toolName);
+  const prop = t && ((t.def.function.parameters || {}).properties || {})[key];
+  const type = prop && prop.type;
+  if (type === 'string') return body;
+  if (type) { try { return JSON.parse(body); } catch (e) { return body; } }
+  // No schema to consult: JSON if it parses as something structured, text otherwise. A bare
+  // word is not JSON and stays a word.
+  try {
+    const v = JSON.parse(body);
+    return (v !== null && typeof v === 'object') || typeof v === 'boolean' ? v : body;
+  } catch (e) { return body; }
+}
+
+// A call written back to the model, in the form its template writes. Used when correcting a
+// call it got wrong: the example it is shown has to be something it can send verbatim.
+function renderCall(name, args) {
+  if (modelCallPayload === 'xml') {
+    const open = modelCallOpen || '<tool_call>';
+    const close = modelCallClose || '</tool_call>';
+    const body = Object.keys(args).map((k) => {
+      const v = args[k];
+      const text = typeof v === 'string' ? v : JSON.stringify(v);
+      return '<parameter=' + k + '>\n' + text + '\n</parameter>';
+    }).join('\n');
+    return open + '\n<function=' + name + '>\n' + body + '\n</function>\n' + close;
+  }
+  return JSON.stringify(modelToolShape === 'flat'
+    ? { name: name, arguments: args }
+    : { type: 'function', function: { name: name, arguments: args } }, null, 2);
+}
+
+function asXmlCall(payload) {
+  reXmlCall.lastIndex = 0;
+  const m = reXmlCall.exec(String(payload));
+  if (!m) return null;
+  const name = m[1];
+  const args = {};
+  reXmlParam.lastIndex = 0;
+  let p;
+  while ((p = reXmlParam.exec(m[2]))) args[p[1]] = xmlParamValue(name, p[1], p[2]);
+  return { name: name, args: args, known: !!findTool(name), id: null };
+}
+
 function scanToolCalls(text) {
   const src = String(text);
   const found = [];
@@ -2817,16 +2890,45 @@ function scanToolCalls(text) {
                  .find(v => typeof v === 'string' && v) || null;
     return { name: inner.name, args: inner.arguments || inner.parameters || {}, known, id };
   };
+  // WHICH form to read is the model's own answer, taken off its template by the probe --
+  // not something tried until one sticks. Trying both is only what to do when the template
+  // could not be read at all, and then it is a guess and says so.
+  const form = modelCallPayload;                       // 'flat' | 'nested' | 'xml' | null
+  const asJson = (body) => {
+    try { return asCall(JSON.parse(body), true); } catch (e) { return null; }
+  };
+  // Inside the model's own call delimiters the question is no longer WHETHER this is a
+  // call -- the wrapper settled that -- only which encoding it used. So the declared form
+  // is tried first and the other one after: a template that says JSON while the model
+  // writes XML is a real disagreement, and refusing to read it puts the markup back in the
+  // reply for the sanitiser to strip into a bare fragment. Outside the delimiters nothing
+  // is that generous.
+  const readPayload = (body) =>
+    form === 'xml' ? (asXmlCall(body) || asJson(body))
+                   : (asJson(body) || asXmlCall(body));
   callRegexes().forEach((re) => {
     re.lastIndex = 0;
     let m;
     while ((m = re.exec(src))) {
-      let c = null;
-      try { c = asCall(JSON.parse(m[1]), true); } catch (e) { /* not JSON: not a call */ }
+      const c = readPayload(m[1]);
       if (c && !found.some(f => m.index < f.end && f.start < m.index + m[0].length))
         found.push({ start: m.index, end: m.index + m[0].length, call: c });
     }
   });
+  // The same payload with its wrapper missing. Only for a model whose form this IS (or one
+  // we could not ask): a `<function=…>` block is markup nothing else writes, and left as
+  // prose the sanitiser eats the tags as unknown elements and prints the arguments as if
+  // they were the answer -- which is what a reader saw, one bare line of Python and no
+  // result.
+  if (form === 'xml' || form == null) {
+    reXmlCall.lastIndex = 0;
+    let xm;
+    while ((xm = reXmlCall.exec(src))) {
+      if (found.some(f => xm.index < f.end && f.start < xm.index + xm[0].length)) continue;
+      const c = asXmlCall(xm[0]);
+      if (c) found.push({ start: xm.index, end: xm.index + xm[0].length, call: c });
+    }
+  }
   // Bare objects, wherever they sit. Brace-matched rather than regexed: the arguments are
   // themselves an object, and a pattern stopping at the first `}` would cut a call in half.
   for (let k = 0; k < src.length; k++) {
@@ -2900,15 +3002,10 @@ async function runToolCall(c) {
            const props = Object.keys((x.def.function.parameters || {}).properties || {});
            return given.length && given.every(k => props.includes(k));
          }) || TOOLS[0];
-    // The corrected call is shown in the shape this model's template actually reads -- the
-    // same shape its definitions went out in -- with the model's OWN arguments.
-    const fixed = guess
-      ? JSON.stringify(modelToolShape === 'flat'
-          ? { name: guess.def.function.name, arguments: c.args || {} }
-          : { type: 'function',
-              function: { name: guess.def.function.name, arguments: c.args || {} } },
-          null, 2)
-      : '';
+    // The corrected call is shown in the form this model's template actually writes -- with
+    // the model's OWN arguments. Handing back JSON to a model whose format is the XML one
+    // would correct the name and break the call.
+    const fixed = guess ? renderCall(guess.def.function.name, c.args || {}) : '';
     return 'there is no tool called "' + c.name + '". These exist, with their arguments:\n'
          + listed + '\n\nYour call again, with the name corrected — send this:\n' + fixed;
   }
