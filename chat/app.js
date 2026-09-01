@@ -630,12 +630,47 @@ function showSlowNote(rate, gb, lim) {
 const DBG_ON_KEY = 'webtorch.dbgEnabled';
 const DBG_URL_KEY = 'webtorch.dbgUrl';
 const DBG_URL_DEFAULT = 'wss://broker.hivemq.com:8884/mqtt';
-// New each time the page starts, and 128 bits of it: the topic is the only thing standing
-// between a public broker and this page's diagnostics, so it is not guessable and it does
-// not outlive the session that had the problem.
-const DBG_TOPIC = 'webtorch/' + Array.from(crypto.getRandomValues(new Uint8Array(16)))
-                                     .map(b => b.toString(16).padStart(2, '0')).join('');
+// 128 bits of it, because the topic is the only thing standing between a public broker and
+// this page's diagnostics: it has to be unguessable, and it has to end.
+//
+// Kept for a day rather than for one page load. Diagnosing something usually outlives the
+// tab it was noticed in -- a reload, a crash, coming back after lunch -- and a topic that
+// changed each time meant the person had to re-send it every time, which in practice meant
+// the helper was looking at a channel nobody was on any more. A day is long enough to cover
+// that and short enough that a topic handed out once does not stay live indefinitely.
+//
+// The clock runs from when the topic was MINTED, not from last use: an expiry that slid
+// forward on every visit would never arrive for the page that is open the most.
+const DBG_TOPIC_KEY = 'webtorch.dbgTopic';
+const DBG_TOPIC_TTL_MS = 24 * 60 * 60 * 1000;
+
+function dbgMintTopic() {
+  const t = 'webtorch/' + Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                               .map(b => b.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem(DBG_TOPIC_KEY, JSON.stringify({ topic: t, at: Date.now() })); }
+  catch (e) { /* a topic that cannot be stored still works for this page */ }
+  return t;
+}
+function dbgTopicBorn() {
+  try {
+    const v = JSON.parse(localStorage.getItem(DBG_TOPIC_KEY) || 'null');
+    return v && typeof v.at === 'number' ? v.at : 0;
+  } catch (e) { return 0; }
+}
+function dbgLoadTopic() {
+  try {
+    const v = JSON.parse(localStorage.getItem(DBG_TOPIC_KEY) || 'null');
+    if (v && typeof v.topic === 'string' && /^webtorch\/[0-9a-f]{32}$/.test(v.topic)
+        && typeof v.at === 'number' && Date.now() - v.at < DBG_TOPIC_TTL_MS) {
+      return v.topic;
+    }
+  } catch (e) { /* unreadable is the same as absent */ }
+  return dbgMintTopic();
+}
+let DBG_TOPIC = dbgLoadTopic();
 let dbgClient = null;
+let dbgWatchT = null;      // the periodic state check
+let dbgDownSince = 0;      // when the channel was last known to be up, 0 while it is
 
 function dbgEnabled() { return localStorage.getItem(DBG_ON_KEY) !== '0'; }
 function dbgUrl() { return localStorage.getItem(DBG_URL_KEY) || DBG_URL_DEFAULT; }
@@ -713,13 +748,20 @@ async function dbgStart() {
         document.head.appendChild(sc);
       });
     }
-    const c = mqtt.connect(dbgUrl(), { connectTimeout: 10000, reconnectPeriod: 15000 });
+    // `resubscribe` covers a reconnect the library handles itself; the `connect` handler
+    // covers one it does not, and both are cheap. The keepalive is well under the minute a
+    // background tab throttles timers to, so a tab that is merely hidden still pings.
+    const c = mqtt.connect(dbgUrl(), { connectTimeout: 10000, reconnectPeriod: 4000,
+                                       keepalive: 30, clean: true, resubscribe: true });
     dbgClient = c;
     c.on('connect', () => {
+      dbgDownSince = 0;
       c.subscribe(DBG_TOPIC + '/ask', (e) => {
         dbgSay(e ? ('subscribe failed: ' + e.message) : 'listening on ' + DBG_TOPIC);
       });
     });
+    c.on('reconnect', () => { if (dbgClient === c) dbgSay('reconnecting…'); });
+    c.on('offline', () => { if (dbgClient === c) { dbgDown(); dbgSay('offline — retrying'); } });
     c.on('message', async (_t, payload) => {
       const cmd = payload.toString().trim().slice(0, 32) || 'ping';
       let body;
@@ -728,19 +770,81 @@ async function dbgStart() {
       try { c.publish(DBG_TOPIC + '/say', JSON.stringify({ cmd: cmd, body: body })); }
       catch (e) { /* nothing useful to do about a failed reply */ }
     });
-    c.on('error', (e) => { dbgSay('error: ' + String(e && e.message || e)); });
-    c.on('close', () => { if (dbgClient === c) dbgSay('disconnected'); });
+    c.on('error', (e) => { dbgDown(); dbgSay('error: ' + String(e && e.message || e)); });
+    c.on('close', () => { if (dbgClient === c) { dbgDown(); dbgSay('disconnected — retrying'); } });
+    dbgWatchStart();
   } catch (e) {
     dbgSay('unavailable: ' + String(e && e.message || e));
   }
 }
+
+// Getting the channel back is not one mechanism but three, because the ways it goes down
+// are not alike:
+//
+//  - The library's own retry handles a broker that dropped one connection.
+//  - It does NOT handle a background tab, which is the common case for a page left open to
+//    be diagnosed: timers there are throttled to about once a minute, the keepalive ping is
+//    missed, the broker drops the connection, and the retry that would fix it is throttled
+//    by the same rule. What gets that back is an EVENT -- the tab becoming visible, the
+//    network returning -- so those reconnect directly.
+//  - And neither handles a client that has stopped retrying at all, which a socket error at
+//    the wrong moment can leave behind. Only asking "is it actually connected?" on a timer
+//    finds that one, so the check runs whether or not anything was reported.
+//
+// The topic is deliberately NOT part of any of this. It is fixed for the life of the page,
+// because whoever is helping was given it once; a reconnect that renamed the channel would
+// be indistinguishable from the channel staying down.
+const DBG_DOWN_LIMIT_MS = 45000;   // past this the library's own retry is not working
+
+function dbgDown() { if (!dbgDownSince) dbgDownSince = Date.now(); }
+
+function dbgCheck(why) {
+  if (!dbgEnabled()) return;
+  const c = dbgClient;
+  if (!c) { dbgStart(); return; }                    // enabled with no client at all
+  if (c.connected) { dbgDownSince = 0; return; }
+  dbgDown();
+  // Down long enough that reconnecting this client is not what is missing -- build another.
+  // `end(true)` first, or the old one keeps its timers and its socket.
+  if (Date.now() - dbgDownSince > DBG_DOWN_LIMIT_MS) {
+    dbgSay('reconnecting from scratch' + (why ? ' (' + why + ')' : ''));
+    dbgStart();
+    return;
+  }
+  try { c.reconnect(); } catch (e) { dbgStart(); }
+}
+
+function dbgWatchStart() {
+  clearInterval(dbgWatchT);
+  dbgWatchT = setInterval(() => dbgCheck('periodic'), 15000);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') dbgCheck('tab visible');
+});
+window.addEventListener('online', () => dbgCheck('network back'));
+
 function dbgStop() {
+  clearInterval(dbgWatchT); dbgWatchT = null;
+  dbgDownSince = 0;
   if (dbgClient) { try { dbgClient.end(true); } catch (e) {} dbgClient = null; }
+}
+
+// How much of the day is left, said where the topic is shown -- a topic that has quietly
+// expired and one that is simply not being asked about look identical otherwise.
+function dbgTopicAge() {
+  const el = $('#dbgTopic');
+  if (!el) return;
+  const left = DBG_TOPIC_TTL_MS - (Date.now() - dbgTopicBorn());
+  const h = Math.floor(left / 3600000), m = Math.floor((left % 3600000) / 60000);
+  el.title = left > 0 ? 'This topic stops working in ' + (h ? h + 'h ' : '') + m + 'm'
+                      : 'Expired — a new topic is minted on the next reload';
 }
 
 function wireDebug() {
   const t = $('#dbgTopic'); if (!t) return;
   t.value = DBG_TOPIC;
+  dbgTopicAge();
   $('#dbgUrl').value = dbgUrl();
   $('#dbgEnabled').checked = dbgEnabled();
   $('#dbgApply').onclick = () => {
@@ -751,8 +855,14 @@ function wireDebug() {
     dbgStart();
   };
   $('#dbgNew').onclick = () => {
-    // A topic is per-session by design; changing it means reloading into a new one.
-    note('The topic is new every time the page starts — reload to get another.');
+    // Retiring a topic that has been handed out is the point of this control, so it takes
+    // effect at once: the old one stops being listened on before the new one is announced.
+    DBG_TOPIC = dbgMintTopic();
+    t.value = DBG_TOPIC;
+    dbgTopicAge();
+    dbgStop();
+    if (dbgEnabled()) dbgStart(); else dbgSay('off');
+    note('New diagnostics topic — send this one instead: ' + DBG_TOPIC);
   };
   $('#dbgEnabled').onchange = () => {
     localStorage.setItem(DBG_ON_KEY, $('#dbgEnabled').checked ? '1' : '0');

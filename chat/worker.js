@@ -46,6 +46,30 @@ let INTR = null;
 try { INTR = new Uint8Array(new SharedArrayBuffer(1)); } catch (e) { INTR = null; }
 function intrClear() { if (INTR) INTR[0] = 0; }
 
+// A stop that already worked leaves a loaded gun behind. The page escalates by writing
+// SIGINT into this buffer 120ms after the polite flag, and the polite flag usually wins --
+// so the byte is often still set when there is no longer anything to interrupt. Pyodide
+// raises at its NEXT checkpoint whatever that happens to be, and the next thing to run is
+// the event loop's own scheduling, where nothing is awaiting anything: it surfaces as an
+// uncaught PythonError whose traceback is entirely webloop.py, describing the machinery
+// rather than anything the person did.
+//
+// Cleared below the moment a command ends, which closes the common case, and absorbed here
+// for the window that clear cannot cover -- the page's timer can fire a microsecond after
+// it. A KeyboardInterrupt with no command running IS the stop that already succeeded, and
+// reporting it as a failure would be reporting the thing working.
+function isStrayInterrupt(reason) {
+  if (cmdDepth > 0) return false;
+  const m = String((reason && (reason.message || reason.toString())) || '');
+  return /KeyboardInterrupt/.test(m);
+}
+let cmdDepth = 0;
+self.addEventListener('unhandledrejection', (e) => {
+  if (!isStrayInterrupt(e.reason)) return;
+  intrClear();
+  e.preventDefault();
+});
+
 // Ending the WAIT, which is not the same as ending the WORK.
 //
 // The flag above ends the work, but only where the work looks at it: a decode loop between
@@ -615,6 +639,7 @@ function stopLoad() {
 
 onmessage = async (e) => {
   const { id, cmd, args } = e.data;
+  cmdDepth++;
   try {
     let res = null;
     if (cmd === 'boot') await boot();
@@ -656,5 +681,10 @@ onmessage = async (e) => {
       const last = msg.split('\n').filter(l => l.trim()).pop() || msg;
       send({ type: 'status', text: 'error: ' + last });
     }
+  } finally {
+    // Whatever this command was, nothing is running now, so an interrupt still armed here
+    // has no work left to land on -- only the interpreter's own plumbing.
+    cmdDepth--;
+    if (cmdDepth === 0) intrClear();
   }
 };
