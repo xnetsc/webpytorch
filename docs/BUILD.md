@@ -29,6 +29,32 @@ npm run build            # -> dist/wgpy-worker.js etc.
 > The Python backend kernels (`webgl/`, `webgpu/`) are WGSL/GLSL strings added at runtime,
 > so **Python-only** kernel edits need only the wheel rebuilt — no JS/webpack rebuild.
 
+For a Python-only edit there is a shortcut that needs no venv and no build deps: it swaps
+the changed files into the existing wheels and recomputes `RECORD`, leaving everything else
+byte for byte as `bdist_wheel` produced it. A wheel whose sources have not changed comes out
+identical, so it shows as no diff.
+
+```bash
+python3 scripts/pack-wheels.py            # rebuild both from webgpu/ and webgl/
+python3 scripts/pack-wheels.py --check    # report staleness only, exit 1 if stale
+```
+
+Use the venv build above when anything about the packaging itself changes — a new module,
+metadata, dependencies. The shortcut only replaces files the wheel already contains.
+
+### The wheels are checked in, so they can disagree with the tree
+
+`dist/*.whl` are build artifacts kept in the repo, because the page installs them with
+micropip and a static host has nothing to build with. Editing `webgpu/` and committing
+therefore ships nothing: the tree says one thing and the artifact the browser runs says
+another, silently. A hook refuses that commit —
+
+```bash
+git config core.hooksPath .githooks       # once per clone
+```
+
+— and `git commit --no-verify` gets past it when the mismatch is deliberate.
+
 ## 2. Pyodide runtime
 Pyodide is NOT vendored: the workers load it from the CDN, pinned in one place
 (`chat/pyodide-version.js`), and the service worker caches it — the version is in the

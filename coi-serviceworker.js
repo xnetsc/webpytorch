@@ -38,23 +38,37 @@
 //            does, so they are NETWORK-FIRST: the cache is a fallback for when the network
 //            is gone, never a reason to keep serving yesterday's code.
 //
-// Bump the suffix to abandon both; `activate` deletes anything that is not current.
+// Bump the suffix to abandon both; `activate` deletes anything that is not current. That is
+// for a change to the caching itself, not for shipping new code — APP is network-first, so
+// new code lands without it.
 //
-// One hole in FIXED's "version is in the name" assumption: the wheels ship as
-// wgpy_webgpu-1.0.0-py3-none-any.whl / wgpy_webgl-1.0.0-py3-none-any.whl and that
-// name never changes even when the bytes do. Once a client has cached one, cache-first
-// would serve it forever. So: bump CACHE_V whenever a wheel's CONTENT changes — the
-// browser byte-diffs this SW script on the user's next visit, the new copy installs
-// (skipWaiting), activate deletes the old caches, and everything is refetched fresh.
+// FIXED's rule is "the version is in the name", and the wheels THIS PROJECT ships break it:
+// wgpy_webgpu-1.0.0-py3-none-any.whl and wgpy_webgl-1.0.0-py3-none-any.whl keep that name
+// whatever their bytes say. They used to be cached as fixed anyway, with a note to bump
+// CACHE_V whenever their contents changed. That is a rule someone has to remember, in a
+// place far from the file they edited, and it was forgotten the first time it mattered: a
+// backend fix shipped, and every client that had ever loaded the page went on installing
+// the wheel from before it. Nothing looked wrong — the fix simply was not there.
+//
+// So they are not treated as fixed. A wheel served from THIS origin is one of ours and its
+// name says nothing about its contents, so it goes in APP and is fetched network-first like
+// the rest of our code: a change lands on the next load, and the cached copy still answers
+// when the network is gone. A wheel from anywhere else (PyPI, a CDN) does carry its version
+// in its name and stays fixed. The cost is one conditional request for ~50KB per load,
+// against a Pyodide distribution measured in megabytes.
 var CACHE_V = 'v4';
 var FIXED = 'webtorch-fixed-' + CACHE_V;
 var APP = 'webtorch-app-' + CACHE_V;
 
 // Named by version, so a hit is always the right bytes.
 var FIXED_EXT = /\.(whl|wasm|zip|tar|data|tgz|gz|woff2?|ttf)$/i;
+// The wheels this repo builds and serves: a fixed name over changing bytes, so they are not
+// fixed no matter what the extension says.
+var OUR_WHEEL = /\/dist\/[^/]+\.whl$/i;
 function isFixed(url) {
   try {
     var u = new URL(url);
+    if (u.origin === self.location.origin && OUR_WHEEL.test(u.pathname)) return false;
     if (FIXED_EXT.test(u.pathname)) return true;
     if (/pyodide-lock\.json$/.test(u.pathname)) return true;
     // A CDN path that pins a version: /npm/marked@18.0.11/…, /pyodide/v0.27.7/…
@@ -136,6 +150,21 @@ if (typeof window === 'undefined') {
 
   // Anything from an older cache version is dead weight.
   // Take over the open pages, and drop anything from an older cache version.
+  // Anything FIXED holds that this worker would no longer call fixed. Bumping CACHE_V is not
+  // what removes it: the name is current, so the generation survives, and the entry sits
+  // there unreachable -- `fromCache` is never consulted for that URL any more. It is only
+  // wasted bytes, but it is also the kind of leftover that makes a cache read as evidence of
+  // something that is not happening. A rule that changes should take its old entries with it.
+  function dropMisfiled() {
+    return caches.open(FIXED).then(function (c) {
+      return c.keys().then(function (reqs) {
+        return Promise.all(reqs.map(function (r) {
+          if (!isFixed(r.url)) return c.delete(r);
+        }));
+      });
+    }).catch(function () { /* nothing here is worth failing activation over */ });
+  }
+
   self.addEventListener('activate', function (e) {
     e.waitUntil(Promise.all([
       self.clients.claim(),
@@ -143,7 +172,7 @@ if (typeof window === 'undefined') {
         return Promise.all(names.map(function (n) {
           if (/^webtorch-(fixed|app)-/.test(n) && n !== FIXED && n !== APP) return caches.delete(n);
         }));
-      })
+      }).then(dropMisfiled)
     ]));
   });
 
