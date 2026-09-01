@@ -46,7 +46,7 @@
 // would serve it forever. So: bump CACHE_V whenever a wheel's CONTENT changes — the
 // browser byte-diffs this SW script on the user's next visit, the new copy installs
 // (skipWaiting), activate deletes the old caches, and everything is refetched fresh.
-var CACHE_V = 'v3';
+var CACHE_V = 'v4';
 var FIXED = 'webtorch-fixed-' + CACHE_V;
 var APP = 'webtorch-app-' + CACHE_V;
 
