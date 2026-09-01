@@ -3005,8 +3005,6 @@ function runSandboxedJs(code, timeoutMs, wantDom) {
   return new Promise((resolve) => {
     const f = document.createElement('iframe');
     f.setAttribute('sandbox', 'allow-scripts');
-    // Off the screen, but LAID OUT. `display:none` means no layout, so everything the page
-    // builds reports a height of zero and the frame it is shown in cannot be sized to it.
     // Off the screen, but VISIBLE and laid out. `display:none` skips layout entirely, and
     // `visibility:hidden` skips it inside an iframe too -- under either, every element in
     // the page reports a zero-height box and the frame it is shown in cannot be sized to
