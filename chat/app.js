@@ -273,6 +273,18 @@ function endStop() {
   if (intrBuf) { try { intrBuf[0] = 0; } catch (e) {} }
 }
 
+// A click picks the message a browser belongs to, and moves that browser into place. Only
+// a click does this: the passive reading of "current" must not scroll anything.
+document.addEventListener('click', (e) => {
+  const el = $('#messages');
+  if (!el || !el.contains(e.target)) return;
+  if (e.target.closest('.webtabs')) return;      // working inside a browser is not picking one
+  const msg = e.target.closest('.msg');
+  if (!msg || msg.dataset.idx == null) return;
+  clickedMsgIdx = Number(msg.dataset.idx);
+  alignCurrentWeb();
+});
+
 worker.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'stopbuf') { stopFlag = new Int32Array(m.buf); return; }
@@ -1455,9 +1467,46 @@ function render() {
       'Pick a model in ⚙ Settings, load it, and start chatting.</div></div>';
     return;
   }
-  messages.forEach(m => el.appendChild(messageNode(m)));
+  messages.forEach((m, i) => {
+    const node = messageNode(m);
+    node.dataset.idx = i;
+    el.appendChild(node);
+  });
   paintSlowNote();                       // lives in this list, so it is re-emitted with it
   el.scrollTop = el.scrollHeight;
+}
+
+// Which message is "current".
+//
+// A click names one. Without a click it is the LAST message still in view, which is what
+// someone reading a conversation is looking at. Deliberately not recomputed into a scroll:
+// letting a scroll change the current message and letting the current message drive a
+// scroll is a loop, and this page already had one bug where following the reply took the
+// view away from whoever was reading it.
+let clickedMsgIdx = null;
+function currentMsgIdx() {
+  if (clickedMsgIdx != null) return clickedMsgIdx;
+  const el = $('#messages');
+  if (!el) return null;
+  const bottom = el.getBoundingClientRect().bottom;
+  let last = null;
+  el.querySelectorAll('.msg').forEach(n => {
+    if (n.getBoundingClientRect().top < bottom) last = n;
+  });
+  return last ? Number(last.dataset.idx) : null;
+}
+
+// The rule for where a browser sits: the current message's panel starts at the top of the
+// view, and whatever does not fit runs on below it. Everything else stays in the flow, so
+// the panels above and below are pushed by this one rather than competing with it.
+function alignCurrentWeb() {
+  const el = $('#messages');
+  const idx = currentMsgIdx();
+  if (!el || idx == null) return;
+  const node = el.querySelector('.msg[data-idx="' + idx + '"]');
+  const panel = node && node.querySelector('.webtabs');
+  if (!panel) return;
+  el.scrollTop += panel.getBoundingClientRect().top - el.getBoundingClientRect().top;
 }
 
 // One message as DOM. The body is either rendered fresh (finished message) or driven
@@ -2213,6 +2262,18 @@ function fillBody(b, msg, live) {
     }
     if (msg.toollog && msg.toollog.length) setToollogLive(live, msg.toollog);
     setRenderedLive(live.ans, rest);      // no msg: a reply still arriving is not editable
+    // A page built mid-reply appears in the reply as it is written, after the answer so far.
+    // Rebuilt only when what it should SHOW changes -- how many pages, and whether the
+    // reader has opened them. Counting `.webtab` cannot tell the icon from an empty panel,
+    // so the icon was being rebuilt on every token.
+    const sig = webPagesOf(msg.toollog).length + '/' + webPagesOf(msg.toollog, true).length
+              + (openWebPanels.has(msg.toollog) ? ':open' : ':icon');
+    if (sig !== live.webSig) {
+      if (live.web) live.web.remove();
+      live.web = webPanelFor(msg);
+      live.webSig = sig;
+      if (live.web) b.appendChild(live.web);
+    }
     return;
   }
   if (think !== null) {
@@ -2229,6 +2290,8 @@ function fillBody(b, msg, live) {
   ans.className = 'ans';
   setRendered(ans, rest, live ? null : msg);
   b.appendChild(ans);
+  const web = webPanelFor(msg);
+  if (web) b.appendChild(web);
 }
 // The waiting dots: prefill can take seconds before the first token exists, and an empty
 // bubble reads as a frozen page. They live in the reply body from submit until the first
@@ -2356,8 +2419,22 @@ $('#composer').onsubmit = async (e) => {
       // An id the template can answer a result with. The model's own call may already carry
       // one -- keep it; making another would tie the result to an id the model never said.
       calls.forEach((c, i) => { if (!c.id) c.id = 'wt_' + round + '_' + i; });
+      // Each call is recorded the moment it returns, not at the end of the round. Two
+      // reasons, both found by watching it: a later call in the SAME round that asks what
+      // pages are open has to see the ones already built (`list_web_pages` answered "none"
+      // immediately after two `render_web_page` calls beside it), and the reader should
+      // see a page as soon as it exists rather than when the whole round finishes.
       const results = [];
-      for (const c of calls) results.push(await runToolCall(c));
+      for (const c of calls) {
+        const res = await runToolCall(c);
+        results.push(res);
+        reply.toollog = (reply.toollog || [])
+          .concat([{ name: c.name, args: c.args, result: res,
+                     logs: c.logs || null, images: c.images || null,
+                     view: c.view || null, viewHeight: c.viewHeight || 0,
+                     tab: c.tab || null }]);
+        setToollogLive(live, reply.toollog);
+      }
       // The conversation the model sees next: what it said, then what each call returned.
       if (modelCallIdShape) {
         // The template ties results to calls by id, so the calls go back as structured
@@ -2377,9 +2454,6 @@ $('#composer').onsubmit = async (e) => {
       // real trace in its history it next "called" a tool by writing a forged one --
       // invalid JSON and all -- and answered from the forgery. The answer stays the
       // answer; the record of what ran stays beside it, and out of the model's context.
-      reply.toollog = (reply.toollog || [])
-        .concat(calls.map((c, i) => ({ name: c.name, args: c.args, result: results[i],
-                                       view: c.view || null })));
       reply.content = prefix + shown;
       streamedLen = reply.content.length;
       setRendered(body.querySelector('.ans') || body, reply.content);
@@ -2682,10 +2756,15 @@ async function runToolCall(c) {
     // part rides on the call rather than in the result: it goes to the panel beside the
     // reply, and never into the context, where a page of markup would cost more than the
     // whole answer and tell the model nothing it did not just write.
-    if (r && typeof r === 'object' && r.__view != null) {
-      c.view = r.__view;
+    if (r && typeof r === 'object'
+        && (r.__view != null || r.__logs != null || r.__images != null)) {
+      if (r.__view != null) { c.view = r.__view; c.viewHeight = r.__viewHeight || 0;
+                              c.tab = r.__tab || null; }
+      if (r.__logs != null) c.logs = r.__logs;
+      if (r.__images != null) c.images = r.__images;
       const forModel = Object.assign({}, r);
-      delete forModel.__view;
+      delete forModel.__view; delete forModel.__viewHeight; delete forModel.__tab;
+      delete forModel.__logs; delete forModel.__images;
       return JSON.stringify(forModel);
     }
     return typeof r === 'string' ? r : JSON.stringify(r);
@@ -2715,8 +2794,18 @@ function toolTrace(calls, results) {
 // The folded panel that records a reply's tool calls: what was asked for, what came back.
 // Kept OUT of the message content on purpose -- the answer is the answer, and a trace
 // sitting in the answer text gets imitated by the model as content on the next turn.
+// Whether a reply's tool panel is open, kept across redraws for the same reason the web
+// panels are: opening a page rebuilds the list, and a panel that collapsed itself every
+// time anything was clicked inside it would be unusable.
+const openToolLogs = new WeakSet();
+
 function toollogNode(log) {
   const det = document.createElement('details'); det.className = 'toollog';
+  if (log && openToolLogs.has(log)) det.open = true;
+  det.addEventListener('toggle', () => {
+    if (!log) return;
+    if (det.open) openToolLogs.add(log); else openToolLogs.delete(log);
+  });
   const sum = document.createElement('summary');
   sum.textContent = log.length === 1 ? 'Used a tool' : 'Used ' + log.length + ' tool calls';
   // `toolTrace` writes markdown -- the call's name in bold, its arguments as a fenced
@@ -2725,8 +2814,47 @@ function toollogNode(log) {
   const body = document.createElement('div'); body.className = 'ans';
   setRendered(body, toolTrace(log, log.map(e => e.result)), null);
   det.append(sum, body);
-  log.forEach(e => { if (e && e.view) det.appendChild(jsViewNode(e.view)); });
+  // What it printed, then what it drew: the order the call itself produced them in.
+  // What it printed and what it drew, in the order a run produces them -- the order the run
+  // button under a code block already shows them in.
+  log.forEach(e => {
+    if (e && e.logs && e.logs.length) det.appendChild(consoleBlock(e.logs));
+    if (e && e.images && e.images.length) det.appendChild(imagesBlock(e.images));
+  });
   return det;
+}
+
+// The pages a reply built, in the reply itself.
+//
+// Not inside the tool record: that panel is the trace of what ran, folded away by default
+// because most of the time nobody needs it, and a page built FOR the reader does not belong
+// behind it. What the reply produced sits in the reply.
+function webPanelFor(msg) {
+  const log = msg && msg.toollog;
+  const built = webPagesOf(log, true);
+  if (!built.length) return null;      // nothing was built, or the model took it all back
+  return webTabsNode(webPagesOf(log), (name) => {
+    // The reader's control puts a page AWAY; it does not destroy it. Closing the last tab
+    // used to leave the reply with no route back to what it had produced -- and because the
+    // flag is written to storage with the conversation, not even a reload brought it back.
+    // Only `close_web_page` is a real close: the author retracting its own page.
+    log.forEach(e => { if (e && e.view && e.tab === name) e.hidden = true; });
+    saveConvs(); render();
+  }, log, built.length);
+}
+
+// The pages a tool log holds, newest name wins if a tab was reopened. `all` counts the ones
+// the reader has put away too -- what the reply produced, rather than what is on show.
+function webPagesOf(log, all) {
+  const out = [];
+  (log || []).forEach(e => {
+    if (!e || !e.view || e.closed) return;
+    if (!all && e.hidden) return;
+    const at = out.findIndex(p => p.name === e.tab);
+    const page = { name: e.tab || 'page', html: e.view, height: e.viewHeight || 0 };
+    if (at >= 0) out[at] = page; else out.push(page);
+  });
+  return out;
 }
 // Live update while the reply is still streaming: the panel appears as soon as the first
 // call returns, open so the work is visible; the loop folds it when the reply finishes.
@@ -2736,9 +2864,11 @@ function setToollogLive(live, log) {
     live.tdet = toollogNode(log);
     live.tdet.open = true;
     live.ans.parentNode && live.ans.parentNode.insertBefore(live.tdet, live.ans);
-  } else if (log.some(e => e && e.view)
-             && live.tdet.querySelectorAll('iframe.jsview').length
-                !== log.filter(e => e && e.view).length) {
+  } else if ((webPagesOf(log).length
+              && live.tdet.querySelectorAll('.webtab').length !== webPagesOf(log).length)
+             || (log.some(e => e && e.logs && e.logs.length)
+                 && live.tdet.querySelectorAll('.jslog').length
+                    !== log.filter(e => e && e.logs && e.logs.length).length)) {
     const fresh = toollogNode(log);                 // a new view to show: rebuild the panel
     fresh.open = live.tdet.open;
     live.tdet.replaceWith(fresh);
@@ -2783,7 +2913,7 @@ registerTool({
                       traceback: 'no code was given', figures: 0 };
   const r = await pyCall('run', { code: String(code) });
   const clean = (x) => (x ? String(x).replace(/\n+$/, '') : '');
-  return {
+  const out = {
     stdout: clean(r.out),
     stderr: clean(r.err),
     // A run that raised HAS no result. Reporting the last value alongside a traceback invites
@@ -2792,6 +2922,18 @@ registerTool({
     traceback: r.error ? String(r.error) : null,
     figures: (r.images || []).length,
   };
+  // The definition says figures are shown to the reader, and until now they were not: this
+  // counted them and dropped the pictures. They travel the same side channel the JavaScript
+  // tool's do -- to the panel, never into the model's context, where a base64 PNG would cost
+  // more than every reply in the conversation.
+  if ((r.images || []).length) out.__images = r.images;
+  // And the two streams as lines, so a call's output reads the same whichever tool made it.
+  const lines = [];
+  clean(r.out).split('\n').forEach(t => { if (t) lines.push({ level: 'log', text: t }); });
+  clean(r.err).split('\n').forEach(t => { if (t) lines.push({ level: 'warn', text: t }); });
+  if (r.error) lines.push({ level: 'error', text: String(r.error).replace(/\n+$/, '') });
+  if (lines.length) out.__logs = lines;
+  return out;
 });
 
 registerTool({
@@ -2850,14 +2992,27 @@ registerTool({
 // SecurityError, while the page itself sees both databases.
 //
 // It is a document rather than a Worker because a Worker is same-origin: no DOM, but the
-// stored models are still one `indexedDB.open` away. The document also gives this the
-// second half for free -- a script that builds something has somewhere to build it.
+// stored models are still one `indexedDB.open` away.
 const JS_TIMEOUT_MS = 5000;
-function runSandboxedJs(code, timeoutMs) {
+
+// The DOM names a computation has no business touching. Shadowing them is the CONTRACT --
+// "this tool has no page" -- not the security boundary; the sandbox is that, and it holds
+// whatever the code does with these. What shadowing buys is that a script written for the
+// computing tool cannot half-work by drawing something nobody will see.
+const JS_NO_DOM = ['document', 'window', 'top', 'parent', 'frames', 'location', 'history'];
+
+function runSandboxedJs(code, timeoutMs, wantDom) {
   return new Promise((resolve) => {
     const f = document.createElement('iframe');
     f.setAttribute('sandbox', 'allow-scripts');
-    f.style.display = 'none';
+    // Off the screen, but LAID OUT. `display:none` means no layout, so everything the page
+    // builds reports a height of zero and the frame it is shown in cannot be sized to it.
+    // Off the screen, but VISIBLE and laid out. `display:none` skips layout entirely, and
+    // `visibility:hidden` skips it inside an iframe too -- under either, every element in
+    // the page reports a zero-height box and the frame it is shown in cannot be sized to
+    // its contents. Moving it out of view is the only one of the three that still measures.
+    f.style.cssText = 'position:absolute;left:-10000px;top:0;width:760px;height:600px;'
+                    + 'border:0;opacity:0;pointer-events:none';
     let settled = false;
     const done = (v) => {
       if (settled) return;
@@ -2868,26 +3023,36 @@ function runSandboxedJs(code, timeoutMs) {
     };
     const onMsg = (e) => { if (e.source === f.contentWindow) done(e.data); };
     window.addEventListener('message', onMsg);
-    // The script travels as a JSON string, so nothing in it can close the tag it lives in --
-    // written inline, the document would end at the first closing script tag it contained.
-    f.srcdoc = '<!doctype html><meta charset="utf-8"><body></body><scr' + 'ipt>'
+    // The script goes in the HEAD. Put after <body> it is parsed INTO the body, so the
+    // document always held something and "did this draw anything?" was always yes.
+    f.srcdoc = '<!doctype html><html><head><meta charset="utf-8">'
+      + '<scr' + 'ipt data-wt-harness>'
       + '(async () => {'
+      // The script sits in the HEAD -- put after <body> it is parsed INTO the body, and the
+      // captured page then contains its own source. So wait for the body to exist before
+      // running anything that expects one.
+      + '  if (document.readyState === "loading") {'
+      + '    await new Promise(r => document.addEventListener("DOMContentLoaded", r));'
+      + '  }'
       + '  const out = [];'
-      + '  const w = (...a) => out.push(a.map(x => {'
+      + '  const w = (level) => (...a) => out.push({ level: level, text: a.map(x => {'
       + '    try { return typeof x === "string" ? x : JSON.stringify(x); }'
-      + '    catch (e) { return String(x); } }).join(" "));'
-      + '  console.log = w; console.info = w; console.warn = w; console.error = w;'
+      + '    catch (e) { return String(x); } }).join(" ") });'
+      + '  console.log = w("log"); console.info = w("info");'
+      + '  console.warn = w("warn"); console.error = w("error");'
+      + '  console.debug = w("log");'
       + '  let value = null, error = null;'
       + '  const src = ' + JSON.stringify(code) + ';'
-      // Compiled before it is run, and in three shapes, the first that COMPILES winning.
+      + '  const hide = ' + JSON.stringify(wantDom ? [] : JS_NO_DOM) + ';'
+      // Compiled before it is run, and in four shapes, the first that COMPILES winning.
       // `eval` cannot hold a top-level await -- awaiting its RESULT is not the same thing,
       // and a script that used one came back null -- so the body goes inside an async
       // function, which can. But an async BLOCK has no completion value, so a script whose
-      // last line is the answer would come back null instead. Hence the middle shape: the
-      // last statement returned and the rest run before it, split at the last newline or,
-      // for a one-liner, the last semicolon. `new Function` raising at construction is what
-      // makes trying them safe -- nothing has run when a shape does not fit, so a split
-      // that lands inside a string simply fails to compile and the next shape is used.
+      // last line is the answer would come back null the other way. Hence the middle
+      // shapes: the last statement returned and the rest run before it, split at the last
+      // newline or, for a one-liner, the last semicolon. `new Function` raising at
+      // construction is what makes trying them safe -- a split landing inside a string
+      // simply fails to compile and the next shape is used.
       + '  const tail = (i) => i < 0 ? null : "return (async () => {" + src.slice(0, i + 1)'
       + '                + "\\nreturn (" + src.slice(i + 1) + "\\n); })()";'
       + '  const shapes = ['
@@ -2899,10 +3064,10 @@ function runSandboxedJs(code, timeoutMs) {
       + '  let fn = null;'
       + '  for (const shape of shapes) {'
       + '    if (!shape) continue;'
-      + '    try { fn = new Function(shape); break; } catch (e) { fn = null; }'
+      + '    try { fn = new Function(...hide, shape); break; } catch (e) { fn = null; }'
       + '  }'
       + '  if (!fn) { error = "could not compile that as JavaScript"; }'
-      + '  else { try { value = await fn(); }'
+      + '  else { try { value = await fn(...hide.map(() => undefined)); }'
       + '         catch (e) { error = String((e && (e.stack || e.message)) || e); } }'
       + '  let shown = null;'
       + '  if (value !== undefined && value !== null) {'
@@ -2910,43 +3075,207 @@ function runSandboxedJs(code, timeoutMs) {
       + '    catch (e) { shown = String(value); }'
       + '    if (shown === undefined) shown = String(value);'
       + '  }'
-      + '  const body = document.body ? document.body.innerHTML.trim() : "";'
-      + '  const view = body ? document.documentElement.outerHTML : null;'
-      + '  parent.postMessage({ stdout: out.join("\\n"), result: shown, error: error,'
+      + '  let view = null;'
+      + '  if (' + (wantDom ? 'true' : 'false') + ') {'
+      // Serialised WITHOUT this harness. `documentElement.outerHTML` includes the script in
+      // the head that is running right now, so a stored page would re-run it on every
+      // render -- executing the model's code again and posting to whatever framed it.
+      + '    const copy = document.documentElement.cloneNode(true);'
+      + '    copy.querySelectorAll("script[data-wt-harness]").forEach(n => n.remove());'
+      + '    view = copy.outerHTML;'
+      // Height is NOT measured here. This frame is parked off-screen to run in, and what
+      // it reports depends on how it was hidden rather than on the page: display:none and
+      // visibility:hidden skip layout outright, and even moved off-screen every element
+      // came back with a zero box. The frame that shows the page measures itself instead --
+      // see `jsViewFrame`, which is the one actually laid out.
+      + '  }'
+      + '  parent.postMessage({ logs: out, result: shown, error: error,'
       + '                       view: view }, "*");'
       + '})();'
-      + '</scr' + 'ipt>';
+      + '</scr' + 'ipt></head><body></body></html>';
     document.body.appendChild(f);
     // A script that never finishes -- an endless loop, an await that never settles -- blocks
     // only its own frame. Dropping the frame is what ends it.
-    setTimeout(() => done({ stdout: '', result: null, view: null,
+    setTimeout(() => done({ logs: [], result: null, view: null,
       error: 'timed out after ' + timeoutMs + 'ms and was stopped' }), timeoutMs);
   });
 }
 
-// A page the sandbox produced, shown where the call that produced it is recorded. Rebuilt
-// from its own source into a fresh sandbox rather than kept as a live frame: the source is
-// what the conversation stores, so it survives a redraw and a reload, and it is displayed
-// under exactly the restrictions it ran under.
-function jsViewNode(html) {
+// What a call printed, as its own block.
+//
+// Not an iframe, which is what a rendered page gets. That one has to be a frame: it is a
+// foreign document and the sandbox is the only thing making it safe to show. These are
+// lines of text we captured -- putting them in a frame would cost a second document, make
+// them unselectable, and leave the height to be guessed, for nothing. They stay in our own
+// DOM, as text.
+//
+// The level is kept because it is the one thing the model cannot use and a reader can: a
+// warning and a result look identical once they are both "output".
+function consoleBlock(logs) {
+  const box = document.createElement('div');
+  box.className = 'jslog';
+  logs.forEach(l => {
+    const line = document.createElement('div');
+    line.className = 'jsline ' + (l.level === 'error' ? 'err'
+                                : l.level === 'warn' ? 'warn' : 'out');
+    line.textContent = l.text;
+    box.appendChild(line);
+  });
+  return box;
+}
+
+// Figures a call produced. The same treatment they get from the run button under a code
+// block -- inline, and double-click to open -- because they are the same thing arriving by
+// a different route.
+function imagesBlock(images) {
+  const box = document.createElement('div');
+  box.className = 'jsfigs';
+  images.forEach((b64, k) => {
+    const im = new Image();
+    im.src = 'data:image/png;base64,' + b64;
+    wireImage(im, 'figure-' + (k + 1) + '.png');
+    box.appendChild(im);
+  });
+  return box;
+}
+
+// The pages a reply built, in one panel with a tab per page -- a browser's shape, because
+// that is what a model driving several pages is doing.
+//
+// Each page is rebuilt from its own source into a fresh sandbox rather than kept as a live
+// frame: the source is what the conversation stores, so it survives a redraw and a reload,
+// and it is shown under exactly the restrictions it ran under. Only the SELECTED tab is
+// built, so ten pages cost one frame.
+//
+// The height a page reported for itself sizes its frame, bounded: a page is embedded in a
+// reply, and a runaway one must not take the reply over.
+const JS_VIEW_MIN = 80, JS_VIEW_MAX = 640;
+
+function jsViewFrame(page) {
   const f = document.createElement('iframe');
   f.className = 'jsview';
   f.setAttribute('sandbox', 'allow-scripts');
-  f.srcdoc = html;
+  f.style.height = JS_VIEW_MIN + 'px';
+  // The page measures ITSELF, in the frame that is actually on screen. Measuring where it
+  // ran does not work: that frame is parked off-screen, and under every way of hiding it
+  // the contents report a zero-height box. A stored page is a page and nothing else, so the
+  // reporter is added HERE, at display time, and never becomes part of what is stored.
+  const reporter = '<scr' + 'ipt data-wt-fit>(() => {'
+    + 'const post = () => {'
+    + '  let bottom = 0;'
+    + '  for (const el of document.body ? document.body.children : []) {'
+    + '    bottom = Math.max(bottom, el.getBoundingClientRect().bottom); }'
+    + '  const pad = document.body'
+    + '    ? parseFloat(getComputedStyle(document.body).paddingBottom) || 0 : 0;'
+    + '  parent.postMessage({ __wtFit: Math.ceil(bottom + pad) }, "*"); };'
+    + 'addEventListener("load", post); setTimeout(post, 0); setTimeout(post, 250);'
+    + 'if (window.ResizeObserver && document.body) {'
+    + '  new ResizeObserver(post).observe(document.body); }'
+    + '})();</scr' + 'ipt>';
+  f.srcdoc = String(page.html || '').replace(/<\/body>/i, reporter + '</body>')
+             + (/<\/body>/i.test(page.html || '') ? '' : reporter);
+  const onFit = (e) => {
+    if (e.source !== f.contentWindow || !e.data || typeof e.data.__wtFit !== 'number') return;
+    const h = Math.min(Math.max(e.data.__wtFit, JS_VIEW_MIN), JS_VIEW_MAX);
+    f.style.height = h + 'px';
+  };
+  window.addEventListener('message', onFit);
+  // The listener outlives nothing: a frame removed from the page stops posting, and the
+  // panel is rebuilt wholesale on every redraw.
+  f.addEventListener('DOMNodeRemovedFromDocument',
+                     () => window.removeEventListener('message', onFit));
   return f;
+}
+
+// Which reply's panel is open. Nothing is open by default: a page is a page -- it runs
+// scripts, loads fonts, animates -- and a conversation that quietly starts eight of them
+// every time it is drawn is a conversation that gets slower the longer it goes. A message
+// that has pages says so with a button, and the pages exist when someone asks for them.
+//
+// Keyed on the log array, which is the message's own object, so the choice survives a
+// redraw and dies with the conversation rather than being written to storage.
+const openWebPanels = new WeakSet();
+
+// `pages` are {name, html, height} and `onClose(name)` removes one for good. Hiding is a
+// different thing and deliberately so: it keeps the pages, because "I do not want to look
+// at this right now" is not "throw it away".
+//
+// Two states, one control. There is the icon and there is the browser, and `hide` is the
+// way back -- the earlier design had a global "hide pages" AND a per-panel collapse, which
+// are the same intent expressed twice and could disagree about what was showing.
+function webTabsNode(pages, onClose, log, built) {
+  // An empty tab bar is not a state: putting the last tab away IS going back to the icon.
+  if (log && !pages.length) openWebPanels.delete(log);
+  if (log && !openWebPanels.has(log)) {
+    const n = pages.length || built || 0;
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'webopen';
+    open.innerHTML = '<span class="webopenicon">◱</span> '
+      + (n === 1 ? '1 page' : n + ' pages');
+    open.title = pages.length ? 'Show the pages this reply built'
+                              : 'Bring back the pages this reply built';
+    open.onclick = () => {
+      if (!pages.length) {                      // everything was put away -- bring it back
+        (log || []).forEach(e => { if (e) e.hidden = false; });
+        saveConvs();
+      }
+      openWebPanels.add(log); render();
+    };
+    return open;
+  }
+  const box = document.createElement('div');
+  box.className = 'webtabs';
+  const bar = document.createElement('div');
+  bar.className = 'webtabbar';
+  const stage = document.createElement('div');
+  stage.className = 'webstage';
+  let active = 0;
+
+  const draw = () => {
+    bar.textContent = ''; stage.textContent = '';
+    pages.forEach((p, i) => {
+      const t = document.createElement('span');
+      t.className = 'webtab' + (i === active ? ' on' : '');
+      const label = document.createElement('span');
+      label.textContent = p.name;
+      label.onclick = () => { active = i; draw(); };
+      t.appendChild(label);
+      if (onClose) {
+        const x = document.createElement('button');
+        x.type = 'button'; x.className = 'webtabx'; x.textContent = '×';
+        x.title = 'Put this page away';
+        x.onclick = (e) => { e.stopPropagation(); onClose(p.name); };
+        t.appendChild(x);
+      }
+      bar.appendChild(t);
+    });
+    // One control, because there are only two states: the icon, and the pages. Hiding is
+    // not closing -- the pages are still there, and the icon says how many.
+    const eye = document.createElement('button');
+    eye.type = 'button'; eye.className = 'webtabhide';
+    eye.textContent = 'hide';
+    eye.title = 'Put these pages back behind their icon';
+    eye.onclick = () => { if (log) openWebPanels.delete(log); render(); };
+    bar.appendChild(eye);
+    if (pages[active]) stage.appendChild(jsViewFrame(pages[active]));
+  };
+  draw();
+  box.append(bar, stage);
+  return box;
 }
 
 registerTool({
   type: 'function',
   function: {
     name: 'run_javascript',
-    description: 'Run JavaScript, get the output back. A sandbox with no access to the page, '
-      + 'its storage or the models; each call starts empty, so nothing persists between '
-      + 'calls. Top-level await works. It has its own blank document: anything left in it is '
-      + 'shown to the reader, so build there to draw something.\n'
-      + 'Returns {"stdout":str,"result":str|null,"error":str|null,"rendered":bool}. result is '
-      + 'the last expression. error non-null means it threw or timed out and result is null. '
-      + 'rendered true means the reader was shown what you built; you do not see it.',
+    description: 'Run JavaScript and get the output back. A sandbox with no page in it: '
+      + 'document, window and location are not defined, and nothing is displayed. Each call '
+      + 'starts empty, so nothing persists between calls. Top-level await works.\n'
+      + 'Returns {"stdout":str,"stderr":str,"result":str|null,"error":str|null}. stdout is '
+      + 'console.log/info, stderr is console.warn/error, result is the last expression. '
+      + 'error non-null means it threw or timed out and result is null.\n'
+      + 'To build something for the reader to look at, use render_web_page instead.',
     parameters: {
       type: 'object',
       properties: { code: { type: 'string', description: 'The JavaScript source to run.' } },
@@ -2954,16 +3283,114 @@ registerTool({
     },
   },
 }, async ({ code }) => {
-  if (!code) return { stdout: '', result: null, error: 'no code was given', rendered: false };
-  const r = await runSandboxedJs(String(code), JS_TIMEOUT_MS);
-  const out = { stdout: r.stdout || '', result: r.result == null ? null : r.result,
-                error: r.error || null, rendered: !!r.view };
-  // The page itself goes to the reader, never into the model's context: it is usually far
-  // larger than the answer and says nothing the model does not already know, having just
-  // written it.
-  if (r.view) out.__view = r.view;
+  if (!code) return { stdout: '', stderr: '', result: null, error: 'no code was given' };
+  const r = await runSandboxedJs(String(code), JS_TIMEOUT_MS, false);
+  return jsOut(r, false);
+});
+
+// Each reply gets its OWN browser. Pages a reply builds are tabs of one panel; the reply
+// before it has a different panel with different tabs, because they are different pieces of
+// work and nothing said the second should inherit the first's windows.
+//
+// A name is a tab within that reply: opening one that exists replaces its contents, the way
+// reloading a tab does; a new name opens another tab beside it.
+let webTabSeq = 0;
+function replyBeingWritten() {
+  if (!streaming) return null;
+  const conv = convs.find(c => c.id === streaming.convId);
+  return conv ? conv.messages[streaming.idx] : null;
+}
+function openWebTabs() {
+  const m = replyBeingWritten();
+  return webPagesOf(m ? m.toollog : []).map(p => p.name);
+}
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'render_web_page',
+    description: 'Run JavaScript that builds a web page, and show that page to the reader in '
+      + 'a tab. A sandbox with its own empty document: build in it with the DOM, or set '
+      + 'document.body.innerHTML. Styles, images, SVG and canvas all work. Top-level await '
+      + 'works. The reader sees the page; you do not.\n'
+      + 'tab names the tab. Reusing a name replaces that tab, a new name opens another '
+      + 'beside it; omit it and one is named for you. Each call still starts from an empty '
+      + 'document -- a tab is where a page is shown, not a session.\n'
+      + 'Returns {"stdout":str,"stderr":str,"result":str|null,"error":str|null,'
+      + '"rendered":bool,"tab":str}.',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'JavaScript that builds the page.' },
+        tab: { type: 'string', description: 'Which tab to show it in.' },
+      },
+      required: ['code'],
+    },
+  },
+}, async ({ code, tab }) => {
+  const m0 = replyBeingWritten();
+  if (m0 && !m0.toollog) webTabSeq = 0;          // a fresh reply starts its numbering over
+  const name = String(tab || '').trim() || ('page ' + (++webTabSeq));
+  if (!code) return { stdout: '', stderr: '', result: null,
+                      error: 'no code was given', rendered: false, tab: name };
+  const r = await runSandboxedJs(String(code), JS_TIMEOUT_MS, true);
+  const out = jsOut(r, true);
+  out.tab = name;
+  if (out.__view != null) out.__tab = name;
   return out;
 });
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'list_web_pages',
+    description: 'The tabs of pages currently open in this conversation.\n'
+      + 'Returns {"tabs":[str]}.',
+    parameters: { type: 'object', properties: {} },
+  },
+}, async () => ({ tabs: openWebTabs() }));
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'close_web_page',
+    description: 'Close one open page by its tab name. Gone, not hidden -- the reader has '
+      + 'their own control for hiding.\n'
+      + 'Returns {"closed":bool,"tabs":[str]}; closed false means no tab had that name.',
+    parameters: {
+      type: 'object',
+      properties: { tab: { type: 'string', description: 'Which tab to close.' } },
+      required: ['tab'],
+    },
+  },
+}, async ({ tab }) => {
+  const name = String(tab || '').trim();
+  let closed = false;
+  const m = replyBeingWritten();
+  (m && m.toollog || []).forEach(e => {
+    if (e && e.view && !e.closed && e.tab === name) { e.closed = true; closed = true; }
+  });
+  if (closed) { saveConvs(); render(); }
+  return { closed, tabs: openWebTabs() };
+});
+
+// Both tools report the same way -- and the same way `run_python` does, so a call's output
+// reads alike whichever tool made it.
+function jsOut(r, withView) {
+  const logs = r.logs || [];
+  const pick = (levels) => logs.filter(l => levels.includes(l.level))
+                               .map(l => l.text).join('\n');
+  const out = { stdout: pick(['log', 'info']), stderr: pick(['warn', 'error']),
+                result: r.result == null ? null : r.result, error: r.error || null };
+  if (withView) out.rendered = !!r.view;
+  // These go to the reader, never into the model's context. The page because it is usually
+  // larger than the answer and says nothing the model does not know, having just written
+  // it; the log records because the model already has both streams above, and what it does
+  // not have -- which line was a warning -- is a question for someone reading.
+  if (withView && r.view) { out.__view = r.view; out.__viewHeight = r.height || 0; }
+  if (logs.length) out.__logs = logs;
+  return out;
+}
 
 
 // ---- the Python-environment settings -------------------------------------------------

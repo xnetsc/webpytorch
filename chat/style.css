@@ -390,5 +390,63 @@ dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-rad
 
 /* A page the sandboxed JS tool produced. It is someone else's document in someone else's
    origin, so it gets a frame rather than being spliced into ours. */
-iframe.jsview{width:100%;height:260px;border:1px solid var(--line);border-radius:6px;
+/* Sized from the height the page reported for itself, so it reads as an embedded page
+   rather than a fixed porthole; the bounds live in app.js next to the report. */
+iframe.jsview{width:100%;border:1px solid var(--line);border-radius:6px;
               margin:8px 0 0;background:#fff;display:block}
+
+/* What a sandboxed call printed. Its own block, distinct from the page it drew: that one is
+   a foreign document behind a frame, these are lines we captured and can style and select.
+   Warnings read the way stderr already does here; errors are the only thing that shouts. */
+.jslog{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+       word-wrap:break-word;border-left:2px solid var(--line);padding:6px 0 6px 9px;
+       margin:8px 0 0}
+/* The panel around this is muted, so ordinary output has to say so explicitly or it reads
+   as a warning -- which is exactly how it looked before this line existed. */
+.jsline{padding:1px 0;color:var(--fg)}
+.jsline.warn{color:var(--mut);font-style:italic}
+.jsline.err{color:var(--danger)}
+
+/* Figures, from either tool. */
+.jsfigs{margin:8px 0 0;display:flex;flex-wrap:wrap;gap:8px}
+.jsfigs img{max-width:100%;border:1px solid var(--line);border-radius:6px;background:#fff}
+
+/* The pages a reply built: one browser per reply, a tab per page. */
+.webtabs{margin:8px 0 0;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.webtabbar{display:flex;align-items:center;gap:2px;flex-wrap:wrap;padding:4px 6px;
+           background:var(--code);border-bottom:1px solid var(--line)}
+.webtab{display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:5px;
+        font-size:12px;color:var(--mut);cursor:pointer;max-width:180px}
+.webtab.on{background:var(--panel);color:var(--fg)}
+.webtab > span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.webtabx{border:0;background:none;color:var(--mut);cursor:pointer;font-size:14px;
+         line-height:1;padding:0 2px}
+.webtabx:hover{color:var(--danger)}
+.webtabhide{margin-left:auto;border:0;background:none;color:var(--mut);cursor:pointer;
+            font-size:12px;padding:2px 4px}
+.webtabhide:hover{color:var(--fg)}
+.webstage{background:#fff}
+.webstage iframe.jsview{border:0;border-radius:0;margin:0}
+
+/* Phones. The tab bar is the part that breaks first: a row of tabs plus a hide button does
+   not fit 360px, and a 12px × is not a touch target. It scrolls sideways instead of
+   wrapping into a wall, the controls grow to something a thumb can hit, and the page below
+   gets more of the screen because there is less of it to spare. */
+@media (max-width: 640px){
+  .webtabbar{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;
+             scrollbar-width:none;padding:5px 6px}
+  .webtabbar::-webkit-scrollbar{display:none}
+  .webtab{flex:0 0 auto;max-width:44vw;padding:5px 8px;font-size:13px}
+  .webtabx{font-size:17px;padding:0 6px;min-width:28px;min-height:28px}
+  .webtabhide{position:sticky;right:0;flex:0 0 auto;font-size:13px;padding:5px 8px;
+              min-height:28px;background:var(--code)}
+  .jsview{min-height:120px}
+}
+
+/* A reply that built pages says so, and opens them on request rather than on sight. */
+.webopen{margin:8px 0 0;display:inline-flex;align-items:center;gap:6px;padding:5px 10px;
+         border:1px solid var(--line);border-radius:7px;background:var(--panel);
+         color:var(--mut);font-size:12px;cursor:pointer}
+.webopen:hover{color:var(--fg);border-color:var(--mut)}
+.webopenicon{font-size:14px;line-height:1}
+@media (max-width: 640px){ .webopen{padding:8px 12px;font-size:13px;min-height:36px} }

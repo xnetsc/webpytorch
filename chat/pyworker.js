@@ -31,9 +31,24 @@ async function boot(packages) {
   booting = (async () => {
     send({ type: 'state', state: 'booting' });
     py = await loadPyodide({ indexURL: PYODIDE_URL });
-    // matplotlib in a worker has no screen to draw on; AGG renders to a buffer, which is
-    // what the figure capture below reads.
-    py.runPython('import os; os.environ.setdefault("MPLBACKEND", "AGG")');
+    // Nothing here has a screen to draw on, and each library has to be told in its own way.
+    //
+    // matplotlib: AGG renders to a buffer, which is what the figure capture below reads.
+    //
+    // SDL: this matters more than a default, because without it pygame does not fail, it
+    // HANGS. `pygame.display.set_mode()` looks for the canvas the emscripten driver needs,
+    // a worker has no document to find one in, and the call never returns -- taking the
+    // interpreter with it, so every later call queues behind it forever (measured: a
+    // following `1+1` never came back either). Naming a driver this build does not have
+    // turns that into a plain error at the point of the call. Neither `dummy` nor
+    // `offscreen` is compiled into the SDL 2.28.4 here, and an OffscreenCanvas installed
+    // through `specialHTMLTargets` does not satisfy the emscripten driver either -- both
+    // tried, both still hung. Drawing itself is unaffected: Surfaces, draw, font and
+    // image.save need no video driver at all.
+    py.runPython(`import os
+os.environ.setdefault("MPLBACKEND", "AGG")
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")`);
     await add(packages || []);
     send({ type: 'state', state: 'ready', packages: [...loaded],
            version: (py && py.version) || null });
@@ -113,8 +128,38 @@ async function run(code) {
   } catch (e) {
     error = String(e.message || e);
   }
-  // Any figure the code left open, as a PNG. Done after the run so a script that both
-  // prints and plots shows both.
+  // Anything the code left drawn, as a PNG. Done after the run so a script that both prints
+  // and plots shows both.
+  //
+  // pygame draws too, and its pictures reach the reader the same way -- one channel for
+  // "what this run produced to look at", whichever library made it. Its display surface is
+  // the closest thing it has to matplotlib's open figures; a Surface that was never given
+  // to `set_mode` is a value the code holds, and only the code knows which of them was the
+  // point.
+  try {
+    if (loaded.has('pygame-ce') || loaded.has('pygame')) {
+      const b64 = py.runPython(`
+def __wt_pygame():
+    import base64, io
+    try:
+        import pygame
+        if not pygame.display.get_init():
+            return []
+        s = pygame.display.get_surface()
+        if s is None:
+            return []
+        buf = io.BytesIO()
+        pygame.image.save(s, buf, "PNG")
+        return [base64.b64encode(buf.getvalue()).decode()]
+    except Exception:
+        return []
+__wt_pygame()
+`);
+      const got = b64 ? b64.toJs() : [];
+      if (b64 && b64.destroy) b64.destroy();
+      images = images.concat(got);
+    }
+  } catch (e) { /* a broken surface must not hide the output */ }
   try {
     if (loaded.has('matplotlib')) {
       const b64 = py.runPython(`
