@@ -809,6 +809,19 @@ class _Store:
     async def delete(self, key):
         raise NotImplementedError
 
+    async def delete_chunk(self, key, i):
+        """Remove one chunk's bytes. Default: nothing, because not every backend can.
+
+        A disk entry is ONE sparse file, so there is no record to remove from the middle of
+        it -- the coverage map is what says which bytes count, and trimming that is the
+        whole operation there. A store that keeps a record per chunk overrides this and
+        reclaims the space.
+
+        What this must never be is a write of empty bytes. That leaves a record which reads
+        back as null: `get` reports the chunk missing, `stored` trips over it, and an entry
+        that was complete becomes one that cannot be exported or resumed."""
+        return False
+
     async def keys(self):
         raise NotImplementedError
 
@@ -1015,9 +1028,15 @@ class _IdbStore(_Store):
         await self.open()
         from js import IDBKeyRange
         rng = IDBKeyRange.bound(key + "#", key + "#\uffff")
+        recs = await _idb_req(self._store(self.CHUNKS, "readonly").getAll(rng))
         ks = await _idb_req(self._store(self.CHUNKS, "readonly").getAllKeys(rng))
         out = set()
-        for k in (ks or []):
+        for n, k in enumerate(ks or []):
+            # An empty record is not a stored chunk -- see `stored`. Counting one as present
+            # is what would keep a damaged entry from refetching the bytes it is missing.
+            v = (recs or [])[n] if recs is not None and n < len(recs) else None
+            if v is None or int(getattr(v, "byteLength", 0) or 0) == 0:
+                continue
             try: out.add(int(str(k).rsplit("#", 1)[1]))
             except (ValueError, IndexError): pass
         return out
@@ -1107,13 +1126,25 @@ class _IdbStore(_Store):
         ks = await _idb_req(self._store(self.META, "readonly").getAllKeys())
         return sorted(str(k) for k in (ks or []))
 
+    async def delete_chunk(self, key, i):
+        """Remove one chunk's record, reclaiming its space."""
+        await self.open()
+        try:
+            await _idb_req(self._store(self.CHUNKS, "readwrite").delete(self._ck(key, i)))
+            return True
+        except Exception:
+            return False
+
     async def stored(self, key):
         """Summed from the chunk records, so a partial entry reports what it really holds."""
         await self.open()
         from js import IDBKeyRange
         rng = IDBKeyRange.bound(key + "#", key + "#\uffff")
         vals = await _idb_req(self._store(self.CHUNKS, "readonly").getAll(rng))
-        return int(sum(int(v.byteLength) for v in (vals or [])))
+        # A record with no bytes is not a chunk. One release wrote empty records to "drop" a
+        # chunk, and every entry it touched then failed here rather than reporting what it
+        # held; treating them as absent is what lets such an entry heal by refetching.
+        return int(sum(int(v.byteLength) for v in (vals or []) if v is not None))
 
 
 def _in_browser():
@@ -2045,7 +2076,7 @@ async def trim_partial(key, cache_dir=None):
     if not dropped:
         return 0
     for i in sorted(set(dropped)):
-        await store.put(key, i, b"")                     # the bytes go; the slot may remain
+        await store.delete_chunk(key, i)                 # a real removal, or nothing at all
     spans = []
     for lo, hi in sorted(kept):
         spans = _merge(spans, lo, hi)
