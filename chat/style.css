@@ -387,3 +387,8 @@ dialog.cpuwarn pre{margin:8px 0 0;padding:10px;background:var(--code);border-rad
 /* What a library said on the way, not what the code produced. Present, and visibly not the
    answer -- merged into stdout it has been reported as the result. */
 .runout pre.stderr{color:var(--mut);font-style:italic}
+
+/* A page the sandboxed JS tool produced. It is someone else's document in someone else's
+   origin, so it gets a frame rather than being spliced into ours. */
+iframe.jsview{width:100%;height:260px;border:1px solid var(--line);border-radius:6px;
+              margin:8px 0 0;background:#fff;display:block}

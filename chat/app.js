@@ -2378,7 +2378,8 @@ $('#composer').onsubmit = async (e) => {
       // invalid JSON and all -- and answered from the forgery. The answer stays the
       // answer; the record of what ran stays beside it, and out of the model's context.
       reply.toollog = (reply.toollog || [])
-        .concat(calls.map((c, i) => ({ name: c.name, args: c.args, result: results[i] })));
+        .concat(calls.map((c, i) => ({ name: c.name, args: c.args, result: results[i],
+                                       view: c.view || null })));
       reply.content = prefix + shown;
       streamedLen = reply.content.length;
       setRendered(body.querySelector('.ans') || body, reply.content);
@@ -2677,6 +2678,16 @@ async function runToolCall(c) {
   try {
     const args = typeof c.args === 'string' ? JSON.parse(c.args) : (c.args || {});
     const r = await t.run(args);
+    // A tool may produce something for the READER as well as an answer for the model. That
+    // part rides on the call rather than in the result: it goes to the panel beside the
+    // reply, and never into the context, where a page of markup would cost more than the
+    // whole answer and tell the model nothing it did not just write.
+    if (r && typeof r === 'object' && r.__view != null) {
+      c.view = r.__view;
+      const forModel = Object.assign({}, r);
+      delete forModel.__view;
+      return JSON.stringify(forModel);
+    }
     return typeof r === 'string' ? r : JSON.stringify(r);
   } catch (e) {
     // The failure goes BACK to the model rather than ending the turn: "that raised, here is
@@ -2714,6 +2725,7 @@ function toollogNode(log) {
   const body = document.createElement('div'); body.className = 'ans';
   setRendered(body, toolTrace(log, log.map(e => e.result)), null);
   det.append(sum, body);
+  log.forEach(e => { if (e && e.view) det.appendChild(jsViewNode(e.view)); });
   return det;
 }
 // Live update while the reply is still streaming: the panel appears as soon as the first
@@ -2724,6 +2736,13 @@ function setToollogLive(live, log) {
     live.tdet = toollogNode(log);
     live.tdet.open = true;
     live.ans.parentNode && live.ans.parentNode.insertBefore(live.tdet, live.ans);
+  } else if (log.some(e => e && e.view)
+             && live.tdet.querySelectorAll('iframe.jsview').length
+                !== log.filter(e => e && e.view).length) {
+    const fresh = toollogNode(log);                 // a new view to show: rebuild the panel
+    fresh.open = live.tdet.open;
+    live.tdet.replaceWith(fresh);
+    live.tdet = fresh;
   } else {
     setRenderedLive(live.tdet.querySelector('.ans'),
                     toolTrace(log, log.map(e => e.result)));
@@ -2819,6 +2838,131 @@ registerTool({
     await new Promise(r => setTimeout(r, 250));
   return { restarted: true, state: pyState,
            ready: pyState === 'ready' ? pyPackages() : [] };
+});
+
+
+// JavaScript, run where it cannot reach anything of ours.
+//
+// `eval` on this page would hand a model's script the conversation, the stored models and
+// the DOM. A sandboxed iframe with no `allow-same-origin` gets an opaque origin instead,
+// and that is not a claim -- measured from inside one: listing IndexedDB, opening
+// `webtorch-chunks` (where the model weights are) and reading Cache Storage all raise
+// SecurityError, while the page itself sees both databases.
+//
+// It is a document rather than a Worker because a Worker is same-origin: no DOM, but the
+// stored models are still one `indexedDB.open` away. The document also gives this the
+// second half for free -- a script that builds something has somewhere to build it.
+const JS_TIMEOUT_MS = 5000;
+function runSandboxedJs(code, timeoutMs) {
+  return new Promise((resolve) => {
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', 'allow-scripts');
+    f.style.display = 'none';
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      try { f.remove(); } catch (e) {}
+      window.removeEventListener('message', onMsg);
+      resolve(v);
+    };
+    const onMsg = (e) => { if (e.source === f.contentWindow) done(e.data); };
+    window.addEventListener('message', onMsg);
+    // The script travels as a JSON string, so nothing in it can close the tag it lives in --
+    // written inline, the document would end at the first closing script tag it contained.
+    f.srcdoc = '<!doctype html><meta charset="utf-8"><body></body><scr' + 'ipt>'
+      + '(async () => {'
+      + '  const out = [];'
+      + '  const w = (...a) => out.push(a.map(x => {'
+      + '    try { return typeof x === "string" ? x : JSON.stringify(x); }'
+      + '    catch (e) { return String(x); } }).join(" "));'
+      + '  console.log = w; console.info = w; console.warn = w; console.error = w;'
+      + '  let value = null, error = null;'
+      + '  const src = ' + JSON.stringify(code) + ';'
+      // Compiled before it is run, and in three shapes, the first that COMPILES winning.
+      // `eval` cannot hold a top-level await -- awaiting its RESULT is not the same thing,
+      // and a script that used one came back null -- so the body goes inside an async
+      // function, which can. But an async BLOCK has no completion value, so a script whose
+      // last line is the answer would come back null instead. Hence the middle shape: the
+      // last statement returned and the rest run before it, split at the last newline or,
+      // for a one-liner, the last semicolon. `new Function` raising at construction is what
+      // makes trying them safe -- nothing has run when a shape does not fit, so a split
+      // that lands inside a string simply fails to compile and the next shape is used.
+      + '  const tail = (i) => i < 0 ? null : "return (async () => {" + src.slice(0, i + 1)'
+      + '                + "\\nreturn (" + src.slice(i + 1) + "\\n); })()";'
+      + '  const shapes = ['
+      + '    "return (async () => (" + src + "\\n))()",'
+      + '    tail(src.lastIndexOf("\\n") - 1),'
+      + '    tail(src.lastIndexOf(";")),'
+      + '    "return (async () => {" + src + "\\n})()"'
+      + '  ];'
+      + '  let fn = null;'
+      + '  for (const shape of shapes) {'
+      + '    if (!shape) continue;'
+      + '    try { fn = new Function(shape); break; } catch (e) { fn = null; }'
+      + '  }'
+      + '  if (!fn) { error = "could not compile that as JavaScript"; }'
+      + '  else { try { value = await fn(); }'
+      + '         catch (e) { error = String((e && (e.stack || e.message)) || e); } }'
+      + '  let shown = null;'
+      + '  if (value !== undefined && value !== null) {'
+      + '    try { shown = typeof value === "string" ? value : JSON.stringify(value); }'
+      + '    catch (e) { shown = String(value); }'
+      + '    if (shown === undefined) shown = String(value);'
+      + '  }'
+      + '  const body = document.body ? document.body.innerHTML.trim() : "";'
+      + '  const view = body ? document.documentElement.outerHTML : null;'
+      + '  parent.postMessage({ stdout: out.join("\\n"), result: shown, error: error,'
+      + '                       view: view }, "*");'
+      + '})();'
+      + '</scr' + 'ipt>';
+    document.body.appendChild(f);
+    // A script that never finishes -- an endless loop, an await that never settles -- blocks
+    // only its own frame. Dropping the frame is what ends it.
+    setTimeout(() => done({ stdout: '', result: null, view: null,
+      error: 'timed out after ' + timeoutMs + 'ms and was stopped' }), timeoutMs);
+  });
+}
+
+// A page the sandbox produced, shown where the call that produced it is recorded. Rebuilt
+// from its own source into a fresh sandbox rather than kept as a live frame: the source is
+// what the conversation stores, so it survives a redraw and a reload, and it is displayed
+// under exactly the restrictions it ran under.
+function jsViewNode(html) {
+  const f = document.createElement('iframe');
+  f.className = 'jsview';
+  f.setAttribute('sandbox', 'allow-scripts');
+  f.srcdoc = html;
+  return f;
+}
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'run_javascript',
+    description: 'Run JavaScript, get the output back. A sandbox with no access to the page, '
+      + 'its storage or the models; each call starts empty, so nothing persists between '
+      + 'calls. Top-level await works. It has its own blank document: anything left in it is '
+      + 'shown to the reader, so build there to draw something.\n'
+      + 'Returns {"stdout":str,"result":str|null,"error":str|null,"rendered":bool}. result is '
+      + 'the last expression. error non-null means it threw or timed out and result is null. '
+      + 'rendered true means the reader was shown what you built; you do not see it.',
+    parameters: {
+      type: 'object',
+      properties: { code: { type: 'string', description: 'The JavaScript source to run.' } },
+      required: ['code'],
+    },
+  },
+}, async ({ code }) => {
+  if (!code) return { stdout: '', result: null, error: 'no code was given', rendered: false };
+  const r = await runSandboxedJs(String(code), JS_TIMEOUT_MS);
+  const out = { stdout: r.stdout || '', result: r.result == null ? null : r.result,
+                error: r.error || null, rendered: !!r.view };
+  // The page itself goes to the reader, never into the model's context: it is usually far
+  // larger than the answer and says nothing the model does not already know, having just
+  // written it.
+  if (r.view) out.__view = r.view;
+  return out;
 });
 
 
