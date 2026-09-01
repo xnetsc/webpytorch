@@ -1840,6 +1840,12 @@ class CausalLM:
     # reallocates a handful of times rather than once per turn.
     _KV_FLOOR = 512
 
+    # Rows kept ahead of the reply, rather than room for the longest reply it could give.
+    # `max_new` unset means "until the model stops", which `_plan_length` turns into the whole
+    # remaining context -- reserving that up front is exactly the eager allocation this
+    # replaced. The decode loop grows the cache when it actually reaches the end.
+    _KV_HEADROOM = 256
+
     # Decode cost used to scale with the context because a step scanned the whole KV buffer
     # and re-uploaded a full-length mask every token. Both are gone -- the fused attention
     # reads the live length from the step control block, and the mask is only built for the
@@ -2422,7 +2428,7 @@ class CausalLM:
             return
         # Continue from whatever of this prompt the cache already holds, and do not clear it
         # first -- the same two points as in `generate`.
-        self._kv_reserve(P + max_new)                   # rows this generation can reach
+        self._kv_reserve(P + min(max_new, self._KV_HEADROOM))
         keep = self._kv_prefix(ids)
         g0 = self._prefill(ids[keep:], start=keep); self._stream_ttft = time.perf_counter() - t0
         held = list(ids)
@@ -2438,7 +2444,14 @@ class CausalLM:
                 yield piece
             if self._stop_now():
                 break                           # just-yielded text satisfies the constraint
-            self._set_inputs(nxt, pos); plat.replay("decode")
+            if pos >= self.kv_cap:                  # out of rows -- see `generate`
+                self._kv_reserve(pos + 1)
+                self._set_inputs(nxt, pos)
+                plat.beginCapture("decode")
+                logits_t = self._decode_fwd(); logits_t.numpy()
+                plat.endCapture()
+            else:
+                self._set_inputs(nxt, pos); plat.replay("decode")
             held.append(nxt)                    # row `pos` holds it as of this replay
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
         self._kv_ids = held
@@ -2579,7 +2592,7 @@ class CausalLM:
         # not write -- clearing was defensive, and on a 30B (2GB of KV) it cost 738ms of
         # every single generation. It is also what made continuing from a cached prefix
         # impossible, which is the far bigger saving: see `_kv_prefix`.
-        self._kv_reserve(P + max_new)                   # rows this generation can reach
+        self._kv_reserve(P + min(max_new, self._KV_HEADROOM))
         keep = self._kv_prefix(ids, embeds, rope_pos)
         t0 = time.perf_counter(); g0 = self._prefill(ids[keep:], embeds=embeds, start=keep)
         ttft = time.perf_counter() - t0
@@ -2601,8 +2614,18 @@ class CausalLM:
             gen.append(nxt)
             if len(gen) >= max_new or self._stop_now():
                 break
-            self._set_inputs(nxt, pos)
-            plat.replay("decode")
+            if pos >= self.kv_cap:
+                # Out of rows. Growing moves the buffers the capture was recorded against, so
+                # this step is captured afresh instead of replayed -- beginCapture runs it for
+                # real, so the token still comes out of this iteration.
+                self._kv_reserve(pos + 1)
+                self._set_inputs(nxt, pos)
+                plat.beginCapture("decode")
+                logits_t = self._decode_fwd(); logits_t.numpy()
+                plat.endCapture()
+            else:
+                self._set_inputs(nxt, pos)
+                plat.replay("decode")
             held.append(nxt)                   # row `pos` holds it as of this replay
             nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
         # Only what was actually written is claimed: the reply usually ends on a token whose
