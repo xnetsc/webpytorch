@@ -2731,75 +2731,37 @@ function setToollogLive(live, log) {
 }
 
 // ---- the Python runtime, as tools -----------------------------------------------------
+// Three tools, not one with a mode. Folding them into a single `python(action=…)` was
+// tried and measured: on the same template and tokenizer it took the definitions from 483
+// tokens to 459 -- 24 tokens, 5%. The cost is the three return contracts, not the frame
+// repeated around them, and those contracts are what stop a model quoting a traceback as
+// an answer. Against that saving, a name like `run_python` says on its own what the tool
+// is for, while `python` plus an action asks a small model for one more decision before it
+// can use anything at all -- and a 0.6B asked to multiply two large numbers talked itself
+// out of calling the merged tool. Not worth 5%.
 registerTool({
   type: 'function',
   function: {
-    name: 'python',
-    // ONE tool with a mode rather than three tools.
-    //
-    // A definition is re-sent with every request, so its prose is paid for on every prompt
-    // and every decode step after it. Three of these cost 781 tokens written out at length,
-    // which took a 0.6B from 110 tok/s to 64 and its first token from 0.3s to 3.4; trimmed
-    // to signatures they were 360, of which two were the name/description/parameters frame
-    // repeated for tools the model reaches for far less often than the first. Folding them
-    // into one mode parameter pays that frame once.
-    //
-    // The contract still has to be exact -- it is a signature, not an essay. What the model
-    // must not confuse is stated; the rest is left out.
-    description: 'Python in a separate interpreter from the model; state persists across '
-      + 'calls. Use it instead of computing in your head.\n'
-      + 'action "run": needs code. -> {"stdout":str,"stderr":str,"result":str|null,'
-      + '"traceback":str|null,"figures":int}. stderr is library noise, not the answer. '
-      + 'traceback non-null means it failed and result is null. figures are shown to the '
-      + 'reader, not to you.\n'
-      + 'action "install": names makes modules importable (distribution first, else a '
-      + 'pure-Python wheel from PyPI); no names asks what is loaded. -> {"ready":[str],'
-      + '"installed_from_pypi":[str],"unavailable":[{"name":str,"why":str}]}. Do not '
-      + 're-request an unavailable name.\n'
-      + 'action "restart": discards the interpreter, losing everything defined so far. For a '
-      + 'wedged runtime, not for an ordinary traceback. -> {"restarted":true,"state":str,'
-      + '"ready":[str]}.',
+    name: 'run_python',
+    // Terse on purpose. A definition is re-sent with EVERY request, so its prose is paid
+    // for on every prompt and every decode step after it: written out at length these three
+    // cost 781 tokens, which took a 0.6B from 110 tok/s to 64 and its first token from 0.3 s
+    // to 3.4. The contract still has to be exact -- it just has to be a signature, not an
+    // essay. What the model must NOT confuse is stated; the rest is left out.
+    description: 'Run Python, get the output back. Separate interpreter from the model; '
+      + 'state persists across calls. Use it instead of computing in your head.\n'
+      + 'Returns {"stdout":str,"stderr":str,"result":str|null,"traceback":str|null,'
+      + '"figures":int}. stderr is library noise, not the answer. traceback non-null means it '
+      + 'failed and result is null. figures are shown to the reader, not to you.',
     parameters: {
       type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['run', 'install', 'restart'],
-                  description: 'Which of the three to do.' },
-        code: { type: 'string', description: 'The Python source, for action "run".' },
-        names: { type: 'array', items: { type: 'string' },
-                 description: 'Module names for action "install", e.g. ["sympy"].' },
-      },
-      required: ['action'],
+      properties: { code: { type: 'string', description: 'The Python source to run.' } },
+      required: ['code'],
     },
   },
-}, async ({ action, code, names }) => {
-  const act = String(action || '').toLowerCase().trim();
-  if (act === 'install') {
-    const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
-    const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
-                                                               : pyPackages() });
-    return {
-      ready: r.loaded || [],
-      installed_from_pypi: r.fromPyPI || [],
-      unavailable: (r.unavailable || []).map(u => (typeof u === 'string'
-        ? { name: u, why: '' } : { name: u.name, why: u.why || '' })),
-    };
-  }
-  if (act === 'restart') {
-    try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
-    pyStop(); pyStart();
-    for (let i = 0; i < 240 && pyState !== 'ready'; i++)
-      await new Promise(r => setTimeout(r, 250));
-    return { restarted: true, state: pyState,
-             ready: pyState === 'ready' ? pyPackages() : [] };
-  }
-  // "run", and anything unrecognised: the mode a model reaching for this almost always
-  // wants, and it fails visibly (a traceback) rather than silently doing nothing.
+}, async ({ code }) => {
   if (!code) return { stdout: '', stderr: '', result: null,
-                      traceback: act && act !== 'run'
-                        ? ('unknown action ' + JSON.stringify(action)
-                           + '; use "run", "install" or "restart"')
-                        : 'no code was given',
-                      figures: 0 };
+                      traceback: 'no code was given', figures: 0 };
   const r = await pyCall('run', { code: String(code) });
   const clean = (x) => (x ? String(x).replace(/\n+$/, '') : '');
   return {
@@ -2811,6 +2773,52 @@ registerTool({
     traceback: r.error ? String(r.error) : null,
     figures: (r.images || []).length,
   };
+});
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'install_python_packages',
+    description: 'Make modules importable by name (distribution first, else a pure-Python '
+      + 'wheel from PyPI). No names asks what is loaded.\n'
+      + 'Returns {"ready":[str],"installed_from_pypi":[str],'
+      + '"unavailable":[{"name":str,"why":str}]}. Do not re-request an unavailable name.',
+    parameters: {
+      type: 'object',
+      properties: {
+        names: { type: 'array', items: { type: 'string' },
+                 description: 'Module names, e.g. ["sympy", "networkx"].' },
+      },
+    },
+  },
+}, async ({ names }) => {
+  const want = Array.isArray(names) ? names.map(String).filter(Boolean) : [];
+  const r = await pyCall('packages', { packages: want.length ? pyPackages().concat(want)
+                                                             : pyPackages() });
+  return {
+    ready: r.loaded || [],
+    installed_from_pypi: r.fromPyPI || [],
+    unavailable: (r.unavailable || []).map(u => (typeof u === 'string'
+      ? { name: u, why: '' } : { name: u.name, why: u.why || '' })),
+  };
+});
+
+registerTool({
+  type: 'function',
+  function: {
+    name: 'restart_python',
+    description: 'Discard the interpreter and start a fresh one; everything defined so far '
+      + 'is lost. For a wedged runtime, not for an ordinary traceback.\n'
+      + 'Returns {"restarted":true,"state":str,"ready":[str]}. state "ready" means usable.',
+      parameters: { type: 'object', properties: {} },
+  },
+}, async () => {
+  try { await pyCall('reset'); } catch (e) { /* the interpreter is going away regardless */ }
+  pyStop(); pyStart();
+  for (let i = 0; i < 240 && pyState !== 'ready'; i++)
+    await new Promise(r => setTimeout(r, 250));
+  return { restarted: true, state: pyState,
+           ready: pyState === 'ready' ? pyPackages() : [] };
 });
 
 
