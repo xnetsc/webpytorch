@@ -1681,7 +1681,10 @@ function pyStart() {
       const el = $('#pyState');
       if (el) el.textContent = m.state === 'ready'
         ? 'ready · ' + (m.packages || []).join(', ') : m.state + '…';
-      document.querySelectorAll('.runbtn').forEach(b => { b.disabled = pyState !== 'ready'; });
+      // Only the Python buttons. JavaScript runs in a sandboxed frame that is always
+      // there, so its blocks are runnable whether or not the interpreter is up.
+      document.querySelectorAll('.runbtn[data-runner="python"]')
+              .forEach(b => { b.disabled = pyState !== 'ready'; });
     }
   };
   pyCall('boot', { packages: pyPackages() }).catch(() => {});
@@ -1690,11 +1693,23 @@ function pyStop() {
   if (!pyWorker) return;
   pyWorker.terminate(); pyWorker = null; pyState = 'off';
   const el = $('#pyState'); if (el) el.textContent = 'off';
-  document.querySelectorAll('.runbtn').forEach(b => { b.disabled = true; });
+  document.querySelectorAll('.runbtn[data-runner="python"]')
+          .forEach(b => { b.disabled = true; });
 }
 
-// Attach a Run control to every Python block in `root` that has not got one. Called after a
-// reply is rendered rather than woven into the renderer, so the sanitiser still sees plain
+// Which environment a fenced block runs in, or null for one that does not run. THIS is
+// where the language is decided -- not at the place the button is attached. It used to be
+// the other way round, and `runBlock` fed whatever it was handed to Pyodide: widening that
+// gate by one language would have sent JavaScript to Python and got back a SyntaxError.
+// A block in any other language gets no button at all.
+function langRunner(lang) {
+  if (/^(py|python|python3)$/i.test(lang)) return 'python';
+  if (/^(js|javascript|mjs|node)$/i.test(lang)) return 'javascript';
+  return null;
+}
+
+// Attach a Run control to every runnable block in `root` that has not got one. Called after
+// a reply is rendered rather than woven into the renderer, so the sanitiser still sees plain
 // Markdown output and no button can arrive from the model's own text.
 function wireRunButtons(root, msg) {
   let idx = -1;
@@ -1738,12 +1753,15 @@ function wireRunButtons(root, msg) {
     }
 
     const lang = (code.className.match(/language-([\w+-]+)/) || [])[1] || '';
-    if (!/^(py|python|python3)$/i.test(lang)) return;
+    const runner = langRunner(lang);
+    if (!runner) return;
     const btn = document.createElement('button');
-    btn.type = 'button'; btn.className = 'runbtn'; btn.title = 'Run this code';
+    btn.type = 'button'; btn.className = 'runbtn';
+    btn.dataset.runner = runner;
+    btn.title = runner === 'python' ? 'Run this Python' : 'Run this JavaScript';
     btn.textContent = '▶';
-    btn.disabled = pyState !== 'ready';
-    btn.onclick = () => runBlock(code.textContent, wrap, btn);
+    btn.disabled = runner === 'python' && pyState !== 'ready';
+    btn.onclick = () => runBlock(code.textContent, wrap, btn, lang);
     wrap.appendChild(btn);
   });
 }
@@ -1811,7 +1829,8 @@ function addRunoutClose(panel) {
   panel.appendChild(x);
 }
 
-async function runBlock(code, wrap, btn) {
+async function runBlock(code, wrap, btn, lang) {
+  const runner = langRunner(lang) || 'python';
   let panel = wrap.nextElementSibling;
   if (!panel || !panel.classList.contains('runout')) {
     panel = document.createElement('div'); panel.className = 'runout';
@@ -1820,33 +1839,60 @@ async function runBlock(code, wrap, btn) {
   panel.textContent = 'running…'; panel.className = 'runout';
   btn.disabled = true;
   try {
-    const r = await pyCall('run', { code });
-    panel.textContent = '';
-    // Output first, then the value of the last expression, then whatever it drew. Errors
-    // are shown in the same place: a traceback is a result too.
-    if (r.out) { const p = document.createElement('pre'); p.textContent = r.out.replace(/\n$/, ''); panel.appendChild(p); }
-    if (r.err) {
-      const p = document.createElement('pre'); p.className = 'stderr';
-      p.textContent = r.err.replace(/\n$/, ''); panel.appendChild(p);
-    }
-    if (r.value != null && r.value !== 'None') {
-      const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.value; panel.appendChild(p);
-    }
-    (r.images || []).forEach((b64, k) => {
-      const im = new Image(); im.src = 'data:image/png;base64,' + b64;
-      wireImage(im, 'figure-' + (k + 1) + '.png');
-      panel.appendChild(im);
-    });
-    if (r.error) {
-      panel.classList.add('bad');
-      const p = document.createElement('pre'); p.textContent = r.error; panel.appendChild(p);
-    }
+    if (runner === 'javascript') await showJsRun(code, panel);
+    else await showPyRun(code, panel);
     if (!panel.childNodes.length) panel.textContent = '(no output)';
   } catch (e) {
     panel.classList.add('bad'); panel.textContent = String(e.message || e);
   } finally {
-    btn.disabled = pyState !== 'ready';
+    btn.disabled = runner === 'python' && pyState !== 'ready';
     addRunoutClose(panel);
+  }
+}
+
+// Python, in the second interpreter. Output first, then the value of the last expression,
+// then whatever it drew. Errors are shown in the same place: a traceback is a result too.
+async function showPyRun(code, panel) {
+  const r = await pyCall('run', { code });
+  panel.textContent = '';
+  if (r.out) {
+    const p = document.createElement('pre'); p.textContent = r.out.replace(/\n$/, '');
+    panel.appendChild(p);
+  }
+  if (r.err) {
+    const p = document.createElement('pre'); p.className = 'stderr';
+    p.textContent = r.err.replace(/\n$/, ''); panel.appendChild(p);
+  }
+  if (r.value != null && r.value !== 'None') {
+    const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.value;
+    panel.appendChild(p);
+  }
+  if ((r.images || []).length) panel.appendChild(imagesBlock(r.images));
+  if (r.error) {
+    panel.classList.add('bad');
+    const p = document.createElement('pre'); p.textContent = r.error; panel.appendChild(p);
+  }
+}
+
+// JavaScript, in the same sandboxed frame the tools use -- an opaque origin with no way
+// back to this page. Nothing about it goes through Pyodide.
+//
+// One button has to serve both kinds of script, so the DOM is THERE and whether a page is
+// shown is decided by what the code did with it: a calculation leaves the body empty and
+// gets output and a value, a script that builds something gets the page as well. The model
+// has two separate tools instead, because it has to say which it means before it runs.
+async function showJsRun(code, panel) {
+  const r = await runSandboxedJs(code, JS_TIMEOUT_MS, 'auto');
+  panel.textContent = '';
+  if ((r.logs || []).length) panel.appendChild(consoleBlock(r.logs));
+  if (r.result != null) {
+    const p = document.createElement('pre'); p.className = 'val'; p.textContent = r.result;
+    panel.appendChild(p);
+  }
+  if (r.view) panel.appendChild(jsViewFrame({ name: 'page', html: r.view, height: 0 }));
+  if (r.error) {
+    panel.classList.add('bad');
+    const p = document.createElement('pre'); p.textContent = r.error; panel.appendChild(p);
   }
 }
 
@@ -3074,7 +3120,14 @@ function runSandboxedJs(code, timeoutMs, wantDom) {
       + '    if (shown === undefined) shown = String(value);'
       + '  }'
       + '  let view = null;'
-      + '  if (' + (wantDom ? 'true' : 'false') + ') {'
+      // three modes, not two. `always` is the render tool, which was asked for a page and
+      // gets one even if it is blank; `auto` is the run button, where one control serves
+      // both a calculation and a drawing and only the code knows which it was; `never` is
+      // the computing tool, which has no document to serialise.
+      + '  const viewMode = ' + JSON.stringify(wantDom === 'auto' ? 'auto'
+                                             : wantDom ? 'always' : 'never') + ';'
+      + '  const drew = !!(document.body && document.body.innerHTML.trim());'
+      + '  if (viewMode === "always" || (viewMode === "auto" && drew)) {'
       // Serialised WITHOUT this harness. `documentElement.outerHTML` includes the script in
       // the head that is running right now, so a stored page would re-run it on every
       // render -- executing the model's code again and posting to whatever framed it.
