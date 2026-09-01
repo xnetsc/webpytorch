@@ -2085,17 +2085,66 @@ class CausalLM:
         y = lay["linear"].forward(x, st)
         return y if isinstance(y, wt.Tensor) else wt.Tensor(np.asarray(y, np.float32))
 
-    def _prefill(self, ids, embeds=None):
+    def _kv_prefix(self, ids, embeds=None, rope_pos=None):
+        """How many leading tokens of `ids` the KV cache already holds, and can keep.
+
+        A chat re-sends its whole history every turn, so turn N's prompt is turn N-1's prompt
+        plus what has been said since. Recomputing the shared part costs what the first turn
+        cost -- and prefill is the expensive half: on a 30B MoE a 500-token prompt is ~90s of
+        prefill against 30 tokens/s of decode, which is why a reply that triggers a tool and
+        comes back for a second round appears to stall for a minute between the two. Those
+        keys and values are already in the cache and unchanged; this finds how many.
+
+        Reuse needs the cached rows to still mean what they meant when they were written:
+
+        - Spliced embeddings (`embeds`) and explicit rotary positions (`rope_pos`) both break
+          the token-to-position correspondence this compares on, so they start over.
+        - A recurrent (linear-attention) layer carries a state rather than a per-position
+          cache, and that state has already run PAST the shared prefix -- there is no row to
+          rewind to. Models with any such layer start over.
+
+        One token is always left to run: prefill produces the next-token logits, so a
+        completely cached prompt still has to push its last token through."""
+        if embeds is not None or rope_pos is not None:
+            return 0
+        if any(self._is_linear_layer(i) for i in range(len(self.layers))):
+            return 0
+        have = self.__dict__.get("_kv_ids")
+        if not have:
+            return 0
+        n, lim = 0, min(len(have), len(ids) - 1)
+        while n < lim and have[n] == ids[n]:
+            n += 1
+        return n
+
+    def _kv_drop(self):
+        """Forget what the cache holds. Anything that makes the cached rows unusable --
+        releasing the model, resizing the cache, a run that wrote rows it did not track --
+        calls this, and the next generation prefills from zero."""
+        self.__dict__.pop("_kv_ids", None)
+
+    def _prefill(self, ids, embeds=None, start=0):
+        """Run `ids` through the model, writing their keys and values into the cache at
+        `start`, and return the argmax of the last position's logits.
+
+        `start` > 0 means the cache already holds the `start` tokens before these -- see
+        `_kv_prefix`. The new tokens then carry rotary positions `start..start+T-1` and
+        attend back over everything from 0, so the result is identical to prefilling the
+        whole sequence; only the work already done is skipped."""
         T = len(ids); H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.lmax
-        c, s = self._rope_np(0, T)
+        end = start + T
+        c, s = self._rope_np(start, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
-        # Attend over the T positions this prompt actually fills, not the whole cache. The
+        # Attend over the positions this prompt actually fills, not the whole cache. The
         # cache is sized for the context, so scanning all of it costs LMAX/T times more for
         # nothing -- a 28-token prompt in a 16k context is 585x the work, and it showed:
         # attention was 15% of prefill. Slicing the live rows out costs NKV*T*HD floats
         # (~114KB here), which is nothing next to what it saves.
-        m = np.triu(np.full((T, T), -1e9, np.float32), 1)
-        mask = wt.Tensor(m.reshape(1, T, T))
+        #
+        # The mask is (T, end), not (T, T): a continued prefill's queries see every cached
+        # position before them as well as their own, so the causal diagonal sits at `start`.
+        m = np.triu(np.full((T, end), -1e9, np.float32), start + 1)
+        mask = wt.Tensor(m.reshape(1, T, end))
         h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
         for i, lay in enumerate(self.layers):
@@ -2106,10 +2155,10 @@ class CausalLM:
                 q, k, v = self._qkv(lay, x, T)
                 q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
-                K.data = wt.kv_write(K.data, wt._contig(k).data, 0, T, NKV, HD, LMAX)
-                V.data = wt.kv_write(V.data, wt._contig(v).data, 0, T, NKV, HD, LMAX)
-                Kp = wt.Tensor(wt._contig(K.data[:, :T, :]))
-                Vp = wt.Tensor(wt._contig(V.data[:, :T, :]))
+                K.data = wt.kv_write(K.data, wt._contig(k).data, start, T, NKV, HD, LMAX)
+                V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
+                Kp = wt.Tensor(wt._contig(K.data[:, :end, :]))
+                Vp = wt.Tensor(wt._contig(V.data[:, :end, :]))
                 o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc)
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
@@ -2283,9 +2332,11 @@ class CausalLM:
                 yield tail
             _stats(n, n >= max_new and nxt != eot, steps, t_first)
             return
-        for c in self.Kc: c.data[:] = 0.0
-        for v in self.Vc: v.data[:] = 0.0
-        g0 = self._prefill(ids); self._stream_ttft = time.perf_counter() - t0
+        # Continue from whatever of this prompt the cache already holds, and do not clear it
+        # first -- the same two points as in `generate`.
+        keep = self._kv_prefix(ids)
+        g0 = self._prefill(ids[keep:], start=keep); self._stream_ttft = time.perf_counter() - t0
+        held = list(ids)
         plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
@@ -2299,7 +2350,9 @@ class CausalLM:
             if self._stop_now():
                 break                           # just-yielded text satisfies the constraint
             self._set_inputs(nxt, pos); plat.replay("decode")
+            held.append(nxt)                    # row `pos` holds it as of this replay
             nxt = self._pick(logits_t.numpy()[0]); pos += 1
+        self._kv_ids = held
         tail = dec.flush()
         if tail:
             yield tail
@@ -2313,6 +2366,7 @@ class CausalLM:
         `from_pretrained` dedup on the weights); this releases ONE handle, and the weights
         drop only when the last handle does."""
         from . import _sdk
+        self._kv_drop()                 # the rows it named are about to stop existing
         _sdk._impl_release(self)
         return self
 
@@ -2423,13 +2477,17 @@ class CausalLM:
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                              round(ttft, 3), _decode_rate(t_first, steps))
 
-        # WebGPU capture path
-        for c in self.Kc:
-            c.data[:] = 0.0
-        for v in self.Vc:
-            v.data[:] = 0.0
-        t0 = time.perf_counter(); g0 = self._prefill(ids, embeds=embeds)
+        # WebGPU capture path.
+        #
+        # The cache is NOT cleared first. Prefill writes every row it goes on to read, and a
+        # decode step attends over `pos` positions only, so no run ever reads a row it did
+        # not write -- clearing was defensive, and on a 30B (2GB of KV) it cost 738ms of
+        # every single generation. It is also what made continuing from a cached prefix
+        # impossible, which is the far bigger saving: see `_kv_prefix`.
+        keep = self._kv_prefix(ids, embeds, rope_pos)
+        t0 = time.perf_counter(); g0 = self._prefill(ids[keep:], embeds=embeds, start=keep)
         ttft = time.perf_counter() - t0
+        held = list(ids)                               # rows 0..P-1 hold these
         plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)
         plat.beginCapture("decode")
@@ -2441,6 +2499,7 @@ class CausalLM:
         # captured result and start replaying from the next position.
         t_first = time.perf_counter()          # the first token exists as of here
         gen = [g0]; steps = 1
+        held.append(g0)                        # the captured step wrote row P
         nxt = self._pick(logits_t.numpy()[0]); pos = P + 1
         while nxt != eot and len(gen) < max_new:
             gen.append(nxt)
@@ -2448,6 +2507,13 @@ class CausalLM:
                 break
             self._set_inputs(nxt, pos)
             plat.replay("decode")
+            held.append(nxt)                   # row `pos` holds it as of this replay
             nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
+        # Only what was actually written is claimed: the reply usually ends on a token whose
+        # own keys and values were never needed, and claiming it would corrupt the next turn.
+        if embeds is None and rope_pos is None:
+            self._kv_ids = held
+        else:
+            self._kv_drop()
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                          round(ttft, 3), _decode_rate(t_first, steps))
