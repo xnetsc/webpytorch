@@ -244,15 +244,42 @@ function call(cmd, args) {
 // not reach `onmessage` at all, so a stop that travels as a message cannot arrive until the
 // thing it is stopping has finished. Storing into this is seen at the SDK's next checkpoint.
 let stopFlag = null;
+let intrBuf = null;
+let escalateT = null;
+
+// Two stops, in order of politeness.
+//
+// The flag is cooperative and is the one worth having: the work ends at its own next
+// checkpoint, so a reply keeps the tokens it has already produced. But a checkpoint is only
+// reached if the work is looking, and a load whose bytes are cached goes a long way between
+// looks -- measured at 19 seconds of a worker that answers nothing.
+//
+// So if the flag has not been acted on shortly, interrupt the interpreter itself. Pyodide
+// reads this buffer from its own eval loop and raises KeyboardInterrupt inside whatever is
+// running, which does not depend on that code checking anything. `endStop` is called when
+// the work does end, so the escalation only fires when it genuinely did not.
+// Long enough for the polite stop to win where it can, short enough not to be a wait. A
+// generation notices the flag between tokens and has been measured at 4-19ms; this is an
+// order of magnitude above that, and everything past it was not going to notice at all.
+const STOP_GRACE_MS = 120;
 function askStop() {
   if (stopFlag) Atomics.store(stopFlag, 0, 1);
+  if (!intrBuf) return;
+  clearTimeout(escalateT);
+  escalateT = setTimeout(() => { try { intrBuf[0] = 2; } catch (e) {} }, STOP_GRACE_MS);
+}
+function endStop() {
+  clearTimeout(escalateT); escalateT = null;
+  if (intrBuf) { try { intrBuf[0] = 0; } catch (e) {} }
 }
 
 worker.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'stopbuf') { stopFlag = new Int32Array(m.buf); return; }
+  if (m.type === 'intrbuf') { intrBuf = new Uint8Array(m.buf); return; }
   if (m.type === 'result') {
     const p = pending.get(m.id); pending.delete(m.id);
+    endStop();                                  // it ended; nothing left to escalate to
     if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
   } else if (m.type === 'status') {
     $('#modelStatus').textContent = m.text;
