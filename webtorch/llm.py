@@ -1819,6 +1819,14 @@ class CausalLM:
     # is trimmed to this; an explicit `lmax` always wins.
     _KV_BUDGET = 2 << 30
 
+    # What "nobody said" means for temperature. A model that ships a generation_config.json
+    # states its own -- Qwen3 asks for 0.6, and that file always wins over this. This is only
+    # for the case where NOTHING states one, which is every model loaded from a bare .gguf:
+    # the file carries the weights and the chat template but no sampling settings, so before
+    # this the sampler fell through to zero and decoded greedily. Chat models are trained and
+    # evaluated sampled, and greedy is where the degenerate repeats live.
+    _DEFAULT_TEMPERATURE = 0.6
+
     # Decode cost used to scale with the context because a step scanned the whole KV buffer
     # and re-uploaded a full-length mask every token. Both are gone -- the fused attention
     # reads the live length from the step control block, and the mask is only built for the
@@ -1908,11 +1916,21 @@ class CausalLM:
                      ("min_new_tokens", min_new_tokens)):
             if v is not None:
                 base[k] = v
-        # temperature 0 is greedy, and says so louder than any default: a model whose
+        # An ABSENT temperature is not a temperature of zero. It used to be read as one, and
+        # the difference is the whole reply: a model loaded from a bare .gguf has no
+        # generation_config.json to state what it wants, so nothing set a temperature, so
+        # every such model decoded greedily -- no top_p, no top_k, no repetition penalty.
+        # Greedy has no way out of a loop it walks into, and small models walk into them:
+        # asked for a product of two large numbers, a 0.6B answered with eight hundred
+        # consecutive "6"s. Adding two characters to the prompt was enough to flip it between
+        # a sane answer and that, which is what a missing sampler looks like from outside.
+        if "temperature" not in base:
+            base["temperature"] = self._DEFAULT_TEMPERATURE
+        # An EXPLICIT zero is still greedy, and says so louder than any default: a model whose
         # generation_config ships `do_sample: true` would otherwise keep sampling through it,
         # and the reply would not reproduce even though the caller asked for the deterministic
         # one. Every mainstream API reads a zero temperature this way.
-        if float(base.get("temperature", 0) or 0) <= 0:
+        if float(base.get("temperature") or 0) <= 0:
             base["do_sample"] = False
         elif base.get("do_sample") is None:
             base["do_sample"] = True
