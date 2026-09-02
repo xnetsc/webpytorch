@@ -3350,77 +3350,126 @@ fn HF(h: u32) -> f32 {
 # activations straight from global memory -- with a batch to amortize, there is enough work
 # in flight to hide that.
 _GGML_GEMM_PRE = """
-var<workgroup> psum: array<f32, KSGx256>;
+// The block's activations, staged once for the whole workgroup: KSG blocks in flight, four
+// rows each. Every one of the 64 threads in x holds a different OUTPUT COLUMN and therefore
+// reads the same activations, so without this each of them fetches them again from global
+// memory. Counted as traffic that is not close: 16*N*K bytes of activation against N*K*0.33
+// of weight for a 2-bit format -- about fifty times more spent on re-reading the same rows
+// than on the weights the pass exists to read. It is why the batched path ran at a tenth of
+// the decode path's bandwidth, and why widening the rows made it worse rather than better.
+var<workgroup> xs4: array<f32, XS4SZ>;
 var<private> a0: f32;
 var<private> a1: f32;
 var<private> a2: f32;
 var<private> a3: f32;
 var<private> mb: u32;
 var<private> mn: u32;
+var<private> kbase: u32;
+var<private> xsoff: u32;
+var<private> live: bool;
 // Separate scalars, not array<f32,4>. A private array indexed by a loop variable is not
 // guaranteed to live in registers, and here it did not: the batched matmul cost time
 // strictly proportional to the batch (12.3 / 35.5 / 94.2 ms at M = 8 / 24 / 64) because
-// every accumulate went to memory. Widening the rows per thread made it worse, which is
-// what ruled out the decode being the expensive part. gemv was always fast for the same
-// reason in reverse -- it accumulates into one scalar.
+// every accumulate went to memory. gemv was always fast for the same reason in reverse --
+// it accumulates into one scalar.
 fn ACC(k: u32, v: f32) {
-  let b = mb * gm.K + k;
-  a0 = a0 + x[b] * v;
-  if (mn > 1u) { a1 = a1 + x[b + gm.K] * v; }
-  if (mn > 2u) { a2 = a2 + x[b + 2u * gm.K] * v; }
-  if (mn > 3u) { a3 = a3 + x[b + 3u * gm.K] * v; }
+  if (!live) { return; }
+  let s = xsoff + (k - kbase);
+  a0 = a0 + xs4[s] * v;
+  if (mn > 1u) { a1 = a1 + xs4[s + BLKVALS] * v; }
+  if (mn > 2u) { a2 = a2 + xs4[s + 2u * BLKVALS] * v; }
+  if (mn > 3u) { a3 = a3 + xs4[s + 3u * BLKVALS] * v; }
 }
 fn ACC4(k: u32, v: vec4<f32>) {
-  let b = mb * gm.K + k;
-  a0 = a0 + dot(vec4<f32>(x[b], x[b + 1u], x[b + 2u], x[b + 3u]), v);
-  if (mn > 1u) { let c = b + gm.K;
-    a1 = a1 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
-  if (mn > 2u) { let c = b + 2u * gm.K;
-    a2 = a2 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
-  if (mn > 3u) { let c = b + 3u * gm.K;
-    a3 = a3 + dot(vec4<f32>(x[c], x[c + 1u], x[c + 2u], x[c + 3u]), v); }
+  if (!live) { return; }
+  let s = xsoff + (k - kbase);
+  a0 = a0 + dot(vec4<f32>(xs4[s], xs4[s + 1u], xs4[s + 2u], xs4[s + 3u]), v);
+  if (mn > 1u) { let c = s + BLKVALS;
+    a1 = a1 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
+  if (mn > 2u) { let c = s + 2u * BLKVALS;
+    a2 = a2 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
+  if (mn > 3u) { let c = s + 3u * BLKVALS;
+    a3 = a3 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
 }
 """
 
 _GGML_GEMM_MAIN = """
 @compute @workgroup_size(64, KSGu)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(workgroup_id) wgid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let n = gid.x;
   let lx = lid.x;
   let ly = lid.y;
 WOFFINIT
 GEMMINIT
-  mb = gid.z * 4u;
-  mn = select(0u, min(4u, gm.M - mb), mb < gm.M);
+  // From `workgroup_id`, not from the private `mb`/`mn` below, and not from
+  // `global_invocation_id`: the loop that follows contains barriers, so its condition has to
+  // be UNIFORM, and uniformity here is decided syntactically. A module-scope private is
+  // treated as possibly non-uniform however it was assigned -- the compiler rejected exactly
+  // that -- while `workgroup_id` is uniform by definition. The z dimension of the workgroup
+  // size is 1, so this is the same number the private one holds.
+  // Each lane row owns four output rows of its own. From `workgroup_id`, so the loop below
+  // -- which contains barriers -- has a bound every lane agrees on; the per-lane part is the
+  // row group, which only selects data.
+  let mgroup = wgid.z * (4u * KSGu);
+  let mbu = mgroup + ly * 4u;
+  let anyrow = mgroup < gm.M;
+  mb = mbu;
+  mn = select(0u, min(4u, gm.M - mbu), mbu < gm.M);
   nrow = n;
   a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
+  xsoff = ly * 4u * BLKVALS;
+  live = (n < gm.N);
   let base = 0u;
   let nb = gm.K / BLKVALS;
   let livec = (n < gm.N && mn > 0u);
-  if (livec) {
-    for (var b: u32 = ly; b < nb; b = b + KSGu) {
+  // `mn` comes from gid.z, so this is uniform across the workgroup and the barriers below
+  // are reached by every lane. The per-thread part of "is this lane live" is `live`, which
+  // gates the accumulate rather than the control flow -- a barrier inside a branch that
+  // only some lanes take is undefined behaviour, not a slow path.
+  if (anyrow) {
+    for (var b: u32 = 0u; b < nb; b = b + 1u) {
+      kbase = b * BLKVALS;
+      for (var t: u32 = lx; t < BLKVALS; t = t + 64u) {
+        let sx = mbu * gm.K + kbase + t;
+        xs4[xsoff + t] = select(0.0, x[sx], mn > 0u);
+        xs4[xsoff + BLKVALS + t] = select(0.0, x[sx + gm.K], mn > 1u);
+        xs4[xsoff + 2u * BLKVALS + t] = select(0.0, x[sx + 2u * gm.K], mn > 2u);
+        xs4[xsoff + 3u * BLKVALS + t] = select(0.0, x[sx + 3u * gm.K], mn > 3u);
+      }
+      workgroupBarrier();
 """
 
 _GGML_GEMM_TAIL = """
+      workgroupBarrier();
     }
   }
-  let pb = (ly * 64u + lx) * 4u;
-  psum[pb] = a0; psum[pb + 1u] = a1; psum[pb + 2u] = a2; psum[pb + 3u] = a3;
-  workgroupBarrier();
-  if (ly == 0u && livec) {
-    for (var r: u32 = 0u; r < mn; r = r + 1u) {
-      var tot: f32 = 0.0;
-      for (var i: u32 = 0u; i < KSGu; i = i + 1u) {
-        tot = tot + psum[(i * 64u + lx) * 4u + r];
-      }
-      outp[(mb + r) * gm.N + n] = tot;
-    }
+  if (live) {
+    if (mn > 0u) { outp[mbu * gm.N + n] = a0; }
+    if (mn > 1u) { outp[(mbu + 1u) * gm.N + n] = a1; }
+    if (mn > 2u) { outp[(mbu + 2u) * gm.N + n] = a2; }
+    if (mn > 3u) { outp[(mbu + 3u) * gm.N + n] = a3; }
   }
 }
 """
 
-_GGML_KSG = 2               # split-K rows on the batched path
+# The batched path splits the ROW dimension across `lid.y`, not K.
+#
+# Splitting K was what it did, and it is incompatible with staging the activations: the loop
+# bound becomes `lid.y`, each lane walks a different number of blocks, and a barrier inside a
+# loop whose trip count differs per lane is rejected by the compiler outright. Splitting rows
+# instead makes the block loop identical for every lane -- so the barrier is legal -- and
+# costs nothing, because each lane then owns four output rows outright and the cross-lane
+# reduction the split-K version needed disappears with it.
+#
+# It does NOT pay to widen it past one, and the measurement says why. Four lane rows cover
+# sixteen output rows per pass instead of four, which looked like a fourfold cut in weight
+# traffic and delivered nothing (mlp 66.5s at one lane row, 70.1s at four). The reason is
+# that `dec` runs per THREAD: every lane row decodes the same weight block again, so wider
+# lanes buy more rows and pay for them in repeated decode. Sharing the DECODED block through
+# workgroup memory is what would actually cut it, and that is a different kernel.
+_GGML_KSG = 1               # row groups (of 4 rows each) per workgroup on the batched path
 
 # GEMV (decode, batch of one): the shape where the naive kernel loses. Two things fix it,
 # both of which ggml blocks happen to suit. Blocks are independent, so KS rows of threads
@@ -4565,6 +4614,13 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
             ("PSUMSZ", str(_GGML_KS_L * _GGML_WGX_L * rows * orw)),
             ("KSxBLK", str(_GGML_KS_L * vals)), ("KSxWGX", str(_GGML_KS_L * _GGML_WGX_L)),
             ("KSGx256", str(_GGML_KSG * 256)), ("KSGu", "%uu" % _GGML_KSG),
+            # Four rows of one block, for each block in flight. 8KB at the widest format,
+            # which every device allows; a workgroup allocation that does not fit fails to
+            # COMPILE, and a failed compile here is silent -- the kernel just writes zeros.
+            ("XS4SZ", str(_GGML_KSG * 4 * vals)),
+            # Literally `0u`, not `ly`: a workgroup of height one makes them equal, but the
+            # uniformity analysis is syntactic and `lid.y` is non-uniform whatever the shape.
+            ("BSTART", "0u" if _GGML_KSG == 1 else "ly"),
             ("KSu", "%uu" % _GGML_KS_L), ("MASKBLK", "%uu" % (vals - 1)),
             ("BLKVALS", "%uu" % vals),
             ("WGXu", "%uu" % _GGML_WGX_L), ("WGX", str(_GGML_WGX_L)),
@@ -5689,7 +5745,8 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     plat.runKernel({"name": name, "tensors": bufs,
                     "workGroups": {"x": ((_gemv_groups(N, mode, vals, small)
                                           if M <= 2 else (N + 63) // 64)), "y": 1,
-                                   "z": slots if M <= 2 else (M + 3) // 4}})
+                                   "z": slots if M <= 2 else (M + 4 * _GGML_KSG - 1)
+                                                              // (4 * _GGML_KSG)}})
     return of
 
 
