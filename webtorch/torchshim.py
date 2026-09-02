@@ -58,7 +58,7 @@ def _masked_fill(self, mask, value):
     def _bw():
         if self.requires_grad:
             self._accum(out.grad * (1.0 - mf))
-    out._backward = _bw
+    out._setback(_bw)
     return out
 
 
@@ -83,7 +83,7 @@ def _split(self, size, dim=0):
         return _bw
     for o in outs:
         e = off + o.shape[dim]
-        o._backward = make_bw(o, off, e); off = e
+        o._setback(make_bw(o, off, e)); off = e
     return tuple(outs)
 
 
