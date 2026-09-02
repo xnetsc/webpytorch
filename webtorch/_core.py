@@ -6843,6 +6843,26 @@ def gdn_scan(S, qkv, T, hv, dk, dv, rep=1):
 _gdn_scan_k = {"added": False}
 
 
+def gpu_reap():
+    """Return finished intermediates to the device. A no-op where there is nothing to return.
+
+    Called at a LAYER boundary, not from the allocation path, and the difference is not
+    subtle. A collect can only free what nothing refers to, and inside `WebGPUBuffer.__init__`
+    the call chain still refers to plenty -- a byte-budgeted reap there fired every two or
+    three layers and the ledger climbed straight through it, 13.5GB to 19.6GB in one prefill.
+    The same collect at the boundary between layers holds it flat at 14.0-14.3GB, costs 0.2s
+    across a whole prefill, and makes that prefill FASTER (100.2s to 87.2s) because what it
+    stops is the paging.
+    """
+    try:
+        import wgpy_backends.webgpu.webgpu_buffer as _b
+    except Exception:
+        return                                   # WebGL, or no GPU backend at all
+    fn = getattr(_b, "reap_now", None)
+    if fn is not None:
+        fn()
+
+
 class GGMLLinear(Module):
     """Inference-only Linear whose weight stays in the encoding the GGUF shipped it in.
 

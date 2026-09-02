@@ -2418,6 +2418,14 @@ class CausalLM:
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
+            # Every eighth layer, hand back what the layers before it finished with. A
+            # prompt's intermediates are ~100MB a layer here, and holding all of them to the
+            # end of the prefill is several gigabytes on a machine that has none to spare --
+            # measured: the ledger climbed 13.5GB to 19.6GB across one prefill without this
+            # and stays at 14.0-14.3GB with it. It also makes the prefill faster rather than
+            # slower (100.2s to 87.2s), because the memory it stops using was being paged.
+            if (i & 7) == 7:
+                wt.gpu_reap()
         # Kept, not just passed on: the load-time smoke test needs the logits this produced,
         # and the tensor is built here either way.
         self._last_prefill_hidden = wt.Tensor(wt._contig(
