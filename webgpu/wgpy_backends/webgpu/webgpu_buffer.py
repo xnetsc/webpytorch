@@ -74,10 +74,52 @@ def _maybe_pin(buffer_id: int, byte_length: int):
         _pinned_ids[buffer_id] = byte_length
 
 
+# The pool exists to skip a createBuffer when the next tensor wants a shape we have just
+# finished with. A handful of spares does that; hoarding does not. Measured on a 9.83GB
+# model on a 24GB machine: the pool had grown to 14.6GB, and ONE shape was holding 259
+# buffers of 27.1MB — 7GB parked, for a reuse that needs two or three. Anything past the cap
+# is given back to the device instead.
+_POOL_PER_SHAPE = 4
+
+
 def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
     if buffer_id in _pinned_ids:
         return  # pinned by an active/recorded capture — never recycle
-    _pool[texture_shape].append(buffer_id)
+    ids = _pool[texture_shape]
+    if len(ids) >= _POOL_PER_SHAPE:
+        # Bounded per SHAPE rather than by a global byte budget: a budget has to be
+        # apportioned between shapes that know nothing about each other, and the waste being
+        # cut here is one shape's spares, not the total.
+        get_platform().disposeBuffer(buffer_id)
+        performance_metrics["webgpu.buffer.delete"] += 1
+        performance_metrics["webgpu.buffer.buffer_count"] -= 1
+        performance_metrics["webgpu.buffer.buffer_size"] -= texture_shape.byte_length
+        return
+    ids.append(buffer_id)
+
+
+# Buffers come back to the pool from `WebGPUBuffer.__del__`, which only runs when the last
+# reference goes — and a tensor caught in a reference cycle has no such moment. Refcounting
+# frees the rest promptly, so this looked fine, but the cycles accumulate: on that same
+# model a single collect freed 729,934 objects and moved 72,162 buffers into the pool. Until
+# then those buffers were held by nothing, reachable by nothing, and still on the device.
+#
+# So the collect is part of allocating, not something to hope for. It is not run per buffer
+# -- it walked the whole heap in that measurement -- but on a counter, and only while a
+# model is loaded and actually allocating.
+_REAP_EVERY = 4096
+_alloc_since_reap = 0
+
+
+def _maybe_reap():
+    global _alloc_since_reap
+    _alloc_since_reap += 1
+    if _alloc_since_reap < _REAP_EVERY:
+        return
+    _alloc_since_reap = 0
+    import gc
+
+    gc.collect()
 
 
 def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
@@ -162,6 +204,7 @@ class WebGPUBuffer(WebGPUBufferBase):
         self.size = size
         self.dtype = dtype
         self.texture_shape = texture_shape or get_default_texture_shape(size, dtype)
+        _maybe_reap()
         pooled_buffer_id = _pool_get(self.texture_shape)
         if pooled_buffer_id is not None:
             self.buffer_id = pooled_buffer_id
