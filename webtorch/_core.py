@@ -4817,6 +4817,7 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     sparse-MoE projection runs without the choice of expert being baked into the command."""
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
+    _gpu_stat_push()
     m = 1 if (eidx is not None and xper) else int(xf.shape[0])
     # The batched kernel is where prefill goes, and it is BAD: it reads the weight once and
     # still costs what reading it once per row costs, because it accumulates through memory
@@ -6843,6 +6844,44 @@ def gdn_scan(S, qkv, T, hv, dk, dv, rep=1):
 _gdn_scan_k = {"added": False}
 
 
+# Reporting the ledger out, at most once a second.
+#
+# The worker is single-threaded: while a reply is being written nothing can ASK for these
+# numbers, so a page that polls sees whatever was true before the reply started -- measured
+# at 51 seconds outstanding on one prefill. Pushing is the only way they are live, and the
+# push has to come from somewhere that runs constantly, which is why it hangs off the matmul
+# rather than off the layer loop: eight pushes across a prefill is eleven seconds apart.
+# No clock. The destination is a shared array, so a write is three stores and rationing it
+# by time would cost more than it saves -- an earlier version did read a clock here, using a
+# `time` this module does not import, and the NameError went into the blanket `except` below
+# and stayed there: the counter advanced 516 times and the array never received a byte.
+_stat_n = 0
+_stat_why = None                  # why the last attempt failed, so a silent one cannot hide
+
+
+def _gpu_stat_push():
+    """Write the GPU ledger where the page can read it. Every 64th call, which is several
+    times a layer -- often enough that a display refreshing once a second is never behind."""
+    global _stat_n, _stat_why
+    _stat_n += 1
+    if _stat_n & 63:
+        return
+    try:
+        import js
+        hook = getattr(js.self, "__gpustat", None)
+        if hook is None:
+            _stat_why = "no hook installed"
+            return
+        from wgpy_backends.webgpu.platform import get_platform as _gp
+        held, peak, n = _gp().gpuBytes()
+        hook(held, peak, n)
+        _stat_why = None
+    except Exception as e:
+        # Kept, not swallowed. This path is best-effort, so it must not raise -- but a
+        # failure that leaves no trace is how the last one survived.
+        _stat_why = type(e).__name__ + ": " + str(e)[:80]
+
+
 def gpu_reap():
     """Return finished intermediates to the device. A no-op where there is nothing to return.
 
@@ -6861,6 +6900,7 @@ def gpu_reap():
     fn = getattr(_b, "reap_now", None)
     if fn is not None:
         fn()
+    _gpu_stat_push()
 
 
 class GGMLLinear(Module):

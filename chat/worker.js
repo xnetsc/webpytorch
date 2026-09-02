@@ -31,6 +31,19 @@ const send = (m) => postMessage(m);
 let STOP = null;
 try { STOP = new Int32Array(new SharedArrayBuffer(4)); } catch (e) { STOP = null; }
 
+// The runtime's own figures, in shared memory rather than in messages.
+//
+// The worker is single-threaded, so while a reply is being written it cannot answer a
+// request for them -- one was measured outstanding for 51 seconds, with the panel showing
+// numbers from before the reply began. Messages would work, but they tie how fresh the
+// display is to how often this side decides to send; a shared array leaves that to the
+// reader, which is where it belongs. Float64 because bytes held pass what an f32 counts
+// exactly, and the values are independent scalars, so a torn read costs one stale frame and
+// nothing more -- no atomics needed for that.
+//   [0] bytes held   [1] peak   [2] buffer count   [3] wasm heap
+let STAT = null;
+try { STAT = new Float64Array(new SharedArrayBuffer(32)); } catch (e) { STAT = null; }
+
 // The escalation, for work that will not stop because it is not looking.
 //
 // The flag below is cooperative: it ends a decode loop between tokens and a load at its IO
@@ -135,6 +148,7 @@ webtorch.set_cancel_probe(lambda: _STOPFLAG[0] != 0)
 `);
     send({ type: 'stopbuf', buf: STOP.buffer });
   }
+  if (STAT) send({ type: 'statbuf', buf: STAT.buffer });
   if (INTR) {
     try { pyodide.setInterruptBuffer(INTR); send({ type: 'intrbuf', buf: INTR.buffer }); }
     catch (e) { INTR = null; }           // an older Pyodide: the polite flag is all there is
@@ -691,6 +705,17 @@ function stopLoad() {
 // pretends to: the GPU figure is the backend's own ledger of buffers it asked for and has
 // not returned, and the heap figure is the WASM memory Python is living in. Cheap enough
 // to call on a timer: two property reads and a tuple.
+// Three stores. Called from the matmul, so it runs many times a layer, and costs little
+// enough there that it does not need to be rationed.
+self.__gpustat = (held, peak, n) => {
+  if (!STAT) return;
+  STAT[0] = held; STAT[1] = peak; STAT[2] = n;
+  try {
+    const m = pyodide && pyodide._module && pyodide._module.HEAP8;
+    if (m) STAT[3] = m.byteLength;
+  } catch (e) { /* leave the last value */ }
+};
+
 function runtimeStats() {
   const out = { gpuBytes: null, gpuPeak: null, gpuBuffers: null, wasmBytes: null,
                 loaded: !!ready };

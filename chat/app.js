@@ -359,6 +359,7 @@ worker.onmessage = (e) => {
       keepAtBottom(el, follow);
     }
   }
+  else if (m.type === 'statbuf') { res.buf = new Float64Array(m.buf); return; }
   else if (m.type === 'log') { console.log('[py]', m.text); }
   else if (m.type === 'storageFull') { offerDirectory(m.key); }
   else if (m.type === 'migrate') {
@@ -3704,10 +3705,8 @@ const RES_FRAME_TIGHT = 34, RES_FRAME_SEVERE = 100;   // ms; 34 is two dropped f
 const RES_LEVELS = ['normal', 'tight', 'severe'];
 const RES_LABEL = { normal: 'normal', tight: 'tight', severe: 'severe' };
 
-const res = { steps: [], stepsAt: 0, lastAt: 0, frames: [], lastFrame: 0,
+const res = { steps: [], stepsAt: 0, lastAt: 0, frames: [], lastFrame: 0, buf: null,
               stats: null, statsAt: 0, pending: 0, storage: null, timer: null, poll: 0 };
-// How old a runtime figure may be before it is called out rather than shown as current.
-const RES_STATS_AGE_MS = 4000;
 // A hidden tab does not run animation frames at all, so the buffer stops filling and the
 // last thing in it is from whenever the tab was last looked at. Dropped rather than kept:
 // "no reading" is true, and a level from before the tab was hidden is not.
@@ -3767,6 +3766,14 @@ const resBytes = (n) => n == null ? '—'
   : Math.round(n / 1024) + ' KB';
 
 function resRead() {
+  // Straight out of shared memory, at whatever moment the panel happens to draw. The
+  // polled reply is the fallback for a runtime with no SharedArrayBuffer -- without
+  // cross-origin isolation there is none, and then the figures go stale during a reply
+  // because nothing can ask for them while the worker is busy.
+  if (res.buf && res.buf[0]) {
+    res.stats = { gpuBytes: res.buf[0], gpuPeak: res.buf[1], gpuBuffers: res.buf[2],
+                  wasmBytes: res.buf[3] || (res.stats && res.stats.wasmBytes) || null };
+  }
   // Not expired on a clock. A reply that just finished slowly is exactly what someone is
   // looking at the strip about, and blanking the reading a minute later takes the answer
   // away at the moment it is wanted. It stands until the next reply replaces it, and says
@@ -3822,14 +3829,10 @@ function resRender() {
     + (l ? RES_LABEL[l] : 'no reading yet') + '</span>'
     + '<span class="resnote">' + why + '</span></div>';
 
-  // Both of these come from the worker, so both go stale together while it is busy.
-  const age = res.statsAt ? Date.now() - res.statsAt : 0;
-  const held = res.statsAt && age > RES_STATS_AGE_MS
-             ? Math.round(age / 1000) + 's ago' : '';
   $('#resBody').innerHTML =
       num('GPU buffers', resBytes(r.gpuBytes),
-          held || (r.gpuPeak ? 'peak ' + resBytes(r.gpuPeak) : ''))
-    + num('WASM heap', resBytes(r.wasmBytes), held || 'Python')
+          r.gpuPeak ? 'peak ' + resBytes(r.gpuPeak) : '')
+    + num('WASM heap', resBytes(r.wasmBytes), 'Python')
     + num('JS heap', resBytes(r.jsBytes), 'this tab')
     + num('Stored', r.storage ? resBytes(r.storage.usage) + ' / ' + resBytes(r.storage.quota) : '—',
           'models and chats')
@@ -3848,6 +3851,7 @@ async function resTick() {
     // screen are from before that reply started. Showing them anyway is how a leak that
     // climbed to 20GB read as "flat" -- so the panel says the figure is held rather than
     // presenting a stale one as current.
+    if (res.pending && Date.now() - res.pending < 30000) return;   // one outstanding is enough
     const asked = Date.now();
     res.pending = asked;
     try {
@@ -3879,6 +3883,12 @@ function wireResources() {
   resRender();
   // Faster while a reply is being written, because that is when the numbers move and when
   // someone is looking; slow otherwise, since each tick costs a message to the worker.
+  // Two clocks, deliberately. Drawing runs on its own and never waits for the runtime,
+  // because the runtime cannot answer during a reply -- and the first version put the draw
+  // AFTER the await, so a request left outstanding for 51 seconds took the whole panel with
+  // it: the figures sat at whatever they were before the reply began, with nothing on screen
+  // saying they were stale. Asking is the slow half and is not allowed to hold the fast one.
+  setInterval(resRender, 1000);
   const loop = () => {
     clearTimeout(res.timer);
     res.timer = setTimeout(() => { resTick().finally(loop); }, streaming ? 1000 : 4000);
