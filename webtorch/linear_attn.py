@@ -200,24 +200,33 @@ class LinearAttention:
         r = t.reshape(heads, dim)
         return r / ((r * r).sum(axis=-1, keepdims=True) + eps).sqrt()
 
-    def _step_gpu(self, xt, state):
-        """One token, everything on the device. `xt` is a (1, H) Tensor -> (1, H) Tensor.
+    def _project_gpu(self, xt):
+        """Every projection this layer needs, for however many rows `xt` has.
 
-        Four dispatches carry the layer body -- prepare, the two recurrence passes, and the
-        output norm -- with the projections around them. Doing the same arithmetic with
-        tensor ops is ~50 dispatches, and at 0.3-0.9 ms of fixed overhead each that loses
-        to numpy however little data is involved."""
+        Separated from the recurrence because it does not participate in it. These are plain
+        matrix products over the row axis: batching them costs one pass over each weight
+        matrix for the whole prompt, where doing them a row at a time costs one pass PER
+        TOKEN. On a 27B with 48 recurrent layers that was the difference between prefill
+        being cheaper per token than decode and being several times dearer."""
         nq = self.hk * self.dk
         nv = self.hv * self.dv
         if self.w.get("qkv") is not None:
-            qkv = self._t("qkv", xt).reshape(-1)
+            qkv = self._t("qkv", xt)
         else:
-            qkv = wt.cat([self._t("q", xt).reshape(-1)[:nq],
-                          self._t("k", xt).reshape(-1)[:nq],
-                          self._t("v", xt).reshape(-1)[:nv]], axis=0)
+            qkv = wt.cat([self._t("q", xt)[:, :nq],
+                          self._t("k", xt)[:, :nq],
+                          self._t("v", xt)[:, :nv]], axis=1)
+        return qkv, self._t("beta", xt), self._t("alpha", xt), self._t("g", xt)
+
+    def _recur_gpu(self, qkv, braw, araw, state):
+        """The genuinely sequential part, for ONE row of already-projected values.
+
+        Four dispatches carry it -- prepare, the two recurrence passes, and the output norm.
+        Doing the same arithmetic with tensor ops is ~50 dispatches, and at 0.3-0.9 ms of
+        fixed overhead each that loses to numpy however little data is involved."""
+        nq = self.hk * self.dk
+        nv = self.hv * self.dv
         zero = self._zero_t()
-        braw = self._t("beta", xt)
-        araw = self._t("alpha", xt)
         g = state.gpu()
         packed = wt._empty((2 * nq + nv + 2 * self.hv,))
         flags = ((1 if self._has_conv else 0) | (2 if self.w.get("dt_bias") is not None else 0)
@@ -239,12 +248,21 @@ class LinearAttention:
             rows = self.hv if self._norm_per_head else 1
             r = wt.rmsnorm(out.reshape(rows, nv // rows), gw, self.eps)
             out = r if r is not None else out                # already a Tensor
-        y = out.reshape(1, nv)
-        gp = self._t("g", xt)
+        return out.reshape(1, nv)
+
+    def _gate_out(self, y, gp, nv):
+        """The output gate and projection, over however many rows `y` has."""
         if gp is not None:
-            y = y * wt.silu(gp.reshape(1, -1)[:, :nv])
+            y = y * wt.silu(gp[:, :nv])
         o = self.w.get("o")
         return y if o is None else o(y)
+
+    def _step_gpu(self, xt, state):
+        """One token, everything on the device. `xt` is a (1, H) Tensor -> (1, H) Tensor."""
+        nv = self.hv * self.dv
+        qkv, braw, araw, gp = self._project_gpu(xt)
+        y = self._recur_gpu(qkv.reshape(-1), braw, araw, state)
+        return self._gate_out(y, None if gp is None else gp.reshape(1, -1), nv)
 
     def _zero_t(self):
         return self._cache_t("zero", lambda: wt.xp.zeros((1,), np.float32))
@@ -330,14 +348,18 @@ class LinearAttention:
             xt = x if isinstance(x, wt.Tensor) else wt.Tensor(np.asarray(x, np.float32))
             if T0 == 1:
                 return self._step_gpu(xt.reshape(1, -1), state)
-            # A prompt runs the same device step once per position. The recurrence is
-            # sequential either way -- state t depends on state t-1 -- so nothing is lost by
-            # stepping, and the alternative was the host path below: it pulls the activations
-            # off the device and does the whole layer in numpy. On a 64-layer hybrid that was
-            # two thirds of prefill (measured: 324ms per layer, 15.5s of a 19.7s prefill).
-            H = int(xt.shape[-1])
-            outs = [self._step_gpu(xt[t:t + 1].reshape(1, H), state) for t in range(T0)]
-            return wt.cat(outs, axis=0)
+            # A prompt projects ONCE and then recurs per position. The recurrence is
+            # sequential -- state t depends on state t-1 -- but the projections are not, and
+            # stepping the whole layer per token re-read every projection weight T times.
+            # That is why a prompt cost more per token than decoding did, which is backwards.
+            nv = self.hv * self.dv
+            qkv, braw, araw, gp = self._project_gpu(xt)
+            outs = [self._recur_gpu(qkv[t:t + 1].reshape(-1),
+                                    None if braw is None else braw[t:t + 1],
+                                    None if araw is None else araw[t:t + 1],
+                                    state)
+                    for t in range(T0)]
+            return self._gate_out(wt.cat(outs, axis=0), gp, nv)
         state = state.host()                       # host path owns the state from here
         x = np.asarray(x.numpy() if hasattr(x, "numpy") else x, np.float32)
         T = x.shape[0]

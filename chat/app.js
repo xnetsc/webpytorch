@@ -3705,7 +3705,9 @@ const RES_LEVELS = ['normal', 'tight', 'severe'];
 const RES_LABEL = { normal: 'normal', tight: 'tight', severe: 'severe' };
 
 const res = { steps: [], stepsAt: 0, lastAt: 0, frames: [], lastFrame: 0,
-              stats: null, storage: null, timer: null, poll: 0 };
+              stats: null, statsAt: 0, pending: 0, storage: null, timer: null, poll: 0 };
+// How old a runtime figure may be before it is called out rather than shown as current.
+const RES_STATS_AGE_MS = 4000;
 // A hidden tab does not run animation frames at all, so the buffer stops filling and the
 // last thing in it is from whenever the tab was last looked at. Dropped rather than kept:
 // "no reading" is true, and a level from before the tab was hidden is not.
@@ -3820,10 +3822,14 @@ function resRender() {
     + (l ? RES_LABEL[l] : 'no reading yet') + '</span>'
     + '<span class="resnote">' + why + '</span></div>';
 
+  // Both of these come from the worker, so both go stale together while it is busy.
+  const age = res.statsAt ? Date.now() - res.statsAt : 0;
+  const held = res.statsAt && age > RES_STATS_AGE_MS
+             ? Math.round(age / 1000) + 's ago' : '';
   $('#resBody').innerHTML =
       num('GPU buffers', resBytes(r.gpuBytes),
-          r.gpuPeak ? 'peak ' + resBytes(r.gpuPeak) : '')
-    + num('WASM heap', resBytes(r.wasmBytes), 'Python')
+          held || (r.gpuPeak ? 'peak ' + resBytes(r.gpuPeak) : ''))
+    + num('WASM heap', resBytes(r.wasmBytes), held || 'Python')
     + num('JS heap', resBytes(r.jsBytes), 'this tab')
     + num('Stored', r.storage ? resBytes(r.storage.usage) + ' / ' + resBytes(r.storage.quota) : '—',
           'models and chats')
@@ -3837,7 +3843,17 @@ function resRender() {
 
 async function resTick() {
   if (worker) {
-    try { res.stats = await call('stats'); } catch (e) { /* busy or gone: keep the last */ }
+    // The worker is single-threaded, so this request queues behind whatever it is doing: a
+    // reply in progress can hold it for twenty seconds, and until it answers the numbers on
+    // screen are from before that reply started. Showing them anyway is how a leak that
+    // climbed to 20GB read as "flat" -- so the panel says the figure is held rather than
+    // presenting a stale one as current.
+    const asked = Date.now();
+    res.pending = asked;
+    try {
+      const v = await call('stats');
+      if (res.pending === asked) { res.stats = v; res.statsAt = Date.now(); res.pending = 0; }
+    } catch (e) { res.pending = 0; /* gone: keep the last, still marked by age */ }
   }
   // Storage is the expensive one and the slowest to change; asked for about once a minute.
   if (!res.poll || Date.now() - res.poll > 60000) {

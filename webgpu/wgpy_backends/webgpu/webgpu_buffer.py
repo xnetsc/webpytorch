@@ -105,21 +105,59 @@ def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
 # then those buffers were held by nothing, reachable by nothing, and still on the device.
 #
 # So the collect is part of allocating, not something to hope for. It is not run per buffer
-# -- it walked the whole heap in that measurement -- but on a counter, and only while a
-# model is loaded and actually allocating.
-_REAP_EVERY = 4096
-_alloc_since_reap = 0
+# -- it walks the whole heap -- but on a budget of BYTES since the last one.
+#
+# Bytes and not a count of allocations: the first version counted, every 4096, and left the
+# peak at 22.4GB for a 9.8GB model, because 4096 allocations is however many gigabytes the
+# shapes in front of it happen to be. What has to be bounded is how much dead memory may
+# pile up between collects, and that is a byte figure.
+#
+# The budget scales with the model rather than being a constant, so a 0.4GB model does not
+# pay a 1GB allowance and a 10GB one is not collected every few tensors. It scales off the
+# LOW-WATER mark -- the least ever held after a collect -- and not off what is held right
+# now. Off "now" it feeds back on itself: the ledger drifts up, the budget grows with it,
+# collects get rarer, and the drift accelerates. Measured with that mistake in: the budget
+# had reached 1.7GB, which is 8% of 21GB, on a model whose working set is 9.2GB.
+_REAP_FRACTION = 0.08
+_REAP_FLOOR = 256 * 1024 * 1024
+_live_floor = 0                   # least held after any collect; 0 until the first one
+_reap_budget = _REAP_FLOOR
+_bytes_since_reap = 0
 
 
-def _maybe_reap():
-    global _alloc_since_reap
-    _alloc_since_reap += 1
-    if _alloc_since_reap < _REAP_EVERY:
-        return
-    _alloc_since_reap = 0
+def _note_alloc(byte_length: int):
+    global _bytes_since_reap
+    _bytes_since_reap += byte_length
+
+
+def reap_now():
+    """Collect, and re-scale the allowance from what is actually live afterwards.
+
+    Worth calling at the end of a generation as well as from the allocation path. A collect
+    can only free what nothing refers to, and mid-computation the frames on the stack still
+    refer to plenty: the same collect that freed 9.4GB once the reply had finished had been
+    freeing far less while it was being written. So the allocation path bounds the growth
+    within a reply, and the boundary between replies is where it actually comes back.
+    """
+    global _bytes_since_reap, _reap_budget, _live_floor
+    _bytes_since_reap = 0
     import gc
 
     gc.collect()
+    try:
+        held = get_platform().gpuBytes()[0]
+    except Exception:
+        return
+    if held and (_live_floor == 0 or held < _live_floor):
+        _live_floor = held
+    base = _live_floor or held
+    _reap_budget = max(_REAP_FLOOR, int(base * _REAP_FRACTION))
+
+
+def _maybe_reap():
+    if _bytes_since_reap < _reap_budget:
+        return
+    reap_now()
 
 
 def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
@@ -206,6 +244,7 @@ class WebGPUBuffer(WebGPUBufferBase):
         self.texture_shape = texture_shape or get_default_texture_shape(size, dtype)
         _maybe_reap()
         pooled_buffer_id = _pool_get(self.texture_shape)
+        _note_alloc(self.texture_shape.byte_length)
         if pooled_buffer_id is not None:
             self.buffer_id = pooled_buffer_id
         else:
