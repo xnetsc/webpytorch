@@ -80,13 +80,20 @@ def _maybe_pin(buffer_id: int, byte_length: int):
 # buffers of 27.1MB — 7GB parked, for a reuse that needs two or three. Anything past the cap
 # is given back to the device instead.
 _POOL_PER_SHAPE = 4
+# And a ceiling on the whole pool, because per-shape alone is not one: a prefill touches
+# enough distinct shapes that four spares of each came to 2.33GB parked between replies,
+# on a machine where the model itself is 9.2GB of 24GB.
+_POOL_MAX_BYTES = 512 * 1024 * 1024
+_pool_bytes = 0
 
 
 def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
+    global _pool_bytes
     if buffer_id in _pinned_ids:
         return  # pinned by an active/recorded capture — never recycle
     ids = _pool[texture_shape]
-    if len(ids) >= _POOL_PER_SHAPE:
+    if (len(ids) >= _POOL_PER_SHAPE
+            or _pool_bytes + texture_shape.byte_length > _POOL_MAX_BYTES):
         # Bounded per SHAPE rather than by a global byte budget: a budget has to be
         # apportioned between shapes that know nothing about each other, and the waste being
         # cut here is one shape's spares, not the total.
