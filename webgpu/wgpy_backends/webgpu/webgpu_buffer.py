@@ -96,6 +96,7 @@ def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
         performance_metrics["webgpu.buffer.buffer_size"] -= texture_shape.byte_length
         return
     ids.append(buffer_id)
+    _pool_bytes += texture_shape.byte_length
 
 
 # Buffers come back to the pool from `WebGPUBuffer.__del__`, which only runs when the last
@@ -161,7 +162,9 @@ def _maybe_reap():
 
 
 def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
+    global _pool_bytes
     if len(_pool[texture_shape]) > 0:
+        _pool_bytes -= texture_shape.byte_length
         return _pool[texture_shape].pop()
     return None
 
@@ -201,6 +204,8 @@ def release_pooled_buffers():
                 texture_shape.byte_length
             )
     _pool.clear()
+    global _pool_bytes
+    _pool_bytes = 0
     for data, ids in list(_meta_pool.items()):
         for buffer_id in ids:
             plat.disposeBuffer(buffer_id)

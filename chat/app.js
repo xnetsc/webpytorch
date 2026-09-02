@@ -3766,11 +3766,13 @@ const resBytes = (n) => n == null ? '—'
   : Math.round(n / 1024) + ' KB';
 
 function resRead() {
-  // Straight out of shared memory, at whatever moment the panel happens to draw. The
-  // polled reply is the fallback for a runtime with no SharedArrayBuffer -- without
-  // cross-origin isolation there is none, and then the figures go stale during a reply
-  // because nothing can ask for them while the worker is busy.
-  if (res.buf && res.buf[0]) {
+  // Straight out of shared memory when that is the newer of the two. The polled reply
+  // carries its own time, and shared memory carries the moment it was written, because
+  // neither is always the fresher one: nothing can ask the worker for these while it is
+  // busy, and nothing writes the shared array while it is idle. Taking the array
+  // unconditionally is how a reply's peak stayed on screen after the memory behind it had
+  // been handed back.
+  if (res.buf && res.buf[0] && res.buf[4] >= (res.statsAt || 0)) {
     res.stats = { gpuBytes: res.buf[0], gpuPeak: res.buf[1], gpuBuffers: res.buf[2],
                   wasmBytes: res.buf[3] || (res.stats && res.stats.wasmBytes) || null };
   }

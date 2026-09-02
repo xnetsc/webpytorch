@@ -6859,12 +6859,18 @@ _stat_n = 0
 _stat_why = None                  # why the last attempt failed, so a silent one cannot hide
 
 
-def _gpu_stat_push():
+def _gpu_stat_push(force=False):
     """Write the GPU ledger where the page can read it. Every 64th call, which is several
-    times a layer -- often enough that a display refreshing once a second is never behind."""
+    times a layer -- often enough that a display refreshing once a second is never behind.
+
+    `force` for the moments that are NOT in a hot loop and matter most: the end of a reply,
+    where several gigabytes are handed back at once. Without it the last value written is
+    whatever the final matmul saw, and it stands until the next reply -- a reader watching
+    the number sees the peak of a prefill and no sign that it has since been released.
+    """
     global _stat_n, _stat_why
     _stat_n += 1
-    if _stat_n & 63:
+    if not force and (_stat_n & 63):
         return
     try:
         import js
@@ -6900,7 +6906,7 @@ def gpu_reap():
     fn = getattr(_b, "reap_now", None)
     if fn is not None:
         fn()
-    _gpu_stat_push()
+    _gpu_stat_push(force=True)
 
 
 class GGMLLinear(Module):

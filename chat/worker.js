@@ -40,9 +40,14 @@ try { STOP = new Int32Array(new SharedArrayBuffer(4)); } catch (e) { STOP = null
 // reader, which is where it belongs. Float64 because bytes held pass what an f32 counts
 // exactly, and the values are independent scalars, so a torn read costs one stale frame and
 // nothing more -- no atomics needed for that.
-//   [0] bytes held   [1] peak   [2] buffer count   [3] wasm heap
+//   [0] bytes held   [1] peak   [2] buffer count   [3] wasm heap   [4] when it was written
+//
+// [4] exists because the writer is not always running. These are written from the matmul,
+// so when a reply ends they stop -- and the last value written is the peak of that reply,
+// which then stands as if it were current while several gigabytes are handed back. The
+// reader compares this stamp against its own polled reply and takes whichever is newer.
 let STAT = null;
-try { STAT = new Float64Array(new SharedArrayBuffer(32)); } catch (e) { STAT = null; }
+try { STAT = new Float64Array(new SharedArrayBuffer(40)); } catch (e) { STAT = null; }
 
 // The escalation, for work that will not stop because it is not looking.
 //
@@ -709,7 +714,7 @@ function stopLoad() {
 // enough there that it does not need to be rationed.
 self.__gpustat = (held, peak, n) => {
   if (!STAT) return;
-  STAT[0] = held; STAT[1] = peak; STAT[2] = n;
+  STAT[0] = held; STAT[1] = peak; STAT[2] = n; STAT[4] = Date.now();
   try {
     const m = pyodide && pyodide._module && pyodide._module.HEAP8;
     if (m) STAT[3] = m.byteLength;
