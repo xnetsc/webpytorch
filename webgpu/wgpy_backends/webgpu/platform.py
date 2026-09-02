@@ -64,18 +64,48 @@ class WebGPUPlatform:
         self._latest_comm_buf = None
         self._kernels = {}          # name -> the descriptor it was added with
         self._folds = {}            # name -> folded variant's name, or None if it cannot be
+        # What we have asked the GPU for and not given back. This is the one number about
+        # GPU memory that is honest from inside a browser: the device's own utilisation and
+        # footprint are not exposed to a page at all, but every buffer this backend holds
+        # was allocated through the two calls below, so counting them is exact rather than
+        # an estimate. Peak is kept because the interesting moment -- a model that only just
+        # fits -- is over before anyone looks.
+        self._gpu_bytes = 0
+        self._gpu_peak = 0
+        self._gpu_live = {}         # buffer_id -> its size, so a dispose subtracts the right amount
 
     def getDeviceInfo(self) -> dict:
         return gpu.getDeviceInfo().to_py()
 
     def createBuffer(self, buffer_id: int, byte_length: int):
+        self._gpu_note(buffer_id, byte_length)
         return gpu.createBuffer(buffer_id, byte_length)
 
     def createMetaBuffer(self, buffer_id: int, byte_length: int):
         return gpu.createMetaBuffer(buffer_id, byte_length)
 
     def disposeBuffer(self, buffer_id: int):
+        self._gpu_note(buffer_id, None)
         return gpu.disposeBuffer(buffer_id)
+
+    def _gpu_note(self, buffer_id, byte_length):
+        """Add a buffer to the running total, or take it back out.
+
+        Keyed by id and not just summed: buffers are pooled and reused, so the same id can
+        be created again, and a dispose whose size had to be guessed would drift. An id
+        that is disposed twice, or one we never saw created, changes nothing.
+        """
+        if byte_length is None:
+            self._gpu_bytes -= self._gpu_live.pop(buffer_id, 0)
+            return
+        self._gpu_bytes += int(byte_length) - self._gpu_live.get(buffer_id, 0)
+        self._gpu_live[buffer_id] = int(byte_length)
+        if self._gpu_bytes > self._gpu_peak:
+            self._gpu_peak = self._gpu_bytes
+
+    def gpuBytes(self):
+        """(held, peak, count) -- what this backend has out on the device right now."""
+        return (self._gpu_bytes, self._gpu_peak, len(self._gpu_live))
 
     def setCommBuf(self, buffer: np.ndarray):
         self._latest_comm_buf = buffer

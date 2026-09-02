@@ -672,6 +672,37 @@ function stopLoad() {
   }
 }
 
+// What the runtime can say about itself, for the resource strip on the page.
+//
+// Only numbers we actually hold. A page cannot read the device's GPU utilisation, the
+// process's CPU, or anything about paging -- those have no Web API -- so nothing here
+// pretends to: the GPU figure is the backend's own ledger of buffers it asked for and has
+// not returned, and the heap figure is the WASM memory Python is living in. Cheap enough
+// to call on a timer: two property reads and a tuple.
+function runtimeStats() {
+  const out = { gpuBytes: null, gpuPeak: null, gpuBuffers: null, wasmBytes: null,
+                loaded: !!ready };
+  if (!pyodide) return out;
+  try {
+    // `pyodide._module.HEAP8`, not `pyodide.HEAP8`: the heap views live on the emscripten
+    // module, and the top-level object has never carried them. Reading the wrong one gives
+    // undefined rather than an error, so it reported "unknown" forever.
+    const m = pyodide._module && pyodide._module.HEAP8;
+    if (m && m.byteLength) out.wasmBytes = m.byteLength;
+  } catch (e) { /* a runtime that will not say is reported as unknown, not as zero */ }
+  try {
+    const v = pyodide.runPython(
+      'from wgpy_backends.webgpu.platform import get_platform as _gp\n'
+      + '_gp().gpuBytes() if hasattr(_gp(), "gpuBytes") else (0, 0, 0)');
+    const a = v && v.toJs ? v.toJs() : v;
+    if (v && v.destroy) v.destroy();
+    if (a && a.length === 3) {
+      out.gpuBytes = Number(a[0]); out.gpuPeak = Number(a[1]); out.gpuBuffers = Number(a[2]);
+    }
+  } catch (e) { /* WebGL backend, or no platform yet: unknown rather than zero */ }
+  return out;
+}
+
 onmessage = async (e) => {
   const { id, cmd, args } = e.data;
   cmdDepth++;
@@ -696,6 +727,7 @@ onmessage = async (e) => {
     else if (cmd === 'generate') res = await generate(args.prompt, args);
   else if (cmd === 'toolsSupported') res = await toolsSupported();
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
+    else if (cmd === 'stats') res = runtimeStats();
     else if (cmd === 'cacheList') res = await cacheList();
     else if (cmd === 'cacheDelete') await cacheDelete(args.key);
     else if (cmd === 'cacheClear') await cacheClear();

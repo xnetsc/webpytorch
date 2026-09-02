@@ -48,6 +48,18 @@
   <main id="main">
     <div id="messages"></div>
     <div id="attachments"></div>
+
+    <!-- Fixed above the composer rather than in the settings dialog: the question it answers
+         ("why is this slow right now?") is asked while a reply is being written, and an
+         answer behind two clicks is not an answer. Collapses to one line, which shows the
+         worst of the three pressures, because that is the line worth reading. -->
+    <div id="resbar" hidden>
+      <button type="button" id="resToggle" aria-expanded="true" title="Hide the details">
+        <span id="resCaret">▾</span> <span id="resSummary">resources</span>
+      </button>
+      <div id="resBody"></div>
+    </div>
+
     <form id="composer">
       <div class="tools">
         <button type="button" id="toolFile" title="Attach a file">📎</button>

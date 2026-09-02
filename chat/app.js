@@ -343,6 +343,7 @@ worker.onmessage = (e) => {
       const now = (m.at != null) ? m.at : performance.now();
       const wall = performance.now();
       if (!live.t0) live.t0 = now;
+      resNoteStep(now);                    // the resource strip reads decode latency from here
       // decode speed = tokens after the first, over the time since the first; updated at
       // most twice a second so the number stays readable
       if (live.rate && live.tokens >= 2 && (live.tokens === 2 || wall - live.rateT > 500)) {
@@ -2532,6 +2533,7 @@ $('#composer').onsubmit = async (e) => {
   body.appendChild(rate); live.rate = rate;
   resetLiveRender();                    // the first token of a reply renders immediately
   streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
+  resStartRun();                       // this reply's latency, not the previous one's
   syncButtons();                                      // Send becomes Stop
 
   try {
@@ -2634,6 +2636,7 @@ $('#composer').onsubmit = async (e) => {
   } catch (err) {
     reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
   } finally { stopDots(live); resetLiveRender(); }
+  resEndRun();          // the gap to the next reply is not a decode step
   streaming = null;
   syncButtons();                                      // Stop becomes Send again
   conv.updated = Date.now(); saveConvs(); render();
@@ -3658,6 +3661,215 @@ function jsOut(r, withView) {
 }
 
 
+// ---- the resource strip ---------------------------------------------------------------
+//
+// What a page can and cannot know about the machine it is on, and why this is shaped the
+// way it is.
+//
+// It CAN know, exactly: how many bytes of GPU buffer this backend holds (every one was
+// allocated through wgpy's own createBuffer, so the ledger is not an estimate), how large
+// the WASM heap Python lives in is, how large this thread's JS heap is, and how much
+// storage the origin is using.
+//
+// It CANNOT know, at all: process CPU, GPU utilisation, or anything about paging. No Web
+// API exposes them. So those are NOT shown as numbers -- a percentage nobody measured is
+// worse than no percentage. They are shown as a LEVEL, derived from two things a page can
+// measure and which the system-side numbers were used to calibrate against:
+//
+//   frame interval  -- how long the main thread goes between animation frames. When the
+//                      kernel is busy moving memory, this stretches from 17ms to hundreds.
+//   decode latency  -- milliseconds per token, against the best this model has managed in
+//                      this session. The GPU stalling on compressed pages shows up here and
+//                      nowhere else a page can see.
+//
+// The thresholds come from a measured run rather than from taste. On a 24GB machine running
+// a 12.2GB model, sampling the accelerator's own utilisation beside the kernel's
+// decompression counters gave: under 20k decompressions per sample the GPU ran at 77-86%;
+// at 20-60k it fell to 60%; past 60k it averaged 58% and touched 2-3% while kernel_task
+// took 99-125% of a core. 86 -> 60 is a 1.4x slowdown, which is why "tight" starts below
+// that and "severe" is set well past it.
+const RES_KEY = 'webtorch.resOpen';
+// Dispersion within one reply, not speed. A big model on a small GPU is uniformly slow and
+// has nothing wrong with it; a model whose pages keep being decompressed is slow in bursts,
+// and it is the bursts that this is for. p90 against the MEDIAN of the same window says
+// exactly that and needs no historical floor -- an earlier version compared against the
+// fastest step ever seen and called a perfectly healthy 0.6B "severe", because the first
+// tokens of a reply arrive at 13ms and the rest at 27ms and the minimum is not the floor.
+//
+// Calibration: that healthy run measures 1.23. The pressure we are looking for was sampled
+// on the system side at a 1.4x average throughput loss with individual stalls of seconds,
+// so tight sits above healthy jitter and severe well inside the stalling regime.
+const RES_STEP_TIGHT = 1.5, RES_STEP_SEVERE = 3.0;    // p90 / median of one reply's steps
+const RES_FRAME_TIGHT = 34, RES_FRAME_SEVERE = 100;   // ms; 34 is two dropped frames
+const RES_LEVELS = ['normal', 'tight', 'severe'];
+const RES_LABEL = { normal: 'normal', tight: 'tight', severe: 'severe' };
+
+const res = { steps: [], stepsAt: 0, lastAt: 0, frames: [], lastFrame: 0,
+              stats: null, storage: null, timer: null, poll: 0 };
+// A hidden tab does not run animation frames at all, so the buffer stops filling and the
+// last thing in it is from whenever the tab was last looked at. Dropped rather than kept:
+// "no reading" is true, and a level from before the tab was hidden is not.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') { res.frames.length = 0; res.lastFrame = 0; }
+});
+
+// Decode latency, from the worker's own clock. Only gaps between consecutive tokens of one
+// reply count: the gap across a tool call, or from the last reply to this one, is not a
+// decode step and would read as a stall that never happened.
+function resNoteStep(at) {
+  if (res.lastAt && at > res.lastAt) {
+    const dt = at - res.lastAt;
+    if (dt < 60000) {
+      res.steps.push(dt);
+      res.stepsAt = Date.now();
+      if (res.steps.length > 40) res.steps.shift();
+    }
+  }
+  res.lastAt = at;
+}
+function resEndRun() { res.lastAt = 0; }
+// A new reply measures itself, not the one before it.
+function resStartRun() { res.steps.length = 0; res.lastAt = 0; }
+
+// Frame interval. Sampled continuously, because the pressure being looked for arrives
+// between generations as often as during one.
+function resFrames() {
+  const tick = (t) => {
+    if (res.lastFrame) {
+      res.frames.push(t - res.lastFrame);
+      if (res.frames.length > 90) res.frames.shift();
+    }
+    res.lastFrame = t;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+// The 90th percentile, not the mean: a stall is a tail event, and averaging it with the
+// frames on either side hides exactly the thing being looked for.
+function resPct(a, p) {
+  if (!a.length) return 0;
+  const b = [...a].sort((x, y) => x - y);
+  return b[Math.min(b.length - 1, Math.floor(b.length * p))];
+}
+const resP90 = (a) => resPct(a, 0.9);
+function resLevel(v, tight, severe) {
+  if (!v) return null;
+  return v >= severe ? 'severe' : v >= tight ? 'tight' : 'normal';
+}
+const resWorst = (...ls) => RES_LEVELS[Math.max(...ls.map(l => RES_LEVELS.indexOf(l)).filter(i => i >= 0), 0)];
+
+const resBytes = (n) => n == null ? '—'
+  : n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB'
+  : n >= 1048576 ? Math.round(n / 1048576) + ' MB'
+  : Math.round(n / 1024) + ' KB';
+
+function resRead() {
+  // Not expired on a clock. A reply that just finished slowly is exactly what someone is
+  // looking at the strip about, and blanking the reading a minute later takes the answer
+  // away at the moment it is wanted. It stands until the next reply replaces it, and says
+  // which reply it is about.
+  const stepP90 = resP90(res.steps), stepMid = resPct(res.steps, 0.5);
+  const ratio = (res.steps.length >= 8 && stepMid) ? stepP90 / stepMid : 0;
+  const frame = resP90(res.frames);
+  const gpu = resLevel(ratio, RES_STEP_TIGHT, RES_STEP_SEVERE);
+  const cpu = resLevel(frame, RES_FRAME_TIGHT, RES_FRAME_SEVERE);
+  // Paging is the one pressure with a signature rather than a measurement: the GPU stalls
+  // AND the main thread stutters at the same time, because the kernel is doing the work
+  // both are waiting on. Either alone is something else -- a big model is slow without
+  // stuttering, a busy tab stutters without slowing decode -- so this takes the LOWER of
+  // the two and claims nothing when only one is raised.
+  const paging = (gpu && cpu)
+    ? RES_LEVELS[Math.min(RES_LEVELS.indexOf(gpu), RES_LEVELS.indexOf(cpu))] : null;
+  const s = res.stats || {};
+  let js = null;
+  try { js = performance.memory ? performance.memory.usedJSHeapSize : null; } catch (e) {}
+  return { gpuBytes: s.gpuBytes, gpuPeak: s.gpuPeak, wasmBytes: s.wasmBytes, jsBytes: js,
+           storage: res.storage, gpu, cpu, paging, ratio, frame };
+}
+
+function resRender() {
+  const bar = $('#resbar');
+  if (!bar) return;
+  const r = resRead();
+  const open = localStorage.getItem(RES_KEY) !== '0';
+  bar.hidden = false;
+  $('#resCaret').textContent = open ? '▾' : '▸';
+  $('#resToggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+  $('#resBody').hidden = !open;
+
+  const worst = resWorst(r.paging, r.gpu, r.cpu);
+  const worstName = r.paging === worst ? 'paging' : r.gpu === worst ? 'GPU' : 'CPU';
+  $('#resSummary').innerHTML = open
+    ? 'Resources'
+    : 'Resources · ' + resBytes(r.gpuBytes) + ' on the GPU · '
+      + (worst && worst !== 'normal'
+          ? '<b class="res-' + worst + '">' + worstName + ' ' + RES_LABEL[worst] + '</b>'
+          : '<span class="res-normal">no pressure</span>');
+  if (!open) { $('#resBody').innerHTML = ''; return; }
+
+  // Measured quantities carry their number. Pressures carry a level and nothing else --
+  // there is no honest number behind them, and inventing one would be the whole mistake.
+  const num = (label, v, extra) =>
+    '<div class="rescell"><span class="reslab">' + label + '</span>'
+    + '<span class="resval">' + v + '</span>'
+    + (extra ? '<span class="resnote">' + extra + '</span>' : '') + '</div>';
+  const lvl = (label, l, why) =>
+    '<div class="rescell"><span class="reslab">' + label + '</span>'
+    + '<span class="resval res-' + (l || 'unknown') + '">'
+    + (l ? RES_LABEL[l] : 'no reading yet') + '</span>'
+    + '<span class="resnote">' + why + '</span></div>';
+
+  $('#resBody').innerHTML =
+      num('GPU buffers', resBytes(r.gpuBytes),
+          r.gpuPeak ? 'peak ' + resBytes(r.gpuPeak) : '')
+    + num('WASM heap', resBytes(r.wasmBytes), 'Python')
+    + num('JS heap', resBytes(r.jsBytes), 'this tab')
+    + num('Stored', r.storage ? resBytes(r.storage.usage) + ' / ' + resBytes(r.storage.quota) : '—',
+          'models and chats')
+    + lvl('GPU pressure', r.gpu,
+          r.ratio ? 'decode spread ' + r.ratio.toFixed(1) + '×'
+                    + (streaming ? '' : ', last reply') : 'needs a reply to measure')
+    + lvl('CPU pressure', r.cpu,
+          r.frame ? 'frames ' + Math.round(r.frame) + ' ms' : 'measuring')
+    + lvl('Paging pressure', r.paging, 'GPU and CPU together');
+}
+
+async function resTick() {
+  if (worker) {
+    try { res.stats = await call('stats'); } catch (e) { /* busy or gone: keep the last */ }
+  }
+  // Storage is the expensive one and the slowest to change; asked for about once a minute.
+  if (!res.poll || Date.now() - res.poll > 60000) {
+    res.poll = Date.now();
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const e = await navigator.storage.estimate();
+        res.storage = { usage: e.usage || 0, quota: e.quota || 0 };
+      }
+    } catch (e) { /* a browser that will not say leaves this blank */ }
+  }
+  resRender();
+}
+
+function wireResources() {
+  const bar = $('#resbar');
+  if (!bar) return;
+  $('#resToggle').onclick = () => {
+    localStorage.setItem(RES_KEY, localStorage.getItem(RES_KEY) === '0' ? '1' : '0');
+    resRender();
+  };
+  resFrames();
+  resRender();
+  // Faster while a reply is being written, because that is when the numbers move and when
+  // someone is looking; slow otherwise, since each tick costs a message to the worker.
+  const loop = () => {
+    clearTimeout(res.timer);
+    res.timer = setTimeout(() => { resTick().finally(loop); }, streaming ? 1000 : 4000);
+  };
+  resTick().finally(loop);
+}
+
 // ---- the Python-environment settings -------------------------------------------------
 function wirePython() {
   const box = $('#pyPackages'), on = $('#pyEnabled'), st = $('#pyState');
@@ -3811,6 +4023,7 @@ detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 call('armStorage', {}).catch(() => {});
 wirePython();
 wireDebug();
+wireResources();
 // After the model runtime, which is what the person is waiting for.
 setTimeout(dbgStart, 2500);
 // After the first paint: booting a second Python is a few seconds of CPU, and the model
