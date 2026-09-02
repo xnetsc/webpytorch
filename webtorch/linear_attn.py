@@ -218,6 +218,30 @@ class LinearAttention:
                           self._t("v", xt)[:, :nv]], axis=1)
         return qkv, self._t("beta", xt), self._t("alpha", xt), self._t("g", xt)
 
+    def _prepare_batch(self, qkv, braw, araw, state, out, T, row):
+        """Prepare a whole prompt in one dispatch. False if this backend cannot."""
+        zero = self._zero_t()
+        g = state.gpu()
+        r = wt.gdn_prepare_batch(
+            wt._contig(qkv.data), (zero if braw is None else wt._contig(braw.data)),
+            (zero if araw is None else wt._contig(araw.data)),
+            g[1] if g[1] is not None else zero, self._konst(), out,
+            self.hk, self.hv, self.dk, self.dv, max(1, self.conv_width),
+            self._flags(braw), T, row)
+        if r is None:
+            return False
+        _, cnew = r
+        if g[1] is not None:
+            g[1] = cnew
+        return True
+
+    def _flags(self, braw):
+        return ((1 if self._has_conv else 0)
+                | (2 if self.w.get("dt_bias") is not None else 0)
+                | (4 if self.w.get("A") is not None else 0)
+                | (8 if braw is not None else 0)
+                | (16 if self.w.get("conv_b") is not None else 0))
+
     def _prepare_gpu(self, qkv, braw, araw, state, out=None, base=0):
         """Everything between the projections and the recurrence, for ONE row.
 
@@ -229,9 +253,7 @@ class LinearAttention:
         zero = self._zero_t()
         g = state.gpu()
         packed = wt._empty((2 * nq + nv + 2 * self.hv,)) if out is None else out
-        flags = ((1 if self._has_conv else 0) | (2 if self.w.get("dt_bias") is not None else 0)
-                 | (4 if self.w.get("A") is not None else 0) | (8 if braw is not None else 0)
-                 | (16 if self.w.get("conv_b") is not None else 0))
+        flags = self._flags(braw)
         # Both kernels hand the state back: in place on a backend that can write it that
         # way, and as a new buffer on one that cannot. Storing what comes back is what makes
         # the second case free -- the alternative is a copy over the whole state per layer.
@@ -374,12 +396,18 @@ class LinearAttention:
             one_buf = wt.gdn_scan_ok(self.dk)
             allp = wt._empty((T0 * row,)) if one_buf else None
             packed = []
-            for t in range(T0):
-                packed.append(self._prepare_gpu(
-                    qkv[t:t + 1].reshape(-1),
-                    None if braw is None else braw[t:t + 1],
-                    None if araw is None else araw[t:t + 1],
-                    state, out=allp, base=(t * row if one_buf else 0)))
+            # The preparation for the whole prompt in one dispatch when it can be had. What
+            # looked like a dependency across tokens -- the conv's ring buffer -- is not one:
+            # the convolution is causal over W taps, so a token's window is rows of this same
+            # prompt except for the first W-1, and the ring is rewritten once at the end.
+            done = self._prepare_batch(qkv, braw, araw, state, allp, T0, row) if one_buf else False
+            if not done:
+                for t in range(T0):
+                    packed.append(self._prepare_gpu(
+                        qkv[t:t + 1].reshape(-1),
+                        None if braw is None else braw[t:t + 1],
+                        None if araw is None else araw[t:t + 1],
+                        state, out=allp, base=(t * row if one_buf else 0)))
             # One dispatch for the whole recurrence when the kernel can take it. The
             # sequential part is still sequential -- it is a loop inside the kernel now,
             # over a state that never leaves the workgroup's registers -- but it stops

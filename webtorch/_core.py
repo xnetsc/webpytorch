@@ -6305,6 +6305,165 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 }
 """
 
+# The same preparation for a whole prompt, dispatched over (head, token) instead of once
+# per token.
+#
+# The ring buffer looked like a dependency across tokens and is not one. The convolution is
+# causal over W taps, so token t's window is inputs t-W+1..t: inside the prompt those rows
+# are already in `qkv`, and only the first W-1 tokens reach back into the incoming state. W
+# is 4 here. Nothing has to be shifted while the prompt is being prepared -- the ring is
+# rewritten once at the end from the prompt's own last W-1 rows.
+#
+# This is what is left after the recurrence was folded into one dispatch: 48 layers times T
+# preparations was the whole remaining cost of a long prompt.
+_GDN_PREB_WGSL = """@group(0) @binding(0)
+var<storage,read> qkv: array<f32>;
+@group(0) @binding(1)
+var<storage,read> braw: array<f32>;
+@group(0) @binding(2)
+var<storage,read> araw: array<f32>;
+@group(0) @binding(3)
+var<storage,read_write> cst: array<f32>;
+@group(0) @binding(4)
+var<storage,read> konst: array<f32>;
+@group(0) @binding(5)
+var<storage,read_write> outp: array<f32>;
+struct GP { hk: u32, hv: u32, dk: u32, dv: u32, W: u32, flags: u32, T: u32, row: u32, }
+@group(0) @binding(6)
+var<storage,read> gp: GP;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let g = wg.x;
+  let tk = wg.y;                                   // which token of the prompt
+  let t = lid.x;
+  let nq = gp.hk * gp.dk;
+  let nv = gp.hv * gp.dv;
+  let C = 2u * nq + nv;
+  let heads = 2u * gp.hk + gp.hv;
+  let ob = tk * gp.row;
+  if (g >= heads) {
+    if (t < gp.hv) {
+      let ko = gp.W * C + C;
+      var a = araw[tk * gp.hv + t];
+      if ((gp.flags & 2u) != 0u) { a = a + konst[ko + gp.hv + t]; }
+      let sp = max(a, 0.0) + log(1.0 + exp(-abs(a)));
+      var d = sp;
+      if ((gp.flags & 4u) != 0u) { d = sp * konst[ko + t]; }
+      outp[ob + 2u * nq + nv + t] = exp(min(d, 0.0));
+      var bv: f32 = 1.0;
+      if ((gp.flags & 8u) != 0u) { bv = 1.0 / (1.0 + exp(-braw[tk * gp.hv + t])); }
+      outp[ob + 2u * nq + nv + gp.hv + t] = bv;
+    }
+    return;
+  }
+  var c0: u32; var dim: u32; var isqk: bool;
+  if (g < 2u * gp.hk) { c0 = g * gp.dk; dim = gp.dk; isqk = true; }
+  else { c0 = 2u * nq + (g - 2u * gp.hk) * gp.dv; dim = gp.dv; isqk = false; }
+  var val: f32 = 0.0;
+  if (t < dim) {
+    let c = c0 + t;
+    if ((gp.flags & 1u) != 0u) {
+      var acc: f32 = 0.0;
+      for (var j: u32 = 0u; j < gp.W; j = j + 1u) {
+        // input at t - (W-1) + j: a row of this prompt when that is >= 0, and otherwise the
+        // incoming ring, whose entry j+tk is the same position (cst[0] is the oldest).
+        var x: f32;
+        if (tk + j + 1u >= gp.W) {
+          x = qkv[(tk + j + 1u - gp.W) * C + c];
+        } else {
+          x = cst[(j + tk) * C + c];
+        }
+        acc = acc + x * konst[j * C + c];
+      }
+      if ((gp.flags & 16u) != 0u) { acc = acc + konst[gp.W * C + c]; }
+      val = acc / (1.0 + exp(-acc));               // SiLU
+    } else {
+      val = qkv[tk * C + c];
+    }
+  }
+  if (isqk) {
+    red[t] = val * val;
+    workgroupBarrier();
+    for (var s: u32 = 64u; s > 0u; s = s >> 1u) {
+      if (t < s) { red[t] = red[t] + red[t + s]; }
+      workgroupBarrier();
+    }
+    let inv = inverseSqrt(red[0] + 1e-6);
+    if (t < dim) {
+      var v = val * inv;
+      if (g < gp.hk) { v = v * inverseSqrt(f32(gp.dk)); }
+      outp[ob + c0 + t] = v;
+    }
+  } else if (t < dim) {
+    outp[ob + c0 + t] = val;
+  }
+}
+"""
+
+# The ring, rewritten once from the prompt's own last W-1 input rows. Separate because it
+# must not run until every token has read the OLD ring.
+_GDN_RING_WGSL = """@group(0) @binding(0)
+var<storage,read_write> cst: array<f32>;
+@group(0) @binding(1)
+var<storage,read> qkv: array<f32>;
+struct GR { C: u32, W: u32, T: u32, }
+@group(0) @binding(2)
+var<storage,read> gr: GR;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.x + gid.z * nwg.x * 64u;
+  let n = (gr.W - 1u) * gr.C;
+  if (i >= n) { return; }
+  let j = i / gr.C;
+  let c = i % gr.C;
+  cst[i] = qkv[(gr.T + j + 1u - gr.W) * gr.C + c];
+}
+"""
+
+_gdnpb_k = {"added": False}
+
+
+def gdn_prepare_batch(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags, T, row):
+    """`gdn_prepare` for T tokens at once. Returns (out, cst) or None if unavailable.
+
+    T must be at least W-1: a shorter prompt's new ring would have to be part old and part
+    new, and stepping such a prompt costs nothing worth the branch.
+    """
+    if _webgl_ready() and not _adam_backend_ready():
+        return None
+    if T < max(1, W) - 1 or T < 1:
+        return None
+    plat = _adam_kernel["platform"]
+    if not _gdnpb_k["added"]:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel("gdn_preb", {"source": _GDN_PREB_WGSL,
+                                    "bindingTypes": [ro, ro, ro, rw, ro, rw, ro]})
+        plat.addKernel("gdn_ring", {"source": _GDN_RING_WGSL,
+                                    "bindingTypes": [rw, ro, ro]})
+        _gdnpb_k["added"] = True
+    nq = hk * dk
+    C = 2 * nq + hv * dv
+    meta = _adam_kernel["make_meta"]((hk, hv, dk, dv, W, flags, T, row),
+                                     "u4,u4,u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "gdn_preb",
+                    "tensors": [qkv.buffer.buffer_id, braw.buffer.buffer_id,
+                                araw.buffer.buffer_id, cst.buffer.buffer_id,
+                                konst.buffer.buffer_id, out.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": 2 * hk + hv + 1, "y": T, "z": 1}})
+    if (flags & 1) and W > 1:
+        rmeta = _adam_kernel["make_meta"]((C, W, T), "u4,u4,u4")
+        n = (W - 1) * C
+        plat.runKernel({"name": "gdn_ring",
+                        "tensors": [cst.buffer.buffer_id, qkv.buffer.buffer_id,
+                                    rmeta.buffer_id],
+                        "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    return out, cst
+
+
 _gdnp_k = {"added": False}
 
 
