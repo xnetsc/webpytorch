@@ -91,7 +91,17 @@ class Tensor:
         self.requires_grad = requires_grad
         self.grad = None
         self._backward = lambda: None
-        self._prev = tuple(_children)   # NOT a set — allow __eq__ override (torch shim)
+        # The graph, and only where it will be walked. `_prev` is read by `backward()` and
+        # by nothing else, but it is a REAL reference from an output to its inputs -- so in a
+        # forward pass it chains: h64 -> h63 -> ... -> h0, holding every intermediate along
+        # the way until the last one dies. That is not a cycle and refcounting cannot help;
+        # it is simply the whole prefill kept alive on purpose, for a purpose inference does
+        # not have. Measured with it: a prompt climbed from 10.1GB to 19.0GB in the first two
+        # and a half seconds, before a single token came out.
+        #
+        # Safe to drop when nothing requires grad: an intermediate takes its flag from its
+        # inputs at construction, and a leaf that someone later marks has no `_prev` anyway.
+        self._prev = tuple(_children) if requires_grad else ()   # NOT a set — allow __eq__ override (torch shim)
         self._op = _op
 
     def _setback(self, fn):
