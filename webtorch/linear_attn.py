@@ -218,8 +218,8 @@ class LinearAttention:
                           self._t("v", xt)[:, :nv]], axis=1)
         return qkv, self._t("beta", xt), self._t("alpha", xt), self._t("g", xt)
 
-    def _recur_gpu(self, qkv, braw, araw, state):
-        """The genuinely sequential part, for ONE row of already-projected values.
+    def _prepare_gpu(self, qkv, braw, araw, state, out=None, base=0):
+        """Everything between the projections and the recurrence, for ONE row.
 
         Four dispatches carry it -- prepare, the two recurrence passes, and the output norm.
         Doing the same arithmetic with tensor ops is ~50 dispatches, and at 0.3-0.9 ms of
@@ -228,7 +228,7 @@ class LinearAttention:
         nv = self.hv * self.dv
         zero = self._zero_t()
         g = state.gpu()
-        packed = wt._empty((2 * nq + nv + 2 * self.hv,))
+        packed = wt._empty((2 * nq + nv + 2 * self.hv,)) if out is None else out
         flags = ((1 if self._has_conv else 0) | (2 if self.w.get("dt_bias") is not None else 0)
                  | (4 if self.w.get("A") is not None else 0) | (8 if braw is not None else 0)
                  | (16 if self.w.get("conv_b") is not None else 0))
@@ -239,16 +239,28 @@ class LinearAttention:
             wt._contig(qkv.data), (zero if braw is None else wt._contig(braw.data)),
             (zero if araw is None else wt._contig(araw.data)),
             g[1] if g[1] is not None else zero, self._konst(), packed,
-            self.hk, self.hv, self.dk, self.dv, max(1, self.conv_width), flags)
+            self.hk, self.hv, self.dk, self.dv, max(1, self.conv_width), flags, base)
         if g[1] is not None:
             g[1] = cnew
+        return packed
+
+    def _recur_from_packed(self, packed, state):
+        """The per-token recurrence, from an already-prepared row. The fallback when the
+        scan kernel cannot be used, and the path a single decode step takes."""
+        g = state.gpu()
         out, g[0] = wt.gdn_step(g[0], packed, self.hv, self.dk, self.dv, self.rep)
-        if self.w.get("norm") is not None:
-            gw = self._norm_t()
-            rows = self.hv if self._norm_per_head else 1
-            r = wt.rmsnorm(out.reshape(rows, nv // rows), gw, self.eps)
-            out = r if r is not None else out                # already a Tensor
-        return out.reshape(1, nv)
+        return self._norm_rows(out.reshape(1, -1), 1)
+
+    def _norm_rows(self, out, rows_t):
+        """The output norm, over however many token rows `out` holds."""
+        nv = self.hv * self.dv
+        if self.w.get("norm") is None:
+            return out.reshape(rows_t, nv)
+        gw = self._norm_t()
+        per = self.hv if self._norm_per_head else 1
+        r = wt.rmsnorm(out.reshape(rows_t * per, nv // per), gw, self.eps)
+        out = r if r is not None else out
+        return out.reshape(rows_t, nv)
 
     def _gate_out(self, y, gp, nv):
         """The output gate and projection, over however many rows `y` has."""
@@ -261,7 +273,8 @@ class LinearAttention:
         """One token, everything on the device. `xt` is a (1, H) Tensor -> (1, H) Tensor."""
         nv = self.hv * self.dv
         qkv, braw, araw, gp = self._project_gpu(xt)
-        y = self._recur_gpu(qkv.reshape(-1), braw, araw, state)
+        packed = self._prepare_gpu(qkv.reshape(-1), braw, araw, state)
+        y = self._recur_from_packed(packed, state)
         return self._gate_out(y, None if gp is None else gp.reshape(1, -1), nv)
 
     def _zero_t(self):
@@ -354,12 +367,34 @@ class LinearAttention:
             # That is why a prompt cost more per token than decoding did, which is backwards.
             nv = self.hv * self.dv
             qkv, braw, araw, gp = self._project_gpu(xt)
-            outs = [self._recur_gpu(qkv[t:t + 1].reshape(-1),
-                                    None if braw is None else braw[t:t + 1],
-                                    None if araw is None else araw[t:t + 1],
-                                    state)
-                    for t in range(T0)]
-            return self._gate_out(wt.cat(outs, axis=0), gp, nv)
+            # Prepared straight into one buffer, a row per token, so the scan below has
+            # everything it needs without a concatenation -- which would have cost the
+            # dispatch per token that this is here to remove.
+            row = 2 * self.hk * self.dk + nv + 2 * self.hv
+            one_buf = wt.gdn_scan_ok(self.dk)
+            allp = wt._empty((T0 * row,)) if one_buf else None
+            packed = []
+            for t in range(T0):
+                packed.append(self._prepare_gpu(
+                    qkv[t:t + 1].reshape(-1),
+                    None if braw is None else braw[t:t + 1],
+                    None if araw is None else araw[t:t + 1],
+                    state, out=allp, base=(t * row if one_buf else 0)))
+            # One dispatch for the whole recurrence when the kernel can take it. The
+            # sequential part is still sequential -- it is a loop inside the kernel now,
+            # over a state that never leaves the workgroup's registers -- but it stops
+            # costing two dispatches per token per layer, which is what made a long prompt
+            # take minutes.
+            y = None
+            scan = (wt.gdn_scan(state.gpu()[0], allp, T0, self.hv, self.dk, self.dv,
+                                self.rep) if one_buf else None)
+            if scan is not None:
+                out, state.gpu()[0] = scan
+                y = self._norm_rows(out, T0)
+            if y is None:                       # no scan kernel here: step it
+                y = wt.cat([self._recur_from_packed(packed[t], state) for t in range(T0)],
+                           axis=0)
+            return self._gate_out(y, gp, nv)
         state = state.host()                       # host path owns the state from here
         x = np.asarray(x.numpy() if hasattr(x, "numpy") else x, np.float32)
         T = x.shape[0]

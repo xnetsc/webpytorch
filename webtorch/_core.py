@@ -6080,6 +6080,114 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 """.replace("SPSZ", str(64 * _GDN_SPLIT)).replace("SPu", "%du" % _GDN_SPLIT) \
    .replace("SPN", str(_GDN_SPLIT))
 
+# The whole recurrence for a whole prompt, in ONE dispatch.
+#
+# The per-token pair above costs two dispatches per token per layer. On a 65-layer hybrid
+# with 48 recurrent layers that is 2 x 48 x T: a 1100-token prompt spent 635 seconds before
+# its first token, and the arithmetic was never the problem -- 53,000 dispatches at the
+# fixed cost of a dispatch were.
+#
+# What makes one dispatch possible is that the state does not have to move. A workgroup owns
+# one (head, value-channel) pair, so it owns exactly the dk state elements S[h, :, vi]; those
+# live in registers for the whole scan, and the update that needed a second dispatch is just
+# those threads writing their own registers. T becomes a loop inside the kernel.
+#
+# The recurrence stays strictly sequential -- every workgroup walks t in order, and state t
+# is used before state t+1 is written -- so this is the same computation, not an
+# approximation of it.
+_GDN_SCAN_WGSL = """@group(0) @binding(0)
+var<storage,read_write> S: array<f32>;
+@group(0) @binding(1)
+var<storage,read> qkv: array<f32>;
+@group(0) @binding(2)
+var<storage,read_write> od: array<f32>;
+struct GD { hv: u32, dk: u32, dv: u32, rep: u32, T: u32, row: u32, }
+@group(0) @binding(3)
+var<storage,read> gd: GD;
+var<workgroup> rp: array<f32, 64>;
+var<workgroup> rq: array<f32, 64>;
+var<workgroup> rk: array<f32, 64>;
+var<workgroup> sh_delta: f32;
+var<workgroup> sh_dcy: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let lx = lid.x;
+  let i = wid.x + wid.z * nwg.x;            // folded dispatch: see the platform's runKernel
+  let n = gd.hv * gd.dv;
+  if (i >= n) { return; }                   // whole workgroup leaves together
+  let h = i / gd.dv;
+  let vi = i % gd.dv;
+  // q and k are stored per KEY head and the key heads CYCLE across value heads
+  // (ggml: iq1 = iv1 % n_q_heads), so this is a modulo, not a divide.
+  let hk = gd.hv / gd.rep;
+  let nq = hk * gd.dk;
+  let qo = (h % hk) * gd.dk;
+  let ko = nq + qo;
+  let sbase = h * gd.dk * gd.dv + vi;
+
+  // This workgroup's slice of the state, held for the whole scan. 8 slots covers dk <= 512;
+  // beyond that the kernel would silently drop terms, so the caller checks before using it.
+  var sv: array<f32, 8>;
+  for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+    let d = lx + j * 64u;
+    if (d < gd.dk) { sv[j] = S[sbase + d * gd.dv]; } else { sv[j] = 0.0; }
+  }
+
+  for (var t: u32 = 0u; t < gd.T; t = t + 1u) {
+    let base = t * gd.row;
+    var pred: f32 = 0.0;
+    var qs: f32 = 0.0;
+    var qk: f32 = 0.0;
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let d = lx + j * 64u;
+      if (d < gd.dk) {
+        let kd = qkv[base + ko + d];
+        let qd = qkv[base + qo + d];
+        pred = pred + kd * sv[j];
+        qs = qs + qd * sv[j];
+        qk = qk + qd * kd;
+      }
+    }
+    rp[lx] = pred; rq[lx] = qs; rk[lx] = qk;
+    workgroupBarrier();
+    // Tree reduction rather than one lane adding 64 numbers: the lane doing that is the
+    // whole workgroup's critical path, and this runs T times.
+    for (var off: u32 = 32u; off > 0u; off = off >> 1u) {
+      if (lx < off) {
+        rp[lx] = rp[lx] + rp[lx + off];
+        rq[lx] = rq[lx] + rq[lx + off];
+        rk[lx] = rk[lx] + rk[lx + off];
+      }
+      workgroupBarrier();
+    }
+    if (lx == 0u) {
+      let dcy = qkv[base + 2u * nq + n + h];
+      let bta = qkv[base + 2u * nq + n + gd.hv + h];
+      let vv  = qkv[base + 2u * nq + h * gd.dv + vi];
+      let delta = (vv - dcy * rp[0]) * bta;
+      od[t * n + i] = dcy * rq[0] + delta * rk[0];
+      sh_delta = delta;
+      sh_dcy = dcy;
+    }
+    workgroupBarrier();
+    // S = S * decay + outer(k, delta) -- the second dispatch of the per-token pair, done
+    // here by the threads that already hold the state.
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let d = lx + j * 64u;
+      if (d < gd.dk) { sv[j] = sv[j] * sh_dcy + qkv[base + ko + d] * sh_delta; }
+    }
+    workgroupBarrier();
+  }
+
+  for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+    let d = lx + j * 64u;
+    if (d < gd.dk) { S[sbase + d * gd.dv] = sv[j]; }
+  }
+}
+"""
+
 # S = S * decay + outer(k, delta), one thread per state element.
 _GDN_UPD_WGSL = """@group(0) @binding(0)
 var<storage,read_write> S: array<f32>;
@@ -6124,7 +6232,7 @@ var<storage,read_write> cst: array<f32>;
 var<storage,read> konst: array<f32>;
 @group(0) @binding(5)
 var<storage,read_write> outp: array<f32>;
-struct GP { hk: u32, hv: u32, dk: u32, dv: u32, W: u32, flags: u32, }
+struct GP { hk: u32, hv: u32, dk: u32, dv: u32, W: u32, flags: u32, base: u32, }
 @group(0) @binding(6)
 var<storage,read> gp: GP;
 var<workgroup> red: array<f32, 128>;
@@ -6146,10 +6254,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
       let sp = max(a, 0.0) + log(1.0 + exp(-abs(a)));
       var d = sp;
       if ((gp.flags & 4u) != 0u) { d = sp * konst[ko + t]; }
-      outp[2u * nq + nv + t] = exp(min(d, 0.0));
+      outp[gp.base + 2u * nq + nv + t] = exp(min(d, 0.0));
       var bv: f32 = 1.0;
       if ((gp.flags & 8u) != 0u) { bv = 1.0 / (1.0 + exp(-braw[t])); }
-      outp[2u * nq + nv + gp.hv + t] = bv;
+      outp[gp.base + 2u * nq + nv + gp.hv + t] = bv;
     }
     return;
   }
@@ -6189,10 +6297,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
     if (t < dim) {
       var v = val * inv;
       if (g < gp.hk) { v = v * inverseSqrt(f32(gp.dk)); }   // q also carries 1/sqrt(dk)
-      outp[c0 + t] = v;
+      outp[gp.base + c0 + t] = v;
     }
   } else if (t < dim) {
-    outp[c0 + t] = val;
+    outp[gp.base + c0 + t] = val;
   }
 }
 """
@@ -6200,7 +6308,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 _gdnp_k = {"added": False}
 
 
-def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
+def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags, base=0):
     """Conv + SiLU + L2 norm + gates, writing the packed q|k|v|decay|beta the step wants.
 
     Returns `(out, cst_next)`. `cst_next` is `cst` itself where the backend updates the
@@ -6211,6 +6319,12 @@ def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
 
     `flags` bits: 1 conv, 2 dt_bias, 4 A, 8 beta projection, 16 conv bias."""
     if _webgl_ready() and not _adam_backend_ready():
+        # The WebGL kernel writes from index 0 and has no offset. Callers ask `gdn_scan_ok`
+        # before packing a prompt into one buffer, so this is a contract violation rather
+        # than a case to handle quietly -- writing row 7 over row 0 would produce fluent,
+        # wrong output.
+        if base:
+            raise NotImplementedError("gdn_prepare: the WebGL path has no output offset")
         return _webgl_gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags)
     plat = _adam_kernel["platform"]
     if not _gdnp_k["added"]:
@@ -6218,7 +6332,8 @@ def gdn_prepare(qkv, braw, araw, cst, konst, out, hk, hv, dk, dv, W, flags):
         plat.addKernel("gdn_pre", {"source": _GDN_PRE_WGSL,
                                    "bindingTypes": [ro, ro, ro, rw, ro, rw, ro]})
         _gdnp_k["added"] = True
-    meta = _adam_kernel["make_meta"]((hk, hv, dk, dv, W, flags), "u4,u4,u4,u4,u4,u4")
+    meta = _adam_kernel["make_meta"]((hk, hv, dk, dv, W, flags, int(base)),
+                                     "u4,u4,u4,u4,u4,u4,u4")
     plat.runKernel({"name": "gdn_pre",
                     "tensors": [qkv.buffer.buffer_id, braw.buffer.buffer_id,
                                 araw.buffer.buffer_id, cst.buffer.buffer_id,
@@ -6465,6 +6580,51 @@ def gdn_step(S, qkv, hv, dk, dv, rep=1):
                                 od.buffer.buffer_id, meta.buffer_id],
                     "workGroups": {"x": (tot + 63) // 64, "y": 1, "z": 1}})
     return Tensor(od[:n]), S
+
+
+def gdn_scan_ok(dk):
+    """Can this backend run the whole recurrence in one dispatch for this head width?
+
+    Asked BEFORE a prompt is packed, because the packing differs: the scan wants one buffer
+    with a row per token, and the fallback wants a buffer per token.
+    """
+    if dk > 8 * 64:                       # the workgroup holds 8 registers of state per lane
+        return False
+    return not (_webgl_ready() and not _adam_backend_ready())
+
+
+def gdn_scan(S, qkv, T, hv, dk, dv, rep=1):
+    """The whole Gated-DeltaNet recurrence for T tokens, in one dispatch.
+
+    `qkv` holds T rows of the same packing `gdn_step` takes, laid out contiguously.
+    Returns (outputs (T, hv*dv), S) with the state advanced past the last row.
+
+    Returns None when it cannot be used, and the caller falls back to stepping: the state
+    slice a workgroup holds is 8 registers deep, so dk above 512 would silently drop terms,
+    and a backend without this kernel has nothing to run.
+    """
+    if not gdn_scan_ok(dk):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _gdn_scan_k["added"]:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel("gdn_scan", {"source": _GDN_SCAN_WGSL,
+                                    "bindingTypes": [rw, ro, rw, ro]})
+        _gdn_scan_k["added"] = True
+    n = hv * dv
+    nq = (hv // max(1, rep)) * dk
+    row = 2 * nq + n + 2 * hv
+    out = _empty((T * n,))
+    meta = _adam_kernel["make_meta"]((hv, dk, dv, max(1, rep), T, row),
+                                     "u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "gdn_scan",
+                    "tensors": [S.buffer.buffer_id, qkv.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": n, "y": 1, "z": 1}})
+    return Tensor(out).reshape(T, n), S
+
+
+_gdn_scan_k = {"added": False}
 
 
 class GGMLLinear(Module):
