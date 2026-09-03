@@ -375,6 +375,86 @@ class StopConstraint(Constraint):
         return any(s in text for s in self.stops)
 
 
+# Two ways to say what may come next.
+#
+# `allows(text, piece)` is asked about ONE candidate at a time, walking the model's ranking
+# until something is accepted. Easy to write -- a predicate, no knowledge of the tokenizer --
+# and bounded at 64 questions per token while the model's own top choices are acceptable.
+# When they are not, the sampler widens, and a constraint that permits only something rare
+# can be asked about the whole vocabulary: measured at 153,408 questions for one token.
+#
+# `decide(text, candidates)` is asked ONCE per token. It is handed everything on offer, best
+# first, and answers with a verdict AND the set that is permitted:
+#
+#     def decide(text, candidates):
+#         return webtorch.ALLOW, ["python", "javascript"]   # only these
+#         return webtorch.ALLOW, None                       # no opinion; keep the ranking
+#         return webtorch.ALLOW, []                         # none of these -- widen and ask again
+#         return webtorch.ALLOW_END, ["}"]                   # exactly this, and it is the last
+#
+# The permitted set is TEXT, and a candidate counts when its text is a prefix of one of them
+# or one of them is a prefix of it -- so a name that takes three tokens to spell is reachable
+# without the caller knowing how it splits. A permitted string that is nowhere in the
+# candidates is looked up in the vocabulary and offered anyway, which is how a caller forces
+# a token the model ranked nowhere.
+#
+# One call instead of sixty-four, and no widening loop when the set is small and known: a
+# tool name, an enum value, the terminals a grammar accepts next.
+class _Decider(Constraint):
+    """Wraps a `decide(text, candidates) -> (verdict, allowed)` callback."""
+
+    def __init__(self, decide, finished=None, reset=None):
+        if not callable(decide):
+            raise TypeError("needs a callable decide(text, candidates)")
+        self._decide = decide
+        self._finished = finished
+        self._reset = reset
+
+    def reset(self):
+        if self._reset is not None:
+            self._reset()
+
+    def decide(self, text, candidates):
+        got = self._decide(text, candidates)
+        if isinstance(got, tuple):
+            v, allowed = (list(got) + [None])[:2]
+            return verdict(v), allowed
+        # A bare list is a permitted set with nothing to say about what happens next; a bare
+        # verdict is a decision with no opinion on which candidate.
+        if isinstance(got, Verdict) or got is True or got is False or isinstance(got, str):
+            return verdict(got), None
+        return ALLOW, got
+
+    def allows(self, text, piece):
+        # The per-candidate form, derived, so a constraint written as `decide` still works
+        # everywhere a constraint is accepted -- composed with another one, or reached by a
+        # caller that only knows the predicate protocol.
+        v, opts = self.decide(text, [piece])
+        if not v.allow:
+            return v
+        return v if piece_ok(piece, opts) else DENY
+
+    def finished(self, text):
+        return bool(self._finished(text)) if self._finished is not None else False
+
+
+def piece_ok(piece, options):
+    """Is `piece` a step towards one of `options`? `None` means everything is.
+
+    Either direction counts. A piece shorter than an option is a prefix of it and is how a
+    multi-token option gets spelled out; a piece longer than an option overshoots but still
+    starts with it, which happens when one token covers a whole option and some of what
+    follows.
+    """
+    if options is None:
+        return True
+    for o in options:
+        o = str(o)
+        if o.startswith(piece) or piece.startswith(o):
+            return True
+    return False
+
+
 class CallbackConstraint(Constraint):
     """A plain function decides what may come next: `allows(text, piece) -> bool`.
 
@@ -452,6 +532,8 @@ def build(spec):
             return RegexConstraint(spec["regex"])
         if "stop" in spec:
             return StopConstraint(spec["stop"])
+        if callable(spec.get("decide")):
+            return _Decider(spec["decide"], spec.get("finished"), spec.get("reset"))
         if callable(spec.get("allows")):
             return CallbackConstraint(spec["allows"], spec.get("finished"),
                                       spec.get("reset"))

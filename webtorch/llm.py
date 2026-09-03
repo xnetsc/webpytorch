@@ -2089,8 +2089,12 @@ class CausalLM:
             lg = lg.copy()
             lg[eos] = -np.inf                           # not allowed to stop yet
         con = sp.get("constraint")
-        tok = (self._pick_constrained(lg, con, sp) if con is not None
-               else (self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())))
+        if con is not None and callable(getattr(con, "decide", None)):
+            tok = self._pick_decided(lg, con, sp)
+        elif con is not None:
+            tok = self._pick_constrained(lg, con, sp)
+        else:
+            tok = self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())
         self._seen.append(tok)
         if con is not None:
             self._con_text += self._con_dec.push([tok])
@@ -2142,6 +2146,78 @@ class CausalLM:
             dec = self.tok.decode
             self._piece_tab = [dec([i]) for i in range(len(self.tok.dec))]
         return self._piece_tab
+
+    def _pick_decided(self, lg, con, sp):
+        """One question per token: here is everything on offer, best first -- what is
+        permitted, and what happens next?
+
+        The other form (`_pick_constrained`) asks about one candidate at a time and is
+        bounded at the window size while the model's own top choices are acceptable; when
+        they are not it widens, and a constraint that permits only something rare gets asked
+        about the whole vocabulary -- measured at 153,408 questions for a single token. This
+        form is asked once and answers with the permitted SET, so a small known set (a tool
+        name, an enum value, a grammar's next terminals) costs one call and no widening.
+
+        A permitted string that matches nothing on offer is looked up in the vocabulary and
+        used anyway. That is how a caller forces a token the model ranked nowhere, which is
+        the case a predicate cannot express: it can only reject what it is shown.
+        """
+        from . import constrain
+        n = int(lg.size)
+        k0 = max(1, int(sp.get("constraint_candidates", 64) or 64))
+        for k in (min(k0, n), min(k0 * 16, n), n):
+            if k < n:
+                idx = np.argpartition(-lg, k - 1)[:k]
+                order = idx[np.argsort(-lg[idx])]
+            else:
+                order = np.argsort(-lg)
+            ids = [int(t) for t in order]
+            cands = [self._piece1(t) for t in ids]
+            v, opts = con.decide(self._con_text, cands)
+            v = constrain.verdict(v)
+            if v.then == constrain.THEN_END and not v.take:
+                # About the REPLY, not about a token: complete as it stands.
+                self._con_end = True
+                return int(self.tok.eot)
+            if not v.allow:
+                if v.then == constrain.THEN_FREE:
+                    # None of these, and nothing further to ask -- so the model's own ranking
+                    # decides from here.
+                    self._con_release = True
+                    return int(lg.argmax())
+                continue                      # nothing here; widen and ask again
+            keep = [t for t, p in zip(ids, cands) if constrain.piece_ok(p, opts)]
+            if not keep and opts:
+                # Ranked nowhere, so nothing here ordered them: put the model's own
+                # preference back on the forced set before picking from it.
+                keep = self._ids_for(opts)
+                keep.sort(key=lambda t: -lg[t])
+            if not keep:
+                continue
+            if not sp.get("do_sample"):
+                got = keep[0]
+            else:
+                sub = np.full_like(lg, -np.inf)
+                arr = np.asarray(keep, np.int64)
+                sub[arr] = lg[arr]
+                got = int(self._sample(sub, sp))
+            if v.then != constrain.THEN_ASK:
+                self._con_after = v.then
+            return got
+        return int(lg.argmax())
+
+    def _ids_for(self, options):
+        """Token ids that spell a step towards one of `options`, for a permitted string the
+        model ranked nowhere.
+
+        Costs one pass over the vocabulary, the first time a caller actually forces
+        something -- 150k single-token decodes here -- so it is built on demand and kept.
+        """
+        from . import constrain
+        index = self.__dict__.get("_piece_index")
+        if index is None:
+            index = self.__dict__["_piece_index"] = list(enumerate(self._pieces()))
+        return [i for i, p in index if p and constrain.piece_ok(p, options)]
 
     def _pick_constrained(self, lg, con, sp):
         """Sample from just the candidates the constraint accepts.
