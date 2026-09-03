@@ -1559,6 +1559,8 @@ def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
         # Nothing seq-squared is built at all -- see `_FLASH_WGSL`. The fused causal softmax
         # below is the previous step of the same argument and stays as the fallback for a
         # shape whose tiles do not fit workgroup memory.
+        if T >= _ATTN_CHUNK_MIN_T:
+            return chunked_attention(q, k, v, start=causal_start, scale=scale)
         if 2 * _FLASH_BQ * hd + _FLASH_BK * hd + _FLASH_BQ * _FLASH_BK <= 8192:
             return flash_attention(q, k, v, start=causal_start, scale=scale)
         a = Tensor(_fused_causal_softmax(bmm(qg, transpose_last2(k)).data,
@@ -2505,6 +2507,57 @@ def flash_tune(nh, nkv, hd, T=256):
     best = tune(key, cand, apply, bench, default=was)
     _FLASH_BQ, _FLASH_BK = best
     return best
+
+
+# Attention in query chunks, using the batched path's fast matmul.
+#
+# The flash kernel below never writes the score matrix, which is the right instinct and the
+# wrong trade on this backend: hand-written, it runs at 94 GFLOPS while the fp32 matmul next
+# to it does 1850. Materialising a CHUNK of scores at a time keeps the memory bounded and
+# spends the arithmetic where the machine is fast. Measured per layer, 0.6B, T=2816:
+# flash 179ms, this 49ms.
+#
+# Two details carry most of it. The matmuls are 2-D, one per KV head, because the 3-D
+# batched form is a different and much worse kernel -- 124 GFLOPS against 796 for the same
+# work split into eight 2-D calls. And the key extent is rounded up to a multiple of 32 for
+# the same alignment reason the prefill rounds its rows: the columns past the diagonal are
+# masked to zero by the softmax anyway.
+#
+# Chunks are joined with the GPU concatenate, never by assigning into a preallocated output:
+# WgPy's __setitem__ goes through the host, which is 14ms for 11MB.
+_ATTN_CHUNK = 1024
+# Below this many queries the flash kernel wins -- it is one dispatch against dozens, and at
+# short lengths the dispatches are the cost. Measured: T=256 flash 5.0ms / chunked 6.0ms,
+# T=512 flash 9.6 / chunked 6.2.
+_ATTN_CHUNK_MIN_T = 384
+
+
+def chunked_attention(q, k, v, start=0, scale=None, chunk=None):
+    """Causal grouped-query attention, one query chunk at a time."""
+    nh, T, hd = q.shape
+    nkv, S, _ = k.shape
+    rep = nh // nkv
+    if scale is None:
+        scale = 1.0 / (float(hd) ** 0.5)
+    CH = int(chunk or _ATTN_CHUNK)
+    qg = q.reshape(nkv, rep * T, hd)
+    kt = transpose_last2(k)
+    parts = []
+    for h in range(nkv):
+        khT = Tensor(_contig(kt.data[h]))                  # (hd, S)
+        vh = Tensor(_contig(v.data[h]))                    # (S, hd)
+        for r in range(rep):
+            for i0 in range(0, T, CH):
+                i1 = min(T, i0 + CH)
+                # Everything the LAST query of the chunk can see, rounded up for the matmul.
+                lim = min(S, ((start + i1 + 31) // 32) * 32)
+                qc = Tensor(_contig(qg.data[h][r * T + i0:r * T + i1]))
+                sc = qc @ Tensor(_contig(khT.data[:, :lim]))
+                pw = Tensor(_fused_causal_softmax(sc.data, i1 - i0, start + i0, scale))
+                parts.append(pw @ Tensor(_contig(vh.data[:lim])))
+    # The chunks were produced in (kv, rep, query) order, which is exactly the row order of
+    # the grouped layout, so joining them is the answer with no permutation.
+    return Tensor(cat(parts, axis=0).data.reshape(nh, T, hd))
 
 
 def flash_attention(q, k, v, start=0, scale=None):
