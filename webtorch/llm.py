@@ -2989,6 +2989,7 @@ class CausalLM:
         held = list(ids)
         plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)
+        wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
         dec = self.tok.stream_decoder()
@@ -3160,6 +3161,7 @@ class CausalLM:
         held = list(ids)                               # rows 0..P-1 hold these
         plat = wt._adam_kernel["platform"]
         self._set_inputs(g0, P)
+        wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
         plat.beginCapture("decode")
         logits_t = self._decode_fwd(); logits_t.numpy()
         plat.endCapture(); self.capture_ready = True

@@ -1861,6 +1861,81 @@ _GQA_FUSED = True      # A/B switch for the fused decode attention
 _GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 
 
+# Choosing the split factor by measuring it, because it cannot be chosen by reasoning.
+#
+# How many chunks fills a GPU best depends on the GPU, and on how long the conversation is,
+# and the two disagree: measured on one machine with a 0.6B, medians of interleaved replays,
+#
+#     split      1      4      8     16     32     64
+#     n=256   10.14   9.05   8.76   9.14   9.61  10.99
+#     n=2048  24.20  13.29  12.95  12.38  12.57  12.75
+#
+# -- 8 wins short, 16 wins long, 1 and 64 lose everywhere. A constant compiled in is a guess
+# about somebody else's machine; this asks the machine in front of it. The same is true of
+# every other shape constant here (`_GGML_WGX`, `_SMALL_N`, `_GGML_KS`), and one of them has
+# already been caught being wrong by 37% on shapes it was never measured on.
+#
+# Timed the only way these separate at all: candidates are captured once each and their
+# replays INTERLEAVED, compared by median. Run back to back instead, the same configuration
+# measured 7.61ms and 4.49ms on this machine -- enough drift to invert any ranking.
+_GQA_TUNED = {}
+
+def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
+    """Pick the split factor for this device at this context length, by running them.
+
+    Cheap enough to do at load: it times the attention kernel alone, not a whole step. The
+    answer is remembered per (shape, context bucket) -- `n` is bucketed by powers of four,
+    because the ranking moves with the order of magnitude of the scan and not with a token.
+    """
+    global _GQA_SPLIT
+    import time as _t
+    bucket = 1 << (max(0, int(n)).bit_length() // 2 * 2)
+    key = (int(nh), int(nkv), int(hd), int(bucket))
+    if key in _GQA_TUNED:
+        return _GQA_TUNED[key]
+    was, was_on = _GQA_SPLIT, _GQA_SPLIT_ON
+    # Sized to the scan being tuned for, not to the cache's capacity: a full-capacity pair
+    # is 67MB on an 8k context, which is a lot of allocation to answer a question about
+    # thread shape.
+    lmax = max(64, int(n))
+    q = Tensor(np.zeros((nh, 1, hd), np.float32))
+    kc = Tensor(_empty((nkv, lmax, hd)))
+    vc = Tensor(_empty((nkv, lmax, hd)))
+    mask = Tensor(np.zeros((1, 1, lmax), np.float32))
+    try:
+        outs = {}
+        for sp in candidates:
+            _set_split(sp)
+            outs[sp] = gqa_decode(q, kc, vc, mask, 1.0, valid=n)
+        for o in outs.values():
+            o.numpy()                                   # warm and settle
+        best, best_ms = was, None
+        times = {sp: [] for sp in candidates}
+        for _ in range(rounds):
+            for sp in candidates:
+                _set_split(sp)
+                t0 = _t.perf_counter()
+                gqa_decode(q, kc, vc, mask, 1.0, valid=n).numpy()
+                times[sp].append(_t.perf_counter() - t0)
+        for sp, xs in times.items():
+            xs.sort()
+            med = xs[len(xs) // 2]
+            if best_ms is None or med < best_ms:
+                best, best_ms = sp, med
+        _GQA_TUNED[key] = best
+        return best
+    except Exception:
+        return was
+    finally:
+        _GQA_SPLIT, _GQA_SPLIT_ON = was, was_on
+
+
+def _set_split(sp):
+    global _GQA_SPLIT, _GQA_SPLIT_ON
+    _GQA_SPLIT = int(sp)
+    _GQA_SPLIT_ON = int(sp) > 1
+
+
 def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     """Single-position grouped-query attention in one dispatch.
 
