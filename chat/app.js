@@ -2681,8 +2681,8 @@ function toolDefs() {
     return t.def;                       // nested {type:"function", function:{…}}
   });
 }
-// Whitespace, punctuation and case carry no meaning in a tool name: "run_ Python" is
-// "run_python" with noise in it. Exact match first; a name that is identical once the
+// Whitespace, punctuation and case carry no meaning in a tool name: " Python" is
+// "python" with noise in it. Exact match first; a name that is identical once the
 // noise is stripped is the model's intent stated plainly, so it runs — that is reading
 // what it said, not guessing what it meant.
 const normName = s => String(s || '').toLowerCase().replace(/[\s_\-.]+/g, '');
@@ -2802,7 +2802,7 @@ function callRegexes() {
 // format, spelled out in their own system prompt --
 //
 //     <tool_call>
-//     <function=run_python>
+//     <function=python>
 //     <parameter=code>
 //     print(6 * 7)
 //     </parameter>
@@ -3152,10 +3152,27 @@ function setToollogLive(live, log) {
 // is for, while `python` plus an action asks a small model for one more decision before it
 // can use anything at all -- and a 0.6B asked to multiply two large numbers talked itself
 // out of calling the merged tool. Not worth 5%.
+//
+// They are named `python` and `javascript`, not `run_python` and `run_javascript`. That is
+// a different question from the merge above -- still three tools, still no `action` to
+// decide -- and it is the one that decided whether a call worked at all. A `run_` prefix
+// reads as the start of a FILENAME, and a 0.6B completes it as one: it would name
+// `run_python` correctly while reading the definitions, then write "调用 run_2.py" a
+// sentence later and call that. Measured over 10 attempts at one arithmetic question,
+// with `run_` prefixes: 4 correct, 4 wrong names (`run_2`, `run_2_python`, `run_0_0`,
+// `run_20230920`, `run_ordinary_python`), 2 no call at all. Without them, over 12: 11
+// correct, 0 wrong, 1 no call.
+//
+// Sampling is not what fixes this and neither is temperature. By the time the call is
+// written the model has already committed to the wrong name in its own reasoning, and at
+// that point it is CERTAIN of it: measured on a real failing generation, the next token
+// after `{"name": "run_` was `2` at p=0.99978 (T=0.6) against `python` at 0.00015, so
+// greedy decoding inside the call would lock the mistake in rather than repair it, and
+// top_p=0.95 measured no better than none. The name has to not invite the mistake.
 registerTool({
   type: 'function',
   function: {
-    name: 'run_python',
+    name: 'python',
     // Terse on purpose. A definition is re-sent with EVERY request, so its prose is paid
     // for on every prompt and every decode step after it: written out at length these three
     // cost 781 tokens, which took a 0.6B from 110 tok/s to 64 and its first token from 0.3 s
@@ -3537,7 +3554,7 @@ function webTabsNode(pages, onClose, log, built) {
 registerTool({
   type: 'function',
   function: {
-    name: 'run_javascript',
+    name: 'javascript',
     description: 'Run JavaScript and get the output back. A sandbox with no page in it: '
       + 'document, window and location are not defined, and nothing is displayed. Each call '
       + 'starts empty, so nothing persists between calls. Top-level await works.\n'
@@ -3643,7 +3660,7 @@ registerTool({
   return { closed, tabs: openWebTabs() };
 });
 
-// Both tools report the same way -- and the same way `run_python` does, so a call's output
+// Both tools report the same way -- and the same way `python` does, so a call's output
 // reads alike whichever tool made it.
 function jsOut(r, withView) {
   const logs = r.logs || [];
