@@ -5555,6 +5555,26 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
                               type_name, N, K, err))
 
 
+# Rows above which unpacking the weights once and multiplying fast beats unpacking inside
+# the multiply. Measured on this machine, gate (K=1024 N=3072 Q4_K) and down (K=3072 N=1024
+# Q6_K), medians of interleaved replays, milliseconds:
+#
+#     M          1     2     4     8    16    32    64   256   512  1536
+#     quantised .75   .91  1.42  1.46  2.18  3.19  5.16  6.55 12.02 23.40
+#     dequant   1.54  1.62 1.54  2.26  2.98  1.44  1.81  1.69  2.52  4.83
+#
+# One and two rows belong to the quantised kernel and always will -- unpacking a whole weight
+# matrix to multiply one row is absurd, and the decode path is the hot one. From 32 rows the
+# other way wins and keeps winning, reaching 4.8x by the time a prefill is a real length.
+# Between 4 and 16 the two are inside each other's noise at one to three milliseconds, so the
+# threshold sits at the first size where the answer is not in doubt.
+#
+# Deliberately NOT tuned per device: the region where the choice is close is a couple of
+# milliseconds wide and a prefill is hundreds of rows, so measuring it on every load would
+# spend real time to move a boundary nothing lands on.
+_GGML_DEQ_M = 32
+
+
 def ggml_dequant(packed, type_name, K, N):
     """A packed ggml tensor as a plain (K, N) fp32 matrix, on the device.
 
@@ -5627,6 +5647,13 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
+    if (mode == 0 and eidx is None and not xper and m >= _GGML_DEQ_M
+            and _adam_backend_ready()):
+        # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
+        # quantised kernel; the only difference is fp32 rounding in the accumulation order.
+        w32 = Tensor(ggml_dequant(packed, type_name, K, N))
+        of = (Tensor(xf) @ w32).data
+        return of if bias is None else of + bias
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None
     key = (type_name, mode, small, moe, _GGML_KSG if mode == 0 else 0)
