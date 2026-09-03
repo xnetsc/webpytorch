@@ -62,6 +62,10 @@ def _tpl_raise(msg):
     raise ValueError(msg)
 
 
+# "not asked yet", distinct from "asked, and this model has no call format".
+_UNSET = object()
+
+
 class BPETokenizer:
     """Byte-level BPE (vocab + merges), with the special tokens and chat format discovered
     from the model itself.
@@ -75,6 +79,7 @@ class BPETokenizer:
     def __init__(self, vocab, merges, eos_ids=None, chat_format=None,
                  chat_template=None, control=None):
         self.enc = vocab
+        self._callfmt = _UNSET          # see `tool_call_format`; derived once, on demand
         # A model ships its own prompt layout. Probing the vocabulary for a known marker
         # gets the family right but not the details -- Qwen3 opens its turn with <think>,
         # which no amount of "this looks like ChatML" will tell you, and without it the
@@ -187,6 +192,101 @@ class BPETokenizer:
             self._tpl = False
             return None
         return self.encode_special(txt)
+
+    def render_chat_text(self, messages, add_generation_prompt=True, **kw):
+        """The model's own template applied to a message list -> TEXT, or None if it has
+        no usable template. `render_chat` is this plus tokenisation."""
+        if not self._tpl:
+            return None
+        try:
+            return self._tpl.render(
+                messages=messages, add_generation_prompt=add_generation_prompt,
+                bos_token=self._tok_str(self.SPECIALS.get("<s>")),
+                eos_token=self._tok_str(self.eot), **kw)
+        except Exception:
+            return None
+
+    def tool_call_format(self, tools=None):
+        """How THIS model writes a tool call: {"open", "close", "payload"}, or None.
+
+        Read from the template rather than assumed. The template is what turns `tool_calls`
+        into text, so rendering one whose name and arguments are known markers and reading
+        back what surrounds them gives the exact delimiters this model emits -- guessing that
+        everyone writes <tool_call> would be one family's convention stated as a standard.
+
+        `payload` is "flat" or "nested" for a JSON call and "xml" for the
+        <function=NAME><parameter=K> form some templates use instead.
+        """
+        if self._callfmt is not _UNSET:
+            return self._callfmt
+        self._callfmt = None
+        N, A, V = "zzprobenamezz", "zzprobeargzz", "zzprobevalzz"
+        rc = self.render_chat_text(
+            [{"role": "user", "content": "hi"},
+             {"role": "assistant", "content": "",
+              "tool_calls": [{"id": "zzprobeidzz", "type": "function",
+                              "function": {"name": N, "arguments": {A: V}}}]}],
+            tools=tools)
+        if not rc:
+            return None
+        i = rc.find(N)
+        if i < 0:
+            return None
+        NL = chr(10)
+
+        def _lines_before(upto):
+            xs = [x for x in rc[:upto].split(NL) if x.strip()]
+            return xs[-1] if xs else ""
+
+        def _line_after(frm):
+            xs = [x for x in rc[frm:].split(NL) if x.strip()]
+            return xs[0] if xs else ""
+
+        # The payload is the object that CONTAINS the name, and it is the WIDEST such object
+        # that parses on its own -- not the nearest brace. A template that renders its tool
+        # DEFINITIONS as JSON earlier in the prompt puts a brace before the call that closes
+        # before the call begins; taking that one reported a fragment of the definitions as
+        # the delimiters, after which nothing the model wrote ever matched. Parsing is what
+        # stops the search going too far: a span reaching back into the definitions has prose
+        # in it and does not parse.
+        st = en = -1
+        cand = rc.rfind("{", 0, i)
+        while cand >= 0:
+            d, e = 0, -1
+            for q in range(cand, len(rc)):
+                if rc[q] == "{":
+                    d += 1
+                elif rc[q] == "}":
+                    d -= 1
+                    if d == 0:
+                        e = q + 1
+                        break
+            if e > i:
+                try:
+                    json.loads(rc[cand:e])
+                    st, en = cand, e
+                except Exception:
+                    pass
+            cand = rc.rfind("{", 0, cand)
+        if en > 0:
+            try:
+                obj = json.loads(rc[st:en])
+                payload = "nested" if ("function" in obj and "name" not in obj) else "flat"
+            except Exception:
+                payload = None
+            self._callfmt = {"open": _lines_before(st), "close": _line_after(en),
+                             "payload": payload}
+            return self._callfmt
+        # No JSON payload: several templates write the call as XML instead. The name is
+        # present in that form too, so this cannot hang off "name not found" -- it hangs off
+        # "no payload was read".
+        fx = rc.rfind("<function=", 0, i + len(N))
+        if fx >= 0:
+            fe = rc.find("</function>", fx)
+            self._callfmt = {"open": _lines_before(fx),
+                             "close": _line_after(fe + len("</function>")) if fe >= 0 else "",
+                             "payload": "xml"}
+        return self._callfmt
 
     def _tok_str(self, i):
         return self.dec.get(int(i), "") if i is not None and int(i) >= 0 else ""
@@ -2077,6 +2177,39 @@ class CausalLM:
         con = (getattr(self, "_sampling", None) or {}).get("constraint")
         return bool(con is not None and con.finished(self._con_text))
 
+    def _tool_name_constraint(self, tools, constraint):
+        """Hold the model to the tool names it was actually given, composed with whatever
+        constraint the caller asked for.
+
+        Installed automatically whenever `tools=` is passed, because a name the caller never
+        registered cannot be run and there is no reading of it that helps: a 0.6B that has
+        talked itself into `run_2.py` writes that into the call and is CERTAIN of it --
+        p=0.9998 on the wrong token, measured -- so nothing that reweights the distribution
+        recovers it, only removing the token from the candidate set does.
+
+        Both halves are derived, never written down: the names come from this call's own
+        `tools`, and the delimiter from the model's own template (`tool_call_format`). A
+        model whose call format cannot be read is left unconstrained rather than guessed at.
+        """
+        names = []
+        for t in (tools or []):
+            if not isinstance(t, dict):
+                continue
+            f = t.get("function")
+            n = (f.get("name") if isinstance(f, dict) else None) or t.get("name")
+            if n:
+                names.append(str(n))
+        if not names:
+            return constraint
+        fmt = self.tok.tool_call_format(tools) or {}
+        if not fmt.get("open"):
+            return constraint
+        from . import constrain
+        tc = constrain.ToolNameConstraint(names, fmt.get("open"), fmt.get("payload"))
+        if constraint is None:
+            return tc
+        return constrain.AllOf([constrain.build(constraint), tc])
+
     def _set_sampling(self, temperature=None, top_p=None, top_k=None, seed=None, do_sample=None,
                       repetition_penalty=None, min_p=None, constraint=None,
                       min_new_tokens=None, prompt_ids=None, presence_penalty=None,
@@ -2601,7 +2734,8 @@ class CausalLM:
                     box["close"] = c
                     break
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, constraint, min_new_tokens, prompt_ids=ids,
+                           min_p, self._tool_name_constraint(tools, constraint),
+                           min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
         t0 = time.perf_counter()
@@ -2763,7 +2897,8 @@ class CausalLM:
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, constraint, min_new_tokens, prompt_ids=ids,
+                           min_p, self._tool_name_constraint(tools, constraint),
+                           min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
         self._reset_linear_state()                     # fresh recurrent state per generation

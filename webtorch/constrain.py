@@ -208,6 +208,78 @@ class RegexConstraint(Constraint):
         return self.rx.fullmatch(text) is not None
 
 
+class ToolNameConstraint(Constraint):
+    """Inside a tool call, the name must be one the caller actually registered.
+
+    A model that has talked itself into the wrong name is CERTAIN of it by the time it
+    writes the call -- measured at p=0.9998 on the wrong token -- so nothing that reweights
+    the distribution repairs it: not a lower temperature, not top-p. Removing the token from
+    the candidate set does, which is what a constraint is for.
+
+    Everything outside a call is left alone; prose is prose. The set of names is whatever
+    was passed to this generation, and the delimiter comes from the model's own template
+    (see `tool_call_format`), so nothing here is written down in advance.
+
+    `payload` says where the name sits: a JSON call writes `"name": "X"`, an XML one writes
+    `<function=X>`. Both are located relative to the opening delimiter, so an opener that
+    could not be derived means no constraint rather than a guessed one.
+    """
+
+    # Only the tail is scanned. The name follows its opening delimiter within a few dozen
+    # characters, and `allows` runs per candidate per token -- scanning the whole reply each
+    # time would make the cost of a constraint grow with the length of the thing it guards.
+    WINDOW = 400
+
+    def __init__(self, names, open_tag=None, payload=None):
+        self.names = sorted({str(n) for n in (names or []) if n})
+        self.open = str(open_tag or "")
+        self.payload = payload or "flat"
+
+    def _pending(self, s):
+        """What has been written of a name so far, and whether it is finished -- or None
+        when the text is not inside a name."""
+        if not self.names or not self.open:
+            return None
+        tail = s[-self.WINDOW:]
+        i = tail.rfind(self.open)
+        if i < 0:
+            return None
+        rest = tail[i + len(self.open):]
+        if self.payload == "xml":
+            j = rest.rfind("<function=")
+            if j < 0:
+                return None
+            got = rest[j + len("<function="):]
+            end = got.find(">")
+        else:
+            j = rest.rfind('"name"')
+            if j < 0:
+                return None
+            got = rest[j + len('"name"'):]
+            k = got.find(":")
+            if k < 0:
+                return None
+            got = got[k + 1:].lstrip()
+            if not got.startswith('"'):
+                # the opening quote has not been written yet; nothing to check, but do not
+                # let anything other than the quote start the value
+                return ("", False) if got == "" else None
+            got = got[1:]
+            end = got.find('"')
+        if end >= 0:
+            return (got[:end], True)
+        return (got, False)
+
+    def allows(self, text, piece):
+        got = self._pending(text + piece)
+        if got is None:
+            return True
+        name, done = got
+        if done:
+            return name in self.names
+        return any(n.startswith(name) for n in self.names)
+
+
 class StopConstraint(Constraint):
     """Stop at any of the given strings (in addition to the model's end-of-turn token)."""
 
