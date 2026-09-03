@@ -1858,7 +1858,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
 _gqa_k = {"added": False}
 _GQA_FUSED = True      # A/B switch for the fused decode attention
-_GQA_SPLIT_ON = False  # A/B switch for the split-sequence decode attention (off until verified)
+_GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 
 
 def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
