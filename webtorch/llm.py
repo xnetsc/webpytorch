@@ -2357,12 +2357,19 @@ class CausalLM:
         if new <= cap:
             return
         NKV, HD = self.NKV, self.HD
-        live = min(len(self.__dict__.get("_kv_ids") or []), cap)
+        # Carry over the WHOLE old cache, not the part `_kv_ids` names. That list is written
+        # when a reply ENDS, so while one is being written it still names the previous turn --
+        # and this runs mid-reply, every time `pos` reaches the cap. Trusting it here threw
+        # away every row the reply had just written; on the first reply of a session there is
+        # no list at all, so it kept nothing and the model went on attending over zeros. That
+        # is a reply that starts perfectly and turns to noise a few hundred tokens in.
+        # Rows past what is live are never read -- attention scans `pos + 1` of them -- so
+        # copying all `cap` of them is simply correct, and costs one pass over a buffer that
+        # is at most half the size of the one being allocated.
         for box in (self.Kc, self.Vc):
             for i, old in enumerate(box):
                 grown = wt.Tensor(wt._zeros((NKV, new, HD)))
-                if live:
-                    grown.data[:, :live, :] = old.data[:, :live, :]
+                grown.data[:, :cap, :] = old.data[:, :cap, :]
                 box[i] = grown
         self.mask_b = wt.Tensor(np.zeros((1, 1, new), np.float32))
         self.ctl.buffer.set_data(np.array([0, 1, NKV, HD, new], np.int32))
