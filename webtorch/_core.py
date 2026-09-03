@@ -5574,6 +5574,23 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
 # spend real time to move a boundary nothing lands on.
 _GGML_DEQ_M = 32
 
+# Rows the fp32 matmul wants its input to be a multiple of. Its tiled kernel only runs when
+# they are, and missing it costs seven times -- at K=1024 N=3072, 1850 GFLOPS at M=2816
+# against 249 at M=2800. Every multiple of 32 measured fast (2816, 2848, 2880, 2944, 3008)
+# and every non-multiple slow (2800, 2801, 2802, 2804, 2808, 2832).
+#
+# The alignment is NOT done here. Padding inside the matmul is padding once per call -- 196
+# times in a prefill -- and the copy that does it goes through the host: 14.2ms for 11.5MB,
+# which measured 3.4s of a 4.8s matmul phase, more than the fast path was saving. The caller
+# rounds its own rows up once instead (see `_prefill`), and a caller that has not simply
+# keeps the quantised kernel, which does not care.
+_MATMUL_ROW_ALIGN = 32
+
+
+def _matmul_row_align():
+    """Rows the batched path wants a multiple of, for a caller that can arrange it."""
+    return _MATMUL_ROW_ALIGN if _adam_backend_ready() else 1
+
 
 def ggml_dequant(packed, type_name, K, N):
     """A packed ggml tensor as a plain (K, N) fp32 matrix, on the device.
@@ -5648,26 +5665,11 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
     if (mode == 0 and eidx is None and not xper and m >= _GGML_DEQ_M
-            and _adam_backend_ready()):
+            and m % _MATMUL_ROW_ALIGN == 0 and _adam_backend_ready()):
         # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
         # quantised kernel; the only difference is fp32 rounding in the accumulation order.
         w32 = Tensor(ggml_dequant(packed, type_name, K, N))
-        # Pad the rows to a multiple of 32. The fp32 matmul has a tiled path that only runs
-        # when they are, and the difference is not a few percent: at K=1024 N=3072, M=2816
-        # runs at 1850 GFLOPS and M=2800 at 249 -- seven times, for sixteen rows. Multiples
-        # of 32 measured fast at every size tried (2816, 2848, 2880, 2944, 3008) and every
-        # non-multiple slow (2800, 2801, 2802, 2804, 2808, 2832).
-        #
-        # A prompt is whatever length it is, so without this the fast path is a coin toss
-        # that a prefill loses 31 times out of 32. The padding rows are never read back, so
-        # they are left uninitialised -- a matmul does not mix rows.
-        pad = (-m) % 32
-        if pad:
-            xp = _empty((m + pad, int(K)))
-            xp[:m] = xf
-            of = (Tensor(xp) @ w32).data[:m]
-        else:
-            of = (Tensor(xf) @ w32).data
+        of = (Tensor(xf) @ w32).data
         return of if bias is None else of + bias
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None

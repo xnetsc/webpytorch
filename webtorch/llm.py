@@ -63,6 +63,15 @@ def _tpl_raise(msg):
 
 
 # "not asked yet", distinct from "asked, and this model has no call format".
+def _matmul_row_align():
+    """Rows the batched matmul wants its input to be a multiple of, or 1 when the fast path
+    is not in use. Asked of the backend rather than written down twice."""
+    try:
+        return wt._matmul_row_align()
+    except Exception:
+        return 1
+
+
 _UNSET = object()
 
 
@@ -2921,8 +2930,28 @@ class CausalLM:
         `_kv_prefix`. The new tokens then carry rotary positions `start..start+T-1` and
         attend back over everything from 0, so the result is identical to prefilling the
         whole sequence; only the work already done is skipped."""
-        T = len(ids); H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
         LMAX = self.kv_cap                    # the rows on the device, not the context
+        # Round the prompt up to a multiple of 32 rows, ONCE, here.
+        #
+        # The fp32 matmul the batched path uses has a tiled kernel that only runs when the
+        # row count is a multiple of 32, and missing it costs seven times: 1850 GFLOPS
+        # against 249. Padding inside the matmul instead means padding 196 times a prefill,
+        # and the copy that does it goes through the host -- 14.2ms for 11.5MB, which came to
+        # 3.4s of a 4.8s matmul phase. Paid once, it is 31 rows at worst.
+        #
+        # The extra rows are harmless: attention is causal, so a real query never sees a row
+        # that comes after it, and the cache rows they write sit past the prompt where the
+        # next tokens overwrite them -- `pos` counts real tokens only, and the decode kernel
+        # reads that many.
+        T_real = len(ids)
+        if embeds is None and _matmul_row_align() > 1:
+            step = _matmul_row_align()
+            room = max(0, int(LMAX) - start - T_real)
+            grow = min((-T_real) % step, room)
+            if grow:
+                ids = list(ids) + [ids[-1]] * grow
+        T = len(ids)
         end = start + T
         c, s = self._rope_np(start, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
@@ -2966,8 +2995,9 @@ class CausalLM:
                 wt.gpu_reap()
         # Kept, not just passed on: the load-time smoke test needs the logits this produced,
         # and the tensor is built here either way.
+        # The LAST REAL row, which is not the last row when the prompt was padded above.
         self._last_prefill_hidden = wt.Tensor(wt._contig(
-            self._rms(h, self.final_norm).data[-1:]))
+            self._rms(h, self.final_norm).data[T_real - 1:T_real]))
         return self._head_argmax(self._last_prefill_hidden)
 
     def _set_inputs(self, token, pos):
