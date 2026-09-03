@@ -1556,8 +1556,11 @@ def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
         scale = 1.0 / (float(hd) ** 0.5)               # host-side Python float, not a WgPy tensor pow
     qg = q.reshape(nkv, rep * T, hd)
     if causal_start is not None and _adam_backend_ready() and not q.requires_grad:
-        # One pass instead of four: the scale and the causal mask ride inside the softmax,
-        # and the mask is never built -- see `_SOFTMAX_CAUSAL_WGSL`.
+        # Nothing seq-squared is built at all -- see `_FLASH_WGSL`. The fused causal softmax
+        # below is the previous step of the same argument and stays as the fallback for a
+        # shape whose tiles do not fit workgroup memory.
+        if 2 * _FLASH_BQ * hd + _FLASH_BK * hd + _FLASH_BQ * _FLASH_BK <= 8192:
+            return flash_attention(q, k, v, start=causal_start, scale=scale)
         a = Tensor(_fused_causal_softmax(bmm(qg, transpose_last2(k)).data,
                                          T, causal_start, scale))
     else:
@@ -2465,8 +2468,43 @@ _flash_k = {}
 # Tile shape. BQ*hd + BK*hd + BQ*BK + BQ*hd floats of workgroup memory must fit the 32KB
 # limit: at hd=128 that is (8+32+8)*128 + 8*32 = 6400 floats = 25.6KB. Both are candidates
 # for `tune` once there is a second machine to disagree about them.
-_FLASH_BQ = 8
-_FLASH_BK = 32
+_FLASH_BQ = 16
+_FLASH_BK = 8
+
+
+def flash_tune(nh, nkv, hd, T=256):
+    """Pick the tile shape on this device. The candidates that fit 32KB of workgroup memory
+    differ by more than 2x on one machine -- (8,32) is the slowest of them and was the value
+    guessed first -- so this is measured, not chosen.
+
+    Tuned once at a short sequence and reused for all of them: the ranking is about how many
+    queries one loaded K tile serves, which does not change with length. Measured, the order
+    is identical at 256, 512 and 1536 tokens.
+    """
+    global _FLASH_BQ, _FLASH_BK
+    key = ("flash_tile", int(nh), int(nkv), int(hd))
+    if key in _TUNED:
+        _FLASH_BQ, _FLASH_BK = _TUNED[key]
+        return _TUNED[key]
+    if _adam_kernel.get("platform") is None:
+        return (_FLASH_BQ, _FLASH_BK)
+    cand = [(bq, bk) for bq, bk in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32))
+            if 2 * bq * int(hd) + bk * int(hd) + bq * bk <= 8192]
+    q = Tensor(np.zeros((nh, T, hd), np.float32))
+    k = Tensor(_empty((nkv, T, hd)))
+    v = Tensor(_empty((nkv, T, hd)))
+    was = (_FLASH_BQ, _FLASH_BK)
+
+    def apply(p):
+        global _FLASH_BQ, _FLASH_BK
+        _FLASH_BQ, _FLASH_BK = p
+
+    def bench():
+        _contig(flash_attention(q, k, v, start=0, scale=1.0).data[:1, :1, :1]).get()
+
+    best = tune(key, cand, apply, bench, default=was)
+    _FLASH_BQ, _FLASH_BK = best
+    return best
 
 
 def flash_attention(q, k, v, start=0, scale=None):

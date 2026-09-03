@@ -2700,6 +2700,7 @@ class CausalLM:
                     seen.add(key)
                     x = wt.Tensor(np.zeros((1, int(v.Kt)), np.float32))
                     v(x).numpy()
+            wt.flash_tune(self.NH, self.NKV, self.HD)
         except Exception:
             pass
 
