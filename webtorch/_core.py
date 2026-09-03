@@ -2326,6 +2326,187 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 """
+# Prefill attention with the score matrix never written down.
+#
+# The path this replaces materialises it: at a 1536-token prompt the scores are 151MB PER
+# LAYER, written by one batched matmul, read by a softmax, read again by a second batched
+# matmul. Measured per layer at that length: 133.5ms to write them, 9.7ms to soft-max them,
+# 69.7ms to read them back -- 213ms a layer, 6.0s across 28, and the two matmuls run at 72
+# and 139 GFLOPS because they are moving a buffer, not doing arithmetic.
+#
+# Here a workgroup owns BQ queries and walks the keys in tiles of BK, keeping the running
+# (max, sum, accumulator) of the online softmax in workgroup memory. Scores exist only
+# inside the tile loop. Nothing seq-squared is allocated, read or written at all -- the
+# traffic becomes K and V once each instead of the score matrix three times.
+#
+# The same online-softmax merge as the split decode kernel, and exact for the same reason:
+# rescaling a partial sum by exp(m_old - m_new) is what the algorithm already does between
+# blocks. Causality is a comparison on indices, so tiles entirely past the diagonal are
+# skipped rather than computed and discarded.
+_FLASH_WGSL = """@group(0) @binding(0)
+var<storage,read_write> outp: array<f32>;
+@group(0) @binding(1)
+var<storage,read> qg: array<f32>;
+@group(0) @binding(2)
+var<storage,read> kc: array<f32>;
+@group(0) @binding(3)
+var<storage,read> vc: array<f32>;
+struct FMeta { nkv: u32, rep: u32, T: u32, S: u32, hd: u32, start: u32, scale: f32, }
+@group(0) @binding(4)
+var<storage,read> fm: FMeta;
+var<workgroup> qs: array<f32, BQxHD>;
+var<workgroup> kvs: array<f32, BKxHD>;
+var<workgroup> sc: array<f32, BQxBK>;
+var<workgroup> acc: array<f32, BQxHD>;
+var<workgroup> mrun: array<f32, BQu>;
+var<workgroup> lrun: array<f32, BQu>;
+var<workgroup> crun: array<f32, BQu>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  let tiles = (fm.T + BQu - 1u) / BQu;
+  let b = wid.x / tiles;                 // which (kv, rep) row block
+  let tq = wid.x % tiles;                // which query tile inside it
+  let kv = b / fm.rep;
+  let i0 = tq * BQu;                     // first query index of this tile
+  let qbase = (b * fm.T + i0) * fm.hd;
+  let kvbase = kv * fm.S * fm.hd;
+
+  // Queries and the accumulator stay resident for the whole scan; the scores never leave.
+  for (var x: u32 = t; x < BQu * fm.hd; x = x + 128u) {
+    let r = x / fm.hd;
+    qs[x] = select(0.0, qg[qbase + x], i0 + r < fm.T);
+    acc[x] = 0.0;
+  }
+  if (t < BQu) { mrun[t] = -1e30; lrun[t] = 0.0; crun[t] = 1.0; }
+  workgroupBarrier();
+
+  // Only keys the LAST query of this tile can see are worth visiting: everything past the
+  // diagonal is skipped rather than computed and thrown away.
+  let hi = min(fm.S, fm.start + min(i0 + BQu - 1u, fm.T - 1u) + 1u);
+  var j0: u32 = 0u;
+  loop {
+    if (j0 >= hi) { break; }
+    let jn = min(BKu, hi - j0);
+    for (var x: u32 = t; x < BKu * fm.hd; x = x + 128u) {
+      let j = x / fm.hd;
+      kvs[x] = select(0.0, kc[kvbase + (j0 + j) * fm.hd + (x % fm.hd)], j < jn);
+    }
+    workgroupBarrier();
+
+    for (var x: u32 = t; x < BQu * BKu; x = x + 128u) {
+      let r = x / BKu;
+      let j = x % BKu;
+      var d0: f32 = -1e30;
+      if (j < jn && i0 + r < fm.T && j0 + j <= fm.start + i0 + r) {
+        var dd: f32 = 0.0;
+        for (var d: u32 = 0u; d < fm.hd; d = d + 1u) {
+          dd = dd + qs[r * fm.hd + d] * kvs[j * fm.hd + d];
+        }
+        d0 = dd * fm.scale;
+      }
+      sc[x] = d0;
+    }
+    workgroupBarrier();
+
+    // One lane per query row folds this tile into that row's running softmax, and leaves
+    // behind the factor the accumulator has to be rescaled by.
+    if (t < BQu) {
+      var m_new: f32 = mrun[t];
+      for (var j: u32 = 0u; j < BKu; j = j + 1u) {
+        m_new = max(m_new, sc[t * BKu + j]);
+      }
+      var ssum: f32 = 0.0;
+      for (var j: u32 = 0u; j < BKu; j = j + 1u) {
+        let v = sc[t * BKu + j];
+        let e = select(0.0, exp(v - m_new), v > -1e29);
+        sc[t * BKu + j] = e;
+        ssum = ssum + e;
+      }
+      let corr = select(0.0, exp(mrun[t] - m_new), mrun[t] > -1e29);
+      crun[t] = corr;
+      lrun[t] = lrun[t] * corr + ssum;
+      mrun[t] = m_new;
+    }
+    workgroupBarrier();
+
+    // V reuses the staging K is done with; the scores for this tile are already exp'd.
+    for (var x: u32 = t; x < BKu * fm.hd; x = x + 128u) {
+      let j = x / fm.hd;
+      kvs[x] = select(0.0, vc[kvbase + (j0 + j) * fm.hd + (x % fm.hd)], j < jn);
+    }
+    workgroupBarrier();
+
+    for (var x: u32 = t; x < BQu * fm.hd; x = x + 128u) {
+      let r = x / fm.hd;
+      let d = x % fm.hd;
+      var o: f32 = acc[x] * crun[r];
+      for (var j: u32 = 0u; j < BKu; j = j + 1u) {
+        o = o + sc[r * BKu + j] * kvs[j * fm.hd + d];
+      }
+      acc[x] = o;
+    }
+    workgroupBarrier();
+    j0 = j0 + BKu;
+  }
+
+  for (var x: u32 = t; x < BQu * fm.hd; x = x + 128u) {
+    let r = x / fm.hd;
+    if (i0 + r < fm.T) {
+      outp[qbase + x] = acc[x] / max(lrun[r], 1e-30);
+    }
+  }
+}
+"""
+
+
+_flash_k = {}
+# Tile shape. BQ*hd + BK*hd + BQ*BK + BQ*hd floats of workgroup memory must fit the 32KB
+# limit: at hd=128 that is (8+32+8)*128 + 8*32 = 6400 floats = 25.6KB. Both are candidates
+# for `tune` once there is a second machine to disagree about them.
+_FLASH_BQ = 8
+_FLASH_BK = 32
+
+
+def flash_attention(q, k, v, start=0, scale=None):
+    """Causal grouped-query attention that never writes the score matrix.
+
+    q (nh, T, hd); k, v (nkv, S, hd). Query i attends to keys 0..start+i, which is what a
+    continued prefill needs -- the cache already holds `start` positions before these.
+    """
+    nh, T, hd = q.shape
+    nkv, S, _ = k.shape
+    rep = nh // nkv
+    if scale is None:
+        scale = 1.0 / (float(hd) ** 0.5)
+    plat = _adam_kernel["platform"]
+    key = (_FLASH_BQ, _FLASH_BK, int(hd))
+    if key not in _flash_k:
+        src = (_FLASH_WGSL.replace("BQxHD", str(_FLASH_BQ * int(hd)))
+                          .replace("BKxHD", str(_FLASH_BK * int(hd)))
+                          .replace("BQxBK", str(_FLASH_BQ * _FLASH_BK))
+                          .replace("BQu", "%du" % _FLASH_BQ)
+                          .replace("BKu", "%du" % _FLASH_BK))
+        plat.addKernel("flash_%d_%d_%d" % key,
+                       {"source": src,
+                        "bindingTypes": ["storage"] + ["read-only-storage"] * 4})
+        _flash_k[key] = True
+    qg = _contig(q.reshape(nkv, rep * T, hd).data)
+    kc = _contig(k.data)
+    vc = _contig(v.data)
+    of = _empty((nkv * rep * T * hd,))
+    meta = _adam_kernel["make_meta"]((nkv, rep, T, S, hd, int(start), float(scale)),
+                                     "u4,u4,u4,u4,u4,u4,f4")
+    tiles = (T + _FLASH_BQ - 1) // _FLASH_BQ
+    plat.runKernel({"name": "flash_%d_%d_%d" % key,
+                    "tensors": [of.buffer.buffer_id, qg.buffer.buffer_id,
+                                kc.buffer.buffer_id, vc.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": nkv * rep * tiles, "y": 1, "z": 1}})
+    return Tensor(of.reshape(nh, T, hd))
+
+
 # Scale, causal mask and softmax in ONE pass over the score matrix.
 #
 # The prefill path used to do them as four separate ones -- `a * scale`, `a + mask`, then the
