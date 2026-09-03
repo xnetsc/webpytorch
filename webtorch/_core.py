@@ -1878,6 +1878,107 @@ _GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 # Timed the only way these separate at all: candidates are captured once each and their
 # replays INTERLEAVED, compared by median. Run back to back instead, the same configuration
 # measured 7.61ms and 4.49ms on this machine -- enough drift to invert any ranking.
+# ---- picking shape constants by measuring them ----------------------------------------
+#
+# Workgroup widths, split factors and the thresholds that choose between thread shapes are
+# properties of the MACHINE and of the shapes a given model uses -- not of the algorithm.
+# A number compiled in here is a guess about somebody else's GPU, and the guesses have been
+# caught wrong: the decode matmul's narrow/wide threshold, measured on shapes it was never
+# measured on, picks the slower kernel by 37%.
+#
+# So they are run instead. Two rules, both learned the hard way:
+#
+#  - INTERLEAVE and take medians. Timed back to back, one unchanged configuration measured
+#    7.61ms and then 4.49ms on this stack -- drift enough to invert any ranking, which is
+#    how a guess gets confirmed by accident.
+#  - GATE ON CORRECTNESS FIRST. A WGSL kernel that fails to compile returns zeros without
+#    raising, and a kernel that does nothing is very fast. A candidate that cannot be shown
+#    to compute the right answer is dropped before it is ever timed.
+_TUNED = {}
+
+
+def tune(key, candidates, apply, bench, check=None, rounds=5, default=None):
+    """The best of `candidates` on this device, remembered under `key`.
+
+    `apply(v)` installs a candidate, `bench()` runs the work once and returns only when the
+    GPU has, `check(v)` (optional) returns True if the candidate is correct.
+    """
+    if key in _TUNED:
+        return _TUNED[key]
+    import time as _t
+    ok = []
+    for v in candidates:
+        try:
+            apply(v)
+            if check is not None and not check(v):
+                continue
+            bench()
+            ok.append(v)
+        except Exception:
+            continue
+    if not ok:
+        _TUNED[key] = default
+        return default
+    times = {v: [] for v in ok}
+    for _ in range(rounds):
+        for v in ok:
+            apply(v)
+            t0 = _t.perf_counter()
+            bench()
+            times[v].append(_t.perf_counter() - t0)
+    best, best_ms = None, None
+    for v, xs in times.items():
+        xs.sort()
+        med = xs[len(xs) // 2]
+        if best_ms is None or med < best_ms:
+            best, best_ms = v, med
+    _TUNED[key] = best
+    return best
+
+
+# Which thread shape the decode matmul should use for one (format, N, K), decided by running
+# all three rather than by comparing N against a constant. The kernels already exist -- this
+# only stops `_SMALL_N` being the thing that chooses between them.
+def _ggml_shape_for(type_name, N, K, packed):
+    """The thread shape the decode matmul should use for this (format, N, K), decided by
+    running all three on this device with THIS model's own weights.
+
+    The kernels already exist; this only stops a compiled-in threshold being what chooses
+    between them. Each candidate is self-checked before it is timed -- a shader that failed
+    to compile returns zeros without raising, and doing nothing is fast.
+    """
+    vals = _GGML_TYPES[type_name][2]
+    fallback = _shape_kind(N, K, vals)
+    key = ("ggml_shape", type_name, int(N), int(K))
+    if key in _TUNED:
+        return _TUNED[key]
+    if _adam_kernel.get("platform") is None:
+        return fallback
+    nb = max(1, int(K) // max(1, vals))
+    xd = _contig(Tensor(np.zeros((1, int(K)), np.float32)).data)
+    state = {"kind": fallback}
+
+    def apply(kind):
+        state["kind"] = kind
+        k = (type_name, 1, kind, False)
+        if k not in _ggml_k["added"]:
+            _ggml_add(type_name, 1, kind, False)
+            _ggml_k["added"].add(k)
+
+    def check(kind):
+        try:
+            _selfcheck_one(type_name, 1, kind, False, int(N), nb)
+            return True
+        except Exception:
+            return False
+
+    def bench():
+        _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"]).get()
+
+    return tune(key, ("narrow", "shortk", None), apply, bench, check=check,
+                default=fallback)
+
+
 _GQA_TUNED = {}
 
 def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
@@ -1887,7 +1988,7 @@ def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
     answer is remembered per (shape, context bucket) -- `n` is bucketed by powers of four,
     because the ranking moves with the order of magnitude of the scan and not with a token.
     """
-    global _GQA_SPLIT
+    global _GQA_SPLIT, _GQA_SPLIT_ON
     import time as _t
     bucket = 1 << (max(0, int(n)).bit_length() // 2 * 2)
     key = (int(nh), int(nkv), int(hd), int(bucket))
@@ -5133,7 +5234,7 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
-    small = _shape_kind(N, K, _GGML_TYPES[type_name][2]) if mode == 1 else None
+    small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None
     key = (type_name, mode, small, moe)
     if key not in _ggml_k["added"]:
