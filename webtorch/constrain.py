@@ -13,6 +13,31 @@ allowed set is what matters, not its exact ordering.
 import json
 
 
+# What `allows` may return, when True/False is not enough to say what should happen next.
+#
+# The plain answers stay the plain answers -- True is "allowed, ask me again", False is "not
+# allowed" -- and these three say something about the GENERATION rather than about the token,
+# which is the part a boolean cannot express:
+#
+#   LAST  allowed, and it is the last one. The token is emitted, then generation ends. For a
+#         closing brace, a final digit, the byte that completes a record -- the cases where
+#         the caller knows the reply is over only once it has seen what completes it.
+#   STOP  do not take it, and the reply is complete as it stands. What is already generated
+#         is returned; nothing further is asked for.
+#   FREE  allowed, and stop asking. The rest of the reply is unconstrained, so a caller that
+#         only needs to steer a prefix -- an opening tag, a field name -- pays nothing for
+#         the remainder.
+#
+# Returned as strings so a callback needs no import, and so an unrecognised value is a clear
+# error rather than a silently-truthy one.
+ALLOW = True
+DENY = False
+LAST = "last"
+STOP = "stop"
+FREE = "free"
+_VERDICTS = (LAST, STOP, FREE)
+
+
 class Constraint:
     """Base class. Override `allows`; override `finished` if the output can end early."""
 
@@ -302,8 +327,13 @@ class CallbackConstraint(Constraint):
     written -- a bracket depth, a field the schema has not seen yet, a state machine of the
     caller's own.
 
+    `allows` may answer with more than yes or no: `"last"` takes the token and ends the
+    reply, `"stop"` ends it without taking the token, and `"free"` takes it and never asks
+    again. See the constants at the top of this module.
+
     `finished(text)` is optional and says the output is complete, which lets generation stop
-    on the constraint rather than on a token budget.
+    on the constraint rather than on a token budget. Returning `"stop"` from `allows` is the
+    same statement made at the moment the decision is actually available.
 
     Both see decoded TEXT, never token ids. That is what makes a constraint portable across
     tokenizers and expressible in the caller's own terms: "a digit may follow" is a statement
@@ -322,7 +352,8 @@ class CallbackConstraint(Constraint):
             self._reset()
 
     def allows(self, text, piece):
-        return bool(self._allows(text, piece))
+        v = self._allows(text, piece)
+        return v if v in _VERDICTS else bool(v)
 
     def finished(self, text):
         return bool(self._finished(text)) if self._finished is not None else False

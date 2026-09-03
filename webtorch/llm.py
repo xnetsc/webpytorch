@@ -2094,6 +2094,15 @@ class CausalLM:
         self._seen.append(tok)
         if con is not None:
             self._con_text += self._con_dec.push([tok])
+            v = self.__dict__.pop("_con_verdict", None)
+            if v == "last":
+                # Emitted, and the last one: the loops check `_stop_now` immediately after
+                # yielding a token, so saying so here ends the reply WITH this token in it.
+                self._con_end = True
+            elif v == "free":
+                # Steering a prefix should not cost anything after the prefix.
+                sp["constraint"] = None
+                self._sampling["constraint"] = None
         return tok
 
     def _sample(self, lg, sp):
@@ -2160,19 +2169,34 @@ class CausalLM:
             else:
                 order = np.argsort(-lg)
                 pieces = self._pieces()
-            allowed = [int(t) for t in order
-                       if con.allows(self._con_text,
-                                     pieces[int(t)] if pieces is not None and int(t) < len(pieces)
-                                     else self._piece1(int(t)))]
+            allowed, verdict = [], {}
+            for t in order:
+                ti = int(t)
+                v = con.allows(self._con_text,
+                               pieces[ti] if pieces is not None and ti < len(pieces)
+                               else self._piece1(ti))
+                if v == "stop":
+                    # A statement about the REPLY, not about this token: it is complete as it
+                    # stands. Nothing further is asked for, and the remaining candidates are
+                    # not worth scoring.
+                    self._con_end = True
+                    return int(self.tok.eot)
+                if v is True or v in ("last", "free"):
+                    allowed.append(ti)
+                    if v != True:
+                        verdict[ti] = v
             if allowed:
                 break
         if not allowed:
             return int(lg.argmax())
         if not sp.get("do_sample"):
-            return allowed[0]
-        sub = np.full_like(lg, -np.inf)
-        sub[np.asarray(allowed, np.int64)] = lg[np.asarray(allowed, np.int64)]
-        return self._sample(sub, sp)
+            got = allowed[0]
+        else:
+            sub = np.full_like(lg, -np.inf)
+            sub[np.asarray(allowed, np.int64)] = lg[np.asarray(allowed, np.int64)]
+            got = int(self._sample(sub, sp))
+        self._con_verdict = verdict.get(got)
+        return got
 
     # The KV cache is the only memory that grows with context: fp32, K and V, NKV × HD per
     # token per full-attention layer (recurrent layers keep a fixed-size state instead). A
@@ -2289,6 +2313,8 @@ class CausalLM:
         the tokens it has, it does not throw them away."""
         from .webio import cancel_requested
         if cancel_requested():
+            return True
+        if self.__dict__.get("_con_end"):
             return True
         con = (getattr(self, "_sampling", None) or {}).get("constraint")
         return bool(con is not None and con.finished(self._con_text))
@@ -2486,6 +2512,10 @@ class CausalLM:
         self._seen = list(prompt_ids or [])
         self._gen_start = len(self._seen)
         self._con_text = ""
+        # A verdict belongs to the generation that produced it. Left set, `"stop"` or
+        # `"last"` from one reply would end the NEXT one before its first token.
+        self.__dict__.pop("_con_end", None)
+        self.__dict__.pop("_con_verdict", None)
         # Constraint and stop matching read the text produced so far, so it has to be decoded
         # the same careful way the stream is -- a half-written character would otherwise put
         # a replacement char in the middle of the string a stop sequence is matched against.
