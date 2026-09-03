@@ -1,9 +1,9 @@
 {
  "modules": [
   "__init__.py",
-  "_wgsl2glsl.py",
   "_core.py",
   "_sdk.py",
+  "_wgsl2glsl.py",
   "audiofe.py",
   "backend.py",
   "constrain.py",
@@ -19,6 +19,7 @@
   "onnxrt.py",
   "portable.py",
   "quantize.py",
+  "toolcall.py",
   "torchshim.py",
   "tts.py",
   "vl.py",
