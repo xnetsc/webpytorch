@@ -2161,8 +2161,14 @@ class CausalLM:
             else:
                 self._kv_i.append(n); n += 1
         if self._gpu:                                  # capture path: fixed scatter cache + persistent inputs
-            self.Kc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(n)]
-            self.Vc = [wt.Tensor(wt._zeros((NKV, LMAX, HD))) for _ in range(n)]
+            # `_empty`, not `_zeros`: the latter is host-backed in this WgPy build
+            # (np.zeros then a staging upload), so every row costs RAM on the host as well
+            # as on the device -- 56 of these at a grown context is a WASM heap that goes
+            # from 613MB to 1.5GB and, being an emscripten heap, never gives it back. No row
+            # is ever read before it is written (see `_kv_reserve` and the note in
+            # `generate`), so there is nothing for the zero-fill to protect.
+            self.Kc = [wt.Tensor(wt._empty((NKV, LMAX, HD))) for _ in range(n)]
+            self.Vc = [wt.Tensor(wt._empty((NKV, LMAX, HD))) for _ in range(n)]
             self.h_in = wt.Tensor(np.zeros((1, H), np.float32))
             self.cos_b = wt.Tensor(np.zeros((1, HD), np.float32))
             self.sin_b = wt.Tensor(np.zeros((1, HD), np.float32))
@@ -2368,7 +2374,7 @@ class CausalLM:
         # is at most half the size of the one being allocated.
         for box in (self.Kc, self.Vc):
             for i, old in enumerate(box):
-                grown = wt.Tensor(wt._zeros((NKV, new, HD)))
+                grown = wt.Tensor(wt._empty((NKV, new, HD)))
                 grown.data[:, :cap, :] = old.data[:, :cap, :]
                 box[i] = grown
         self.mask_b = wt.Tensor(np.zeros((1, 1, new), np.float32))
