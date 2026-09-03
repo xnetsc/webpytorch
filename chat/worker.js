@@ -331,7 +331,7 @@ _msgs = _o.get("messages") or None        # full conversation; falls back to the
 # (No backticks in this block -- it is inside a JS template literal.)
 _PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
          "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop",
-         "tools", "constraint")
+         "tools", "constraint", "require_known_tools")
 _kw = dict(max_new=_n or None, stream=True, channels=True, enable_thinking=_think)
 for _k in _PASS:
     _v = _o.get(_k)
@@ -410,6 +410,17 @@ else:
     _r = {"shown": _m.strip_tool_calls(_ts_text, _tl),
           "calls": _m.tool_calls(_ts_text, _tl)}
 json.dumps(_r, ensure_ascii=False)`);
+  return JSON.parse(out);
+}
+
+async function toolRound(text, calls, results) {
+  pyodide.globals.set('_tro_text', String(text || ''));
+  pyodide.globals.set('_tro_calls', JSON.stringify(calls || []));
+  pyodide.globals.set('_tro_res', JSON.stringify(results || []));
+  const out = await pyodide.runPythonAsync(`
+import json
+json.dumps(_MODEL["m"].tool_round_messages(_tro_text, json.loads(_tro_calls),
+                                           json.loads(_tro_res)), ensure_ascii=False)`);
   return JSON.parse(out);
 }
 
@@ -670,6 +681,7 @@ onmessage = async (e) => {
     else if (cmd === 'toolScan') res = await toolScan(args.text, args.tools);
     else if (cmd === 'toolResult') res = await toolResult(args.call, args.content);
     else if (cmd === 'toolSuggest') res = await toolSuggest(args.name, args.args, args.tools);
+    else if (cmd === 'toolRound') res = await toolRound(args.text, args.calls, args.results);
     else if (cmd === 'toolRender') res = await toolRender(args.name, args.args, args.tools);
     else if (cmd === 'splitReasoning') res = await splitReasoning(args.text);
     else if (cmd === 'cacheList') res = await cacheList();

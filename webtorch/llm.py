@@ -400,6 +400,9 @@ class BPETokenizer:
         msgs = messages if messages is not None else (
             ([{"role": "system", "content": system}] if system else [])
             + ([{"role": "user", "content": user}] if user is not None else []))
+        if tools:
+            from . import toolcall
+            tools = toolcall.as_shape(tools, self.tools_shape())
         got = self.render_chat(msgs, tools=tools, **tpl_kw)
         if got is not None:
             return got
@@ -2338,6 +2341,21 @@ class CausalLM:
         from . import toolcall
         return toolcall.render(name, args, self.tok.tool_call_format(tools))
 
+    def tool_round_messages(self, assistant_text, calls, results):
+        """The turns to append after a round of tool calls -- what the model said, then what
+        each call returned -- shaped the way THIS model's template reads them.
+
+        A caller supplies the reply text, the calls it ran and their results; whether the
+        calls travel as structured `tool_calls` or as the model's own text, and which id
+        field ties a result to its call, are read from the template here.
+        """
+        from . import toolcall
+        f = self.tok.tool_result_format()
+        return toolcall.round_messages(assistant_text, calls, results,
+                                       id_shape=f["call_id_shape"],
+                                       keeps_name=f["keeps_name"],
+                                       id_field=f["id_field"], via=f["via"])
+
     def suggest_tool(self, name, tools, args=None):
         """Which registered tools a name that matched none could plausibly have meant, best
         first. Evidence for a caller's own decision -- nothing is run on it."""
@@ -2375,7 +2393,7 @@ class CausalLM:
         if isinstance(constraint, (list, tuple)):
             want = "tool_names" if "tool_names" in constraint else None
             rest = [c for c in constraint if c != "tool_names"] or None
-        if want != "tool_names":
+        if want is not True and want != "tool_names":
             return constraint
         constraint = rest
         names = []
@@ -2860,7 +2878,8 @@ class CausalLM:
                top_k=None, seed=None, do_sample=None, repetition_penalty=None, min_p=None,
                constraint=None, max_length=None, min_new_tokens=None, truncate=True,
                enable_thinking=None, presence_penalty=None, frequency_penalty=None,
-               stop=None, channels=False, **chat_kw):
+               stop=None, channels=False, require_known_tools=False,
+               **chat_kw):
         """Streaming decode: yield each new token's text as it is produced (render live,
         bounded memory). WebGPU replays a captured step per token; WebGL grows a cache.
         Takes the same parameters as `generate`.
@@ -2921,7 +2940,8 @@ class CausalLM:
                     box["close"] = c
                     break
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, self._tool_name_constraint(tools, constraint),
+                           min_p, self._tool_name_constraint(
+                               tools, True if require_known_tools else constraint),
                            min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
@@ -3026,7 +3046,8 @@ class CausalLM:
                  repetition_penalty=None, min_p=None, constraint=None,
                  max_length=None, min_new_tokens=None, truncate=True,
                  stream=False, enable_thinking=None, presence_penalty=None,
-                 frequency_penalty=None, stop=None, channels=False, **chat_kw):
+                 frequency_penalty=None, stop=None, channels=False,
+                 require_known_tools=False, **chat_kw):
         """Chat prompt -> decode -> GenResult. WebGPU replays a captured decode step per
         token (~20x); WebGL uses a correct growing-cache forward.
 
@@ -3073,7 +3094,9 @@ class CausalLM:
                                enable_thinking=enable_thinking,
                                presence_penalty=presence_penalty,
                                frequency_penalty=frequency_penalty, stop=stop,
-                               channels=channels, **chat_kw)
+                               channels=channels,
+                               require_known_tools=require_known_tools,
+                               **chat_kw)
         eot = self.tok.eot
         if enable_thinking is None:
             enable_thinking = bool((getattr(self, "gen_defaults", {}) or {})
@@ -3084,7 +3107,8 @@ class CausalLM:
         ids, max_new = self._plan_length(ids, max_new, max_length, truncate)
         P = len(ids)
         self._set_sampling(temperature, top_p, top_k, seed, do_sample, repetition_penalty,
-                           min_p, self._tool_name_constraint(tools, constraint),
+                           min_p, self._tool_name_constraint(
+                               tools, True if require_known_tools else constraint),
                            min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)

@@ -2561,7 +2561,7 @@ $('#composer').onsubmit = async (e) => {
         // This page's decision, not the SDK's: hold the model to names that exist. A wrong
         // name here cannot be run and the reader sees a failed round; a model that calls
         // nothing instead just answers, which is the better of the two failures for a chat.
-        opts.constraint = 'tool_names';
+        opts.require_known_tools = true;
       }
       try {
         r = await call('generate', opts);
@@ -2613,21 +2613,10 @@ $('#composer').onsubmit = async (e) => {
         setToollogLive(live, reply.toollog);
       }
       // The conversation the model sees next: what it said, then what each call returned.
-      if (modelCallIdShape) {
-        // The template ties results to calls by id, so the calls go back as structured
-        // tool_calls for it to render in ITS format, with the ids kept; the prose stays,
-        // the protocol markup goes -- the structured calls carry it now, and leaving both
-        // would show the model every call twice.
-        msgs.push({ role: 'assistant', content: shown,
-                    tool_calls: calls.map(c => ({ id: c.id, type: 'function',
-                                                  function: { name: c.name, arguments: c.args } })) });
-      } else {
-        // Its call format is content, so its own text goes back verbatim.
-        msgs.push({ role: 'assistant', content: raw });
-      }
-      for (let i = 0; i < calls.length; i++) {
-        msgs.push(await call('toolResult', { call: calls[i], content: results[i] }));
-      }
+      // Whether the calls travel as structured `tool_calls` or as the model's own text is
+      // a property of its template, so the SDK builds these turns -- this page only says
+      // what happened.
+      (await call('toolRound', { text: shown, calls, results })).forEach(m => msgs.push(m));
       // The call and its result go to a folded side panel, NOT into the answer text.
       // Putting the trace in the answer taught the model to imitate it as content: with a
       // real trace in its history it next "called" a tool by writing a forged one --
@@ -2686,13 +2675,7 @@ function registerTool(def, run) { TOOLS.push({ def, run }); }
 // canonical form; which one goes over the wire is a fact about the model, discovered by
 // `toolsSupported`, not a convention picked here.
 function toolDefs() {
-  return TOOLS.map(t => {
-    const f = t.def.function;
-    if (modelToolShape === 'flat') {
-      return { name: f.name, description: f.description, parameters: f.parameters };
-    }
-    return t.def;                       // nested {type:"function", function:{…}}
-  });
+  return TOOLS.map(t => t.def);         // one canonical form; the SDK reshapes for the model
 }
 // A plain lookup: the SDK reads what the model wrote and reports the REGISTERED name, so
 // noise ("run_ Python" for "python") has already been resolved by the time a call gets
@@ -2705,30 +2688,14 @@ const TOOLS_KEY = 'webtorch.toolsOn';
 // Whether the LOADED model can be told about tools -- asked once per model, never guessed.
 // null = not asked yet, so the first reply after a load does not race the probe.
 let modelTakesTools = null;      // null = not asked yet
-let modelToolShape = null;       // which definition shape its template actually reads
-let modelResultVia = null;       // 'tool' | 'user' | null -- how a RESULT reaches it
-let modelResultKeepsName = false;
-let modelCallIdShape = null;     // 'nested' | 'flat' | null -- renders an id on a call
-let modelResultIdField = null;   // which id field it reads back on the result, if any
-// How THIS model WRITES a call, read off its own template by the probe. An empty opener is
-// an answer too: it means the model writes a bare object with no delimiters at all.
-let modelCallOpen = null, modelCallClose = null, modelCallPayload = null;
+// One question, in the page's own terms: can this model use tools at all? How its template
+// writes a call, which shape of definition it reads, how a result gets back to it -- those
+// are the SDK's business and no longer travel up here.
 async function probeTools() {
-  modelTakesTools = null; modelToolShape = null;
-  modelResultVia = null; modelResultKeepsName = false;
-  modelCallIdShape = null; modelResultIdField = null;
-  modelCallOpen = null; modelCallClose = null; modelCallPayload = null;
+  modelTakesTools = null;
   try {
     const r = await call('toolsSupported');
     modelTakesTools = !!(r && r.ok);
-    modelToolShape = (r && r.shape) || null;
-    modelResultVia = (r && r.result_via) || null;
-    modelResultKeepsName = !!(r && r.result_keeps_name);
-    modelCallIdShape = (r && r.call_id_shape) || null;
-    modelResultIdField = (r && r.result_id_field) || null;
-    modelCallOpen = (r && typeof r.call_open === 'string') ? r.call_open : null;
-    modelCallClose = (r && typeof r.call_close === 'string') ? r.call_close : null;
-    modelCallPayload = (r && r.call_payload) || null;
   } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
 }

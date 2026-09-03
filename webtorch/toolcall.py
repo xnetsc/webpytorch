@@ -361,3 +361,48 @@ def result_message(call, content, keeps_name=False, id_field=None, via=None):
     if id_field:
         msg[id_field] = call.get("id")
     return msg
+
+
+def as_shape(tools, shape):
+    """Tool definitions in the shape a template actually reads.
+
+    Callers write one canonical form -- either is accepted -- and this puts it into whichever
+    one the model's template renders. Which that is (`tools_shape`) is a fact about the
+    model, so a caller should never have to ask, let alone keep two copies of its own tools.
+    """
+    if not tools:
+        return []
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        f = t.get("function") if isinstance(t.get("function"), dict) else t
+        if shape == "flat":
+            out.append({k: v for k, v in f.items() if k != "type"})
+        else:
+            out.append({"type": "function", "function": f})
+    return out
+
+
+def round_messages(assistant_text, calls, results, id_shape=None, keeps_name=False,
+                   id_field=None, via=None):
+    """The turns to append after a round of tool calls: what the model said, then what each
+    call returned, shaped the way its template reads them.
+
+    Whether the calls go back as structured `tool_calls` or as the model's own text is
+    decided here rather than by the caller. A template that ties a result to its call by id
+    needs the structured form -- and then the protocol markup must NOT also be in the text,
+    or the model is shown every call twice.
+    """
+    msgs = []
+    if id_shape:
+        msgs.append({"role": "assistant", "content": assistant_text,
+                     "tool_calls": [{"id": c.get("id"), "type": "function",
+                                     "function": {"name": c.get("name"),
+                                                  "arguments": c.get("args") or {}}}
+                                    for c in calls]})
+    else:
+        msgs.append({"role": "assistant", "content": assistant_text})
+    for c, r in zip(calls, results):
+        msgs.append(result_message(c, r, keeps_name=keeps_name, id_field=id_field, via=via))
+    return msgs
