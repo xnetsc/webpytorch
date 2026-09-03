@@ -4159,7 +4159,26 @@ _GGML_GEMM_TAIL = """
 # that `dec` runs per THREAD: every lane row decodes the same weight block again, so wider
 # lanes buy more rows and pay for them in repeated decode. Sharing the DECODED block through
 # workgroup memory is what would actually cut it, and that is a different kernel.
-_GGML_KSG = 1               # row groups (of 4 rows each) per workgroup on the batched path
+# Row groups (of 4 rows each) per workgroup on the batched path. A workgroup covers 4*KSG
+# activation rows, so the weights it reads serve that many -- which divides the weight
+# traffic by 4*KSG and looks like the obvious lever for prefill.
+#
+# It is not one, and the measurement says why. Interleaved medians, 0.6B, all 28 layers:
+#
+#     T       KSG=1     KSG=2     KSG=4
+#     512    1180.5    1175.6    1165.8   ms
+#     1536   3421.2    3374.8    3405.2   ms
+#
+# 1.3% apart, which is noise. The arithmetic is invariant to KSG (2*M*N*K either way) and it
+# comes out at 395 / 401 / 397 GFLOPS, while the weight traffic the change actually removes
+# would have been 29.5 / 15.0 / 7.4 GB/s. Constant compute, collapsing traffic, unchanged
+# time: this kernel is bound by the arithmetic, not by re-reading weights, so nothing that
+# only moves traffic can help it. (For scale, the generic fp32 batched matmul next door runs
+# at 72-139 GFLOPS; this one is already the fast path.)
+#
+# So KSG is deliberately NOT a tuned knob -- measuring it on every load would cost time to
+# rediscover a number that does not matter.
+_GGML_KSG = 1
 
 # GEMV (decode, batch of one): the shape where the naive kernel loses. Two things fix it,
 # both of which ggml blocks happen to suit. Blocks are independent, so KS rows of threads
