@@ -293,6 +293,41 @@ class StopConstraint(Constraint):
         return any(s in text for s in self.stops)
 
 
+class CallbackConstraint(Constraint):
+    """A plain function decides what may come next: `allows(text, piece) -> bool`.
+
+    The simplest form of the whole idea, and the one that needs no class: given everything
+    generated so far and one candidate continuation, say whether it is allowed. The decision
+    is made per token against the CURRENT text, so it can depend on everything already
+    written -- a bracket depth, a field the schema has not seen yet, a state machine of the
+    caller's own.
+
+    `finished(text)` is optional and says the output is complete, which lets generation stop
+    on the constraint rather than on a token budget.
+
+    Both see decoded TEXT, never token ids. That is what makes a constraint portable across
+    tokenizers and expressible in the caller's own terms: "a digit may follow" is a statement
+    about characters, and which token ids happen to spell them is not the caller's problem.
+    """
+
+    def __init__(self, allows, finished=None, reset=None):
+        if not callable(allows):
+            raise TypeError("a callback constraint needs a callable allows(text, piece)")
+        self._allows = allows
+        self._finished = finished
+        self._reset = reset
+
+    def reset(self):
+        if self._reset is not None:
+            self._reset()
+
+    def allows(self, text, piece):
+        return bool(self._allows(text, piece))
+
+    def finished(self, text):
+        return bool(self._finished(text)) if self._finished is not None else False
+
+
 class AllOf(Constraint):
     """Every part must allow a piece, and any part may end the generation. Lets `stop=`
     compose with a structural constraint instead of one silently replacing the other."""
@@ -329,10 +364,17 @@ def build(spec):
             return RegexConstraint(spec["regex"])
         if "stop" in spec:
             return StopConstraint(spec["stop"])
-        raise ValueError("constraint dict needs a 'regex' or 'stop' key, got %s"
+        if callable(spec.get("allows")):
+            return CallbackConstraint(spec["allows"], spec.get("finished"),
+                                      spec.get("reset"))
+        raise ValueError("constraint dict needs an 'allows', 'regex' or 'stop' key, got %s"
                          % sorted(spec))
     if isinstance(spec, (list, tuple)):
         return StopConstraint(spec)
     if callable(getattr(spec, "allows", None)):
         return spec
-    raise TypeError("constraint must be a name, a dict, a list of stops, or a Constraint")
+    # A bare function is the most direct spelling of the idea, so it is accepted as one.
+    if callable(spec):
+        return CallbackConstraint(spec)
+    raise TypeError("constraint must be a name, a callable allows(text, piece), a dict, "
+                    "a list of stops, or a Constraint")
