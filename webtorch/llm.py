@@ -2899,7 +2899,7 @@ class CausalLM:
                               top_p, top_k, seed, do_sample, repetition_penalty, min_p,
                               constraint, max_length, min_new_tokens, truncate,
                               enable_thinking, presence_penalty, frequency_penalty, stop,
-                              box, **chat_kw)
+                              box, require_known_tools, **chat_kw)
         return self._stream_channels(it, box) if channels else it
 
     def _stream_channels(self, it, box):
@@ -2919,7 +2919,8 @@ class CausalLM:
                     top_k=None, seed=None, do_sample=None, repetition_penalty=None,
                     min_p=None, constraint=None, max_length=None, min_new_tokens=None,
                     truncate=True, enable_thinking=None, presence_penalty=None,
-                    frequency_penalty=None, stop=None, box=None, **chat_kw):
+                    frequency_penalty=None, stop=None, box=None,
+                    require_known_tools=False, **chat_kw):
         """The decode loop itself: yields plain text per token."""
         self._check_live()
         eot = self.tok.eot
