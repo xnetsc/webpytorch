@@ -36,6 +36,29 @@ def tool_names(tools):
     return out
 
 
+def match_name(name, tools):
+    """The registered tool `name` refers to, or None.
+
+    Whitespace, punctuation and case carry no meaning in a tool name: "run_ Python" is
+    "run_python" with noise in it. An exact match first; a name that is identical once the
+    noise is stripped is the model's intent stated plainly, so it counts -- that is reading
+    what it said, not guessing what it meant. Anything further apart than that is not
+    matched, because a wrong tool run confidently is worse than one not run.
+    """
+    names = tool_names(tools)
+    if name in names:
+        return name
+    want = _norm(name)
+    for n in names:
+        if _norm(n) == want:
+            return n
+    return None
+
+
+def _norm(s):
+    return re.sub(r"[\s_\-.]+", "", str(s or "").lower())
+
+
 def _schema(tools, name, key):
     """The declared type of one argument, or None."""
     for t in tools or []:

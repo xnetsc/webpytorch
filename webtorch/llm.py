@@ -2280,6 +2280,34 @@ class CausalLM:
     # to it are all facts about the model, so they live here and are read from its own
     # template. Nothing above this line needs to know any of it.
 
+    def split_reasoning(self, text):
+        """Separate a reply's reasoning span from its answer:
+        {"reasoning", "answer", "open"}. `open` means the span was never closed -- the reply
+        is still inside it.
+
+        Which tags mark a reasoning span is a fact about models, not about any one caller, so
+        every form the SDK knows is recognised here rather than one being spelled out at each
+        call site. A live stream does not need this (`stream(channels=True)` labels the
+        pieces as they arrive); this is for text that was stored as one string, where the
+        answer has to be told from the reasoning again afterwards.
+
+        A dangling closer with no opener is read as "all of it was reasoning": that is what a
+        reply saved with only part of the template text looks like, and the alternative is
+        showing the reasoning as the answer.
+        """
+        txt = text if isinstance(text, str) else ""
+        for o, c in _THINK_TAGS:
+            if o not in txt and c in txt:
+                txt = o + txt
+            if not txt.startswith(o):
+                continue
+            k = txt.find(c)
+            if k >= 0:
+                return {"reasoning": txt[len(o):k].strip(),
+                        "answer": txt[k + len(c):].lstrip(), "open": False}
+            return {"reasoning": txt[len(o):].strip(), "answer": "", "open": True}
+        return {"reasoning": None, "answer": txt, "open": False}
+
     def tools_supported(self):
         """The tool-definition shape this model's template renders, or None if it renders
         none. Pass the result nowhere -- `generate(tools=...)` handles the shape itself; this
