@@ -5652,7 +5652,22 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
         # quantised kernel; the only difference is fp32 rounding in the accumulation order.
         w32 = Tensor(ggml_dequant(packed, type_name, K, N))
-        of = (Tensor(xf) @ w32).data
+        # Pad the rows to a multiple of 32. The fp32 matmul has a tiled path that only runs
+        # when they are, and the difference is not a few percent: at K=1024 N=3072, M=2816
+        # runs at 1850 GFLOPS and M=2800 at 249 -- seven times, for sixteen rows. Multiples
+        # of 32 measured fast at every size tried (2816, 2848, 2880, 2944, 3008) and every
+        # non-multiple slow (2800, 2801, 2802, 2804, 2808, 2832).
+        #
+        # A prompt is whatever length it is, so without this the fast path is a coin toss
+        # that a prefill loses 31 times out of 32. The padding rows are never read back, so
+        # they are left uninitialised -- a matmul does not mix rows.
+        pad = (-m) % 32
+        if pad:
+            xp = _empty((m + pad, int(K)))
+            xp[:m] = xf
+            of = (Tensor(xp) @ w32).data[:m]
+        else:
+            of = (Tensor(xf) @ w32).data
         return of if bias is None else of + bias
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None
