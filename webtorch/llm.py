@@ -242,7 +242,21 @@ class BPETokenizer:
 
         def _line_after(frm):
             xs = [x for x in rc[frm:].split(NL) if x.strip()]
-            return xs[0] if xs else ""
+            return _drop_eot(xs[0] if xs else "")
+
+        def _drop_eot(line):
+            """The closing delimiter, without the end-of-turn marker that follows it.
+
+            A template ends the assistant turn on the same line it closes the call, so the
+            raw text gives `</tool_call><|im_end|>` -- but the model's OUTPUT never contains
+            the turn marker, so a delimiter carrying it matches nothing and the markup is
+            left in the reply for a reader to see. (Reading this back through decode() hid
+            the problem by dropping special tokens, which is why it did not show until the
+            text was read directly.)"""
+            for t in (self._tok_str(self.eot), self._tok_str(self.SPECIALS.get("<s>"))):
+                if t and line.endswith(t):
+                    line = line[:-len(t)]
+            return line.rstrip()
 
         # The payload is the object that CONTAINS the name, and it is the WIDEST such object
         # that parses on its own -- not the nearest brace. A template that renders its tool
