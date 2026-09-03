@@ -80,6 +80,8 @@ class BPETokenizer:
                  chat_template=None, control=None):
         self.enc = vocab
         self._callfmt = _UNSET          # see `tool_call_format`; derived once, on demand
+        self._toolshape = _UNSET        # see `tools_shape`
+        self._resfmt = _UNSET           # see `tool_result_format`
         # A model ships its own prompt layout. Probing the vocabulary for a known marker
         # gets the family right but not the details -- Qwen3 opens its turn with <think>,
         # which no amount of "this looks like ChatML" will tell you, and without it the
@@ -287,6 +289,86 @@ class BPETokenizer:
                              "close": _line_after(fe + len("</function>")) if fe >= 0 else "",
                              "payload": "xml"}
         return self._callfmt
+
+    def tools_shape(self):
+        """Which shape of tool DEFINITION this model's template actually renders --
+        "nested" ({"type":"function","function":{...}}), "flat" ({...}), or None when the
+        template ignores tools altogether. Asked of the template, never assumed.
+
+        The name alone is not enough to say a shape worked: a template can mention a tool
+        and drop its arguments, which produces calls with no parameters.
+        """
+        if self._toolshape is not _UNSET:
+            return self._toolshape
+        self._toolshape = None
+        msgs = [{"role": "user", "content": "hi"}]
+        plain = self.render_chat_text(msgs)
+        if plain is None:
+            return None
+        NAME, ARG = "zzprobetoolzz", "zzprobeargzz"
+        fn = {"name": NAME, "description": "probe",
+              "parameters": {"type": "object",
+                             "properties": {ARG: {"type": "string", "description": "probe"}},
+                             "required": [ARG]}}
+        for label, tools in (("nested", [{"type": "function", "function": fn}]),
+                             ("flat", [dict(fn)])):
+            txt = self.render_chat_text(msgs, tools=tools)
+            if not txt or txt == plain:
+                continue                       # the template ignored them entirely
+            if NAME in txt and ARG in txt:
+                self._toolshape = label
+                break
+        return self._toolshape
+
+    def tool_result_format(self):
+        """How a tool RESULT reaches this model: {"via", "keeps_name", "call_id_shape",
+        "id_field"}. Discovered from the template, because a dropped result is SILENT -- the
+        model answers without ever seeing what the tool returned.
+
+        A template may define its own structure for a result, may render it as an ordinary
+        turn, or may drop a role it does not know. `call_id_shape` and `id_field` are
+        independent facts: whether the template RENDERS an id given on a call, and whether it
+        READS one back on the result. A template that does neither ties results to calls by
+        order alone.
+        """
+        if self._resfmt is not _UNSET:
+            return self._resfmt
+        out = {"via": None, "keeps_name": False, "call_id_shape": None, "id_field": None}
+        self._resfmt = out
+        if not self._tpl:
+            return out
+        MK, TN = "zzresultmarkzz", "zztoolnamezz"
+        base = [{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "calling"}]
+
+        def r(msgs):
+            return self.render_chat_text(msgs) or ""
+
+        as_tool = r(base + [{"role": "tool", "name": TN, "content": MK}])
+        if MK in as_tool:
+            out["via"] = "tool"
+            out["keeps_name"] = TN in as_tool
+        elif MK in r(base + [{"role": "user", "content": MK}]):
+            out["via"] = "user"
+        if out["via"] != "tool":
+            return out
+        CID = "zzcallidzz"
+        for shape, tcalls in (
+                ("nested", [{"id": CID, "type": "function",
+                             "function": {"name": TN, "arguments": {}}}]),
+                ("flat", [{"id": CID, "name": TN, "arguments": {}}])):
+            amsg = dict(base[-1]); amsg["tool_calls"] = tcalls
+            if CID in r(base[:-1] + [amsg]):
+                out["call_id_shape"] = shape
+                break
+        if out["call_id_shape"] is not None:
+            for field, val in (("tool_call_id", "zzidtczz"), ("call_id", "zzidcizz"),
+                               ("id", "zzididzz")):
+                m = {"role": "tool", "content": MK, field: val}
+                if val in r(base + [m]):
+                    out["id_field"] = field
+                    break
+        return out
 
     def _tok_str(self, i):
         return self.dec.get(int(i), "") if i is not None and int(i) >= 0 else ""
@@ -2176,6 +2258,50 @@ class CausalLM:
             return True
         con = (getattr(self, "_sampling", None) or {}).get("constraint")
         return bool(con is not None and con.finished(self._con_text))
+
+    # ---- tool calling, as API ----------------------------------------------------------
+    #
+    # A caller decides WHICH tools to offer and implements them; that is its business. How a
+    # model is told they exist, how what it writes back is read, and how a result is returned
+    # to it are all facts about the model, so they live here and are read from its own
+    # template. Nothing above this line needs to know any of it.
+
+    def tools_supported(self):
+        """The tool-definition shape this model's template renders, or None if it renders
+        none. Pass the result nowhere -- `generate(tools=...)` handles the shape itself; this
+        is for a caller that wants to know whether offering tools is worth anything."""
+        return self.tok.tools_shape()
+
+    def tool_call_format(self, tools=None):
+        """How this model writes a call: {"open", "close", "payload"}, or None."""
+        return self.tok.tool_call_format(tools)
+
+    def parse_tool_calls(self, text, tools=None):
+        """Every tool call in `text`, in order, each with the span it occupies."""
+        from . import toolcall
+        return toolcall.parse(text, tools, self.tok.tool_call_format(tools))
+
+    def tool_calls(self, text, tools=None):
+        """Just the calls, without spans."""
+        from . import toolcall
+        return toolcall.calls(text, tools, self.tok.tool_call_format(tools))
+
+    def strip_tool_calls(self, text, tools=None):
+        """`text` with the call markup removed -- what a reader should be shown."""
+        from . import toolcall
+        return toolcall.strip(text, tools, self.tok.tool_call_format(tools))
+
+    def render_tool_call(self, name, args, tools=None):
+        """One call written the way this model writes them."""
+        from . import toolcall
+        return toolcall.render(name, args, self.tok.tool_call_format(tools))
+
+    def tool_result_message(self, call, content):
+        """The message that carries one tool's result back, shaped for this model."""
+        from . import toolcall
+        f = self.tok.tool_result_format()
+        return toolcall.result_message(call, content, keeps_name=f["keeps_name"],
+                                       id_field=f["id_field"], via=f["via"])
 
     def _tool_name_constraint(self, tools, constraint):
         """Hold the model to the tool names it was actually given, composed with whatever
