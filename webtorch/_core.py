@@ -5471,7 +5471,7 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
         out_t = _ggml_run_gl(xp.asarray(x), pk, type_name, K, N, eidx=eidx,
                              eslot=(eslot or 0), estride=estride)
     else:
-        key = (type_name, mode, small, moe)
+        key = (type_name, mode, small, moe, _GGML_KSG if mode == 0 else 0)
         if key not in _ggml_k["added"]:
             _ggml_add(type_name, mode, small, moe)
             _ggml_k["added"].add(key)
@@ -5538,7 +5538,7 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     mode = m if m <= 2 else 0
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None
-    key = (type_name, mode, small, moe)
+    key = (type_name, mode, small, moe, _GGML_KSG if mode == 0 else 0)
     if key not in _ggml_k["added"]:
         _ggml_add(type_name, mode, small, moe)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
@@ -5580,10 +5580,16 @@ def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
     # identified by them too -- otherwise a second variant would silently reuse the first
     # one's pipeline.
     o = _orw_for(mode) if orw is None else orw
-    return "ggml%s_%s%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
-                                "" if o <= 1 else "_r%d" % o,
-                                "_%s" % small if small else "",
-                                "_e" if moe else "")
+    # KSG is a compile-time constant of the BATCHED kernel -- it sets the workgroup's second
+    # dimension and the size of the staged activations -- so it belongs in the name for the
+    # same reason ORW does. Without it a second value silently reuses the first's pipeline,
+    # and every measurement of the second is a measurement of the first.
+    return "ggml%s_%s%s%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
+                                  "" if o <= 1 else "_r%d" % o,
+                                  "_%s" % small if small else "",
+                                  "_e" if moe else "",
+                                  "" if (mode != 0 or _GGML_KSG == 1)
+                                  else "_g%d" % _GGML_KSG)
 
 
 # ==== the small fused decode kernels, on WebGL ==========================================
@@ -6414,7 +6420,8 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     # catch: the platform does not know the name, runs nothing, and leaves the output buffer
     # zeroed -- which reads as a numerically wrong kernel. It cost a full sweep reported as
     # "168 of 168 formats broken" while the model beside it generated perfectly.
-    if (type_name, mode, small, moe) not in _ggml_k["added"]:
+    if (type_name, mode, small, moe,
+            _GGML_KSG if mode == 0 else 0) not in _ggml_k["added"]:
         raise RuntimeError("ggml kernel variant %r was never built -- go through ggml_matmul, "
                            "or pass the same `small` it derives (_AUTO works)"
                            % ((type_name, mode, small, moe),))
