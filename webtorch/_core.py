@@ -1688,8 +1688,177 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   for (var d: u32 = t; d < gm.hd; d = d + 128u) { outp[qo + d] = acc[d] / l_run; }
 }
 """
+# Split-sequence decode attention: the same answer as the kernel above, but spread over
+# `SPLIT` times as many workgroups.
+#
+# The kernel above dispatches ONE workgroup per attention head -- 16 of them on a 0.6B, 2048
+# threads for the whole GPU -- and every one of them walks the whole cache alone. Measured on
+# the captured decode step: 7.07ms fixed plus 8.3us per context token, which for the 229KB
+# each context token costs across 28 layers is 27.6 GB/s, an order of magnitude under what
+# the machine can do. Nothing is compute-bound here; the device is simply idle.
+#
+# So each head's scan is cut into SPLIT chunks that run at once, each producing a PARTIAL
+# softmax -- its own running max, its own sum, its own weighted values -- and a second, tiny
+# pass merges them. Merging is exact, not an approximation: the max/sum/accumulator triple is
+# what the online softmax already carries between blocks inside one workgroup, and combining
+# two of them is the same rescale it already does.
+#
+# The chunk bounds come from `n` at RUN time while SPLIT is fixed at compile time, because a
+# captured graph replays fixed dispatch dimensions -- a chunk that lands past the end of a
+# short conversation contributes nothing and says so with l = 0.
+_GQA_SPLIT = 16
+
+_GQA_SPLIT_WGSL = """@group(0) @binding(0)
+var<storage,read_write> part: array<f32>;      // (nh*SPLIT) x (hd + 2): acc, then m, l
+@group(0) @binding(1)
+var<storage,read> q: array<f32>;
+@group(0) @binding(2)
+var<storage,read> kc: array<f32>;
+@group(0) @binding(3)
+var<storage,read> vc: array<f32>;
+struct GMeta { nh: u32, nkv: u32, hd: u32, lmax: u32, valid: u32, use_ctl: u32, scale: f32, }
+@group(0) @binding(4)
+var<storage,read> gm: GMeta;
+@group(0) @binding(5)
+var<storage,read> ctl: array<i32>;
+var<workgroup> sc: array<f32, 128>;
+var<workgroup> red: array<f32, 128>;
+var<workgroup> acc: array<f32, 256>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x / SPLITu;
+  let ch = wid.x % SPLITu;
+  let t = lid.x;
+  let rep = gm.nh / gm.nkv;
+  let kv = h / rep;
+  let qo = h * gm.hd;
+  let ko = kv * gm.lmax * gm.hd;
+  var n: u32 = gm.valid;
+  if (gm.use_ctl == 1u) { n = u32(max(ctl[0], 0)) + 1u; }
+  n = clamp(n, 1u, gm.lmax);
+  // Even split, rounded up, so the last chunk is the short one and every chunk index is
+  // computed the same way whatever `n` turns out to be.
+  let per = (n + SPLITu - 1u) / SPLITu;
+  let lo = ch * per;
+  let hi = min(n, lo + per);
+  let po = (h * SPLITu + ch) * (gm.hd + 2u);
+
+  for (var d: u32 = t; d < gm.hd; d = d + 128u) { acc[d] = 0.0; }
+  var m_run: f32 = -1e30;
+  var l_run: f32 = 0.0;
+  workgroupBarrier();
+
+  // An empty chunk still has to write its slot -- the merge reads every one of them.
+  if (lo >= hi) {
+    for (var d: u32 = t; d < gm.hd; d = d + 128u) { part[po + d] = 0.0; }
+    if (t == 0u) { part[po + gm.hd] = -1e30; part[po + gm.hd + 1u] = 0.0; }
+    return;
+  }
+
+  var base: u32 = lo;
+  loop {
+    if (base >= hi) { break; }
+    let s = base + t;
+    var d0: f32 = -1e30;
+    if (s < hi) {
+      var dd: f32 = 0.0;
+      let kb = ko + s * gm.hd;
+      for (var i: u32 = 0u; i < gm.hd; i = i + 1u) {
+        dd = dd + q[qo + i] * kc[kb + i];
+      }
+      d0 = dd * gm.scale;
+    }
+    red[t] = d0;
+    workgroupBarrier();
+    var r: u32 = 64u;
+    loop {
+      if (r == 0u) { break; }
+      if (t < r) { red[t] = max(red[t], red[t + r]); }
+      workgroupBarrier();
+      r = r / 2u;
+    }
+    let m_new = max(m_run, red[0]);
+    workgroupBarrier();
+
+    var e: f32 = 0.0;
+    if (s < hi) { e = exp(d0 - m_new); }
+    sc[t] = e;
+    red[t] = e;
+    workgroupBarrier();
+    r = 64u;
+    loop {
+      if (r == 0u) { break; }
+      if (t < r) { red[t] = red[t] + red[t + r]; }
+      workgroupBarrier();
+      r = r / 2u;
+    }
+    let corr = exp(m_run - m_new);
+    l_run = l_run * corr + red[0];
+    m_run = m_new;
+    workgroupBarrier();
+
+    let cnt = min(128u, hi - base);
+    for (var d: u32 = t; d < gm.hd; d = d + 128u) {
+      var o: f32 = acc[d] * corr;
+      for (var pp: u32 = 0u; pp < cnt; pp = pp + 1u) {
+        o = o + sc[pp] * vc[ko + (base + pp) * gm.hd + d];
+      }
+      acc[d] = o;
+    }
+    workgroupBarrier();
+    base = base + 128u;
+  }
+
+  // Unnormalised: the merge divides once, by the total across chunks.
+  for (var d: u32 = t; d < gm.hd; d = d + 128u) { part[po + d] = acc[d]; }
+  if (t == 0u) { part[po + gm.hd] = m_run; part[po + gm.hd + 1u] = l_run; }
+}
+"""
+
+# The merge. One workgroup per head, one lane per head dimension: read SPLIT partial
+# softmaxes and fold them into one, which is the same rescale-and-add the split kernel does
+# between its own blocks. Chunks that covered nothing carry l = 0 and drop out of the sum.
+_GQA_MERGE_WGSL = """@group(0) @binding(0)
+var<storage,read_write> outp: array<f32>;
+@group(0) @binding(1)
+var<storage,read> part: array<f32>;
+struct GMeta { nh: u32, nkv: u32, hd: u32, lmax: u32, valid: u32, use_ctl: u32, scale: f32, }
+@group(0) @binding(2)
+var<storage,read> gm: GMeta;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x;
+  let t = lid.x;
+  var m_all: f32 = -1e30;
+  for (var c: u32 = 0u; c < SPLITu; c = c + 1u) {
+    let po = (h * SPLITu + c) * (gm.hd + 2u);
+    if (part[po + gm.hd + 1u] > 0.0) { m_all = max(m_all, part[po + gm.hd]); }
+  }
+  var l_all: f32 = 0.0;
+  for (var c: u32 = 0u; c < SPLITu; c = c + 1u) {
+    let po = (h * SPLITu + c) * (gm.hd + 2u);
+    let l = part[po + gm.hd + 1u];
+    if (l > 0.0) { l_all = l_all + l * exp(part[po + gm.hd] - m_all); }
+  }
+  for (var d: u32 = t; d < gm.hd; d = d + 128u) {
+    var o: f32 = 0.0;
+    for (var c: u32 = 0u; c < SPLITu; c = c + 1u) {
+      let po = (h * SPLITu + c) * (gm.hd + 2u);
+      if (part[po + gm.hd + 1u] > 0.0) {
+        o = o + part[po + d] * exp(part[po + gm.hd] - m_all);
+      }
+    }
+    outp[h * gm.hd + d] = o / l_all;
+  }
+}
+"""
+
+
 _gqa_k = {"added": False}
 _GQA_FUSED = True      # A/B switch for the fused decode attention
+_GQA_SPLIT_ON = False  # A/B switch for the split-sequence decode attention (off until verified)
 
 
 def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
@@ -1732,6 +1901,14 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
         plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
                                       "bindingTypes": ["storage"]
                                       + ["read-only-storage"] * 5})
+        _sub = lambda src: src.replace("SPLITu", "%du" % _GQA_SPLIT)
+        plat.addKernel("gqa_split", {"source": _sub(_GQA_SPLIT_WGSL),
+                                     "bindingTypes": ["storage"]
+                                     + ["read-only-storage"] * 5})
+        plat.addKernel("gqa_merge", {"source": _sub(_GQA_MERGE_WGSL),
+                                     "bindingTypes": ["storage",
+                                                      "read-only-storage",
+                                                      "read-only-storage"]})
         _gqa_k["added"] = True
     # Bind through named locals. Inlining `_contig(...)` into the list drops the only
     # reference to each temporary as soon as its id is read, so its GPU buffer can be
@@ -1746,6 +1923,20 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     # binding 5 must always be bound; without a control buffer it points at the meta buffer
     # and `use_ctl` tells the shader to ignore it.
     cb = ctl.buffer if ctl is not None else meta
+    if _GQA_SPLIT_ON:
+        # Two dispatches instead of one, and SPLIT times the workgroups in the first. Both
+        # shapes are fixed, so the pair captures and replays exactly like the single kernel.
+        part = _empty((nh * _GQA_SPLIT * (hd + 2),))
+        plat.runKernel({"name": "gqa_split",
+                        "tensors": [part.buffer.buffer_id, qc.buffer.buffer_id,
+                                    kcc.buffer.buffer_id, vcc.buffer.buffer_id,
+                                    meta.buffer_id, cb.buffer_id],
+                        "workGroups": {"x": nh * _GQA_SPLIT, "y": 1, "z": 1}})
+        plat.runKernel({"name": "gqa_merge",
+                        "tensors": [of.buffer.buffer_id, part.buffer.buffer_id,
+                                    meta.buffer_id],
+                        "workGroups": {"x": nh, "y": 1, "z": 1}})
+        return Tensor(of.reshape(nh, 1, hd))
     plat.runKernel({"name": "gqa_decode",
                     "tensors": [of.buffer.buffer_id, qc.buffer.buffer_id,
                                 kcc.buffer.buffer_id, vcc.buffer.buffer_id,
