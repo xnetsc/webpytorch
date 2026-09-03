@@ -2108,6 +2108,23 @@ class CausalLM:
             top_p=float(sp.get("top_p", 1.0) or 1.0),
             top_k=int(sp.get("top_k", 0) or 10 ** 9), rng=sp.get("rng")))
 
+    def _piece1(self, tid):
+        """The text of one token, memoised.
+
+        The candidate window is re-decoded on every step -- 64 tokenizer calls per token --
+        and the same handful of ids come back over and over, since a constrained reply keeps
+        choosing from the same small set. Measured before this: a constraint cost 6.5ms a
+        token on a step that is otherwise 12.5ms, and the callback itself was a lambda. It is
+        the decoding that costs, and a token's text never changes.
+        """
+        memo = self.__dict__.get("_piece1_memo")
+        if memo is None:
+            memo = self.__dict__["_piece1_memo"] = {}
+        got = memo.get(tid)
+        if got is None:
+            got = memo[tid] = self.tok.decode([tid])
+        return got
+
     def _pieces(self):
         """id -> text for the whole vocabulary, built once. Only the widened constraint search
         needs it, and only for models that are actually asked to satisfy a constraint."""
@@ -2146,7 +2163,7 @@ class CausalLM:
             allowed = [int(t) for t in order
                        if con.allows(self._con_text,
                                      pieces[int(t)] if pieces is not None and int(t) < len(pieces)
-                                     else self.tok.decode([int(t)]))]
+                                     else self._piece1(int(t)))]
             if allowed:
                 break
         if not allowed:
