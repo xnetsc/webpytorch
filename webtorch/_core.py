@@ -1972,8 +1972,17 @@ def _ggml_shape_for(type_name, N, K, packed):
         except Exception:
             return False
 
+    # Many dispatches per sync. A readback costs 1-2ms on this stack and one decode matmul
+    # costs tens of microseconds, so timing them one at a time measures the readback and
+    # ranks the candidates by noise -- which is exactly what happened: the first version of
+    # this picked a mix of shapes that took a 0.6B from 104 tok/s to 64.
+    REP = 24
+
     def bench():
-        _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"]).get()
+        o = None
+        for _ in range(REP):
+            o = _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"])
+        o.get()
 
     return tune(key, ("narrow", "shortk", None), apply, bench, check=check,
                 default=fallback)
