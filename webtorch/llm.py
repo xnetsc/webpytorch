@@ -2370,6 +2370,26 @@ class CausalLM:
         # Every kernel was captured against the old buffers and the old stride.
         self.capture_ready = False
 
+    def _kv_commit(self, held, embeds=None, rope_pos=None):
+        """Record what the cache rows actually hold. MUST run on every exit path.
+
+        `held` is maintained so that it always names exactly the rows written so far, so
+        committing it is right whether the reply ended, was stopped, raised, or -- for the
+        streaming pair, which are generators -- was simply abandoned by its consumer when
+        the page stopped pulling. Committing only on the happy path is what broke: the rows
+        for the abandoned run stay on the device while `_kv_ids` still names the PREVIOUS
+        turn, and `_kv_prefix` then reuses rows that hold a different conversation. That
+        reads as a model that has lost its mind -- repeating, drifting into text from an
+        earlier turn -- with a forward pass that is provably still exact.
+
+        Spliced embeddings and explicit rotary positions have no token-to-row
+        correspondence to record, so they drop instead; see `_kv_prefix`.
+        """
+        if embeds is None and rope_pos is None:
+            self._kv_ids = held
+        else:
+            self._kv_drop()
+
     def _kv_drop(self):
         """Forget what the cache holds. Anything that makes the cached rows unusable --
         releasing the model, resizing the cache, a run that wrote rows it did not track --
@@ -2589,15 +2609,17 @@ class CausalLM:
             pos = P; n = 0; steps = 0
             dec = self.tok.stream_decoder()
             t_first = time.perf_counter()
-            while n < max_new and nxt != eot:
-                piece = dec.push([nxt]); n += 1; steps += 1
-                if piece:
-                    yield piece
-                if self._stop_now():
-                    break                       # just-yielded text satisfies the constraint
-                held.append(nxt)                # its row is written by the call below
-                nxt = self._kv_forward([nxt], pos, cache); pos += 1
-            self._kv_ids = held
+            try:
+                while n < max_new and nxt != eot:
+                    piece = dec.push([nxt]); n += 1; steps += 1
+                    if piece:
+                        yield piece
+                    if self._stop_now():
+                        break                   # just-yielded text satisfies the constraint
+                    held.append(nxt)            # its row is written by the call below
+                    nxt = self._kv_forward([nxt], pos, cache); pos += 1
+            finally:
+                self._kv_commit(held)
             tail = dec.flush()
             if tail:
                 yield tail
@@ -2615,23 +2637,25 @@ class CausalLM:
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
         dec = self.tok.stream_decoder()
         t_first = time.perf_counter()
-        while n < max_new and nxt != eot:
-            piece = dec.push([nxt]); n += 1; steps += 1
-            if piece:
-                yield piece
-            if self._stop_now():
-                break                           # just-yielded text satisfies the constraint
-            if pos >= self.kv_cap:                  # out of rows -- see `generate`
-                self._kv_reserve(pos + 1)
-                self._set_inputs(nxt, pos)
-                plat.beginCapture("decode")
-                logits_t = self._decode_fwd(); logits_t.numpy()
-                plat.endCapture()
-            else:
-                self._set_inputs(nxt, pos); plat.replay("decode")
-            held.append(nxt)                    # row `pos` holds it as of this replay
-            nxt = self._pick(logits_t.numpy()[0]); pos += 1
-        self._kv_ids = held
+        try:
+            while n < max_new and nxt != eot:
+                piece = dec.push([nxt]); n += 1; steps += 1
+                if piece:
+                    yield piece
+                if self._stop_now():
+                    break                       # just-yielded text satisfies the constraint
+                if pos >= self.kv_cap:              # out of rows -- see `generate`
+                    self._kv_reserve(pos + 1)
+                    self._set_inputs(nxt, pos)
+                    plat.beginCapture("decode")
+                    logits_t = self._decode_fwd(); logits_t.numpy()
+                    plat.endCapture()
+                else:
+                    self._set_inputs(nxt, pos); plat.replay("decode")
+                held.append(nxt)                # row `pos` holds it as of this replay
+                nxt = self._pick(logits_t.numpy()[0]); pos += 1
+        finally:
+            self._kv_commit(held)
         tail = dec.flush()
         if tail:
             yield tail
@@ -2748,17 +2772,16 @@ class CausalLM:
             # token count, and the reply has to continue from where THEY ended.
             rnext = P if rope_pos is None else int(np.asarray(rope_pos).max()) + 1
             t_first = time.perf_counter()      # the first token exists as of here
-            while len(gen) < max_new and not self._stop_now():
-                held.append(nxt)                    # its row is written by the call below
-                nxt = self._kv_forward([nxt], pos, cache, rope_pos=rnext)
-                pos += 1; rnext += 1; steps += 1
-                if nxt == eot:
-                    break
-                gen.append(nxt)
-            if embeds is None and rope_pos is None:
-                self._kv_ids = held
-            else:
-                self._kv_drop()
+            try:
+                while len(gen) < max_new and not self._stop_now():
+                    held.append(nxt)                # its row is written by the call below
+                    nxt = self._kv_forward([nxt], pos, cache, rope_pos=rnext)
+                    pos += 1; rnext += 1; steps += 1
+                    if nxt == eot:
+                        break
+                    gen.append(nxt)
+            finally:
+                self._kv_commit(held, embeds, rope_pos)
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                              round(ttft, 3), _decode_rate(t_first, steps))
 
@@ -2787,29 +2810,29 @@ class CausalLM:
         gen = [g0]; steps = 1
         held.append(g0)                        # the captured step wrote row P
         nxt = self._pick(logits_t.numpy()[0]); pos = P + 1
-        while nxt != eot and len(gen) < max_new:
-            gen.append(nxt)
-            if len(gen) >= max_new or self._stop_now():
-                break
-            if pos >= self.kv_cap:
-                # Out of rows. Growing moves the buffers the capture was recorded against, so
-                # this step is captured afresh instead of replayed -- beginCapture runs it for
-                # real, so the token still comes out of this iteration.
-                self._kv_reserve(pos + 1)
-                self._set_inputs(nxt, pos)
-                plat.beginCapture("decode")
-                logits_t = self._decode_fwd(); logits_t.numpy()
-                plat.endCapture()
-            else:
-                self._set_inputs(nxt, pos)
-                plat.replay("decode")
-            held.append(nxt)                   # row `pos` holds it as of this replay
-            nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
         # Only what was actually written is claimed: the reply usually ends on a token whose
         # own keys and values were never needed, and claiming it would corrupt the next turn.
-        if embeds is None and rope_pos is None:
-            self._kv_ids = held
-        else:
-            self._kv_drop()
+        try:
+            while nxt != eot and len(gen) < max_new:
+                gen.append(nxt)
+                if len(gen) >= max_new or self._stop_now():
+                    break
+                if pos >= self.kv_cap:
+                    # Out of rows. Growing moves the buffers the capture was recorded
+                    # against, so this step is captured afresh instead of replayed --
+                    # beginCapture runs it for real, so the token still comes out of this
+                    # iteration.
+                    self._kv_reserve(pos + 1)
+                    self._set_inputs(nxt, pos)
+                    plat.beginCapture("decode")
+                    logits_t = self._decode_fwd(); logits_t.numpy()
+                    plat.endCapture()
+                else:
+                    self._set_inputs(nxt, pos)
+                    plat.replay("decode")
+                held.append(nxt)               # row `pos` holds it as of this replay
+                nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
+        finally:
+            self._kv_commit(held, embeds, rope_pos)
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
                          round(ttft, 3), _decode_rate(t_first, steps))
