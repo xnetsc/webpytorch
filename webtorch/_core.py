@@ -5256,6 +5256,43 @@ def _gemv_groups(N, mode=1, vals=None, kind=None):
     return (int(N) + per - 1) // per
 
 
+# Dequantise a packed tensor to fp32, using the SAME decode fragment the matmuls use.
+#
+# Every format hands each decoded value to `ACC(k, v)`, so an ACC that STORES instead of
+# multiplying turns the matmul into a dequantiser -- and there is no second copy of any
+# format's bit-twiddling to keep in step with the first. The fragments, their helpers and
+# their placeholder substitutions are shared verbatim.
+#
+# Written as (K, N) so the result is what a plain `x @ W` wants, no transpose after.
+_GGML_DEQ_PRE = """
+fn ACC(k: u32, v: f32) { outp[k * gm.N + nrow] = v; }
+fn ACC4(k: u32, v: vec4<f32>) {
+  outp[k * gm.N + nrow] = v.x;
+  outp[(k + 1u) * gm.N + nrow] = v.y;
+  outp[(k + 2u) * gm.N + nrow] = v.z;
+  outp[(k + 3u) * gm.N + nrow] = v.w;
+}
+"""
+
+_GGML_DEQ_MAIN = """
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= gm.N) { return; }
+  nrow = n;
+WOFFINIT
+HELPERINIT
+  let base = 0u;
+  let nb = gm.K / BLKVALS;
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+"""
+
+_GGML_DEQ_TAIL = """
+  }
+}
+"""
+
+
 def _ggml_src(type_name, mode, cfg=None, moe=False):
     """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one.
     `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
@@ -5274,12 +5311,16 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     # friends) cannot use vec4 at all.
     vec_win = (vals % 4 == 0 and "ACC4(" in dec
                and "ACC(" not in dec.replace("ACC4(", ""))
-    pre, main, tail = (((_GGML_GEMV_PRE_V4 if vec_win else _GGML_GEMV_PRE_F32),
-                        _GGML_GEMV_MAIN, _GGML_GEMV_TAIL) if mode
-                       else (_GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL))
+    if mode == 3:
+        pre, main, tail = _GGML_DEQ_PRE, _GGML_DEQ_MAIN, _GGML_DEQ_TAIL
+    elif mode:
+        pre, main, tail = ((_GGML_GEMV_PRE_V4 if vec_win else _GGML_GEMV_PRE_F32),
+                           _GGML_GEMV_MAIN, _GGML_GEMV_TAIL)
+    else:
+        pre, main, tail = _GGML_GEMM_PRE, _GGML_GEMM_MAIN, _GGML_GEMM_TAIL
     # helpers are functions, so they go BEFORE main -- WGSL has no nested functions.
     src = _GGML_BIND + (_MOE_BIND if moe else "") + helpers + pre + main + dec + tail
-    rows = max(1, mode)
+    rows = 1 if mode == 3 else max(1, mode)
     two = rows == 2
     # Multi-row accumulation is for the single-token decode path, which is the hot one. The
     # two-token variant addresses psum with its own fixed layout, so it stays at one row.
@@ -5514,6 +5555,37 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
                               type_name, N, K, err))
 
 
+def ggml_dequant(packed, type_name, K, N):
+    """A packed ggml tensor as a plain (K, N) fp32 matrix, on the device.
+
+    For the batched path only. Measured on this machine, same shape (1536x1024x3072) and the
+    same arithmetic: the quantised kernel tops out at 426 GFLOPS while a plain fp32 matmul
+    does 2117 -- five times, and the device is plainly not what limits the first. Unpacking
+    once and multiplying fast beats unpacking inside the multiply, as soon as there are
+    enough rows to pay for the unpacking.
+
+    Decode is not reimplemented here; `_ggml_src(mode=3)` reuses each format's own fragment.
+    """
+    plat = _adam_kernel["platform"]
+    key = (type_name, 3, None, False, 0)
+    if key not in _ggml_k["added"]:
+        plat.addKernel(_ggml_name(type_name, 3),
+                       {"source": _ggml_src(type_name, 3),
+                        "bindingTypes": ["read-only-storage", "read-only-storage",
+                                         "storage", "read-only-storage"]})
+        _ggml_k["added"].add(key)
+    of = _empty((int(K) * int(N),))
+    meta = _adam_kernel["make_meta"]((1, int(N), int(K), 0, 0, 0, 0, 0),
+                                     "u4,u4,u4,u4,u4,u4,u4,u4")
+    # binding 0 is the activation the matmul kernels read; nothing reads it here, so the
+    # weight buffer is bound again rather than allocating something to ignore.
+    plat.runKernel({"name": _ggml_name(type_name, 3),
+                    "tensors": [packed.buffer.buffer_id, packed.buffer.buffer_id,
+                                of.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (int(N) + 63) // 64, "y": 1, "z": 1}})
+    return of.reshape(int(K), int(N))
+
+
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                 xper=False, bias=None):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
@@ -5603,7 +5675,7 @@ def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
     # dimension and the size of the staged activations -- so it belongs in the name for the
     # same reason ORW does. Without it a second value silently reuses the first's pipeline,
     # and every measurement of the second is a measurement of the first.
-    return "ggml%s_%s%s%s%s%s" % (("v", "v2", "")[mode], type_name.lower(),
+    return "ggml%s_%s%s%s%s%s" % (("v", "v2", "", "deq")[mode], type_name.lower(),
                                   "" if o <= 1 else "_r%d" % o,
                                   "_%s" % small if small else "",
                                   "_e" if moe else "",
