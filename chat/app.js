@@ -2556,7 +2556,13 @@ $('#composer').onsubmit = async (e) => {
       const opts = Object.assign({ messages: msgs, images: imgs, prompt: promptFor(msg) },
                                  genOpts());
       const withTools = toolsEnabled();
-      if (withTools) opts.tools = toolDefs();
+      if (withTools) {
+        opts.tools = toolDefs();
+        // This page's decision, not the SDK's: hold the model to names that exist. A wrong
+        // name here cannot be run and the reader sees a failed round; a model that calls
+        // nothing instead just answers, which is the better of the two failures for a chat.
+        opts.constraint = 'tool_names';
+      }
       try {
         r = await call('generate', opts);
       } catch (err) {
@@ -2574,13 +2580,18 @@ $('#composer').onsubmit = async (e) => {
       const raw = reply.content.slice(streamedLen);      // this round's reply, nothing else
       streamedLen = reply.content.length;
       const prefix = reply.content.slice(0, streamedLen - raw.length);
-      const shown = stripToolCalls(raw);                 // prose kept, protocol removed
+      // ONE scan, and it happens in the SDK: what the reader is shown and what the loop
+      // runs have to come from the same reading of the text, or a call the loop missed gets
+      // printed as prose. Reading a model's own call format is the SDK's job, not this
+      // page's -- see `toolcall.py` and the tokenizer's `tool_call_format`.
+      const scan = await call('toolScan', { text: raw, tools: toolDefs() });
+      const shown = scan.shown;                          // prose kept, protocol removed
       if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) {
         // No round comes back around to tidy this one, so it tidies itself.
         reply.content = prefix + shown;
         break;
       }
-      const calls = parseToolCalls(raw);
+      const calls = scan.calls;
       if (!calls.length) { reply.content = prefix + shown; break; }
       // An id the template can answer a result with. The model's own call may already carry
       // one -- keep it; making another would tie the result to an id the model never said.
@@ -2614,7 +2625,9 @@ $('#composer').onsubmit = async (e) => {
         // Its call format is content, so its own text goes back verbatim.
         msgs.push({ role: 'assistant', content: raw });
       }
-      calls.forEach((c, i) => msgs.push(toolResultMessage(c, results[i])));
+      for (let i = 0; i < calls.length; i++) {
+        msgs.push(await call('toolResult', { call: calls[i], content: results[i] }));
+      }
       // The call and its result go to a folded side panel, NOT into the answer text.
       // Putting the trace in the answer taught the model to imitate it as content: with a
       // real trace in its history it next "called" a tool by writing a forged one --
@@ -2681,14 +2694,11 @@ function toolDefs() {
     return t.def;                       // nested {type:"function", function:{…}}
   });
 }
-// Whitespace, punctuation and case carry no meaning in a tool name: " Python" is
-// "python" with noise in it. Exact match first; a name that is identical once the
-// noise is stripped is the model's intent stated plainly, so it runs — that is reading
-// what it said, not guessing what it meant.
-const normName = s => String(s || '').toLowerCase().replace(/[\s_\-.]+/g, '');
+// A plain lookup: the SDK reads what the model wrote and reports the REGISTERED name, so
+// noise ("run_ Python" for "python") has already been resolved by the time a call gets
+// here. See `toolcall.match_name`.
 function findTool(name) {
-  return TOOLS.find(t => t.def.function.name === name)
-      || TOOLS.find(t => normName(t.def.function.name) === normName(name));
+  return TOOLS.find(t => t.def.function.name === name);
 }
 
 const TOOLS_KEY = 'webtorch.toolsOn';
@@ -2729,21 +2739,6 @@ async function probeTools() {
 // a template that does not know the `tool` role drops it silently -- the model then answers
 // without ever having seen what the tool returned. The probe says which is the case; an
 // ordinary user turn is the fallback, never the assumption.
-// The NAME travels with the result only when nothing else carries it. A template that
-// renders the name itself, or ties the result to the call by id, needs no extra hint; one
-// that carries neither leaves two calls in a round as anonymous blocks the model can only
-// guess at -- so then the name is folded into the content itself.
-function toolResultMessage(call, content) {
-  const carries = modelResultKeepsName || (modelCallIdShape && modelResultIdField);
-  const body = carries ? content
-             : JSON.stringify({ tool: call.name, result: safeJson(content) });
-  if (modelResultVia === 'user') {
-    return { role: 'user', content: 'Result of the tool you called:\n' + body };
-  }
-  const msg = { role: 'tool', name: call.name, content: body };
-  if (modelResultIdField) msg[modelResultIdField] = call.id;
-  return msg;
-}
 
 // Keep the result an object when it is one, so folding the name in does not bury JSON
 // inside a JSON string.
@@ -2766,212 +2761,6 @@ function toolsEnabled() {
 // answers every result with another call would otherwise never finish.
 const MAX_TOOL_ROUNDS = 4;
 
-// Tool calls out of a finished reply.
-//
-// `<tool_call>{…}</tool_call>` is what a ChatML template emits, and a bare JSON object is
-// what a model without one tends to produce. Both are read, and anything else is simply not
-// a tool call -- a reply that merely talks about JSON is left alone, because the object has
-// to carry a name that is actually registered before it is run.
-// The delimiters a model wraps a call in are ITS convention, not a standard, so they are
-// read off its own template by the probe. The list below is only what to try when a template
-// could not be read at all -- a last resort, never the rule.
-const FALLBACK_CALL_DELIMS = [['<tool_call>', '</tool_call>'],
-                              ['<|tool_call|>', '<|/tool_call|>'],
-                              ['[TOOL_CALLS]', '']];
-function callDelimiters() {
-  if (typeof modelCallOpen === 'string' && modelCallOpen)
-    return [[modelCallOpen, modelCallClose || '']];
-  return FALLBACK_CALL_DELIMS;
-}
-const reEsc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-function callRegexes() {
-  return callDelimiters().map(([o, c]) => new RegExp(
-    reEsc(o) + '\\s*([\\s\\S]*?)\\s*' + (c ? reEsc(c) : '(?=\\n|$)'), 'g'));
-}
-
-// ONE scan, used for both running the calls and removing them from what is shown. Two
-// separate readers drift: the reply ends up with a call the loop did not run, printed raw as
-// prose, which is exactly what happened -- a bare call at the end of a message was neither
-// executed nor hidden.
-//
-// A span counts as a call when it is inside <tool_call> markup (that is protocol, whatever
-// name it carries) or when it is a bare JSON object naming a tool that ACTUALLY EXISTS here.
-// Bare JSON with an unknown name is left alone: a reply may legitimately show a JSON object,
-// and guessing would eat the answer.
-// The other payload form, and it is not a fringe one: several templates ship it as THE
-// format, spelled out in their own system prompt --
-//
-//     <tool_call>
-//     <function=python>
-//     <parameter=code>
-//     print(6 * 7)
-//     </parameter>
-//     </function>
-//     </tool_call>
-//
-// A parser that only knows JSON reads that as prose. Worse than useless: the tags look like
-// HTML, the sanitiser drops them as unknown elements, and what reaches the reader is the
-// argument text alone -- a line of Python where an answer should be, with nothing to say a
-// tool was meant to run.
-//
-// Supporting it is not a special case for one model. It is a second wire format, the way
-// `nested` and `flat` definitions are two shapes of the same thing.
-const reXmlCall = /<function=([^>\s]+)\s*>([\s\S]*?)<\/function\s*>/g;
-const reXmlParam = /<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter\s*>/g;
-
-// How a value was encoded is stated by the templates that write this form:
-//
-//     args_value | string if args_value is string else args_value | tojson
-//
-// so a string went in as itself and everything else went in as JSON. Read back the same
-// way, using the tool's own schema to say which -- guessing from the text would turn the
-// string "12" into a number, and a code argument that happens to be `[1, 2]` into a list.
-function xmlParamValue(toolName, key, raw) {
-  const body = String(raw).replace(/^\n/, '').replace(/\n$/, '');
-  const t = findTool(toolName);
-  const prop = t && ((t.def.function.parameters || {}).properties || {})[key];
-  const type = prop && prop.type;
-  if (type === 'string') return body;
-  if (type) { try { return JSON.parse(body); } catch (e) { return body; } }
-  // No schema to consult: JSON if it parses as something structured, text otherwise. A bare
-  // word is not JSON and stays a word.
-  try {
-    const v = JSON.parse(body);
-    return (v !== null && typeof v === 'object') || typeof v === 'boolean' ? v : body;
-  } catch (e) { return body; }
-}
-
-// A call written back to the model, in the form its template writes. Used when correcting a
-// call it got wrong: the example it is shown has to be something it can send verbatim.
-function renderCall(name, args) {
-  if (modelCallPayload === 'xml') {
-    const open = modelCallOpen || '<tool_call>';
-    const close = modelCallClose || '</tool_call>';
-    const body = Object.keys(args).map((k) => {
-      const v = args[k];
-      const text = typeof v === 'string' ? v : JSON.stringify(v);
-      return '<parameter=' + k + '>\n' + text + '\n</parameter>';
-    }).join('\n');
-    return open + '\n<function=' + name + '>\n' + body + '\n</function>\n' + close;
-  }
-  return JSON.stringify(modelToolShape === 'flat'
-    ? { name: name, arguments: args }
-    : { type: 'function', function: { name: name, arguments: args } }, null, 2);
-}
-
-function asXmlCall(payload) {
-  reXmlCall.lastIndex = 0;
-  const m = reXmlCall.exec(String(payload));
-  if (!m) return null;
-  const name = m[1];
-  const args = {};
-  reXmlParam.lastIndex = 0;
-  let p;
-  while ((p = reXmlParam.exec(m[2]))) args[p[1]] = xmlParamValue(name, p[1], p[2]);
-  return { name: name, args: args, known: !!findTool(name), id: null };
-}
-
-function scanToolCalls(text) {
-  const src = String(text);
-  const found = [];
-  const asCall = (o, wrapped) => {
-    if (!o) return null;
-    // The nested form is recognised HERE, at the outer object, not left to be found as the
-    // inner one. Both are calls and both parsed -- but the span differs, and the span is
-    // what gets removed: matching the inner object stripped it out of the middle of its
-    // wrapper and left `{"type":"function","function":}` in the reply. Parse and strip have
-    // to agree on the same characters, which is the whole reason they share one scan.
-    const inner = (o.type === 'function' && o.function && typeof o.function === 'object')
-                ? o.function : o;
-    if (typeof inner.name !== 'string') return null;
-    const known = !!findTool(inner.name);
-    if (!known && !wrapped) return null;
-    // An id a model gives its own call is kept: a template that ties results to calls by
-    // id must see the SAME one back, not one invented here. It sits on the wrapper when
-    // there is one, so both are looked at.
-    const id = ['id', 'tool_call_id', 'call_id']
-                 .map(k => (o[k] !== undefined ? o[k] : inner[k]))
-                 .find(v => typeof v === 'string' && v) || null;
-    return { name: inner.name, args: inner.arguments || inner.parameters || {}, known, id };
-  };
-  // WHICH form to read is the model's own answer, taken off its template by the probe --
-  // not something tried until one sticks. Trying both is only what to do when the template
-  // could not be read at all, and then it is a guess and says so.
-  const form = modelCallPayload;                       // 'flat' | 'nested' | 'xml' | null
-  const asJson = (body) => {
-    try { return asCall(JSON.parse(body), true); } catch (e) { return null; }
-  };
-  // Inside the model's own call delimiters the question is no longer WHETHER this is a
-  // call -- the wrapper settled that -- only which encoding it used. So the declared form
-  // is tried first and the other one after: a template that says JSON while the model
-  // writes XML is a real disagreement, and refusing to read it puts the markup back in the
-  // reply for the sanitiser to strip into a bare fragment. Outside the delimiters nothing
-  // is that generous.
-  const readPayload = (body) =>
-    form === 'xml' ? (asXmlCall(body) || asJson(body))
-                   : (asJson(body) || asXmlCall(body));
-  callRegexes().forEach((re) => {
-    re.lastIndex = 0;
-    let m;
-    while ((m = re.exec(src))) {
-      const c = readPayload(m[1]);
-      if (c && !found.some(f => m.index < f.end && f.start < m.index + m[0].length))
-        found.push({ start: m.index, end: m.index + m[0].length, call: c });
-    }
-  });
-  // The same payload with its wrapper missing. Only for a model whose form this IS (or one
-  // we could not ask): a `<function=…>` block is markup nothing else writes, and left as
-  // prose the sanitiser eats the tags as unknown elements and prints the arguments as if
-  // they were the answer -- which is what a reader saw, one bare line of Python and no
-  // result.
-  if (form === 'xml' || form == null) {
-    reXmlCall.lastIndex = 0;
-    let xm;
-    while ((xm = reXmlCall.exec(src))) {
-      if (found.some(f => xm.index < f.end && f.start < xm.index + xm[0].length)) continue;
-      const c = asXmlCall(xm[0]);
-      if (c) found.push({ start: xm.index, end: xm.index + xm[0].length, call: c });
-    }
-  }
-  // Bare objects, wherever they sit. Brace-matched rather than regexed: the arguments are
-  // themselves an object, and a pattern stopping at the first `}` would cut a call in half.
-  for (let k = 0; k < src.length; k++) {
-    if (src[k] !== '{') continue;
-    if (found.some(f => k >= f.start && k < f.end)) continue;
-    let depth = 0, inStr = false, esc = false, end = -1;
-    for (let q = k; q < src.length; q++) {
-      const ch = src[q];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (ch === '\\') esc = true;
-        else if (ch === '"') inStr = false;
-        continue;
-      }
-      if (ch === '"') inStr = true;
-      else if (ch === '{') depth++;
-      else if (ch === '}') { depth--; if (depth === 0) { end = q + 1; break; } }
-    }
-    if (end < 0) break;
-    let c = null;
-    try { c = asCall(JSON.parse(src.slice(k, end)), false); } catch (e) {}
-    if (c) { found.push({ start: k, end, call: c }); k = end - 1; }
-  }
-  found.sort((a, b) => a.start - b.start);
-  return found;
-}
-
-function parseToolCalls(text) { return scanToolCalls(text).map(f => f.call); }
-
-// The markup is protocol, not prose, and so is a bare call to a tool that exists here.
-function stripToolCalls(text) {
-  const src = String(text);
-  const spans = scanToolCalls(src);
-  if (!spans.length) return src.trim();
-  let out = '', at = 0;
-  spans.forEach(f => { out += src.slice(at, f.start); at = f.end; });
-  out += src.slice(at);
-  return out.replace(/\n{3,}/g, '\n\n').trim();
-}
 
 async function runToolCall(c) {
   const t = findTool(c.name);
@@ -2992,24 +2781,22 @@ async function runToolCall(c) {
     // punctuation carry no meaning ("run_ Python" is "runpython"); matching argument names
     // decide where the name is no resemblance at all. It is only used to address the
     // correction -- nothing runs on a guess.
-    const sim = (a, b) => {
-      let hits = 0; const pool = b.split('');
-      for (const ch of a) { const i = pool.indexOf(ch); if (i >= 0) { hits++; pool.splice(i, 1); } }
-      return (2 * hits) / ((a.length + b.length) || 1);
-    };
-    const cn = normName(c.name);
-    const ranked = TOOLS.map(x => ({ x, s: sim(cn, normName(x.def.function.name)) }))
-                        .sort((p, q) => q.s - p.s);
-    const given = Object.keys((typeof c.args === 'object' && c.args) || {});
-    const guess = (ranked.length && ranked[0].s >= 0.5 && ranked[0].x)
-      || TOOLS.find(x => {
-           const props = Object.keys((x.def.function.parameters || {}).properties || {});
-           return given.length && given.every(k => props.includes(k));
-         }) || TOOLS[0];
+    // The evidence comes from the SDK (`suggest_tool`); the threshold and the fallback
+    // order are THIS page's policy, because what to do about a call that named nothing is
+    // a product question, not a fact about the model.
+    const ranked = await call('toolSuggest',
+                              { name: c.name, args: c.args || {}, tools: toolDefs() });
+    const pick = (ranked[0] && ranked[0].name_score >= 0.5 && ranked[0].name)
+              || (ranked.find(r => r.args_match) || {}).name
+              || (TOOLS[0] && TOOLS[0].def.function.name);
+    const guess = pick ? TOOLS.find(x => x.def.function.name === pick) : null;
     // The corrected call is shown in the form this model's template actually writes -- with
     // the model's OWN arguments. Handing back JSON to a model whose format is the XML one
     // would correct the name and break the call.
-    const fixed = guess ? renderCall(guess.def.function.name, c.args || {}) : '';
+    const fixed = guess
+      ? await call('toolRender', { name: guess.def.function.name, args: c.args || {},
+                                   tools: toolDefs() })
+      : '';
     return 'there is no tool called "' + c.name + '". These exist, with their arguments:\n'
          + listed + '\n\nYour call again, with the name corrected — send this:\n' + fixed;
   }

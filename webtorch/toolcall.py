@@ -59,6 +59,42 @@ def _norm(s):
     return re.sub(r"[\s_\-.]+", "", str(s or "").lower())
 
 
+def suggest(name, tools, args=None):
+    """Which registered tools a name that matched none could plausibly have meant, best
+    first: [{"name", "name_score", "args_match"}].
+
+    Evidence, not a decision. A call whose name matches nothing is reported as
+    `known: False` by `parse`; what to do about it -- correct it, ask again, give up -- is
+    the caller's policy, and this is here so that policy has something to stand on.
+
+    `name_score` is character overlap once whitespace, punctuation and case are dropped
+    ("run_ Python" is "runpython"). `args_match` says the arguments the model supplied are
+    all real parameters of that tool, which is the evidence that matters when the name is no
+    resemblance at all. Nothing is ever run on a guess.
+    """
+    want = _norm(name)
+    given = set((args or {}).keys()) if isinstance(args, dict) else set()
+    out = []
+    for n in tool_names(tools):
+        pool = list(_norm(n))
+        hits = 0
+        for ch in want:
+            if ch in pool:
+                hits += 1
+                pool.remove(ch)
+        denom = len(want) + len(_norm(n))
+        props = set()
+        for t in tools or []:
+            f = t.get("function") if isinstance(t.get("function"), dict) else t
+            if isinstance(f, dict) and f.get("name") == n:
+                props = set(((f.get("parameters") or {}).get("properties") or {}).keys())
+        out.append({"name": n,
+                    "name_score": (2.0 * hits / denom) if denom else 0.0,
+                    "args_match": bool(given) and given <= props})
+    out.sort(key=lambda r: (-r["name_score"], not r["args_match"]))
+    return out
+
+
 def _schema(tools, name, key):
     """The declared type of one argument, or None."""
     for t in tools or []:
@@ -124,7 +160,13 @@ def _as_call(o, wrapped, tools):
     name = inner.get("name")
     if not isinstance(name, str):
         return None
-    known = name in tool_names(tools)
+    # Reported under the name it was REGISTERED with, not the one the model typed: the
+    # difference is only noise (case, spaces, punctuation -- see `match_name`), and a caller
+    # that has to re-match it is doing the model-reading the SDK is for.
+    resolved = match_name(name, tools)
+    known = resolved is not None
+    if known:
+        name = resolved
     if not known and not wrapped:
         return None
     # An id a model gives its own call is kept: a template that ties results to calls by id
@@ -151,7 +193,8 @@ def _as_xml(payload, tools):
     args = {}
     for p in _RE_XML_PARAM.finditer(m.group(2)):
         args[p.group(1)] = _xml_value(tools, name, p.group(1), p.group(2))
-    return {"name": name, "args": args, "known": name in tool_names(tools), "id": None}
+    resolved = match_name(name, tools)
+    return {"name": resolved or name, "args": args, "known": resolved is not None, "id": None}
 
 
 def parse(text, tools=None, fmt=None):

@@ -2338,6 +2338,12 @@ class CausalLM:
         from . import toolcall
         return toolcall.render(name, args, self.tok.tool_call_format(tools))
 
+    def suggest_tool(self, name, tools, args=None):
+        """Which registered tools a name that matched none could plausibly have meant, best
+        first. Evidence for a caller's own decision -- nothing is run on it."""
+        from . import toolcall
+        return toolcall.suggest(name, tools, args)
+
     def tool_result_message(self, call, content):
         """The message that carries one tool's result back, shaped for this model."""
         from . import toolcall
@@ -2346,19 +2352,32 @@ class CausalLM:
                                        id_field=f["id_field"], via=f["via"])
 
     def _tool_name_constraint(self, tools, constraint):
-        """Hold the model to the tool names it was actually given, composed with whatever
-        constraint the caller asked for.
+        """Materialise `constraint="tool_names"` into a constraint over this call's tools.
 
-        Installed automatically whenever `tools=` is passed, because a name the caller never
-        registered cannot be run and there is no reading of it that helps: a 0.6B that has
-        talked itself into `run_2.py` writes that into the call and is CERTAIN of it --
-        p=0.9998 on the wrong token, measured -- so nothing that reweights the distribution
-        recovers it, only removing the token from the candidate set does.
+        ASKED FOR, never assumed. Holding a model to the names it was given changes what it
+        is allowed to say, and whether that trade is worth making is the caller's decision,
+        not this library's: the guard also makes a model that would have called the wrong
+        tool sometimes call none at all (measured 2 of 8 -> 4 of 8), and which of those is
+        the better failure depends on what the caller does next. So it is offered and not
+        installed -- pass `constraint="tool_names"`, alone or beside another constraint.
+
+        It is the repair that sampling cannot be. A model that has talked itself into
+        `run_2.py` is CERTAIN of it by the time it writes the call -- p=0.9998 on the wrong
+        token, measured -- so nothing that reweights the distribution recovers it; only
+        removing the token from the candidate set does.
 
         Both halves are derived, never written down: the names come from this call's own
-        `tools`, and the delimiter from the model's own template (`tool_call_format`). A
-        model whose call format cannot be read is left unconstrained rather than guessed at.
+        `tools`, the delimiter from the model's own template (`tool_call_format`). A model
+        whose call format cannot be read is left unconstrained rather than guessed at.
         """
+        want = constraint
+        rest = None
+        if isinstance(constraint, (list, tuple)):
+            want = "tool_names" if "tool_names" in constraint else None
+            rest = [c for c in constraint if c != "tool_names"] or None
+        if want != "tool_names":
+            return constraint
+        constraint = rest
         names = []
         for t in (tools or []):
             if not isinstance(t, dict):

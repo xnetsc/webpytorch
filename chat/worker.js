@@ -255,198 +255,30 @@ async function decodeImages(urls) {
   return out;
 }
 
-// Which shape of tool definition does THIS model's template actually consume?
-//
-// There is no universal one. The nested {type:"function", function:{...}} form is what most
-// templates written against the OpenAI convention expect; others take the flat
-// {name, description, parameters}. Handing over the wrong one is not an error -- a Jinja
-// template quietly renders nothing for a field it does not know, so the model is told about
-// a tool it never sees, and then never calls it. Silent, and indistinguishable from a model
-// that simply chose not to.
-//
-// So the shapes are TRIED, not assumed: render the same chat with each and keep the one whose
-// rendering actually contains the tool's name AND its parameter's name. That is evidence the
-// template read the definition rather than skipped it. If none does, the model cannot be told
-// about tools in any form this knows how to write, and it is not offered any.
+// What this model's template can carry, asked of the SDK. Every one of these is a fact
+// about the model read from its own template -- which definition shape it renders, how it
+// writes a call, how a result reaches it -- so the reading lives in the SDK
+// (`tools_shape`, `tool_call_format`, `tool_result_format`) and this only ferries the
+// answer to the page.
 async function toolsSupported() {
   if (!ready || !pyodide) return { ok: false, shape: null };
   try {
     const r = await pyodide.runPythonAsync(`
 import json
-_shape = None
 _m = _MODEL["m"]
-_t = getattr(getattr(_m, "impl", _m), "tok", None) if _m is not None else None
-if _t is not None:
-    _msgs = [{"role": "user", "content": "hi"}]
-    _NAME = "zzprobetoolzz"
-    _ARG = "zzprobeargzz"
-    _fn = {"name": _NAME, "description": "probe",
-           "parameters": {"type": "object",
-                          "properties": {_ARG: {"type": "string", "description": "probe"}},
-                          "required": [_ARG]}}
-    _cands = [("nested", [{"type": "function", "function": _fn}]),
-              ("flat", [dict(_fn)])]
-    try:
-        _plain = _t.encode_chat(None, None, messages=_msgs)
-    except Exception:
-        _plain = None
-    if _plain is not None:
-        for _label, _tools in _cands:
-            try:
-                _ids = _t.encode_chat(None, None, messages=_msgs, tools=_tools)
-            except Exception:
-                continue
-            if _ids == _plain:
-                continue                      # the template ignored them entirely
-            try:
-                _txt = _t.decode(_ids)
-            except Exception:
-                _txt = ""
-            # The NAME alone is not enough: a template can mention a tool and drop its
-            # arguments, which produces calls with no parameters.
-            if _NAME in _txt and _ARG in _txt:
-                _shape = _label
-                break
-# How a tool RESULT reaches this model, discovered the same way. A template may define its
-# own structure for one, may render it as an ordinary turn, or may drop a role it does not
-# know -- and a dropped result is silent: the model answers without ever seeing what the
-# tool returned.
-_result_via = None
-_keeps_name = False
-if _t is not None:
-    _MK = "zzresultmarkzz"; _TN = "zztoolnamezz"
-    _base = [{"role": "user", "content": "hi"},
-             {"role": "assistant", "content": "calling"}]
-    def _renders(_msgs):
-        try:
-            return _t.decode(_t.encode_chat(None, None, messages=_msgs))
-        except Exception:
-            return ""
-    _as_tool = _renders(_base + [{"role": "tool", "name": _TN, "content": _MK}])
-    if _MK in _as_tool:
-        _result_via = "tool"
-        _keeps_name = _TN in _as_tool
-    else:
-        _as_user = _renders(_base + [{"role": "user", "content": _MK}])
-        if _MK in _as_user:
-            _result_via = "user"
-# How a RESULT is tied to the CALL it answers, discovered the same way. Some templates
-# carry an id both ways -- one rendered on the assistant's call, one read back on the
-# result -- and then a reply with several calls needs no other hint about which answer
-# belongs to which. Two probes, because the two halves are independent facts: does the
-# template RENDER an id given on the call (and in which of the shapes it takes there),
-# and does it READ an id field on the result message (and which name does it read).
-# A template that does neither ties results to calls by order alone.
-_call_id_shape = None
-_result_id_field = None
-if _t is not None and _result_via == "tool":
-    _CID = "zzcallidzz"
-    _amsg = {"role": "assistant", "content": "calling"}
-    for _s, _calls in (("nested", [{"id": _CID, "type": "function",
-                                    "function": {"name": _TN, "arguments": {}}}]),
-                       ("flat", [{"id": _CID, "name": _TN, "arguments": {}}])):
-        _c = dict(_amsg); _c["tool_calls"] = _calls
-        if _CID in _renders(_base[:-1] + [_c]):
-            _call_id_shape = _s
-            break
-    if _call_id_shape is not None:
-        _ids = (("tool_call_id", "zzidtczz"), ("call_id", "zzidcizz"), ("id", "zzididzz"))
-        _rm = {"role": "tool", "content": _MK}
-        for _f, _v in _ids:
-            _rm[_f] = _v
-        _r = _renders(_base + [_rm])
-        for _f, _v in _ids:
-            if _v in _r:
-                _result_id_field = _f
-                break
-# How this model WRITES a call, taken from the template rather than assumed. The template
-# is what turns "tool_calls" into text, so rendering one with known markers and reading back
-# what surrounds it gives the exact delimiters this model emits -- no guessing that everyone
-# uses <tool_call>, which is one family's convention and not a standard.
-_call_open = None
-_call_close = None
-_call_payload = None
-if _t is not None and _shape is not None:
-    _N = "zzprobenamezz"; _A = "zzprobeargzz"; _V = "zzprobevalzz"
-    _rc = _renders([{"role": "user", "content": "hi"},
-                    {"role": "assistant", "content": "",
-                     "tool_calls": [{"id": "zzprobeidzz", "type": "function",
-                                     "function": {"name": _N, "arguments": {_A: _V}}}]}])
-    _i = _rc.find(_N)
-    if _i >= 0:
-        # The payload is the object that CONTAINS the name. Walking back to the nearest
-        # brace and matching it forward is not that: on a template whose tool definitions
-        # are rendered as JSON earlier in the prompt, the nearest brace before the call is
-        # inside those definitions, and it closes before the call even begins. That parsed,
-        # so the probe reported the definition's shape as the call's and handed back a
-        # fragment of the tools block as the delimiters -- after which nothing the model
-        # wrote could ever match, and its calls were neither run nor removed.
-        #
-        # So: walk candidate braces outward from the name and keep the WIDEST one that both
-        # contains the name and parses as JSON on its own. Widest, not nearest, because the
-        # nested form wraps the call -- {"type":"function","function":{"name":...}} -- and
-        # stopping at the first container reports the inner object as the payload and the
-        # wrapper text as the delimiter. Parsing is what stops it going too far: a span that
-        # reached back into the tools block would have prose in it and would not parse.
-        _st = -1; _en = -1
-        _cand = _rc.rfind("{", 0, _i)
-        while _cand >= 0:
-            _d = 0; _e = -1
-            for _q in range(_cand, len(_rc)):
-                if _rc[_q] == "{": _d += 1
-                elif _rc[_q] == "}":
-                    _d -= 1
-                    if _d == 0: _e = _q + 1; break
-            if _e > _i:
-                try:
-                    json.loads(_rc[_cand:_e])
-                    _st = _cand; _en = _e
-                except Exception:
-                    pass
-            _cand = _rc.rfind("{", 0, _cand)
-        if _en > 0:
-            _pre = _rc[:_st]
-            _post = _rc[_en:]
-            # chr(10), never a backslash-n literal: this whole block lives inside a JS
-            # template literal, so JS turns the escape into a real newline before Python ever
-            # sees it and the string is left unterminated. It compiled fine when read from
-            # the FILE and failed only when run -- which is why testing the file's text is
-            # not testing what runs.
-            _NL = chr(10)
-            # The LAST NON-EMPTY line before the payload is the opener. A template that puts
-            # its tag on its own line leaves an empty remainder after the final newline, and
-            # taking that reports "this model uses no delimiters" about one that does.
-            _lines = [x for x in _pre.split(_NL) if x.strip()]
-            _call_open = _lines[-1] if _lines else ""
-            _after = [x for x in _post.split(_NL) if x.strip()]
-            _call_close = _after[0] if _after else ""
-            try:
-                _obj = json.loads(_rc[_st:_en])
-                _call_payload = "nested" if ("function" in _obj and "name" not in _obj) else "flat"
-            except Exception:
-                _call_payload = None
-    # No JSON payload found: several templates write the call as XML instead --
-    #   <tool_call>{nl}<function=NAME>{nl}<parameter=KEY>{nl}value{nl}</parameter>{nl}</function>
-    # -- and looking only for a brace reported "this model has no call format" about a model
-    # whose format is spelled out in its own system prompt. The name IS present in that form,
-    # so this cannot hang off "name not found"; it hangs off "no payload was read".
-    if _call_payload is None:
-        _fx = _rc.find("<function=")
-        if _fx >= 0:
-            _NL = chr(10)
-            _lines = [x for x in _rc[:_fx].split(_NL) if x.strip()]
-            _call_open = _lines[-1] if _lines else ""
-            _fe = _rc.find("</function>", _fx)
-            _post = _rc[_fe + len("</function>"):] if _fe >= 0 else ""
-            _after = [x for x in _post.split(_NL) if x.strip()]
-            _call_close = _after[0] if _after else ""
-            _call_payload = "xml"
-json.dumps({"ok": _shape is not None, "shape": _shape,
-            "result_via": _result_via, "result_keeps_name": bool(_keeps_name),
-            "call_id_shape": _call_id_shape, "result_id_field": _result_id_field,
-            "call_open": _call_open, "call_close": _call_close,
-            "call_payload": _call_payload})
-`);
+if _m is None:
+    _r = {"ok": False, "shape": None}
+else:
+    _tk = _m.tok
+    _shape = _tk.tools_shape()
+    _cf = _tk.tool_call_format() or {}
+    _rf = _tk.tool_result_format()
+    _r = {"ok": _shape is not None, "shape": _shape,
+          "result_via": _rf["via"], "result_keeps_name": bool(_rf["keeps_name"]),
+          "call_id_shape": _rf["call_id_shape"], "result_id_field": _rf["id_field"],
+          "call_open": _cf.get("open"), "call_close": _cf.get("close"),
+          "call_payload": _cf.get("payload")}
+json.dumps(_r)`);
     return JSON.parse(r);
   } catch (e) {
     // The reason travels with the answer. A probe that fails silently is indistinguishable
@@ -499,7 +331,7 @@ _msgs = _o.get("messages") or None        # full conversation; falls back to the
 # (No backticks in this block -- it is inside a JS template literal.)
 _PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
          "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop",
-         "tools")
+         "tools", "constraint")
 _kw = dict(max_new=_n or None, stream=True, channels=True, enable_thinking=_think)
 for _k in _PASS:
     _v = _o.get(_k)
@@ -554,6 +386,71 @@ json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
         + 'if hasattr(_b, "reap_now"): _b.reap_now()');
     } catch (e) { /* WebGL, or a runtime already gone: nothing to reap */ }
   }
+}
+
+// ---- tool calling: the SDK does it, this only carries the question across -------------
+//
+// Reading a model's calls, shaping a result for it and knowing what its template can carry
+// are facts about the model, so they live in the SDK (webtorch/toolcall.py and the
+// tokenizer's three probes). Nothing here decides any of it.
+
+// One round trip, not two: the reply the reader sees and the calls to run come from the
+// SAME scan, and two scans drift -- a call the loop did not run gets printed as prose.
+async function toolScan(text, tools) {
+  if (!ready || !pyodide) return { shown: String(text || ''), calls: [] };
+  pyodide.globals.set('_ts_text', String(text || ''));
+  pyodide.globals.set('_ts_tools', JSON.stringify(tools || []));
+  const out = await pyodide.runPythonAsync(`
+import json
+_m = _MODEL["m"]
+_tl = json.loads(_ts_tools)
+if _m is None:
+    _r = {"shown": _ts_text, "calls": []}
+else:
+    _r = {"shown": _m.strip_tool_calls(_ts_text, _tl),
+          "calls": _m.tool_calls(_ts_text, _tl)}
+json.dumps(_r, ensure_ascii=False)`);
+  return JSON.parse(out);
+}
+
+async function toolSuggest(name, args, tools) {
+  pyodide.globals.set('_sg_name', String(name || ''));
+  pyodide.globals.set('_sg_args', JSON.stringify(args || {}));
+  pyodide.globals.set('_sg_tools', JSON.stringify(tools || []));
+  const out = await pyodide.runPythonAsync(`
+import json
+json.dumps(_MODEL["m"].suggest_tool(_sg_name, json.loads(_sg_tools), json.loads(_sg_args)))`);
+  return JSON.parse(out);
+}
+
+async function toolResult(callObj, content) {
+  pyodide.globals.set('_tr_call', JSON.stringify(callObj || {}));
+  pyodide.globals.set('_tr_body', String(content == null ? '' : content));
+  const out = await pyodide.runPythonAsync(`
+import json
+json.dumps(_MODEL["m"].tool_result_message(json.loads(_tr_call), _tr_body),
+           ensure_ascii=False)`);
+  return JSON.parse(out);
+}
+
+async function toolRender(name, args, tools) {
+  pyodide.globals.set('_rc_name', String(name || ''));
+  pyodide.globals.set('_rc_args', JSON.stringify(args || {}));
+  pyodide.globals.set('_rc_tools', JSON.stringify(tools || []));
+  return await pyodide.runPythonAsync(`
+import json
+_MODEL["m"].render_tool_call(_rc_name, json.loads(_rc_args), json.loads(_rc_tools))`);
+}
+
+async function splitReasoning(text) {
+  if (!ready || !pyodide) return { reasoning: null, answer: String(text || ''), open: false };
+  pyodide.globals.set('_sr_text', String(text || ''));
+  const out = await pyodide.runPythonAsync(`
+import json
+_m = _MODEL["m"]
+json.dumps(_m.split_reasoning(_sr_text) if _m is not None
+           else {"reasoning": None, "answer": _sr_text, "open": False}, ensure_ascii=False)`);
+  return JSON.parse(out);
 }
 
 async function cacheList() {
@@ -770,6 +667,11 @@ onmessage = async (e) => {
   else if (cmd === 'toolsSupported') res = await toolsSupported();
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'stats') res = runtimeStats();
+    else if (cmd === 'toolScan') res = await toolScan(args.text, args.tools);
+    else if (cmd === 'toolResult') res = await toolResult(args.call, args.content);
+    else if (cmd === 'toolSuggest') res = await toolSuggest(args.name, args.args, args.tools);
+    else if (cmd === 'toolRender') res = await toolRender(args.name, args.args, args.tools);
+    else if (cmd === 'splitReasoning') res = await splitReasoning(args.text);
     else if (cmd === 'cacheList') res = await cacheList();
     else if (cmd === 'cacheDelete') await cacheDelete(args.key);
     else if (cmd === 'cacheClear') await cacheClear();
