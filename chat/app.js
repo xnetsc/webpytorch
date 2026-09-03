@@ -2089,7 +2089,15 @@ function normalizeMath(src) {
     parts[i] = parts[i]
       .replace(/\\\[([\s\S]*?)\\\]/g, (_, f) => '$$' + f.trim() + '$$')
       .replace(/\\\(([\s\S]*?)\\\)/g, (_, f) => '$' + f.trim() + '$')
-      .replace(/\$\$[ \t]*\n([\s\S]*?)\n[ \t]*\$\$/g, (_, f) => '$$' + f.trim() + '$$');
+      // The body may not itself contain `$$`, and the closer may sit at the end of the
+      // formula's own line. Both come from what models actually emit: one wrote
+      //     $$\n<formula> $$\n$$\n<formula>\n$$
+      // -- the first block closed on its own line's end -- and a pattern that only looked
+      // for a newline before the closer ran straight THROUGH that boundary, swallowing the
+      // `$$` between the two blocks. The first formula came out truncated and the second
+      // was left as literal `$$` delimiters in the reply.
+      .replace(/\$\$[ \t]*\n((?:(?!\$\$)[\s\S])*?)\s*\$\$/g,
+               (_, f) => '$$' + f.trim() + '$$');
   }
   return parts.join('');
 }
