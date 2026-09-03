@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js');
+const worker = new Worker('worker.js?v=962be8875b');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1781,7 +1781,7 @@ function pyCall(cmd, args) {
 
 function pyStart() {
   if (pyWorker || !pyEnabled()) return;
-  pyWorker = new Worker('pyworker.js');
+  pyWorker = new Worker('pyworker.js?v=1fea30ec14');
   pyWorker.onmessage = (e) => {
     const m = e.data || {};
     if (m.type === 'res') {
