@@ -1539,7 +1539,7 @@ def bmm(a, b):
     return out
 
 
-def gqa_attention(q, k, v, mask=None, scale=None):
+def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
     """Grouped-query attention WITHOUT materializing the KV head expansion.
 
     q (nh, T, hd); k, v (nkv, S, hd); nh % nkv == 0.
@@ -1555,10 +1555,16 @@ def gqa_attention(q, k, v, mask=None, scale=None):
     if scale is None:
         scale = 1.0 / (float(hd) ** 0.5)               # host-side Python float, not a WgPy tensor pow
     qg = q.reshape(nkv, rep * T, hd)
-    a = bmm(qg, transpose_last2(k)) * scale            # (nkv, rep*T, S)
-    if mask is not None:
-        a = (a.reshape(nkv, rep, T, S) + mask).reshape(nkv, rep * T, S)
-    a = softmax(a)
+    if causal_start is not None and _adam_backend_ready() and not q.requires_grad:
+        # One pass instead of four: the scale and the causal mask ride inside the softmax,
+        # and the mask is never built -- see `_SOFTMAX_CAUSAL_WGSL`.
+        a = Tensor(_fused_causal_softmax(bmm(qg, transpose_last2(k)).data,
+                                         T, causal_start, scale))
+    else:
+        a = bmm(qg, transpose_last2(k)) * scale        # (nkv, rep*T, S)
+        if mask is not None:
+            a = (a.reshape(nkv, rep, T, S) + mask).reshape(nkv, rep * T, S)
+        a = softmax(a)
     o = bmm(a, v)                                      # (nkv, rep*T, hd)
     return o.reshape(nh, T, hd)                        # head = kv*rep + r
 
@@ -2320,6 +2326,74 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 """
+# Scale, causal mask and softmax in ONE pass over the score matrix.
+#
+# The prefill path used to do them as four separate ones -- `a * scale`, `a + mask`, then the
+# fused softmax -- and the thing being traversed is seq-squared: at a 1536-token prompt the
+# scores are 151MB per layer, so each extra traversal is 300MB of reading and writing, 28
+# times over. Measured, prefill attention ran at about 7 GB/s for that reason, and at 1536
+# tokens it was 4.7s of an 8.2s prefill.
+#
+# The mask does not exist here at all. A causal mask is pure structure -- column j is allowed
+# for query i exactly when j <= start + i -- so it is a comparison on indices, not 9.4MB of
+# -1e9 built on the HOST with np.triu and uploaded. And knowing where the row ends means the
+# loops stop there: the masked half was still being read and exponentiated to produce zeros.
+_SOFTMAX_CAUSAL_WGSL = """@group(0) @binding(0)
+var<storage,read> inp: array<f32>;
+@group(0) @binding(1)
+var<storage,read_write> outp: array<f32>;
+struct CMeta { rows: u32, width: u32, T: u32, start: u32, scale: f32, }
+@group(0) @binding(2)
+var<storage,read> cmeta: CMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= cmeta.rows) { return; }
+  let base = row * cmeta.width;
+  // Rows run (kv, rep, T) so the query index is the row within its T block.
+  let i = row % cmeta.T;
+  let lim = min(cmeta.width, cmeta.start + i + 1u);
+  var mx: f32 = inp[base] * cmeta.scale;
+  for (var j: u32 = 1u; j < lim; j = j + 1u) {
+    let v = inp[base + j] * cmeta.scale;
+    if (v > mx) { mx = v; }
+  }
+  var sm: f32 = 0.0;
+  for (var j: u32 = 0u; j < lim; j = j + 1u) {
+    sm = sm + exp(inp[base + j] * cmeta.scale - mx);
+  }
+  for (var j: u32 = 0u; j < lim; j = j + 1u) {
+    outp[base + j] = exp(inp[base + j] * cmeta.scale - mx) / sm;
+  }
+  // Everything past the diagonal is exactly zero, and has to be written: the buffer is
+  // reused and the matmul that follows reads the whole row.
+  for (var j: u32 = lim; j < cmeta.width; j = j + 1u) { outp[base + j] = 0.0; }
+}
+"""
+_softmax_causal_k = {"added": False}
+
+
+def _fused_causal_softmax(xd, T, start, scale):
+    """scale -> causal mask -> softmax, in one pass. `xd` is (..., rows, width) with the
+    query index running fastest over `T` inside each block."""
+    plat = _adam_kernel["platform"]
+    if not _softmax_causal_k["added"]:
+        plat.addKernel("softmax_causal", {
+            "source": _SOFTMAX_CAUSAL_WGSL,
+            "bindingTypes": ["read-only-storage", "storage", "read-only-storage"]})
+        _softmax_causal_k["added"] = True
+    width = int(xd.shape[-1])
+    rows = int(xd.size) // width
+    of = _empty(xd.shape)
+    meta = _adam_kernel["make_meta"]((rows, width, int(T), int(start), float(scale)),
+                                     "u4,u4,u4,u4,f4")
+    plat.runKernel({"name": "softmax_causal",
+                    "tensors": [_contig(xd).buffer.buffer_id, of.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": (rows + 63) // 64, "y": 1, "z": 1}})
+    return of
+
+
 _softmax_kernel = {"added": False}
 
 

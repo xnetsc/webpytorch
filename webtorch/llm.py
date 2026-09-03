@@ -2812,7 +2812,9 @@ class CausalLM:
                 V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
                 Kp = wt.Tensor(wt._contig(K.data[:, :end, :]))
                 Vp = wt.Tensor(wt._contig(V.data[:, :end, :]))
-                o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc)
+                # `causal_start` instead of the mask tensor: the shape is what the mask
+                # says, so the kernel derives it and nothing seq-squared is built or sent.
+                o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc, causal_start=start)
                 h = h + self._attn_out(lay, o, T)
             x = self._rms(h, lay["post_ln"])
             h = h + self._mlp(lay, x)
