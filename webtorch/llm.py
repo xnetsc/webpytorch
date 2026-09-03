@@ -2487,6 +2487,12 @@ class CausalLM:
         # few hundred tokens. On a machine already holding 13GB of weights that is the
         # difference between fitting and swapping.
         LMAX = self.kv_cap = min(int(self.lmax), self._KV_FLOOR)
+        # Settle the shape constants now, while a load is already taking seconds, rather than
+        # inside the first reply. Left to happen lazily it lands in the middle of the first
+        # generation and shows there: measured, the first reply ran at 9.6 tok/s against the
+        # 109 every reply after it. A cost paid where someone is already waiting is not the
+        # same cost as one paid where they are reading.
+        self._warm_shapes()
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
@@ -2676,6 +2682,26 @@ class CausalLM:
         cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
         self._gcache = cache
         return cache, 0
+
+    def _warm_shapes(self):
+        """Run each distinct quantised matmul shape once, so the tuner settles during the
+        load instead of during the first reply. Best-effort: a model whose weights are not
+        of this kind, or a backend that cannot run it, simply skips."""
+        try:
+            seen = set()
+            for lay in getattr(self, "layers", []) or []:
+                for v in lay.values():
+                    packed = getattr(v, "packed", None)
+                    if packed is None or not hasattr(v, "Kt"):
+                        continue
+                    key = (v.type_name, int(v.Nt), int(v.Kt))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    x = wt.Tensor(np.zeros((1, int(v.Kt)), np.float32))
+                    v(x).numpy()
+        except Exception:
+            pass
 
     def _kv_reserve(self, need):
         """Make sure the KV cache holds at least `need` rows, growing it if it does not.
