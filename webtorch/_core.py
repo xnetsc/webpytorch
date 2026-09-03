@@ -1901,15 +1901,19 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
         plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
                                       "bindingTypes": ["storage"]
                                       + ["read-only-storage"] * 5})
-        _sub = lambda src: src.replace("SPLITu", "%du" % _GQA_SPLIT)
-        plat.addKernel("gqa_split", {"source": _sub(_GQA_SPLIT_WGSL),
-                                     "bindingTypes": ["storage"]
-                                     + ["read-only-storage"] * 5})
-        plat.addKernel("gqa_merge", {"source": _sub(_GQA_MERGE_WGSL),
-                                     "bindingTypes": ["storage",
-                                                      "read-only-storage",
-                                                      "read-only-storage"]})
         _gqa_k["added"] = True
+    # The split factor is baked into the shader, so each value is its OWN kernel -- named
+    # for it, so several can exist at once and be compared on the device that will run them.
+    if _GQA_SPLIT not in _gqa_k:
+        sub = lambda src: src.replace("SPLITu", "%du" % _GQA_SPLIT)
+        plat.addKernel("gqa_split_%d" % _GQA_SPLIT,
+                       {"source": sub(_GQA_SPLIT_WGSL),
+                        "bindingTypes": ["storage"] + ["read-only-storage"] * 5})
+        plat.addKernel("gqa_merge_%d" % _GQA_SPLIT,
+                       {"source": sub(_GQA_MERGE_WGSL),
+                        "bindingTypes": ["storage", "read-only-storage",
+                                         "read-only-storage"]})
+        _gqa_k[_GQA_SPLIT] = True
     # Bind through named locals. Inlining `_contig(...)` into the list drops the only
     # reference to each temporary as soon as its id is read, so its GPU buffer can be
     # recycled for the next one -- two bindings then silently share a buffer.
@@ -1927,12 +1931,12 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
         # Two dispatches instead of one, and SPLIT times the workgroups in the first. Both
         # shapes are fixed, so the pair captures and replays exactly like the single kernel.
         part = _empty((nh * _GQA_SPLIT * (hd + 2),))
-        plat.runKernel({"name": "gqa_split",
+        plat.runKernel({"name": "gqa_split_%d" % _GQA_SPLIT,
                         "tensors": [part.buffer.buffer_id, qc.buffer.buffer_id,
                                     kcc.buffer.buffer_id, vcc.buffer.buffer_id,
                                     meta.buffer_id, cb.buffer_id],
                         "workGroups": {"x": nh * _GQA_SPLIT, "y": 1, "z": 1}})
-        plat.runKernel({"name": "gqa_merge",
+        plat.runKernel({"name": "gqa_merge_%d" % _GQA_SPLIT,
                         "tensors": [of.buffer.buffer_id, part.buffer.buffer_id,
                                     meta.buffer_id],
                         "workGroups": {"x": nh, "y": 1, "z": 1}})
