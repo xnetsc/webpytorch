@@ -43,6 +43,12 @@ from ._sdk import (install_torch, load, Model, release, loaded_models, release_a
 from .backend import backend, has_gpu, require_gpu
 from .portable import export_model, import_model, model_groups
 from .lm_engine import TransformerLM, build_lm, SAMPLERS
+# Output constraints. The six verdicts are the whole vocabulary a constraint answers in, so
+# they belong at the top level -- a caller should not have to know which module they live in
+# to say ALLOW_END.
+from .constrain import (Constraint, Verdict, verdict,
+                        DENY, DENY_FREE, END, ALLOW, ALLOW_FREE, ALLOW_END,
+                        THEN_ASK, THEN_FREE, THEN_END)
 from .multimodal import MultimodalLM, register_encoder, load_encoder, list_encoders, splice_embeddings
 
 # The PUBLIC API is generic / task-level only (below). Concrete model implementations

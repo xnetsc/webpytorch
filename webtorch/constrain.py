@@ -13,29 +13,86 @@ allowed set is what matters, not its exact ordering.
 import json
 
 
-# What `allows` may return, when True/False is not enough to say what should happen next.
+# What `allows` answers, as one type.
 #
-# The plain answers stay the plain answers -- True is "allowed, ask me again", False is "not
-# allowed" -- and these three say something about the GENERATION rather than about the token,
-# which is the part a boolean cannot express:
+# A verdict is three independent things, and they are worth keeping independent because a
+# caller genuinely needs the combinations:
 #
-#   LAST  allowed, and it is the last one. The token is emitted, then generation ends. For a
-#         closing brace, a final digit, the byte that completes a record -- the cases where
-#         the caller knows the reply is over only once it has seen what completes it.
-#   STOP  do not take it, and the reply is complete as it stands. What is already generated
-#         is returned; nothing further is asked for.
-#   FREE  allowed, and stop asking. The rest of the reply is unconstrained, so a caller that
-#         only needs to steer a prefix -- an opening tag, a field name -- pays nothing for
-#         the remainder.
+#   allow  may this candidate be used at all
+#   take   if it may, does it go into the reply
+#   then   what happens from here -- keep ASKING, stop asking and run FREE, or END the reply
 #
-# Returned as strings so a callback needs no import, and so an unrecognised value is a clear
-# error rather than a silently-truthy one.
-ALLOW = True
-DENY = False
-LAST = "last"
-STOP = "stop"
-FREE = "free"
-_VERDICTS = (LAST, STOP, FREE)
+# Twelve combinations exist; six of them mean something. `allow=True, take=False` with more
+# to come cannot be honoured -- every step has to emit a token -- and with nothing to come it
+# is just "end without this one", which `END` already is. The six that remain are below, and
+# they are the whole space, not a list that grew by need:
+#
+#     allow  take  then       name
+#     no     -     THEN_ASK   DENY          not this one; keep asking
+#     no     -     THEN_FREE  DENY_FREE     not this one, and stop asking from here
+#     no     -     THEN_END   END           the reply is complete as it stands
+#     yes    yes   THEN_ASK   ALLOW         the ordinary answer
+#     yes    yes   THEN_FREE  ALLOW_FREE    take it, then stop asking
+#     yes    yes   THEN_END   ALLOW_END     take it; it is the last
+#
+# `True` and `False` are accepted as ALLOW and DENY, because those two are most of the uses
+# and a predicate should be allowed to look like one.
+# The `then` axis is an int, not a string: it is read a few hundred times per token (once
+# per candidate) and an integer compare needs no interning assumption to be cheap. The names
+# are what anyone writing or reading a constraint uses; the numbers are what the loop sees.
+THEN_ASK = 0
+THEN_FREE = 1
+THEN_END = 2
+
+
+class Verdict(object):
+    """One answer from a constraint. The six below are the only values -- compare with `is`,
+    or read `.allow` / `.take` / `.then`."""
+
+    __slots__ = ("allow", "take", "then", "_name")
+
+    def __init__(self, allow, take, then, name):
+        self.allow = allow
+        self.take = take
+        self.then = then            # THEN_ASK | THEN_FREE | THEN_END
+        self._name = name
+
+    def __repr__(self):
+        return "Verdict.%s" % self._name
+
+    def __bool__(self):             # so `if verdict:` reads as "was it allowed"
+        return bool(self.allow)
+
+    __nonzero__ = __bool__
+
+
+DENY = Verdict(False, False, THEN_ASK, "DENY")
+DENY_FREE = Verdict(False, False, THEN_FREE, "DENY_FREE")
+END = Verdict(False, False, THEN_END, "END")
+ALLOW = Verdict(True, True, THEN_ASK, "ALLOW")
+ALLOW_FREE = Verdict(True, True, THEN_FREE, "ALLOW_FREE")
+ALLOW_END = Verdict(True, True, THEN_END, "ALLOW_END")
+
+# The older spellings, kept because they read well in a one-line callback.
+_ALIASES = {True: ALLOW, False: DENY, None: DENY,
+            "allow": ALLOW, "deny": DENY,
+            "last": ALLOW_END, "stop": END, "free": ALLOW_FREE,
+            "deny_free": DENY_FREE, "end": END}
+
+
+def verdict(v):
+    """Whatever a callback returned, as a `Verdict`."""
+    if isinstance(v, Verdict):
+        return v
+    try:
+        got = _ALIASES.get(v)
+    except TypeError:               # unhashable -- certainly not one of ours
+        got = None
+    if got is not None:
+        return got
+    raise TypeError(
+        "a constraint must answer with a Verdict (or True/False); got %r. The six are "
+        "DENY, DENY_FREE, END, ALLOW, ALLOW_FREE, ALLOW_END." % (v,))
 
 
 class Constraint:
@@ -327,9 +384,10 @@ class CallbackConstraint(Constraint):
     written -- a bracket depth, a field the schema has not seen yet, a state machine of the
     caller's own.
 
-    `allows` may answer with more than yes or no: `"last"` takes the token and ends the
-    reply, `"stop"` ends it without taking the token, and `"free"` takes it and never asks
-    again. See the constants at the top of this module.
+    `allows` may answer with more than yes or no. The answer is a `Verdict`, which says
+    three separate things -- whether the candidate is allowed, whether it goes into the
+    reply, and whether to keep asking, run free, or end -- and the six that mean anything
+    are named at the top of this module. `True` and `False` still work, as ALLOW and DENY.
 
     `finished(text)` is optional and says the output is complete, which lets generation stop
     on the constraint rather than on a token budget. Returning `"stop"` from `allows` is the
@@ -352,8 +410,7 @@ class CallbackConstraint(Constraint):
             self._reset()
 
     def allows(self, text, piece):
-        v = self._allows(text, piece)
-        return v if v in _VERDICTS else bool(v)
+        return verdict(self._allows(text, piece))
 
     def finished(self, text):
         return bool(self._finished(text)) if self._finished is not None else False

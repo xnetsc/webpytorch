@@ -2094,12 +2094,13 @@ class CausalLM:
         self._seen.append(tok)
         if con is not None:
             self._con_text += self._con_dec.push([tok])
-            v = self.__dict__.pop("_con_verdict", None)
-            if v == "last":
+            from . import constrain
+            v = self.__dict__.pop("_con_after", None)
+            if v == constrain.THEN_END:
                 # Emitted, and the last one: the loops check `_stop_now` immediately after
                 # yielding a token, so saying so here ends the reply WITH this token in it.
                 self._con_end = True
-            elif v == "free":
+            if v == constrain.THEN_FREE or self.__dict__.pop("_con_release", False):
                 # Steering a prefix should not cost anything after the prefix.
                 sp["constraint"] = None
                 self._sampling["constraint"] = None
@@ -2169,22 +2170,34 @@ class CausalLM:
             else:
                 order = np.argsort(-lg)
                 pieces = self._pieces()
-            allowed, verdict = [], {}
+            from . import constrain
+            allowed, after, released = [], {}, False
             for t in order:
                 ti = int(t)
-                v = con.allows(self._con_text,
+                if released:
+                    # Told to stop asking: the rest of this step's candidates are as good as
+                    # the model ranked them.
+                    allowed.append(ti)
+                    continue
+                v = constrain.verdict(
+                    con.allows(self._con_text,
                                pieces[ti] if pieces is not None and ti < len(pieces)
-                               else self._piece1(ti))
-                if v == "stop":
-                    # A statement about the REPLY, not about this token: it is complete as it
-                    # stands. Nothing further is asked for, and the remaining candidates are
-                    # not worth scoring.
+                               else self._piece1(ti)))
+                if v.then == constrain.THEN_END and not v.take:
+                    # A statement about the REPLY, not about this token: complete as it
+                    # stands. The remaining candidates are not worth scoring.
                     self._con_end = True
                     return int(self.tok.eot)
-                if v is True or v in ("last", "free"):
-                    allowed.append(ti)
-                    if v != True:
-                        verdict[ti] = v
+                if not v.allow:
+                    if v.then == constrain.THEN_FREE:
+                        # Not this one, and nothing further to ask about -- so the release
+                        # takes effect from here, including the rest of this scan.
+                        released = True
+                        self._con_release = True
+                    continue
+                allowed.append(ti)
+                if v.then != constrain.THEN_ASK:
+                    after[ti] = v.then
             if allowed:
                 break
         if not allowed:
@@ -2195,7 +2208,7 @@ class CausalLM:
             sub = np.full_like(lg, -np.inf)
             sub[np.asarray(allowed, np.int64)] = lg[np.asarray(allowed, np.int64)]
             got = int(self._sample(sub, sp))
-        self._con_verdict = verdict.get(got)
+        self._con_after = after.get(got)
         return got
 
     # The KV cache is the only memory that grows with context: fp32, K and V, NKV × HD per
@@ -2515,7 +2528,8 @@ class CausalLM:
         # A verdict belongs to the generation that produced it. Left set, `"stop"` or
         # `"last"` from one reply would end the NEXT one before its first token.
         self.__dict__.pop("_con_end", None)
-        self.__dict__.pop("_con_verdict", None)
+        self.__dict__.pop("_con_after", None)
+        self.__dict__.pop("_con_release", None)
         # Constraint and stop matching read the text produced so far, so it has to be decoded
         # the same careful way the stream is -- a half-written character would otherwise put
         # a replacement char in the middle of the string a stop sequence is matched against.
