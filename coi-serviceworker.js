@@ -127,8 +127,16 @@ if (typeof window === 'undefined') {
 
   // App: network, then cache. A running network always wins, so an update lands the moment
   // it exists; the cache only answers when the network cannot.
+  //
+  // `no-cache` is what makes that true. A plain `fetch(req)` carries the request's own cache
+  // mode, so the browser's HTTP cache answers it without going to the network at all -- the
+  // "network first" rule then quietly serves a stale file, and the update lands only on the
+  // SECOND reload, once the first has revalidated it. That is the "have to refresh twice"
+  // behaviour, and it is not cosmetic: it served a worker.js old enough to be missing a
+  // command the page had already been updated to call. `no-cache` revalidates rather than
+  // re-downloads, so an unchanged file still costs one 304.
   function fromNetwork(event, req) {
-    return fetch(req)
+    return fetch(new Request(req, { cache: 'no-cache' }))
       .then(function (res) { return isolate(keep(event, APP, req, res)); })
       .catch(function (err) {
         return caches.match(req.url).then(function (hit) {

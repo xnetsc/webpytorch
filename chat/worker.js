@@ -255,40 +255,25 @@ async function decodeImages(urls) {
   return out;
 }
 
-// What this model's template can carry, asked of the SDK. Every one of these is a fact
-// about the model read from its own template -- which definition shape it renders, how it
-// writes a call, how a result reaches it -- so the reading lives in the SDK
-// (`tools_shape`, `tool_call_format`, `tool_result_format`) and this only ferries the
-// answer to the page.
+// Can this model be given tools at all -- the one question the page has. Which definition
+// shape its template reads, how it writes a call, how a result reaches it: the SDK settles
+// all of that inside `generate(tools=...)` and the tool methods, and none of it comes up
+// here. A page that branched on any of it would be making decisions about a chat template.
 async function toolsSupported() {
-  if (!ready || !pyodide) return { ok: false, shape: null };
+  if (!ready || !pyodide) return { ok: false };
   try {
     const r = await pyodide.runPythonAsync(`
 import json
 _m = _MODEL["m"]
-if _m is None:
-    _r = {"ok": False, "shape": None}
-else:
-    _tk = _m.tok
-    _shape = _tk.tools_shape()
-    _cf = _tk.tool_call_format() or {}
-    _rf = _tk.tool_result_format()
-    _r = {"ok": _shape is not None, "shape": _shape,
-          "result_via": _rf["via"], "result_keeps_name": bool(_rf["keeps_name"]),
-          "call_id_shape": _rf["call_id_shape"], "result_id_field": _rf["id_field"],
-          "call_open": _cf.get("open"), "call_close": _cf.get("close"),
-          "call_payload": _cf.get("payload")}
-json.dumps(_r)`);
+json.dumps({"ok": bool(_m is not None and _m.tools_supported())})`);
     return JSON.parse(r);
   } catch (e) {
     // The reason travels with the answer. A probe that fails silently is indistinguishable
     // from a model that takes no tools, and that ambiguity cost an hour.
-    return { ok: false, shape: null, result_via: null, result_keeps_name: false,
-             call_id_shape: null, result_id_field: null,
-             call_open: null, call_close: null, call_payload: null,
-             error: String((e && e.message) || e).slice(-400) };
+    return { ok: false, error: String((e && e.message) || e).slice(-400) };
   }
 }
+
 
 async function generate(prompt, opts) {
   // A stop asked for during the LAST reply must not end this one before it starts.

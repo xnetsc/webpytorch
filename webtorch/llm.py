@@ -2312,14 +2312,15 @@ class CausalLM:
         return {"reasoning": None, "answer": txt, "open": False}
 
     def tools_supported(self):
-        """The tool-definition shape this model's template renders, or None if it renders
-        none. Pass the result nowhere -- `generate(tools=...)` handles the shape itself; this
-        is for a caller that wants to know whether offering tools is worth anything."""
-        return self.tok.tools_shape()
+        """Whether this model can be given tools at all.
 
-    def tool_call_format(self, tools=None):
-        """How this model writes a call: {"open", "close", "payload"}, or None."""
-        return self.tok.tool_call_format(tools)
+        The one question a caller has. WHICH definition shape its template reads, how it
+        writes a call, how a result gets back to it -- all of that is settled inside
+        `generate(tools=...)` and the methods below, and none of it is a caller's business:
+        a decision made from it would be a decision made about a chat template, which is
+        exactly what this library exists to not make anyone do.
+        """
+        return self.tok.tools_shape() is not None
 
     def parse_tool_calls(self, text, tools=None):
         """Every tool call in `text`, in order, each with the span it occupies."""
