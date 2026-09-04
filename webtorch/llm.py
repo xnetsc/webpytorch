@@ -2892,7 +2892,7 @@ class CausalLM:
         # Rows past what is live are never read -- attention scans `pos + 1` of them -- so
         # copying all `cap` of them is simply correct, and costs one pass over a buffer that
         # is at most half the size of the one being allocated.
-        KVW = wt.kv_cache_hd(HD)          # the STORED width, which is half of HD when packed
+        KVW = int(self.Kc[0].data.shape[-1]) if self.Kc else wt.kv_cache_hd(HD)
         for box in (self.Kc, self.Vc):
             for i, old in enumerate(box):
                 grown = wt.Tensor(wt._empty((NKV, new, KVW)))

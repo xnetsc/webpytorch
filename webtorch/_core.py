@@ -2215,8 +2215,17 @@ def kv_f16():
 
 
 def kv_cache_hd(hd):
-    """Elements per row to ALLOCATE for a cache of head-dimension `hd`."""
-    return (int(hd) // 2) if kv_f16() else int(hd)
+    """Elements per row to ALLOCATE for a cache of head-dimension `hd`.
+
+    The `% 2` matters and is not defensive noise: every OTHER site that decides whether a
+    cache is packed requires an even head dimension, so halving here without that test
+    would allocate `hd // 2` rows for a model whose readers and writers still treat them as
+    `hd` -- a cache too small for what is written into it, which reads back as a kernel that
+    never ran rather than as an error.
+    """
+    hd = int(hd)
+    return (hd // 2) if (kv_f16() and hd % 2 == 0) else hd
+
 
 
 # Pack on the way in: same scatter, same indexing, two source values per stored word.
@@ -5847,22 +5856,74 @@ def ggml_dequant(packed, type_name, K, N):
     """
     plat = _adam_kernel["platform"]
     key = (type_name, 3, None, False, 0)
+    # An i-quant decodes through a codebook, which is a FIFTH binding. Declaring four and
+    # dispatching four leaves the shader referencing a binding that is not there, which does
+    # not raise: the kernel never runs, and `of` comes back holding whatever the pooled
+    # buffer held before -- measured, IQ4_XS returned the numbers Q3_K had just produced.
+    # `_ggml_add` has always appended this binding; this path was written without it.
+    grid = _ggml_grid(type_name)
+    binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
+    if grid is not None:
+        binds.append("read-only-storage")
     if key not in _ggml_k["added"]:
         plat.addKernel(_ggml_name(type_name, 3),
-                       {"source": _ggml_src(type_name, 3),
-                        "bindingTypes": ["read-only-storage", "read-only-storage",
-                                         "storage", "read-only-storage"]})
+                       {"source": _ggml_src(type_name, 3), "bindingTypes": binds})
         _ggml_k["added"].add(key)
     of = _empty((int(K) * int(N),))
     meta = _adam_kernel["make_meta"]((1, int(N), int(K), 0, 0, 0, 0, 0),
                                      "u4,u4,u4,u4,u4,u4,u4,u4")
     # binding 0 is the activation the matmul kernels read; nothing reads it here, so the
     # weight buffer is bound again rather than allocating something to ignore.
-    plat.runKernel({"name": _ggml_name(type_name, 3),
-                    "tensors": [packed.buffer.buffer_id, packed.buffer.buffer_id,
-                                of.buffer.buffer_id, meta.buffer_id],
+    bufs = [packed.buffer.buffer_id, packed.buffer.buffer_id,
+            of.buffer.buffer_id, meta.buffer_id]
+    if grid is not None:
+        bufs.append(grid.buffer.buffer_id)
+    plat.runKernel({"name": _ggml_name(type_name, 3), "tensors": bufs,
                     "workGroups": {"x": (int(N) + 63) // 64, "y": 1, "z": 1}})
     return of.reshape(int(K), int(N))
+
+
+_DEQ_OK = {}
+
+
+def ggml_dequant_ok(type_name):
+    """Does unpacking this format agree with multiplying it packed? Asked once per format.
+
+    Every other kernel registration in this file is followed by a numerical self-check,
+    because a WGSL failure here returns a buffer rather than an exception. This path was
+    added without one, and an i-quant then silently produced another format's leftovers --
+    which reaches the caller as a model that scores every token identically, i.e. as a
+    refused load rather than as the kernel bug it is.
+
+    The reference is the quantised kernel itself, since agreeing with it is exactly the
+    property the fast path claims. A format that disagrees keeps the quantised path: slower,
+    and right.
+    """
+    if type_name in _DEQ_OK:
+        return _DEQ_OK[type_name]
+    ok = False
+    try:
+        vals = int(_GGML_TYPES[type_name][2])
+        blk = int(_GGML_TYPES[type_name][3])
+        K = max(vals, 256 - (256 % vals)) if vals <= 256 else vals
+        K = vals * max(1, 256 // vals)
+        N = 64
+        nbytes = (K // vals) * N * blk
+        raw = np.random.default_rng(0).integers(0, 200, nbytes + (-nbytes % 4),
+                                                dtype=np.uint8)
+        W = Tensor(raw.view(np.float32).copy()).data
+        x = np.random.default_rng(1).standard_normal((1, K)).astype(np.float32)
+        a = np.asarray(ggml_matmul(Tensor(x).data, W, type_name, K, N).get(),
+                       np.float32).ravel()
+        b = np.asarray((Tensor(x) @ Tensor(ggml_dequant(W, type_name, K, N))).data.get(),
+                       np.float32).ravel()
+        scale = max(1e-6, float(np.abs(a).max()))
+        ok = bool(np.all(np.isfinite(b))
+                  and float(np.abs(a - b).max()) / scale < 1e-3)
+    except Exception:
+        ok = False
+    _DEQ_OK[type_name] = ok
+    return ok
 
 
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
@@ -5907,7 +5968,8 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
     if (mode == 0 and eidx is None and not xper and m >= _GGML_DEQ_M
-            and m % _MATMUL_ROW_ALIGN == 0 and _adam_backend_ready()):
+            and m % _MATMUL_ROW_ALIGN == 0 and _adam_backend_ready()
+            and ggml_dequant_ok(type_name)):
         # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
         # quantised kernel; the only difference is fp32 rounding in the accumulation order.
         w32 = Tensor(ggml_dequant(packed, type_name, K, N))
