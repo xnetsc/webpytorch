@@ -197,8 +197,9 @@ async function loadModel(repo, file, lmax) {
   // the load does -- what follows measures kernel shapes, checks the weights against the
   // file and runs one forward -- and on a 13GB model that tail is minutes with the byte
   // meter frozen at the end, which reads as a hang.
-  self.__stage = (stage, done, total) => {
-    send({ type: 'stage', stage, done: done || 0, total: total || 0 });
+  self.__stage = (stage, done, total, after, elapsed) => {
+    send({ type: 'stage', stage, done: done || 0, total: total || 0,
+           after: after || null, elapsed: elapsed || 0 });
   };
   stopFlagClear(); intrClear();          // the Python flag is cleared below; these are its twins
   const run = newRun();
@@ -210,7 +211,8 @@ webtorch.cancel(False)      # a stale stop request must not hit this load
 webtorch.set_read_progress(lambda i: js.self.__prog(i["done"], i["total"] or 0, i["rate"]))
 webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 webtorch.set_load_progress(
-    lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total")))
+    lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total"),
+                              i.get("after"), i.get("elapsed")))
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None

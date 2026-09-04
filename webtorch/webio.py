@@ -1187,7 +1187,7 @@ def get_read_progress():
     return _progress["cb"]
 
 
-_stage = {"cb": None}
+_stage = {"cb": None, "at": None}
 
 
 def set_load_progress(cb):
@@ -1211,6 +1211,7 @@ def set_load_progress(cb):
     a caller decides what to show, and should not have to parse a sentence to do it.
     """
     _stage["cb"] = cb
+    _stage["at"] = None             # a fresh hook times a fresh load, not the last one
 
 
 def get_load_progress():
@@ -1219,10 +1220,22 @@ def get_load_progress():
 
 def load_stage(stage, done=None, total=None):
     """Report that a load has reached `stage`. Called by the loaders, not by callers."""
+    import time
+    now = time.monotonic()
+    prev, t0 = _stage.get("at") or (None, now)
+    _stage["at"] = (stage, now)
     cb = _stage["cb"]
     if cb is None:
         return
     info = {"stage": stage}
+    # How long the stage that just ENDED took. Without this a slow load is an impression
+    # rather than a number: every part of this phase measures fast in isolation on a settled
+    # machine, and the one time it matters is right after several gigabytes have been
+    # uploaded. Carrying the elapsed time means the next slow load says where it went
+    # instead of being argued about.
+    if prev is not None:
+        info["after"] = prev
+        info["elapsed"] = round(now - t0, 2)
     if done is not None:
         info["done"] = int(done)
     if total is not None:
