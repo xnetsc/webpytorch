@@ -56,6 +56,28 @@ Three failure modes here are silent, and all three have cost real days:
 If a knob measures as no help, say so *next to the constant* and leave it fixed. Making it
 dynamic anyway costs a tuning pass at every load and buys nothing.
 
+## Documentation ships with the change
+
+A document does not go wrong by getting old. It goes wrong when it **asserts something
+about the code that is no longer true** — and a reader who follows it is then worse off
+than if it had said nothing. So a change and the document it makes false belong in the
+same commit.
+
+"Touched code, therefore touch a document" is not that rule: it is satisfied by editing a
+space, and it stops commits that genuinely need no documentation change. The rule is
+narrower and harder — *no document may state a fact about the code that your commit makes
+false* — and two parts of it are checked for you by `.githooks/check-docs.py`:
+
+- a signature written in `docs/API.md` as a definition entry must agree with the real one
+  (usage examples mid-sentence are not definitions, and are ignored);
+- a name your commit **adds** to `webtorch.__all__` must appear in `docs/API.md`.
+
+Those are refused. Everything else — what a backend does, how fast something is, which
+formats are supported — cannot be checked against source, so when the public surface moves
+and no document does, the hook names what changed and lets you through. That judgement is
+yours. If a number you are changing appears in a document, re-measure it under the method
+that document states rather than adjusting it to taste.
+
 ## PRs
-Keep changes focused, describe how you verified them, and update `docs/` when you change
-a public interface.
+Keep changes focused and describe how you verified them. Enable the hooks once per clone —
+`git config core.hooksPath .githooks` — and `--no-verify` when a mismatch is deliberate.

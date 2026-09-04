@@ -55,6 +55,10 @@ git config core.hooksPath .githooks       # once per clone
 
 — and `git commit --no-verify` gets past it when the mismatch is deliberate.
 
+`.githooks/` holds one check per file and runs them all: `check-wheels.py` is the above,
+`check-docs.py` refuses a commit whose `docs/API.md` contradicts the signatures it
+documents. See [../CONTRIBUTING.md](../CONTRIBUTING.md).
+
 ### Two generated files that are easy to forget
 
 Neither is built by npm or by the wheel scripts, and skipping either fails at runtime rather
