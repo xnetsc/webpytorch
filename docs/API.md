@@ -145,6 +145,27 @@ including the correct ones, so the constraint silently applied to nothing. It no
 with the fix in the message (`await micropip.install("regex")`), or use a callback, which
 needs no package at all.
 
+### `dormant(text)` — an optional way to be cheap
+
+Asking a constraint costs the sampler a full ranking of the vocabulary and a decode of every
+candidate, which on a 150k-token vocabulary is most of what a token costs. A constraint that
+is only relevant in part of the output — a tool name inside a call, a grammar inside its
+region — can say so from the text alone:
+
+```python
+class Mine(webtorch.Constraint):
+    def dormant(self, text):
+        return "<begin>" not in text[-400:]     # nothing to say out here
+    def allows(self, text, piece):
+        ...
+```
+
+It is **optional and defaults to False**: a constraint that does not implement it is asked
+about every token, exactly as before. Saying "dormant" does not skip the check — the token
+is picked unconstrained and your `allows` is still asked about that one piece, so a wrong
+answer here costs speed, not correctness. Scan a bounded tail rather than the whole text, or
+the cost of the constraint grows with the length of what it guards.
+
 ### Writing your own constraint class
 Anything with `allows` (or `decide`) is accepted; subclass `webtorch.Constraint` for
 `reset()` and `finished()` as well. Compose with `constrain.AllOf([...])`.
