@@ -2118,7 +2118,40 @@ class CausalLM:
             lg = lg.copy()
             lg[eos] = -np.inf                           # not allowed to stop yet
         con = sp.get("constraint")
-        if con is not None and callable(getattr(con, "decide", None)):
+        # A constraint with nothing to say here is still asked -- about ONE token instead of
+        # the whole vocabulary.
+        #
+        # Both constrained paths below must rank 150k logits and decode ~64 candidates
+        # before they can ask anything, and that is most of what a token costs: measured on
+        # a 27B, a reply with tool names constrained ran at 0.8 tok/s against 5.2 without.
+        # In a reply of prose every one of those questions goes to a constraint that permits
+        # everything on offer.
+        #
+        # Skipping it outright is NOT sound, and the soundness check said so: `allows` judges
+        # `text + piece`, so one piece carrying `<tool_call>{"name": "r` turns a dormant text
+        # into a name that has to be checked -- 189 refusals in 3024 checks over texts this
+        # would have skipped. So the PIECE is what gets asked about. Pick the token
+        # unconstrained, decode that one piece, ask once. Allowed is the same answer the full
+        # path would reach, because that path walks the ranking and takes the first
+        # acceptable token, which this is. Refused, and the full path runs having lost only
+        # one decode.
+        #
+        # `getattr`, not a direct call: `build` returns an object that merely HAS `allows` as
+        # it is, without wrapping it, so a caller's own constraint is not required to inherit
+        # anything -- and must not be required to grow a method to keep working. No `dormant`
+        # means "ask me about everything", which is what it got before this existed.
+        _dormant = getattr(con, "dormant", None)
+        _allows = getattr(con, "allows", None)
+        tok = None
+        if (con is not None and callable(_dormant) and callable(_allows)
+                and not callable(getattr(con, "decide", None))
+                and _dormant(self._con_text)):
+            t1 = self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())
+            if _allows(self._con_text, self._piece1(t1)):
+                tok = t1
+        if tok is not None:
+            pass
+        elif con is not None and callable(getattr(con, "decide", None)):
             tok = self._pick_decided(lg, con, sp)
         elif con is not None:
             tok = self._pick_constrained(lg, con, sp)
@@ -2858,6 +2891,7 @@ class CausalLM:
         of this kind, or a backend that cannot run it, simply skips."""
         try:
             seen = set()
+            held = []
             for lay in getattr(self, "layers", []) or []:
                 for v in lay.values():
                     packed = getattr(v, "packed", None)
@@ -2868,7 +2902,18 @@ class CausalLM:
                         continue
                     seen.add(key)
                     x = wt.Tensor(np.zeros((1, int(v.Kt)), np.float32))
-                    v(x).numpy()
+                    # Do NOT read each one back. `.numpy()` per shape is a full sync per
+                    # shape, and a sync waits for everything already queued -- which here is
+                    # the tail of however many gigabytes were just uploaded. Thirty-two of
+                    # those is thirty-two waits for the same backlog. The point of running
+                    # these is to register and tune the kernels, and that happens on the way
+                    # in; the values are not wanted. So the results are held (a dropped
+                    # reference can recycle the buffer under a kernel that has not run yet)
+                    # and one readback at the end drains the lot.
+                    held.append(v(x))
+            if held:
+                held[-1].numpy()
+            held.clear()
             wt.flash_tune(self.NH, self.NKV, self.HD)
         except Exception:
             pass

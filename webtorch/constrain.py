@@ -101,6 +101,23 @@ class Constraint:
     def reset(self):
         """Called once before each generation."""
 
+    def dormant(self, text):
+        """True when this constraint would permit anything at all after `text`.
+
+        Answering yes costs the caller nothing and saves it everything: to ask `allows` or
+        `decide` the sampler must first rank the whole vocabulary and decode the candidates,
+        and on a 150k vocabulary that is most of what a token costs. Measured on a 27B with
+        tool names constrained, a reply ran at 0.8 tok/s against 5.2 with no constraint --
+        and in a reply of prose, essentially every one of those questions was asked of a
+        constraint that had nothing to say.
+
+        The default is False, so a constraint that does not implement this is asked about
+        every token exactly as before. Override it only where the answer can be given from
+        the text ALONE and is certainly right: saying "dormant" wrongly does not slow
+        anything down, it lets through what should have been refused.
+        """
+        return False
+
     def allows(self, text, piece):
         """May `piece` follow `text`?"""
         raise NotImplementedError
@@ -360,6 +377,27 @@ class ToolNameConstraint(Constraint):
             return (got[:end], True)
         return (got, False)
 
+    def dormant(self, text):
+        """Nothing to say unless a call is being opened or a name is being written.
+
+        `allows` judges `text + piece`, so it is not enough that `text` is outside a name --
+        the piece could put it inside one. What bounds that is the opener: a name only ever
+        follows it, so this stays awake while the opener is present in the window, and also
+        while the tail is a partial opener, which is the only way the next piece can complete
+        one. A piece that carries the WHOLE opener at once leaves nothing after it for a name
+        to be, so `allows` would have permitted that step anyway.
+        """
+        if not self.names or not self.open:
+            return True                      # nothing to constrain against
+        tail = text[-self.WINDOW:]
+        if self.open in tail:
+            return False
+        o = self.open
+        for i in range(min(len(o) - 1, len(tail)), 0, -1):
+            if tail.endswith(o[:i]):
+                return False                 # the opener is being written right now
+        return True
+
     def allows(self, text, piece):
         got = self._pending(text + piece)
         if got is None:
@@ -375,6 +413,9 @@ class StopConstraint(Constraint):
 
     def __init__(self, stops):
         self.stops = [s for s in (stops or []) if s]
+
+    def dormant(self, text):
+        return True                          # this one never refuses a piece, it only ends
 
     def allows(self, text, piece):
         return True
@@ -514,6 +555,15 @@ class AllOf(Constraint):
     def reset(self):
         for p in self.parts:
             p.reset()
+
+    def dormant(self, text):
+        """Only when every part is. A part that does not implement it is not dormant --
+        the same reading the sampler gives a constraint of a caller's own."""
+        for p in self.parts:
+            d = getattr(p, "dormant", None)
+            if not (callable(d) and d(text)):
+                return False
+        return True
 
     def allows(self, text, piece):
         return all(p.allows(text, piece) for p in self.parts)
