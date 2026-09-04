@@ -5901,22 +5901,37 @@ def ggml_dequant_ok(type_name):
     """
     if type_name in _DEQ_OK:
         return _DEQ_OK[type_name]
+    # A format that decodes through a codebook has twice been measured returning the buffer
+    # a DIFFERENT format left behind -- the signature of a kernel that did not run -- and
+    # twice done so intermittently, passing the same comparison moments earlier. The binding
+    # it was missing is now declared and dispatched, and that was a real fix, but it is not
+    # the whole of this: something about registering these kernels is order-dependent, and
+    # until that is understood a wrong answer is not worth the speed. They keep the
+    # quantised kernel, which agrees with the GEMV exactly at every shape measured.
+    if _GGML_TYPES[type_name][4] is not None:
+        _DEQ_OK[type_name] = False
+        return False
     ok = False
     try:
         vals = int(_GGML_TYPES[type_name][2])
         blk = int(_GGML_TYPES[type_name][3])
-        K = max(vals, 256 - (256 % vals)) if vals <= 256 else vals
-        K = vals * max(1, 256 // vals)
-        N = 64
+        # Several blocks per column and several workgroups of columns. The first version of
+        # this used one block and one workgroup -- the smallest legal shape -- and passed a
+        # format that was wrong at every shape a model actually has.
+        K = vals * 4
+        N = 256
         nbytes = (K // vals) * N * blk
         raw = np.random.default_rng(0).integers(0, 200, nbytes + (-nbytes % 4),
                                                 dtype=np.uint8)
         W = Tensor(raw.view(np.float32).copy()).data
-        x = np.random.default_rng(1).standard_normal((1, K)).astype(np.float32)
-        a = np.asarray(ggml_matmul(Tensor(x).data, W, type_name, K, N).get(),
+        # One row against many. The quantised GEMV is the reference because decode uses it
+        # every token; the batched rows are what the fast path replaces. Checking only one
+        # row checked the wrong kernel.
+        x1 = np.random.default_rng(1).standard_normal((1, K)).astype(np.float32)
+        a = np.asarray(ggml_matmul(Tensor(x1).data, W, type_name, K, N).get(),
                        np.float32).ravel()
-        b = np.asarray((Tensor(x) @ Tensor(ggml_dequant(W, type_name, K, N))).data.get(),
-                       np.float32).ravel()
+        deq = Tensor(ggml_dequant(W, type_name, K, N))
+        b = np.asarray((Tensor(x1) @ deq).data.get(), np.float32).ravel()
         scale = max(1e-6, float(np.abs(a).max()))
         ok = bool(np.all(np.isfinite(b))
                   and float(np.abs(a - b).max()) / scale < 1e-3)
@@ -5968,12 +5983,29 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
     if (mode == 0 and eidx is None and not xper and m >= _GGML_DEQ_M
-            and m % _MATMUL_ROW_ALIGN == 0 and _adam_backend_ready()
-            and ggml_dequant_ok(type_name)):
+            and _adam_backend_ready() and ggml_dequant_ok(type_name)):
         # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
         # quantised kernel; the only difference is fp32 rounding in the accumulation order.
+        #
+        # The tiled fp32 kernel only runs on a row count that is a multiple of
+        # `_MATMUL_ROW_ALIGN`, and missing it costs seven times. That alignment belongs to
+        # THE MATMUL, so it is met here rather than by lengthening the prompt: padding the
+        # prompt makes every layer see the extra positions, and a recurrent layer advances
+        # its state once per position -- which is how a stack that is mostly recurrent came
+        # to be excluded from this path entirely, and lost it.
+        #
+        # The rows are added with the GPU concatenate, NOT by assigning into a preallocated
+        # buffer. `xp[:m] = xf` is WgPy's `__setitem__`, which reads the whole thing back to
+        # the host and uploads it again -- 11.5MB at 0.8 GB/s, 14.2ms a call, and prefill
+        # calls this ~200 times. That is the version of this idea that measured 3.4s.
+        pad = (-m) % _MATMUL_ROW_ALIGN
+        xin = Tensor(xf)
+        if pad:
+            xin = cat([xin, Tensor(_empty((pad, int(K))))], axis=0)
         w32 = Tensor(ggml_dequant(packed, type_name, K, N))
-        of = (Tensor(xf) @ w32).data
+        of = (xin @ w32).data
+        if pad:
+            of = _contig(of[:m])            # the padded rows were arithmetic, not an answer
         return of if bias is None else of + bias
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None

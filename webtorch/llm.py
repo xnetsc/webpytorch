@@ -2956,34 +2956,14 @@ class CausalLM:
         whole sequence; only the work already done is skipped."""
         H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
         LMAX = self.kv_cap                    # the rows on the device, not the context
-        # Round the prompt up to a multiple of 32 rows, ONCE, here.
-        #
-        # The fp32 matmul the batched path uses has a tiled kernel that only runs when the
-        # row count is a multiple of 32, and missing it costs seven times: 1850 GFLOPS
-        # against 249. Padding inside the matmul instead means padding 196 times a prefill,
-        # and the copy that does it goes through the host -- 14.2ms for 11.5MB, which came to
-        # 3.4s of a 4.8s matmul phase. Paid once, it is 31 rows at worst.
-        #
-        # The extra rows are harmless: attention is causal, so a real query never sees a row
-        # that comes after it, and the cache rows they write sit past the prompt where the
-        # next tokens overwrite them -- `pos` counts real tokens only, and the decode kernel
-        # reads that many.
+        # The prompt is NOT padded. Row alignment is the fp32 matmul's requirement and it
+        # is met inside the matmul (see `_MATMUL_ROW_ALIGN` in `ggml_matmul`), where the
+        # extra rows are arithmetic and nothing else. Padding here instead makes every LAYER
+        # see the extra positions, and a recurrent layer advances its state once per
+        # position -- so a stack that is mostly recurrent either lost the fast path or
+        # decoded from a state that had run past the end of the prompt. Neither is a trade
+        # worth making for rows the matmul can add itself.
         T_real = len(ids)
-        # Padding is only sound where the extra positions are INERT, and that is a property
-        # of the layer, not of the matmul. Causal attention never lets a real query see a row
-        # that comes after it, so rows appended past the prompt cost arithmetic and nothing
-        # else. A recurrent layer has no such protection: `_linear_mixer` advances its state
-        # in place, once per position, so 31 invented tokens leave the state 31 steps past
-        # the prompt -- and every token decoded afterwards continues from there. The hidden
-        # state this function returns is still right (position T_real-1 cannot see them), so
-        # nothing raises; the reply simply continues from a state that never existed.
-        recurrent = any(self._is_linear_layer(i) for i in range(len(self.layers)))
-        if embeds is None and not recurrent and _matmul_row_align() > 1:
-            step = _matmul_row_align()
-            room = max(0, int(LMAX) - start - T_real)
-            grow = min((-T_real) % step, room)
-            if grow:
-                ids = list(ids) + [ids[-1]] * grow
         T = len(ids)
         end = start + T
         c, s = self._rope_np(start, T)
