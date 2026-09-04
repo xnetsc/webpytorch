@@ -2663,8 +2663,11 @@ class CausalLM:
             # from 613MB to 1.5GB and, being an emscripten heap, never gives it back. No row
             # is ever read before it is written (see `_kv_reserve` and the note in
             # `generate`), so there is nothing for the zero-fill to protect.
-            self.Kc = [wt.Tensor(wt._empty((NKV, LMAX, HD))) for _ in range(n)]
-            self.Vc = [wt.Tensor(wt._empty((NKV, LMAX, HD))) for _ in range(n)]
+            # Half as many elements when the cache holds packed halves -- see `kv_f16`.
+            # It is still an fp32 tensor to the host; only the shaders read it as pairs.
+            KVW = wt.kv_cache_hd(HD)
+            self.Kc = [wt.Tensor(wt._empty((NKV, LMAX, KVW))) for _ in range(n)]
+            self.Vc = [wt.Tensor(wt._empty((NKV, LMAX, KVW))) for _ in range(n)]
             self.h_in = wt.Tensor(np.zeros((1, H), np.float32))
             self.cos_b = wt.Tensor(np.zeros((1, HD), np.float32))
             self.sin_b = wt.Tensor(np.zeros((1, HD), np.float32))
@@ -2889,9 +2892,10 @@ class CausalLM:
         # Rows past what is live are never read -- attention scans `pos + 1` of them -- so
         # copying all `cap` of them is simply correct, and costs one pass over a buffer that
         # is at most half the size of the one being allocated.
+        KVW = wt.kv_cache_hd(HD)          # the STORED width, which is half of HD when packed
         for box in (self.Kc, self.Vc):
             for i, old in enumerate(box):
-                grown = wt.Tensor(wt._empty((NKV, new, HD)))
+                grown = wt.Tensor(wt._empty((NKV, new, KVW)))
                 grown.data[:, :cap, :] = old.data[:, :cap, :]
                 box[i] = grown
         self.mask_b = wt.Tensor(np.zeros((1, 1, new), np.float32))
@@ -2982,8 +2986,15 @@ class CausalLM:
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
                 K.data = wt.kv_write(K.data, wt._contig(k).data, start, T, NKV, HD, LMAX)
                 V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
-                Kp = wt.Tensor(wt._contig(K.data[:, :end, :]))
-                Vp = wt.Tensor(wt._contig(V.data[:, :end, :]))
+                # Prefill widens the span it attends over back to fp32. It was copying
+                # that span anyway, so the three prefill attention kernels never need to
+                # know how the cache is stored.
+                if wt.kv_f16() and HD % 2 == 0:
+                    Kp = wt.Tensor(wt.kv_unpack(K.data, end, NKV, HD, LMAX))
+                    Vp = wt.Tensor(wt.kv_unpack(V.data, end, NKV, HD, LMAX))
+                else:
+                    Kp = wt.Tensor(wt._contig(K.data[:, :end, :]))
+                    Vp = wt.Tensor(wt._contig(V.data[:, :end, :]))
                 # `causal_start` instead of the mask tensor: the shape is what the mask
                 # says, so the kernel derives it and nothing seq-squared is built or sent.
                 o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc, causal_start=start)

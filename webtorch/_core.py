@@ -2020,8 +2020,9 @@ def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
     # thread shape.
     lmax = max(64, int(n))
     q = Tensor(np.zeros((nh, 1, hd), np.float32))
-    kc = Tensor(_empty((nkv, lmax, hd)))
-    vc = Tensor(_empty((nkv, lmax, hd)))
+    kvw = kv_cache_hd(hd)                  # the tuner must measure the real cache layout
+    kc = Tensor(_empty((nkv, lmax, kvw)))
+    vc = Tensor(_empty((nkv, lmax, kvw)))
     mask = Tensor(np.zeros((1, 1, lmax), np.float32))
     try:
         outs = {}
@@ -2076,9 +2077,14 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
     vd = vc.data if isinstance(vc, Tensor) else vc
     nh, T, hd = (int(v) for v in qd.shape)
     nkv, lmax, hd2 = (int(v) for v in kd.shape)
+    # Is this cache packed? Ask the BUFFER, not a global switch. A cache of halves is
+    # exactly half as wide as the query it is scanned against, and reading that off the
+    # shape here means a full-width cache can never be handed to the packed kernel however
+    # the flag happens to be set -- there is more than one KV cache class in this file.
+    f16 = (hd2 * 2 == hd) and hd % 2 == 0
     # `acc` is sized for hd <= 256, which covers every head dimension in use (128 and 256
     # are the common ones); anything larger keeps the general path.
-    if T != 1 or hd != hd2 or hd > 256 or nh % nkv:
+    if T != 1 or not (hd == hd2 or f16) or hd > 256 or nh % nkv:
         return None
     n = lmax if valid is None else max(1, min(int(valid), lmax))
     # Defaulted here, above the backend split: `gqa_attention` has always filled this in for
@@ -2093,23 +2099,30 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
         return Tensor(_webgl_gqa_decode(_contig(qd), _contig(kd), _contig(vd),
                                         nh, nkv, hd, n, scale))
     plat = _adam_kernel["platform"]
-    if not _gqa_k["added"]:
-        plat.addKernel("gqa_decode", {"source": _GQA_DECODE_WGSL,
-                                      "bindingTypes": ["storage"]
-                                      + ["read-only-storage"] * 5})
-        _gqa_k["added"] = True
+    # A cache of packed halves is read by a different kernel, so it gets a different name:
+    # the two must be able to coexist (the tuner compares them, and a model whose head
+    # dimension is odd stays on the f32 pair).
+    sfx = "_f16" if f16 else ""
+    kvsub = _f16_kv_source if f16 else (lambda src: src)
+    if ("added" + sfx) not in _gqa_k:
+        plat.addKernel("gqa_decode" + sfx, {"source": kvsub(_GQA_DECODE_WGSL),
+                                            "bindingTypes": ["storage"]
+                                            + ["read-only-storage"] * 5})
+        _gqa_k["added" + sfx] = True
     # The split factor is baked into the shader, so each value is its OWN kernel -- named
     # for it, so several can exist at once and be compared on the device that will run them.
-    if _GQA_SPLIT not in _gqa_k:
+    if (_GQA_SPLIT, sfx) not in _gqa_k:
         sub = lambda src: src.replace("SPLITu", "%du" % _GQA_SPLIT)
-        plat.addKernel("gqa_split_%d" % _GQA_SPLIT,
-                       {"source": sub(_GQA_SPLIT_WGSL),
+        plat.addKernel("gqa_split_%d%s" % (_GQA_SPLIT, sfx),
+                       {"source": sub(kvsub(_GQA_SPLIT_WGSL)),
                         "bindingTypes": ["storage"] + ["read-only-storage"] * 5})
-        plat.addKernel("gqa_merge_%d" % _GQA_SPLIT,
+        # The merge pass never touches the cache -- it reads the partials, which are fp32
+        # whatever the cache holds -- so it is the same kernel either way.
+        plat.addKernel("gqa_merge_%d%s" % (_GQA_SPLIT, sfx),
                        {"source": sub(_GQA_MERGE_WGSL),
                         "bindingTypes": ["storage", "read-only-storage",
                                          "read-only-storage"]})
-        _gqa_k[_GQA_SPLIT] = True
+        _gqa_k[(_GQA_SPLIT, sfx)] = True
     # Bind through named locals. Inlining `_contig(...)` into the list drops the only
     # reference to each temporary as soon as its id is read, so its GPU buffer can be
     # recycled for the next one -- two bindings then silently share a buffer.
@@ -2127,17 +2140,17 @@ def gqa_decode(q, kc, vc, mask, scale, valid=None, ctl=None):
         # Two dispatches instead of one, and SPLIT times the workgroups in the first. Both
         # shapes are fixed, so the pair captures and replays exactly like the single kernel.
         part = _empty((nh * _GQA_SPLIT * (hd + 2),))
-        plat.runKernel({"name": "gqa_split_%d" % _GQA_SPLIT,
+        plat.runKernel({"name": "gqa_split_%d%s" % (_GQA_SPLIT, sfx),
                         "tensors": [part.buffer.buffer_id, qc.buffer.buffer_id,
                                     kcc.buffer.buffer_id, vcc.buffer.buffer_id,
                                     meta.buffer_id, cb.buffer_id],
                         "workGroups": {"x": nh * _GQA_SPLIT, "y": 1, "z": 1}})
-        plat.runKernel({"name": "gqa_merge_%d" % _GQA_SPLIT,
+        plat.runKernel({"name": "gqa_merge_%d%s" % (_GQA_SPLIT, sfx),
                         "tensors": [of.buffer.buffer_id, part.buffer.buffer_id,
                                     meta.buffer_id],
                         "workGroups": {"x": nh, "y": 1, "z": 1}})
         return Tensor(of.reshape(nh, 1, hd))
-    plat.runKernel({"name": "gqa_decode",
+    plat.runKernel({"name": "gqa_decode" + sfx,
                     "tensors": [of.buffer.buffer_id, qc.buffer.buffer_id,
                                 kcc.buffer.buffer_id, vcc.buffer.buffer_id,
                                 meta.buffer_id, cb.buffer_id],
@@ -2166,6 +2179,168 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   cache[kv * m.LMAX * m.HD + (m.pos + t) * m.HD + hd] = src[i];
 }
 """
+
+# ---- half-precision KV cache -------------------------------------------------------------
+#
+# Decode's cost splits cleanly in two, measured on a 0.6B: 9.05ms that does not depend on the
+# conversation, plus 0.00223ms for every token already in it. The second term is READING THE
+# CACHE, and nothing else: 28 layers x 2 x 8 kv-heads x 128 dims x 4 bytes is 224KB per
+# context token, so at a context of 3632 one decode step streams 833MB. In 8.11ms. That is
+# 102.7 GB/s.
+#
+# Which is not a kernel that needs improving -- it is faster than anything else here reaches.
+# The generic fp32 matmul streams 62-79 GB/s on the same device, and the split factor is
+# already chosen by measurement from (4, 8, 16, 32) at every context bucket, so there is no
+# parallelism left on the table either. The only way to make this term smaller is to make it
+# fewer bytes.
+#
+# So the cache holds halves. Two of them go in one u32 with `pack2x16float`, and the kernels
+# that read it unpack with `unpack2x16float` -- both core WGSL, needing no device feature,
+# and `unpackHalf2x16` is the GLSL ES 3.0 spelling for the same thing. The arithmetic is
+# free at this ratio: we are moving 833MB and adding one instruction per two values.
+#
+# Nothing about the BACKEND changes. The cache is allocated as an ordinary f32 tensor with
+# half as many elements, and the shaders declare that same binding `array<u32>` -- a storage
+# binding is bytes, and what the host believes about their dtype never reaches the shader.
+#
+# What it costs is precision: K and V round to fp16 (~3 decimal digits) after the rope, which
+# is what llama.cpp's cache does by default. Q, the accumulation and the softmax all stay
+# fp32 -- only the stored value narrows.
+_KV_F16 = True
+
+
+def kv_f16():
+    """Is the KV cache stored as halves? WebGPU only -- the WebGL path is unchanged."""
+    return bool(_KV_F16) and _adam_backend_ready()
+
+
+def kv_cache_hd(hd):
+    """Elements per row to ALLOCATE for a cache of head-dimension `hd`."""
+    return (int(hd) // 2) if kv_f16() else int(hd)
+
+
+# Pack on the way in: same scatter, same indexing, two source values per stored word.
+_KVWRITE_F16_WGSL = """@group(0) @binding(0) var<storage,read_write> cache: array<u32>;
+@group(0) @binding(1) var<storage,read> src: array<f32>;
+struct M { pos:u32, T:u32, NKV:u32, HD:u32, LMAX:u32, }
+@group(0) @binding(2) var<storage,read> m: M;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;                       // one lane per STORED word, not per value
+  let hd2 = m.HD / 2u;
+  let total = m.NKV * m.T * hd2;
+  if (i >= total) { return; }
+  let d = i % hd2;
+  let t = (i / hd2) % m.T;
+  let kv = i / (hd2 * m.T);
+  let so = kv * m.T * m.HD + t * m.HD + d * 2u;
+  cache[kv * m.LMAX * hd2 + (m.pos + t) * hd2 + d] =
+      pack2x16float(vec2<f32>(src[so], src[so + 1u]));
+}
+"""
+
+# Unpack a used span back to f32, for the prefill path. Prefill already copies the span it
+# attends over (`_contig(K.data[:, :end, :])`), so widening happens inside a copy that was
+# there anyway and the three prefill attention kernels never learn about any of this.
+_KVREAD_F16_WGSL = """@group(0) @binding(0) var<storage,read_write> outp: array<f32>;
+@group(0) @binding(1) var<storage,read> cache: array<u32>;
+struct M { pos:u32, T:u32, NKV:u32, HD:u32, LMAX:u32, }
+@group(0) @binding(2) var<storage,read> m: M;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let hd2 = m.HD / 2u;
+  let total = m.NKV * m.T * hd2;
+  if (i >= total) { return; }
+  let d = i % hd2;
+  let t = (i / hd2) % m.T;
+  let kv = i / (hd2 * m.T);
+  let v = unpack2x16float(cache[kv * m.LMAX * hd2 + t * hd2 + d]);
+  let oo = kv * m.T * m.HD + t * m.HD + d * 2u;
+  outp[oo] = v.x;
+  outp[oo + 1u] = v.y;
+}
+"""
+_kvf16 = {"w": False, "r": False}
+
+
+def kv_unpack(cache, end, nkv, hd, lmax):
+    """The first `end` rows of a packed cache, as a fresh f32 (nkv, end, hd) ndarray."""
+    plat = _adam_kernel["platform"]
+    if not _kvf16["r"]:
+        plat.addKernel("kv_read_f16", {"source": _KVREAD_F16_WGSL,
+            "bindingTypes": ["storage", "read-only-storage", "read-only-storage"]})
+        _kvf16["r"] = True
+    end = int(end); nkv = int(nkv); hd = int(hd)
+    out = _empty((nkv, end, hd))
+    meta_id = _adam_kernel["make_meta"](
+        (0, end, nkv, hd, int(lmax)), "u4,u4,u4,u4,u4").buffer_id
+    total = nkv * end * (hd // 2)
+    plat.runKernel({"name": "kv_read_f16",
+        "tensors": [out.buffer.buffer_id, cache.buffer.buffer_id, meta_id],
+        "workGroups": {"x": (total + 63) // 64, "y": 1, "z": 1}})
+    return out
+
+
+def _f16_kv_source(src):
+    """The same attention kernel, reading a cache of packed halves instead of floats.
+
+    Derived rather than copied: the two kernels that scan the cache are long, subtle and
+    identical in the parts that touch it, and a second hand-maintained copy of each would
+    drift from the original the first time anyone fixed a bug in one of them. Every
+    substitution asserts, so a fragment that stops matching is a build error here and not a
+    kernel that silently reads the wrong bytes.
+    """
+    subs = [
+        # The bindings are the same bytes; only what the shader calls them changes.
+        ("var<storage,read> kc: array<f32>;",
+         "var<storage,read> kc: array<u32>;"),
+        ("var<storage,read> vc: array<f32>;",
+         "var<storage,read> vc: array<u32>;"),
+        # Half the elements per row, so half the stride.
+        ("  let ko = kv * gm.lmax * gm.hd;",
+         "  let ko = kv * gm.lmax * (gm.hd / 2u);"),
+        # q . k, two dimensions per stored word.
+        ("""      let kb = ko + s * gm.hd;
+      for (var i: u32 = 0u; i < gm.hd; i = i + 1u) {
+        dd = dd + q[qo + i] * kc[kb + i];
+      }""",
+         """      let hd2 = gm.hd / 2u;
+      let kb = ko + s * hd2;
+      for (var i: u32 = 0u; i < hd2; i = i + 1u) {
+        let kk = unpack2x16float(kc[kb + i]);
+        dd = dd + q[qo + i * 2u] * kk.x + q[qo + i * 2u + 1u] * kk.y;
+      }"""),
+        # The weighted sum of values: one lane per stored word, so it carries two
+        # accumulators. `acc` stays fp32 and full width -- only the STORED value narrows.
+        ("""    for (var d: u32 = t; d < gm.hd; d = d + 128u) {
+      var o: f32 = acc[d] * corr;
+      for (var pp: u32 = 0u; pp < cnt; pp = pp + 1u) {
+        o = o + sc[pp] * vc[ko + (base + pp) * gm.hd + d];
+      }
+      acc[d] = o;
+    }""",
+         """    let hd2v = gm.hd / 2u;
+    for (var d: u32 = t; d < hd2v; d = d + 128u) {
+      var o0: f32 = acc[d * 2u] * corr;
+      var o1: f32 = acc[d * 2u + 1u] * corr;
+      for (var pp: u32 = 0u; pp < cnt; pp = pp + 1u) {
+        let vv = unpack2x16float(vc[ko + (base + pp) * hd2v + d]);
+        o0 = o0 + sc[pp] * vv.x;
+        o1 = o1 + sc[pp] * vv.y;
+      }
+      acc[d * 2u] = o0;
+      acc[d * 2u + 1u] = o1;
+    }"""),
+    ]
+    for old, rep in subs:
+        if src.count(old) != 1:
+            raise RuntimeError("f16 KV: fragment matched %d times, expected 1:\n%s"
+                               % (src.count(old), old[:80]))
+        src = src.replace(old, rep, 1)
+    return src
+
+
 _kvw = {"added": False}
 
 
@@ -2181,7 +2356,14 @@ def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
     if _webgl_ready() and not _adam_backend_ready():
         return _webgl_kv_write(cache, src, pos, T, nkv, hd, lmax)
     plat = _adam_kernel["platform"]
-    if not _kvw["added"]:
+    # Same rule as the reader: the cache's own width says whether it holds halves.
+    packed = (int(cache.shape[-1]) * 2 == int(hd)) and int(hd) % 2 == 0
+    name = "kv_write_f16" if packed else "kv_write"
+    if packed and not _kvf16["w"]:
+        plat.addKernel(name, {"source": _KVWRITE_F16_WGSL,
+            "bindingTypes": ["storage", "read-only-storage", "read-only-storage"]})
+        _kvf16["w"] = True
+    if not packed and not _kvw["added"]:
         plat.addKernel("kv_write", {"source": _KVWRITE_WGSL,
             "bindingTypes": ["storage", "read-only-storage", "read-only-storage"]})
         _kvw["added"] = True
@@ -2190,8 +2372,8 @@ def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
     else:
         meta_id = _adam_kernel["make_meta"](
             (int(pos), int(T), int(nkv), int(hd), int(lmax)), "u4,u4,u4,u4,u4").buffer_id
-    total = nkv * T * hd
-    plat.runKernel({"name": "kv_write",
+    total = nkv * T * (hd // 2 if packed else hd)
+    plat.runKernel({"name": name,
         "tensors": [cache.buffer.buffer_id, src.buffer.buffer_id, meta_id],
         "workGroups": {"x": (total + 63) // 64, "y": 1, "z": 1}})
     return cache

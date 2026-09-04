@@ -76,6 +76,30 @@ captured as a WebGPU command graph on the first token and replayed afterwards, s
 CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
 uses a split-K GQA kernel; how far to split is measured at load, not assumed.
 
+Its cost splits in two, and only one half is about the model. Measured on a 0.6B: 9.05 ms
+that does not depend on the conversation, plus 0.00223 ms for every token already in it.
+The second term is **reading the cache**, and nothing else — 28 layers × 2 × 8 kv-heads ×
+128 dims is 224 KB per context token in fp32, so at a context of 3632 one step streams
+833 MB, in 8.11 ms. That is 102.7 GB/s, which is *faster* than anything else here reaches
+(the general fp32 matmul streams 62–79 GB/s on the same device) and the split factor is
+already chosen by measurement from 4/8/16/32 at every context bucket. There was no kernel
+left to improve, so the bytes had to go: **K and V are stored as halves**, two to a `u32`,
+unpacked in the shader with `unpack2x16float` — core WGSL needing no device feature, and
+`unpackHalf2x16` is the GLSL spelling of the same thing. Measured end to end on the 0.6B at
+greedy: 101.2 → 125.2 tok/s at short context and 67.3 → 83.8 at a context of 2848, with the
+generated text identical in both, token for token. Halving the bytes does not halve the
+time (the packed kernel sustains 66.6 GB/s against 88.0), so the win is ~1.5× on the
+attention term rather than 2×.
+
+Which kernel reads which cache is decided from the **buffer**, never from a flag: a packed
+cache is exactly half as wide as the query scanned against it, and there is more than one
+KV cache class in this file. The two attention kernels that scan the cache are long and
+subtle, so the packed pair is *derived* from the fp32 pair by substitution rather than
+copied — every fragment asserts, so one that stops matching is an error and not a kernel
+quietly reading the wrong bytes. Prefill is unaffected: it already copied the span it
+attends over, so that copy widens back to fp32 and the three prefill kernels never learn
+about any of this.
+
 **Prefill** does the opposite twice over:
 
 - Above `_GGML_DEQ_M` rows the weights *are* unpacked, once, and the plain fp32 matmul runs
