@@ -2954,7 +2954,16 @@ class CausalLM:
         # next tokens overwrite them -- `pos` counts real tokens only, and the decode kernel
         # reads that many.
         T_real = len(ids)
-        if embeds is None and _matmul_row_align() > 1:
+        # Padding is only sound where the extra positions are INERT, and that is a property
+        # of the layer, not of the matmul. Causal attention never lets a real query see a row
+        # that comes after it, so rows appended past the prompt cost arithmetic and nothing
+        # else. A recurrent layer has no such protection: `_linear_mixer` advances its state
+        # in place, once per position, so 31 invented tokens leave the state 31 steps past
+        # the prompt -- and every token decoded afterwards continues from there. The hidden
+        # state this function returns is still right (position T_real-1 cannot see them), so
+        # nothing raises; the reply simply continues from a state that never existed.
+        recurrent = any(self._is_linear_layer(i) for i in range(len(self.layers)))
+        if embeds is None and not recurrent and _matmul_row_align() > 1:
             step = _matmul_row_align()
             room = max(0, int(LMAX) - start - T_real)
             grow = min((-T_real) % step, room)
