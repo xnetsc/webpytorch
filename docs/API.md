@@ -745,6 +745,15 @@ breaking callers.
   `modelscope_read` and `use_default_io` are built on. `info`: `url`, `bytes`, `rate`. A
   read callback of your own that does not use `http_get` will not report here, and should
   not — it may not be downloading anything.
+- `webtorch.set_load_progress(cb)` / `webtorch.get_load_progress()` — which **stage** a load
+  has reached. Reading the weights is not the whole of a load and on a large model is not
+  even the slow part: what follows is measuring the kernel shapes this model will use,
+  checking the weights against the file, and one forward pass to prove the result is usable.
+  Read progress cannot report any of that — by then nothing is being read — so a 13 GB model
+  sits at a finished byte meter for minutes, which reads as a load that has hung. `info`:
+  `stage` (`"reading"` | `"warming"` | `"checking"` | `"proving"` | `"ready"`), plus `done`
+  and `total` for a stage that counts its work. The stage names are a fixed vocabulary, not
+  a sentence: a caller decides what to show and should not have to parse prose to do it.
 - `webtorch.set_storage_full(cb)` — called **once**, when origin storage runs out. `info`:
   `key` (the entry being written when it hit the wall), `quota` (what the browser said the
   origin may use, if it said). This is not an error and is not raised: the load continues by

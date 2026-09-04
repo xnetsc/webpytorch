@@ -618,6 +618,15 @@ def _decode_rate(t_first, steps):
     return round((steps - 1) / dt, 2)
 
 
+def _load_stage(stage, done=None, total=None):
+    """Tell whoever installed `set_load_progress` where this load has got to."""
+    try:
+        from . import webio
+        webio.load_stage(stage, done, total)
+    except Exception:
+        pass
+
+
 class GenResult:
     def __init__(self, text, tokens, ttft_s, decode_tok_s):
         self.text = text; self.tokens = tokens
@@ -1706,9 +1715,15 @@ class CausalLM:
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
-        self._init_state()
+        # Reading is done; everything from here reads nothing, so the byte meter has stopped
+        # and only these say the load is still alive. On a 13GB model they are minutes.
+        _load_stage("warming")
+        self._init_state()          # kernel shapes measured for this model
+        _load_stage("checking")
         self._audit()               # weights must agree with the file
+        _load_stage("proving")
         self._smoke()               # and the first forward must be usable
+        _load_stage("ready")
         return self
 
     async def _gload_mtp(self):

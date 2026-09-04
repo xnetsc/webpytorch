@@ -1187,6 +1187,52 @@ def get_read_progress():
     return _progress["cb"]
 
 
+_stage = {"cb": None}
+
+
+def set_load_progress(cb):
+    """Install `cb(info)`, called as a load moves between STAGES. `None` clears it.
+
+    Reading the weights is not the whole of a load, and on a large model it is not even the
+    slow part: what follows is measuring the kernel shapes this model will use, checking the
+    weights against the file they came from, and one forward pass to prove the result is
+    usable. Read progress cannot report any of that -- it counts bytes served, and by then
+    nothing is being read -- so a 13 GB model sat at a finished progress bar for minutes,
+    which reads as a load that has hung.
+
+    `info` is a dict, so it can gain fields without breaking callers:
+
+        stage   "reading" | "warming" | "checking" | "proving" | "ready"
+        done    items finished in this stage, when the stage counts them
+        total   items in this stage, when that is known ahead of time
+
+    A stage without a count still reports, so a caller always knows what is happening even
+    when it cannot say how far along. Stages are a fixed vocabulary rather than free text:
+    a caller decides what to show, and should not have to parse a sentence to do it.
+    """
+    _stage["cb"] = cb
+
+
+def get_load_progress():
+    return _stage["cb"]
+
+
+def load_stage(stage, done=None, total=None):
+    """Report that a load has reached `stage`. Called by the loaders, not by callers."""
+    cb = _stage["cb"]
+    if cb is None:
+        return
+    info = {"stage": stage}
+    if done is not None:
+        info["done"] = int(done)
+    if total is not None:
+        info["total"] = int(total)
+    try:
+        cb(info)
+    except Exception:
+        pass                        # a reporting hook must never take a load down with it
+
+
 def _prog_state(key):
     st = _progress["state"].get(key)
     if st is None:

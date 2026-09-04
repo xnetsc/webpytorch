@@ -193,6 +193,13 @@ async function loadModel(repo, file, lmax) {
            rate, dlRate: self.__dlRate });
   };
   self.__dl = (rate) => { self.__dlRate = rate; };
+  // Where the load IS, as opposed to how many bytes it has read. Reading stops well before
+  // the load does -- what follows measures kernel shapes, checks the weights against the
+  // file and runs one forward -- and on a 13GB model that tail is minutes with the byte
+  // meter frozen at the end, which reads as a hang.
+  self.__stage = (stage, done, total) => {
+    send({ type: 'stage', stage, done: done || 0, total: total || 0 });
+  };
   stopFlagClear(); intrClear();          // the Python flag is cleared below; these are its twins
   const run = newRun();
   const out = await run.race(pyodide.runPythonAsync(`
@@ -202,6 +209,8 @@ lmax = int(_lmax)
 webtorch.cancel(False)      # a stale stop request must not hit this load
 webtorch.set_read_progress(lambda i: js.self.__prog(i["done"], i["total"] or 0, i["rate"]))
 webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
+webtorch.set_load_progress(
+    lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total")))
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
@@ -219,6 +228,7 @@ except (webtorch.Cancelled, KeyboardInterrupt) as _e:
 finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
+    webtorch.set_load_progress(None)
 getattr(_MODEL["m"], "kind", "")
 `));
   // Abandoned by a stop while it was still running: it may well have gone on to finish, but

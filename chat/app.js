@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=962be8875b');
+const worker = new Worker('worker.js?v=0273ceab3f');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -310,7 +310,29 @@ worker.onmessage = (e) => {
   else if (m.type === 'progress') { if (m.total) { expected = m.total; expectedIsReal = true; }
     if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
     showProgress(m.bytes, m.rate, m.dlRate); }
+  else if (m.type === 'stage') {
+    // The byte meter has stopped and the load has not. Say which of the remaining steps is
+    // running, in the words of what it is FOR rather than the function's name: someone
+    // watching a 13 GB model wants to know it is still working, not which method is on the
+    // stack.
+    const say = {
+      warming:  'measuring kernel shapes for this model',
+      checking: 'checking the weights against the file',
+      proving:  'running one forward pass to prove it works',
+      ready:    '',
+    }[m.stage];
+    if (say) {
+      const n = m.total ? ' (' + m.done + '/' + m.total + ')' : '';
+      $('#progressText').textContent = say + n + ' …';
+      // An indeterminate stage: the bar stops pretending to measure and just moves, which
+      // is the honest signal for "working, cannot say how far".
+      setBarBusy(true);
+    } else {
+      setBarBusy(false);
+    }
+  }
   else if (m.type === 'loaded') {
+    setBarBusy(false);
     probeTools();            // asked once per model, before any reply needs the answer
     modelLoaded = true; modelImage = !!m.image;
     // Done is done: leaving the last mid-load fraction on screen reads as a load that
@@ -919,7 +941,15 @@ function syncButtons() {
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
 let expected = 0, expectedIsReal = false;
 let lastLoadedBytes = 0;
+function setBarBusy(on) {
+  const bar = $('#bar');
+  if (!bar) return;
+  bar.classList.toggle('busy', !!on);
+  if (on) bar.style.width = '100%';
+}
+
 function showProgress(bytes, rate, dlRate) {
+  setBarBusy(false);
   lastLoadedBytes = bytes;
   // "loaded", not "downloaded": the same meter covers a load served entirely from cache.
   // The download figure is shown only while bytes are actually coming over the wire --

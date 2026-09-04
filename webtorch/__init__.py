@@ -74,6 +74,7 @@ from .webio import (use_directory, get_directory, migrate_cache, set_storage_ful
                     use_model_file, local_files, forget_model_file,
                     cancel_requested, set_cancel_probe, trim_partial, trim_stopped,
                     set_read_progress, get_read_progress,
+                    set_load_progress, get_load_progress, load_stage,
                     set_download_progress, get_download_progress,
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     cancel, Cancelled,
@@ -92,6 +93,7 @@ __all__ = [
     "cancel_requested", "set_cancel_probe", "trim_partial", "trim_stopped",
     "backend_reason",
     "set_read_progress", "get_read_progress",
+    "set_load_progress", "get_load_progress",
     "export_model", "import_model", "model_groups",
     "backend", "has_gpu", "require_gpu",
     # torch-compatible core
