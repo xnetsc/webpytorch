@@ -373,6 +373,12 @@ Getting it wrong does not raise. Every op silently falls back to numpy inside wa
 correct, roughly two orders of magnitude slower. That failure mode is why the SDK owns the
 handshake instead of leaving it to callers, and why the live backend is queryable.
 
+- `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
+  nothing is. Reading this is the supported way to find out why a machine that should be
+  fast is not — the reason is recorded where the failure happened, which is the only way to
+  tell a browser without WebGPU from a page that is merely not cross-origin isolated.
+- `webtorch.__version__` — the SDK version string.
+
 **Main thread** — load `dist/wgpy-main.js`, then `webtorch/js/webtorch-main.js`:
 
 ```html
@@ -681,6 +687,103 @@ Lower-level adapters (built on the two callbacks; normally you won't call them d
 `await read_bytes/read_text/read_json/load_npz(src, io=None)`,
 `await write_json(dst, name, obj, io=None)`. safetensors is serialized/parsed in pure
 numpy, so a str `dst` (e.g. `"s3://bucket/model"`) is just a name handed to `io_write`.
+
+## Where the bytes live — local files and directories
+
+Origin storage is capped by browser **policy**, not by the machine: the same page is offered
+4.46 GB in one browser and 11.5 GB in another while the disk has hundreds of GB free, and
+`persist()` is refused in both. A model larger than that number cannot be kept there at all.
+Two ways out, and neither copies the model:
+
+**Read it where it lies.** The person picks a file; it is registered, not imported.
+
+- `webtorch.use_model_file(handle, name=None)` — serve reads for a model out of a local
+  file. `handle` is a `FileSystemFileHandle`. Matching is by file name, because a model's
+  key ends in the name the file has (`…/resolve/master/model.gguf` against `model.gguf`),
+  so a file picked from disk satisfies the very id the loader was about to fetch. Pass
+  `name` to override that.
+- `await webtorch.import_model(handle, name=None)` — the same idea for either kind of
+  handle: a `FileSystemFileHandle` registers one file, a `FileSystemDirectoryHandle`
+  registers every file in it, which is what a multi-file model is. Nothing touches origin
+  storage; reads go to the offsets the loader asks for.
+- `webtorch.local_files()` → the names currently satisfied this way, in registration order.
+- `webtorch.forget_model_file(name)` — stop serving `name` from a local file.
+
+**Or keep the cache in a directory.** A directory carries no quota: what fits is what fits
+on the disk, and what lands there is the file itself — openable by other tools.
+
+- `webtorch.use_directory(handle)` — cache into a directory the person picked instead of
+  origin storage. `webtorch.get_directory()` returns the handle in use, or `None`.
+- `await webtorch.migrate_cache(handle, cache_dir=None, on_progress=None, keep=False)` —
+  move what is already cached into that directory and keep using it. Entry by entry, chunk
+  by chunk, **deleting from origin storage as each is safely written** — which is the point:
+  when the quota is already full, freeing as you go is the only way there is room to
+  continue. Memory holds one chunk, never a model. `keep=True` copies instead of moving.
+  Returns the bytes moved.
+
+**Taking a model elsewhere.**
+
+- `await webtorch.model_groups(cache_dir=None)` → cached entries grouped into models,
+  `[{"name", "label", "keys", "size", "files"}]`. Grouping is by the directory part of the
+  key, which is what separates one repo's files from another's.
+- `await webtorch.export_model(keys, write, cache_dir=None, on_progress=None)` — write
+  cached entries out through `write` (async, called with `bytes`). One key is written as the
+  file itself; several become a stored ZIP. Returns bytes written.
+
+## Progress and storage feedback
+
+Each installs one callback and returns nothing; passing `None` clears it. The paired getter
+returns whatever is installed. `info` is a dict in every case, so it can gain fields without
+breaking callers.
+
+- `webtorch.set_read_progress(cb)` / `webtorch.get_read_progress()` — how far a **load** has
+  got, called as reads are served. `info`: `key`, `done` (cumulative bytes for that entry
+  since the hook was installed), `total` (or `None` when unknown), `elapsed`, `rate`
+  (bytes/second, smoothed).
+- `webtorch.set_download_progress(cb)` / `webtorch.get_download_progress()` — the **network**
+  underneath, for anything going through the built-in `http_get`, which is what `hf_read`,
+  `modelscope_read` and `use_default_io` are built on. `info`: `url`, `bytes`, `rate`. A
+  read callback of your own that does not use `http_get` will not report here, and should
+  not — it may not be downloading anything.
+- `webtorch.set_storage_full(cb)` — called **once**, when origin storage runs out. `info`:
+  `key` (the entry being written when it hit the wall), `quota` (what the browser said the
+  origin may use, if it said). This is not an error and is not raised: the load continues by
+  streaming. It is the moment to offer the person a directory — see `use_directory`.
+
+## Stopping a load or a generation
+
+- `webtorch.cancel(flag=True)` — ask the in-flight load, read or generation to stop.
+  `cancel(False)` withdraws the request. The flag is **sticky**: it stays set, keeping stray
+  IO from starting, until it is withdrawn, which every load does on its way in.
+- `webtorch.Cancelled` — raised at the next IO checkpoint once a stop is asked for; after
+  that the SDK issues no further read/write callbacks. It derives from `BaseException`, the
+  way `asyncio.CancelledError` does, because loaders are full of broad `except Exception`
+  fallbacks (optional files, retry loops, rate-limit gates) and **none of them may swallow a
+  stop**.
+- `webtorch.cancel_requested()` → whether a stop has been asked for. A decode loop reads the
+  flag rather than being raised at: a generation is not IO, has no checkpoint to raise at,
+  and should hand back the tokens it already has instead of losing them to an exception.
+- `webtorch.set_cancel_probe(fn)` — install `fn()` as a second source of "stop was asked
+  for". A stop has to be able to arrive while the interpreter is **busy**: in the browser the
+  decode loop is a plain Python loop inside one `runPythonAsync` call, so a stop sent as a
+  message is not queued behind the work, it is **not received at all** until the work ends,
+  and the button reads as dead. The flag then has to come from somewhere the caller can
+  write without the interpreter's help — a `SharedArrayBuffer` the page stores into — and
+  this is where the SDK reads it. Called between tokens and at every IO checkpoint, so it
+  must be cheap.
+
+**Cleaning up after a stop.** A stopped download leaves whole chunks plus, where it stopped,
+one that is only part-written. Part-written chunks are not *wrong* — `covered` records byte
+for byte what is there and a read never asks outside it — but nothing can be served from them
+until the rest arrives, which is what makes a stopped load look like a cache entry that is
+"there" without being usable.
+
+- `await webtorch.trim_partial(key, cache_dir=None)` → bytes dropped. Whole chunks are kept,
+  so a stopped load still resumes from where it got to; only the ragged edge goes.
+- `await webtorch.trim_stopped(cache_dir=None)` → bytes dropped, for every entry the load
+  that just stopped had written. The stop itself cannot do this — `cancel` is called from
+  wherever the person pressed the button, often mid-chunk — so the loader's caller calls this
+  once the `Cancelled` has come back to it.
 
 ## Advanced: concrete model impls  (`webtorch.models.*`, NOT the public interface)
 Reach these only if you need model-internal control; the generic `pipeline` / `AutoModel*`
