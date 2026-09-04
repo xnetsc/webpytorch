@@ -55,6 +55,22 @@ git config core.hooksPath .githooks       # once per clone
 
 — and `git commit --no-verify` gets past it when the mismatch is deliberate.
 
+### Two generated files that are easy to forget
+
+Neither is built by npm or by the wheel scripts, and skipping either fails at runtime rather
+than at build time:
+
+```bash
+scripts/gen-modules.sh    # after adding/removing a webtorch/*.py
+scripts/stamp.sh          # after changing anything the page loads from chat/
+```
+
+`webtorch/modules.json` is the list the browser bootstrap fetches, because a page cannot list
+a directory — a module missing from it surfaces as an ImportError from inside Pyodide.
+`stamp.sh` puts a content hash on each local script URL (`…/webtorch-main.js?v=01f205aa85`):
+without it the browser's own memory cache answers `<script src>` with the previous file on
+the first reload after a deploy, and the service worker never sees the request.
+
 ## 2. Pyodide runtime
 Pyodide is NOT vendored: the workers load it from the CDN, pinned in one place
 (`chat/pyodide-version.js`), and the service worker caches it — the version is in the
@@ -71,7 +87,8 @@ included server (also does HTTP Range, needed for streaming model loads):
 
 ```bash
 node serve-coi.mjs . 8119
-# open http://localhost:8119/webapp/  → tick WebGPU, pick an example, Run
+# open http://localhost:8119/chat/     → the chat client: pick a model, wait for the load
+# or  http://localhost:8119/webapp/   → the example runner: tick WebGPU, pick an example, Run
 ```
 
 ## 4. Model weights (`models/`, git-ignored)

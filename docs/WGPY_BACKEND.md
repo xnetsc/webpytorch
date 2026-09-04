@@ -1,3 +1,10 @@
+> **This is upstream WgPy's own README, kept here for reference.** It documents the
+> original project's API, build and examples — not this repository's fork of it.
+>
+> *What webtorch changed in the backend* is listed in [NOTICE](../NOTICE); *how webtorch
+> sits on top of it* is [ARCHITECTURE.md](ARCHITECTURE.md). Note that the build steps below
+> are upstream's; the ones this repository uses are in [BUILD.md](BUILD.md).
+
 # wgpy: WebGL accelerated numpy-compatible array library for web browser
 
 wgpy is a WebGL accelerated numpy-compatible array library for web browsers. It runs on [Pyodide](https://pyodide.org/), the python runtime which runs on the web browser. Deep learning can also be performed on GPUs in conjunction with [Chainer](https://github.com/chainer/chainer).

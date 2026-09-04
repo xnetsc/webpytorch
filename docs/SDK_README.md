@@ -63,12 +63,63 @@ covers the **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the **MoE series**
 Qwen1.5-MoE-A2.7B (int4) → coherent text.
 
 **Precision — int4 / int8 / fp16 (`dtype=`).** `dtype="auto"` (default): an AutoGPTQ dir
-loads at whatever bits its `quantization_config` declares (**int4 or int8**); a GGUF is
-requantized to int`bits`; a plain **fp16/bf16 HF dir runs unquantized** (fp16 weights, fp32
-compute, via the `UnquantizedLinear` layer). Force it with `dtype="fp16"`, or quantize a
-fp16 model on load with `dtype="int8"`/`"int4"`. int4/int8 use the capture-accelerated int
-kernel (~20× decode); fp16 uses a plain `x @ W.T + b`. (The general torch core in §1 runs
-native fp32.)
+loads at whatever bits its `quantization_config` declares (**int4 or int8**); a plain
+**fp16/bf16 HF dir runs unquantized** (fp16 weights, fp32 compute, via the
+`UnquantizedLinear` layer). Force it with `dtype="fp16"`, or quantize a fp16 model on load
+with `dtype="int8"`/`"int4"`. int4/int8 use the capture-accelerated int kernel (~20×
+decode); fp16 uses a plain `x @ W.T + b`. (The general torch core in §1 runs native fp32.)
+
+**GGUF keeps its own encoding (`weights="native"`, the default).** A `Q4_K` tensor is
+uploaded packed and multiplied packed — no dequantize, no requantize, no fp32 intermediate.
+Twenty-eight formats are implemented this way, `Q4_K` through the 2-bit i-quants, each
+checked against a reference decoder on both backends. `weights="requant"` is the fallback
+for a type this build does not handle natively: it dequantizes and requantizes to int`bits`
+and runs the ordinary int kernel. Prefill is the exception to "multiplied packed" — above a
+few dozen rows the weights are unpacked once because that is measurably cheaper, which is a
+kernel-selection detail and not a change of what is stored.
+
+### Conversations, constraints and tools
+
+`generate`/`stream` take either a `prompt` or a full `messages` list, and apply the model's
+own chat template:
+
+```python
+out = lm.generate(messages=[{"role": "user", "content": "Hi"}],
+                  max_new=256, enable_thinking=False)
+for tok in lm.stream(messages=msgs, temperature=0.7): render(tok)
+```
+
+**Constraints** decide what may be generated next. A constraint is asked, at each step,
+which of the candidate continuations are allowed — so it is a *callback*, not a fixed list,
+and it may depend on whatever state your application has:
+
+```python
+lm.generate(prompt="Give me the record as JSON", constraint="json")
+
+def only_ascending(text, candidates):          # your own business rule
+    return webtorch.verdict(allow=[c for c in candidates if ok(text, c)])
+lm.generate(prompt=..., constraint=only_ascending)
+```
+
+A verdict may also say *take this continuation and stop*, or *stop asking me and let the
+model run free* — the combinations are named constants, not booleans to remember.
+
+**Tool calling** is built on that. You pass the tools; the SDK renders them into the
+model's own template, parses whatever delimiters that model uses back out, and — with
+`require_known_tools=True` — makes a tool name that is not in your list *unrepresentable*
+rather than merely unlikely:
+
+```python
+tools = [{"name": "python", "description": "Run Python.",
+          "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}]
+out   = lm.generate(messages=msgs, tools=tools, require_known_tools=True)
+calls = lm.tool_calls(out.text, tools)                      # [{name, args, known, id}]
+msgs += lm.tool_round_messages(lm.strip_tool_calls(out.text, tools), calls, results)
+```
+
+`lm.tools_supported()` says whether this model's template has tool syntax at all, and
+`lm.split_reasoning(text)` separates a thinking block from the answer. Nothing here knows
+any model family by name; the syntax is read off the model's own template.
 
 ## 3. Quantization — dedicated, streaming, IO-free, framework-agnostic
 
@@ -198,7 +249,7 @@ the browser it is automatically backed by **IndexedDB (IDBFS)** and synced, so i
 page reloads** with no setup. Manage it with `webtorch.list_cache` / `cache_hosts` /
 `read_cache` / `write_cache` / `delete_cache` / `clear_cache` (entries are separated by
 host/domain, so HF and ModelScope never mix) — see the API reference. All range reads share an **adaptive queue**: `max_parallel`
-(default 8) is the *ceiling*, and the live concurrency self-tunes to rate-limiting — on a 429
+(default 16) is the *ceiling*, and the live concurrency self-tunes to rate-limiting — on a 429
 (or a body with rate-limit wording, EN/中文) it halves and, if pushed to 0 with nothing in
 flight, cools down (30→60→120→180s, cap 3 min) then recovers, holding the current value while
 any request still succeeds and only aborting when fully stalled with nothing in flight.
@@ -231,11 +282,15 @@ webtorch/            the importable SDK package
   _core.py           torch-compatible Tensor/autograd/nn/optim + GPU kernels
   _sdk.py            AutoModel*/AutoTokenizer/Quantizer/pipeline/OnnxModel facade
   torchshim.py       `import torch` compatibility
+  llm.py             CausalLM: loading, prefill/decode, KV reuse, chat, tool calling
   lm_engine.py       generic decoder (CausalLM + MoE series) + samplers + capture
+  constrain.py       output constraints (callback protocol + json/regex/choices built-ins)
+  toolcall.py        reading/writing tool calls in whatever form a model uses
+  multimodal.py      register_encoder + MultimodalLM (any decoder × any encoder)
   quantize.py        streaming quantizer (IO-free core)
   webio.py           the only IO layer: global async read + write callbacks + resolvers
   onnxrt.py          generic ONNX runtime
-  llm.py / cosyvoice.py / tts.py / detection.py / vl.py / audiofe.py   model impls
+  cosyvoice.py / tts.py / detection.py / vl.py / audiofe.py   model impls
 ```
 
 Backend: WgPy (WebGPU/WebGL) in the browser, numpy on the host. See

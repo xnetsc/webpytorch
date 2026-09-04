@@ -400,14 +400,14 @@ const CPU_MAX_GB = 2;
 // What WebGL costs, measured on this codebase rather than estimated: same models, same
 // prompt, same warm-up, each repeated three or four times.
 //
-//   Qwen3-0.6B Q4_K_M      118.6 -> 19.8 tok/s   6.0x
+//   Qwen3-0.6B Q4_K_M      103.7 -> 19.8 tok/s   5.2x
 //   Qwen 3B Q4_K            35.7 -> 5.3          6.7x
 //   Qwen3-30B-A3B MoE       34.8 -> 5.1          6.8x
 //   Qwen3.8-27B hybrid       6.8 -> 0.76         8.9x   (i-quant, 48 of 64 layers recurrent)
 //
 // Stated inline rather than as a dialog: WebGL works and answers correctly, it is only
 // slower, and the dialog is reserved for the case where the model will not run at all.
-const WEBGL_SLOWDOWN = '6-9x';
+const WEBGL_SLOWDOWN = '5-9x';
 // WebGL is a working backend, so this is not the CPU dialog's problem -- but the gap is
 // large enough that a user who does not know which backend they got will read it as the
 // model being slow rather than the browser lacking WebGPU. Same shape as the CPU dialog,
@@ -429,7 +429,7 @@ function warnWebglFallback(sdkWhy) {
     + 'decoder on this backend too \u2014 but they arrive about ' + WEBGL_SLOWDOWN + ' slower.';
   const p2 = document.createElement('p');
   p2.innerHTML = 'Measured here, same prompt and same warm-up: '
-    + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 118.6 on WebGPU; '
+    + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 103.7 on WebGPU; '
     + '<strong>Qwen 3B</strong> 5.3 against 35.7; '
     + '<strong>Qwen3-30B-A3B</strong> (MoE) 5.1 against 34.8; '
     + '<strong>Qwen3.8-27B</strong> (hybrid, i-quant) 0.76 against 6.8 \u2014 the widest gap, '

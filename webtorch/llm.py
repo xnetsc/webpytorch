@@ -1392,8 +1392,13 @@ class CausalLM:
     @classmethod
     async def from_gguf(cls, url, lmax=None, bits=None, quantize=True, weights="native",
                         expert_weights_norm=None):
-        """Load a llama.cpp GGUF, dequantizing + requantizing weights to int`bits` (4 or 8) so
-        they run on the same capture-accelerated engine. `url` is the served .gguf file.
+        """Load a llama.cpp GGUF. `url` is the served .gguf file.
+
+        `weights="native"` (the default) uploads each tensor in its own encoding and
+        multiplies it packed -- no dequantize, no requantize, no fp32 intermediate.
+        `weights="requant"` takes the older path: dequantize, requantize to int`bits`
+        (4 or 8), run the ordinary int kernel. A type with no native decode falls back to
+        that path per tensor regardless.
 
         `lmax=None` runs at the context length the file itself declares (`{arch}.context_length`),
         trimmed only if the KV cache for it would exceed the memory budget; pass a number to

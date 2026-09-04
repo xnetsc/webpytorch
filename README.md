@@ -51,6 +51,14 @@ output is standard AutoGPTQ, loadable by auto_gptq / vLLM / transformers.
 text-to-speech (CosyVoice2 with zero-shot voice cloning, VITS), detection (YOLO/DETR) and
 vision-language (Qwen2.5-VL).
 
+**Say what the output may be.** A constraint sees the text so far and answers which
+continuations are still valid, so `generate(..., constraint="json")` cannot emit malformed
+JSON. Constraints are a callback, not a fixed list: yours is asked for the allowed set at
+every step, and may also say *take this and stop*, or *stop asking me*. That machinery is
+what makes **tool calling** work on small models — `tools=[...]`, and the call is parsed out
+of whatever delimiters the model's own template uses, with `require_known_tools=True` making
+an invented tool name unrepresentable rather than merely unlikely.
+
 **A generic ONNX runtime.** Any `.onnx`, a pure-Python parser and ~50 ops, no dependencies.
 
 **Task pipelines, an open registry.** `pipeline("text-generation" | "text-to-speech" |
@@ -70,10 +78,28 @@ figure the middle of three or four runs:
 
 | Model | Size on disk | WebGPU | WebGL |
 |---|---:|---:|---:|
-| Qwen3-0.6B · Q4_K_M | 0.4 GB | **118.6** | 19.8 |
+| Qwen3-0.6B · Q4_K_M | 0.4 GB | **103.7** | 19.8 |
 | Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | **34.8** | 5.1 |
 | Qwen 3B · Q4_K | 2.0 GB | **35.7** | 5.3 |
 | Qwen3.8-27B · hybrid SSM · i-quant | 13.0 GB | **6.8** | 0.76 |
+
+Decode is only half of what a prompt costs. **Reading** it — the prefill, everything before
+the first token — is the other half, and on a long prompt it is the larger one. Same machine,
+same 0.6B, time to first token end to end:
+
+| Prompt | Time to first token | Prompt tokens/s |
+|---:|---:|---:|
+| 49 tokens | 0.11 s | 441 |
+| 1,182 tokens | 1.65 s | 715 |
+| 3,092 tokens | 5.44 s | 569 |
+
+Two things make that number what it is, and neither is obvious. Above a few dozen rows the
+quantised matmul is the wrong kernel: unpacking the weights once and using the plain fp32
+matmul is 4.8× faster, because that kernel runs at 2117 GFLOPS against the quantised one's
+426 and the device is not what limits the first. And attention materialises a chunk of the
+score matrix at a time rather than none of it — a hand-written flash kernel runs at 94
+GFLOPS here, so spending the arithmetic where the machine is fast wins by 3.6× even at the
+cost of writing the scores down.
 
 On WebGPU, weight streaming runs at the hardware's read ceiling for every quantisation
 format, and what is left is decode arithmetic — close to uniform across formats.
@@ -106,6 +132,9 @@ A complete local chat client lives in [`chat/`](chat/) — the SDK driving a rea
   hub. The list is examples, not a whitelist; the only real limit is GPU memory.
 - **Replies that render.** Markdown, syntax-highlighted code, LaTeX typeset with KaTeX,
   tables. Sanitised before it reaches the DOM.
+- **The model can press it too.** Python and JavaScript are offered to the model as tools;
+  it writes the call, the page runs it and hands back the result. Which tools exist is the
+  app's decision — the SDK parses and constrains them, it does not pick them.
 - **Press the code.** A Python block gets a ▶ and runs in its own Pyodide — separate from the
   one holding the model — with output, tracebacks and matplotlib figures inline. numpy,
   pandas and matplotlib are loaded before you ask; add wheels from a URL or from disk.
@@ -138,7 +167,10 @@ Full steps, including where to get weights: **[docs/BUILD.md](docs/BUILD.md)**.
 webtorch/            the SDK
   _core.py             torch-compatible Tensor / autograd / nn / optim + the GPU kernels
   _sdk.py              transformers-style facade + the task-pipeline registry
+  llm.py               loading, prefill/decode, KV reuse, chat templates, tool calling
   lm_engine.py         generic decoder (dense + MoE) + samplers + capture/replay
+  constrain.py         output constraints (callback, json, regex, choices, …)
+  toolcall.py          reading/writing tool calls in whatever form a model uses
   quantize.py          streaming quantiser (IO-free core)
   webio.py             the only IO layer: global callbacks, hub readers, cache management
   onnxrt.py            generic ONNX runtime

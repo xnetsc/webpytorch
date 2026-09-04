@@ -10,6 +10,10 @@ Modifications to WgPy in this repository (under src/, webgl/, webgpu/):
   - graph capture / replay with buffer-id pinning (WebGPU + WebGL)
   - fused kernels (Adam, softmax, layernorm) and an in-place KV-cache scatter
   - group-wise int4/int8 (GPTQ-compatible) dequant-matmul kernels
+  - a bounded buffer pool: a per-shape cap and a ceiling on the pool as a whole, plus an
+    explicit release, so freed device memory returns to the device
+  - bind-group caching and one shared compute pass across dispatches, with oversized
+    dispatches folded rather than dropping the batch
 
 The webtorch SDK (the top-level `webtorch/` package, plus examples/, webapp/,
 tools/, docs/) is original work in this repository and is also MIT-licensed.

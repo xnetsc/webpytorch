@@ -197,21 +197,29 @@ have called the wrong tool sometimes call none at all (measured 2 of 8 → 4 of 
 and which failure is better depends on what you do next.
 
 ## Causal LM (dense + MoE series)
-- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=None, lmax=None)`
+- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native")`
   - Runs inference at **int4, int8, or fp16** — `dtype` selects it:
-    - `"auto"` (default): AutoGPTQ dir → int at its declared bits; `*.gguf` → int`bits`;
-      plain fp16/bf16 HF dir → **fp16** (unquantized, weights in fp16/bf16, compute fp32).
+    - `"auto"` (default): AutoGPTQ dir → int at its declared bits; `*.gguf` → **its own
+      encoding**, kept packed (see `weights` below); plain fp16/bf16 HF dir → **fp16**
+      (unquantized, weights in fp16/bf16, compute fp32).
     - `"fp16"`: force unquantized fp16 execution (plain HF dir).
     - `"int4"` / `"int8"`: quantize a plain fp16 HF dir on load, or requantize a GGUF to
       that width. (An AutoGPTQ dir always loads at its own stored bits.)
+  - `weights=` (GGUF only) — `"native"` (default): upload each tensor in its own encoding
+    and multiply it packed; no dequantize, no requantize, no fp32 intermediate. Twenty-eight
+    formats, `Q4_K` through the 2-bit i-quants, each checked against a reference decoder on
+    both backends. `"requant"`: dequantize and requantize to int`bits`, then run the ordinary
+    int kernel. A type with no native decode falls back to that path per tensor either way.
+    Any other value raises.
   - `path`: AutoGPTQ dir | `*.gguf` | plain fp16/bf16 HF dir (`config.json` +
     `model.safetensors[.index.json]` + `vocab.json`/`merges.txt`).
   - Config-driven across the whole **CausalLM series** (Qwen2/Qwen3/Llama-shaped) and the
     **MoE series** — no per-model code; the model is identified by its `config`, not a name.
   - int4/int8 use the capture-accelerated int kernel (~20× decode); fp16 uses a plain
     `x @ W.T + b` matmul (the `UnquantizedLinear` layer), same engine and KV-cache.
-  - returns a model with `.generate(prompt, max_new=…) -> str` and
-    `.stream(prompt, max_new=…) -> iterator[token]`.
+  - returns a model with `.generate(prompt, max_new=…) -> GenResult` and
+    `.stream(prompt, max_new=…) -> iterator[token]`. `GenResult` carries `.text`,
+    `.tokens`, `.ttft_s` and `.decode_tok_s`; printing it shows the timings above the text.
 - `await webtorch.AutoTokenizer.from_pretrained(path)` → byte-BPE tokenizer
   (`.encode/.decode`); accepts a vocab/merges dir or a `{vocab,merges}` json.
 - `webtorch.TransformerLM(cfg)` / `webtorch.build_lm(cfg, get, linear, tensor)` → the

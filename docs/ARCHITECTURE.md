@@ -30,7 +30,14 @@ Pyodide (Python-in-WASM) worker in the browser.
 | `quantize.py` | streaming quantizer — IO-free `Quantizer.stream(read,has,names,write)`; convenience `Quantizer.quantize` |
 | `webio.py` | the **only** IO layer: two REQUIRED global async callbacks (`set_io_read`/`io_read`, `set_io_write`/`io_write`; `use_default_io()` for built-ins; `hf_read`/`modelscope_read` to load by hub repo id) + path/bytes/callback/dict resolvers and pure-numpy safetensors read/write on top |
 | `onnxrt.py` | generic ONNX runtime (pure-Python protobuf parser + ~50-op interpreter) |
-| `llm.py` | `CausalLM` — loads AutoGPTQ (int4/int8), GGUF, or plain fp16/bf16 HF; runs int4/int8 (capture kernel) or fp16 (`UnquantizedLinear`, plain matmul); `BPETokenizer` |
+| `llm.py` | `CausalLM` — loads AutoGPTQ (int4/int8), GGUF, or plain fp16/bf16 HF; prefill/decode, KV prefix reuse, chat templates and the tool-call API; `BPETokenizer` (which also *reads* the model's own template to learn its tool syntax) |
+| `constrain.py` | output constraints — `Verdict`, the callback protocol, and the built-ins (`json`, `regex`, `choices`, tool names) |
+| `toolcall.py` | pure functions for reading/writing tool calls in whatever delimiters and shape a model uses; knows no model family by name |
+| `ggufload.py` `hfcompat.py` `iqtables.py` | weight readers: GGUF (28 formats incl. i-quants) and HF/safetensors; `iqtables` is the i-quant codebook data |
+| `multimodal.py` | `register_encoder` + `MultimodalLM` — pairs any decoder with any media encoder |
+| `linear_attn.py` | SSM / linear-attention layers (the hybrid models) |
+| `backend.py` `webenv.py` `portable.py` | backend selection, browser-vs-host environment, and the numpy fallback that lets pure-Python logic be tested off-browser |
+| `_wgsl2glsl.py` | translates the WGSL kernels to GLSL so WebGL gets the same kernels rather than a second implementation |
 | `cosyvoice.py` `tts.py` `detection.py` `vl.py` `audiofe.py` | concrete model impls (**internal** — reached via `pipeline` / `webtorch.models.*`) |
 
 ## Design rules
@@ -55,3 +62,71 @@ Pyodide (Python-in-WASM) worker in the browser.
 - **Backend kernels** (the WgPy fork, `src/` + `webgl/` + `webgpu/`) add: batched matmul,
   graph capture/replay, fused Adam/softmax/layernorm, in-place KV-scatter, int4/int8 dequant-
   matmul. See [NOTICE](../NOTICE) and [WGPY_BACKEND.md](WGPY_BACKEND.md).
+
+## How a token gets produced
+
+Prefill and decode look like the same arithmetic and are not the same problem, so they do
+not share a path. Decode is one row against every weight: nothing to amortise, latency is
+everything. Prefill is hundreds or thousands of rows at once: enough work that the *shape*
+of the work decides the time.
+
+**Decode** runs the quantised matmul directly — the weights are never unpacked, because
+with a single row the unpacking would cost more than the multiply. The whole step is
+captured as a WebGPU command graph on the first token and replayed afterwards, so per-token
+CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
+uses a split-K GQA kernel; how far to split is measured at load, not assumed.
+
+**Prefill** does the opposite twice over:
+
+- Above `_GGML_DEQ_M` rows the weights *are* unpacked, once, and the plain fp32 matmul runs
+  on them. Measured on this machine that kernel sustains 2117 GFLOPS against the quantised
+  kernel's 426 — the quantised one is not bandwidth-bound, it is bound by unpacking the same
+  weights again for every row. Above a few dozen rows, paying once is 4.8× cheaper.
+- Attention materialises the score matrix `_ATTN_CHUNK` queries at a time (above
+  `_ATTN_CHUNK_MIN_T` tokens) instead of streaming it. A flash kernel avoids writing the
+  scores down but runs at 94 GFLOPS here; the chunked form spends more memory traffic in
+  order to spend its arithmetic in the 2117-GFLOPS kernel, and wins by 3.6×. Below that
+  threshold flash still wins — it is one dispatch against dozens, and at short lengths the
+  dispatches *are* the cost — so both kernels stay, chosen by length.
+
+**Alignment is load-bearing, not a detail.** The backend's fp32 matmul falls off a cliff
+when the row count is not a multiple of `_MATMUL_ROW_ALIGN` (32) or the key extent not a
+multiple of 64. So prefill pads its token sequence to 32 *once* and takes the last real row
+back, and chunked attention rounds each chunk's key extent up to 64. Padding per call
+instead — `xp[:m] = xf` — is the trap: `__setitem__` goes through the host at 0.8 GB/s and
+cost 3.4 s, more than the cliff it was fixing.
+
+**Nothing above is hardcoded on faith.** `tune(key, candidates, apply, bench, check)` runs
+the real kernel over the candidates at load time and keeps what measured fastest, per shape
+(`_warm_shapes`). Two rules were learned the hard way and are enforced in `bench`: batch
+24 dispatches per sync, or you measure the 1–2 ms readback instead of the kernel; and
+interleave the candidates, because the same configuration measured 7.61 ms and 4.49 ms in
+one session when run in blocks. Where measurement said a knob does not pay (`_GGML_KSG`,
+widening `_SMALL_N`) it is *not* made dynamic, and the negative result is recorded next to
+the constant so it is not rediscovered.
+
+**KV reuse.** A reply keeps its cache; the next turn re-uses the longest common prefix of
+token ids rather than re-reading the prompt. The invariant that makes it safe: the cache's
+id list is committed in a `finally`, so an aborted or errored generation leaves the recorded
+ids matching the tensor. Committing only on the happy path is what produced a cache that
+claimed a prefix it did not contain — and the symptom was not a crash but fluent, degenerate
+output.
+
+## Where a decision belongs
+
+The SDK is an abstraction over a *class* of needs, not a set of features for the chat app.
+The line is drawn like this:
+
+- **Model internals never reach the caller.** Probing a template for its tool syntax,
+  rendering a call, constraining a decode — each is an API or a parameter to one, not
+  something a caller is expected to assemble.
+- **Parameters speak the business's language**, not the implementation's:
+  `require_known_tools=True`, not `constraint="tool_names"`.
+- **The SDK offers, it does not install.** Defaults do not make a business decision on the
+  caller's behalf.
+- **Application-specific behaviour stays in the application.** Which tools exist, and what
+  closing a tab means, are the chat app's; parsing and constraining them are the SDK's.
+
+Everything functional lives in `webtorch/`. Outside it there is UI and orchestration only —
+`chat/worker.js` marshals calls, `chat/app.js` renders. The chat app is a user of this SDK,
+and holds no capability of its own.
