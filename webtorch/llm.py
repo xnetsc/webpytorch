@@ -2890,6 +2890,16 @@ class CausalLM:
         load instead of during the first reply. Best-effort: a model whose weights are not
         of this kind, or a backend that cannot run it, simply skips."""
         try:
+            # Drain first. Everything below is measurement -- the tuner runs each candidate
+            # thread shape and times it -- and a timing is only as good as the queue it runs
+            # against. This runs immediately after the whole model has gone to the GPU, so
+            # the first sync of every one of those ~480 rounds waits for the tail of that
+            # upload rather than for the kernel it is supposed to be timing.
+            #
+            # Measured on a 27B: this phase reported 48.8s on a real load, against 0.07s
+            # re-run later on the same settled machine. Seventy times, for the same work.
+            # One readback here costs one wait instead of hundreds.
+            wt.Tensor(np.zeros((1, 1), np.float32)).numpy()
             seen = set()
             held = []
             for lay in getattr(self, "layers", []) or []:
