@@ -78,10 +78,20 @@ figure the middle of three or four runs:
 
 | Model | Size on disk | WebGPU | WebGL |
 |---|---:|---:|---:|
-| Qwen3-0.6B · Q4_K_M | 0.4 GB | **103.7** | 19.8 |
+| Qwen3-0.6B · Q4_K_M | 0.4 GB | **108.0** | 19.8 |
 | Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | **34.8** | 5.1 |
 | Qwen 3B · Q4_K | 2.0 GB | **35.7** | 5.3 |
 | Qwen3.8-27B · hybrid SSM · i-quant | 13.0 GB | **6.8** | 0.76 |
+
+A short prompt is the flattering case. Decode slows as the conversation grows, because
+every token re-reads the whole cache — and that, not the model, is what the second half of
+a long chat costs. The cache is stored as halves for exactly this reason; the figures below
+are with that in place:
+
+| Context | Decode |
+|---:|---:|
+| ~20 tokens | 108.0 tok/s |
+| 2,848 tokens | 83.8 tok/s |
 
 Decode is only half of what a prompt costs. **Reading** it — the prefill, everything before
 the first token — is the other half, and on a long prompt it is the larger one. Same machine,

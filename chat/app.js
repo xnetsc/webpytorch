@@ -400,7 +400,7 @@ const CPU_MAX_GB = 2;
 // What WebGL costs, measured on this codebase rather than estimated: same models, same
 // prompt, same warm-up, each repeated three or four times.
 //
-//   Qwen3-0.6B Q4_K_M      103.7 -> 19.8 tok/s   5.2x
+//   Qwen3-0.6B Q4_K_M      108.0 -> 19.8 tok/s   5.5x
 //   Qwen 3B Q4_K            35.7 -> 5.3          6.7x
 //   Qwen3-30B-A3B MoE       34.8 -> 5.1          6.8x
 //   Qwen3.8-27B hybrid       6.8 -> 0.76         8.9x   (i-quant, 48 of 64 layers recurrent)
@@ -429,7 +429,7 @@ function warnWebglFallback(sdkWhy) {
     + 'decoder on this backend too \u2014 but they arrive about ' + WEBGL_SLOWDOWN + ' slower.';
   const p2 = document.createElement('p');
   p2.innerHTML = 'Measured here, same prompt and same warm-up: '
-    + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 103.7 on WebGPU; '
+    + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 108.0 on WebGPU; '
     + '<strong>Qwen 3B</strong> 5.3 against 35.7; '
     + '<strong>Qwen3-30B-A3B</strong> (MoE) 5.1 against 34.8; '
     + '<strong>Qwen3.8-27B</strong> (hybrid, i-quant) 0.76 against 6.8 \u2014 the widest gap, '
