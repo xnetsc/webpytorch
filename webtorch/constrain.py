@@ -266,25 +266,33 @@ class JsonConstraint(Constraint):
 class RegexConstraint(Constraint):
     """Emit only text that matches a regular expression.
 
-    Uses `regex`'s partial matching where available so a prefix is accepted while it can
-    still grow into a match; without it, the check falls back to matching what is complete.
+    Needs the `regex` package, for its PARTIAL matching: deciding what may come next means
+    asking "can this prefix still grow into a match", and the standard library's `re` cannot
+    answer that. It only reports whether something already matches.
+
+    So there is no fallback, and that is deliberate. The old one used `re.match`, which
+    rejects every incomplete prefix -- including the correct ones. Every candidate was
+    refused, the sampler widened to the whole vocabulary, found nothing, and fell back to an
+    unconstrained pick: the constraint silently did NOTHING, and asking for a date pattern
+    returned "Sure! What would you like to d". A constraint that quietly does not apply is
+    worse than one that refuses to start.
     """
 
     def __init__(self, pattern):
         try:
             import regex as _re
-            self._partial = True
         except ImportError:
-            import re as _re
-            self._partial = False
+            raise ImportError(
+                "a regex constraint needs the `regex` package (the standard library's `re` "
+                "cannot test whether a prefix could still become a match, so a constraint "
+                "built on it silently allows everything). In a browser: "
+                "await micropip.install('regex'). Or use a callback constraint -- "
+                "constraint=lambda text, piece: ... -- which needs nothing.")
         self.re = _re
         self.rx = _re.compile(pattern)
 
     def allows(self, text, piece):
-        s = text + piece
-        if self._partial:
-            return self.rx.fullmatch(s, partial=True) is not None
-        return self.rx.match(s) is not None
+        return self.rx.fullmatch(text + piece, partial=True) is not None
 
     def finished(self, text):
         return self.rx.fullmatch(text) is not None

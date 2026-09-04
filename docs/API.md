@@ -43,7 +43,7 @@ m3 = await webtorch.load("Qwen/Qwen3-0.6B")      # released -> loads fresh
 ```
 - `model.release()` frees the weights and drops it from the cache; using a released model
   raises. `webtorch.release_all()` releases everything; `webtorch.loaded_models()` lists what
-  is held; `load(..., reuse=False)` forces a separate instance.
+  is held; `load(..., reuse=True)` forces a separate instance.
 
 ### Releasing any model — `webtorch.release(model)`
 On-demand load/unload has to work for **every** entry point, not just `load()`. `release()`
@@ -61,11 +61,143 @@ cache entry, so a later `load()` rebuilds. Repeated load/release keeps memory fl
 weights are reused by the next load.
 
 ## Generation parameters
-`generate(...)` / `stream(...)` take `temperature`, `top_p`, `top_k`, `seed`, `do_sample`.
-Greedy is the default (`temperature<=0`); with sampling, a given `seed` is reproducible.
+`generate(...)` / `stream(...)` take `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+`do_sample`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`,
+`min_new_tokens`, `stop`, `constraint` and `require_known_tools`.
+
+**Sampling is the default, not greedy.** Anything the model's own `generation_config.json`
+states wins; a model loaded from a bare `.gguf` states nothing, and then the default
+temperature is 0.6. An EXPLICIT `temperature=0` is greedy and reproducible; so is any
+`seed` with sampling on.
+
+## Output constraints — deciding what the model may say next
+No model supports this itself. A model emits a distribution over the vocabulary and has no
+way to forbid anything, so the restriction is always the inference side's to apply, by
+removing candidates before sampling. `constraint=` is where you say what to remove.
+
+```python
+m.generate(prompt, constraint="json")                    # built-in: valid JSON only
+m.generate(prompt, constraint={"regex": r"\d{4}-\d{2}"})  # a pattern (needs `regex`)
+m.generate(prompt, constraint=["END", "\n\n"])            # stop strings
+m.generate(prompt, constraint=lambda text, piece: piece.isdigit())   # your own rule
+```
+
+### The callback forms
+Both see decoded **text**, never token ids — which is what makes a constraint portable
+across tokenizers and expressible in your terms: "a digit may follow" is a statement about
+characters, and which ids spell them is not your problem.
+
+**`allows(text, piece) -> Verdict`** is asked about one candidate at a time, walking the
+model's ranking until something is accepted. Easy to write, and bounded at 64 questions per
+token while the model's own top choices are acceptable. When they are not, the sampler
+widens, and a constraint permitting only something rare can be asked about the whole
+vocabulary.
+
+**`decide(text, candidates) -> (Verdict, allowed)`** is asked **once** per token, handed
+every candidate best-first, and answers with the permitted set as text:
+
+```python
+def decide(text, candidates):
+    return webtorch.ALLOW,     ["python", "javascript"]  # only these
+    return webtorch.ALLOW,     None                      # no opinion; keep the ranking
+    return webtorch.ALLOW,     []                        # none of these -- widen, ask again
+    return webtorch.ALLOW_END, ["}"]                     # exactly this, and it is the last
+    return webtorch.END                                  # the reply is complete
+
+m.generate(prompt, constraint={"decide": decide,
+                               "finished": lambda t: t.endswith("}")})
+```
+
+A candidate counts as permitted when either string is a prefix of the other, so a name that
+takes three tokens to spell is reachable without knowing how it splits. **A permitted string
+that matches no candidate is looked up in the vocabulary and used anyway** — that is how you
+force a token the model ranked nowhere, which a predicate cannot do: it can only reject what
+it is shown.
+
+### Verdicts — `webtorch.Verdict`
+A verdict is three independent things: whether the candidate is allowed, whether it goes
+into the reply, and what happens next. Twelve combinations exist and six mean something:
+
+| | allow | take | then | meaning |
+|---|---|---|---|---|
+| `DENY` | no | — | `THEN_ASK` | not this one; keep asking |
+| `DENY_FREE` | no | — | `THEN_FREE` | not this one, and stop asking from here |
+| `END` | no | — | `THEN_END` | the reply is complete as it stands |
+| `ALLOW` | yes | yes | `THEN_ASK` | the ordinary answer |
+| `ALLOW_FREE` | yes | yes | `THEN_FREE` | take it, then stop asking |
+| `ALLOW_END` | yes | yes | `THEN_END` | take it; it is the last |
+
+`True` / `False` work as `ALLOW` / `DENY`. Anything else raises rather than being silently
+truthy. `ALLOW_FREE` and `DENY_FREE` release the constraint, so steering only a prefix costs
+nothing after the prefix.
+
+### Cost
+Measured on a 0.6B: a permissive callback is free (10.21 ms/token against 10.21 unconstrained);
+a restrictive one that rejects most of the window costs about 6% (10.85). The `decide` form
+is one call per token instead of 64.
+
+### A note on `{"regex": ...}`
+Pattern constraints need the **`regex`** package, for its partial matching: deciding what
+may come next means asking whether a prefix can still grow into a match, and the standard
+library's `re` cannot answer that — it only reports what already matches. There is no
+fallback on purpose. The old one used `re.match`, which rejects every incomplete prefix
+including the correct ones, so the constraint silently applied to nothing. It now raises
+with the fix in the message (`await micropip.install("regex")`), or use a callback, which
+needs no package at all.
+
+### Writing your own constraint class
+Anything with `allows` (or `decide`) is accepted; subclass `webtorch.Constraint` for
+`reset()` and `finished()` as well. Compose with `constrain.AllOf([...])`.
+
+## Tool calling
+You decide **which** tools to offer and what they do. The SDK owns everything about how a
+model is told they exist, how what it writes back is read, and how a result returns to it —
+none of which varies between callers, and all of which is read from the model's own chat
+template rather than assumed.
+
+```python
+tools = [{"type": "function",
+          "function": {"name": "python",
+                       "description": "Run Python, get the output back.",
+                       "parameters": {"type": "object",
+                                      "properties": {"code": {"type": "string"}},
+                                      "required": ["code"]}}}]
+
+if not m.tools_supported():            # can this model be given tools at all?
+    ...
+
+reply = m.generate(prompt, tools=tools, require_known_tools=True)
+calls = m.tool_calls(reply, tools)     # [{"name", "args", "id", "known"}]
+shown = m.strip_tool_calls(reply, tools)   # what a reader should see: prose, no protocol
+results = [run(c) for c in calls]      # your implementations
+msgs += m.tool_round_messages(shown, calls, results)   # the turns to append
+```
+
+- `m.tools_supported()` → whether this model's template renders tool definitions at all.
+  Which **shape** it renders, how it writes a call, and how a result reaches it are settled
+  inside `generate(tools=...)` and the methods below; a caller never needs them.
+- `m.parse_tool_calls(text, tools)` / `m.tool_calls(text, tools)` → the calls, with or
+  without the span each occupies. Names come back as **registered**, so noise like
+  `"run_ Python"` is already resolved.
+- `m.strip_tool_calls(text, tools)` → the reply with the call markup removed. Same single
+  scan as the parse, so the two cannot disagree.
+- `m.render_tool_call(name, args, tools)` → one call written the way this model writes them.
+- `m.tool_result_message(call, content)` → one result, shaped for this template.
+- `m.tool_round_messages(text, calls, results)` → the assistant turn plus every result,
+  including whether the calls travel as structured `tool_calls` or as the model's own text.
+- `m.suggest_tool(name, tools, args)` → ranked candidates for a name that matched nothing:
+  `[{"name", "name_score", "args_match"}]`. **Evidence, not a decision** — the threshold and
+  what to do about it are yours.
+- `m.split_reasoning(text)` → `{"reasoning", "answer", "open"}` for a reply stored as one
+  string. A live stream does not need it: `stream(channels=True)` labels the pieces.
+
+`require_known_tools=True` holds the model to the names you registered, by removing the
+others from the candidate set. Asked for, never assumed: it also makes a model that would
+have called the wrong tool sometimes call none at all (measured 2 of 8 → 4 of 8 on a 0.6B),
+and which failure is better depends on what you do next.
 
 ## Causal LM (dense + MoE series)
-- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=4, lmax=320)`
+- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=None, lmax=None)`
   - Runs inference at **int4, int8, or fp16** — `dtype` selects it:
     - `"auto"` (default): AutoGPTQ dir → int at its declared bits; `*.gguf` → int`bits`;
       plain fp16/bf16 HF dir → **fp16** (unquantized, weights in fp16/bf16, compute fp32).
@@ -340,10 +472,10 @@ browser every read is a network fetch (from the page origin) and is cached (Inde
 by default); on the host, `http(s)://` URLs are cached while a **local file path is read
 directly and never cached** (caching a local file would only duplicate it). Cached entries share
 the same store and management functions (`list_cache` / `clear_cache` / …), keyed by host. Pass
-`use_default_io(cache=False)` for plain, uncached fetch/open; `cache_dir` / `max_parallel` /
+`use_default_io(cache=True)` for plain, uncached fetch/open; `cache_dir` / `max_parallel` /
 `prefetch` / `chunk_mb` / `persist` mirror `hf_read` and apply to the cached (network) reads.
 
-- `webtorch.use_default_io(cache=True, cache_dir=None, max_parallel=8, prefetch=True, chunk_mb=16, persist=True)`
+- `webtorch.use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, chunk_mb=16, persist=True)`
   — install the built-in IO for **self-hosted / local** files (browser `fetch`+Range or host
   `urllib`/`open`; `name` used verbatim, no hub mapping), caching network reads as above. Writes
   always go to the local/Pyodide filesystem.
@@ -354,9 +486,9 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
 - `webtorch.default_io_read` / `webtorch.default_io_write` — the raw (uncached) built-in
   transports underneath: `default_io_read` reads via browser `fetch`+Range or host `urllib`/`open`;
   `default_io_write` writes via host/Pyodide `open`+seek. Install directly if you want the
-  transport without caching (equivalent to `use_default_io(cache=False)`).
+  transport without caching (equivalent to `use_default_io(cache=True)`).
 - `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
-  max_parallel=8, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
+  max_parallel=16, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
   fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:
   ```python
   webtorch.set_io_read(webtorch.hf_read())           # + set_io_write only if you quantize
@@ -396,7 +528,7 @@ and two ready-made pieces are here if your transport is HTTP:
 - `webtorch.http_size(url, headers)` -- its length probe. Returns `None` when the host does not
   expose `Content-Length` (ModelScope does not, cross-origin); the readers then learn the length
   from the first short read.
-- `webtorch.throttle_reads(fetch, max_parallel=8, is_rate_limited=…)` -- concurrency and
+- `webtorch.throttle_reads(fetch, max_parallel=16, is_rate_limited=…)` -- concurrency and
   rate-limit backoff. `webtorch.http_rate_limited` is the HTTP classifier (429, or a body that
   says so). This belongs to the transport: only it knows what "slow down" looks like.
 - `webtorch.prefetch_whole_file(fetch, size=…)` -- reads the rest of a touched file in the
@@ -490,7 +622,7 @@ models, so it runs on the host directly (`python examples/io_cache_tools.py`).
   so the cache **survives page reloads** — no setup needed. `persist=False` keeps an
   in-session-only cache (browser MEMFS, wiped on reload).
 - All range reads (prefetch chunks included) go through an **adaptive queue** governed by
-  `max_parallel` — see the box below. `cache=False` disables caching (pure streaming);
+  `max_parallel` — see the box below. `cache=True` disables caching (pure streaming);
   `prefetch=False` keeps the cache but no read-ahead.
 
 #### `max_parallel` — adaptive concurrency (the read queue)
