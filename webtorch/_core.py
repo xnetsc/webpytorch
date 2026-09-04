@@ -1983,11 +1983,41 @@ def _ggml_shape_for(type_name, N, K, packed):
         except Exception:
             return False
 
-    # Many dispatches per sync. A readback costs 1-2ms on this stack and one decode matmul
-    # costs tens of microseconds, so timing them one at a time measures the readback and
-    # ranks the candidates by noise -- which is exactly what happened: the first version of
-    # this picked a mix of shapes that took a 0.6B from 104 tok/s to 64.
-    REP = 24
+    # Many dispatches per sync -- but how many depends on the shape, and a constant was
+    # wrong at one end of the range.
+    #
+    # The rule is that a round must take long enough that the readback is not what is being
+    # ranked: a readback costs 1-2ms here, and on a 0.6B one decode matmul costs tens of
+    # microseconds, so timing them one at a time ranks the candidates by noise -- which
+    # happened, and picked a mix of shapes that took a 0.6B from 104 tok/s to 64. Twenty-four
+    # dispatches fixed that.
+    #
+    # Twenty-four is calibrated for a matmul of tens of microseconds. A 27B's projections are
+    # an order of magnitude larger in each dimension, so the same constant buys nothing and
+    # costs everything: 32 shapes x 3 candidates x 5 rounds x 24 dispatches is 11,520 large
+    # matrix-vector products, run at load, to choose a thread shape. Measured on that model,
+    # this phase reported 48.9s.
+    #
+    # So the count comes from the shape rather than from a constant: one dispatch is timed,
+    # and the round is however many of those add up to a time the readback cannot dominate.
+    # A cheap shape still gets 24; an expensive one gets 1 or 2 and is ranked just as well,
+    # because the thing being measured is already far above the noise.
+    import time as _time
+    _ROUND_S = 0.020                    # a round this long makes a 1-2ms readback marginal
+    REP = 24                            # what a shape too cheap to measure keeps
+
+    def _one():
+        _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"]).get()
+
+    try:
+        apply(fallback)                 # its kernel may not be built yet; `apply` builds it
+        _one()                          # compile and warm before timing anything
+        _t0 = _time.perf_counter()
+        _one()
+        _t1 = max(1e-6, _time.perf_counter() - _t0)   # one dispatch AND one readback
+        REP = max(1, min(24, int(_ROUND_S / _t1) + 1))
+    except Exception:
+        pass                            # sizing the round must never be what fails a load
 
     def bench():
         o = None
