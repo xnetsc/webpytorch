@@ -2549,8 +2549,15 @@ def chunked_attention(q, k, v, start=0, scale=None, chunk=None):
         for r in range(rep):
             for i0 in range(0, T, CH):
                 i1 = min(T, i0 + CH)
-                # Everything the LAST query of the chunk can see, rounded up for the matmul.
-                lim = min(S, ((start + i1 + 31) // 32) * 32)
+                # Everything the LAST query of the chunk can see, rounded up for the
+                # matmul. SIXTY-FOUR, not thirty-two: the alignment the fast path wants is
+                # not the same on both axes. Rows need a multiple of 32, but the key extent
+                # is the matmul's N and that wants 64 -- measured at M=1024 K=128, N=1056
+                # runs at 45 GFLOPS and N=1088 at 193, while N=2848 gives 193 against 683 at
+                # N=2880. Rounding to 32 left every continued prefill, and the last chunk of
+                # every fresh one, on the slow side: a prompt resumed after 30 cached tokens
+                # took 6.5s where the same work from scratch took 3.9s.
+                lim = min(S, ((start + i1 + 63) // 64) * 64)
                 qc = Tensor(_contig(qg.data[h][r * T + i0:r * T + i1]))
                 sc = qc @ Tensor(_contig(khT.data[:, :lim]))
                 pw = Tensor(_fused_causal_softmax(sc.data, i1 - i0, start + i0, scale))
