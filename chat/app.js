@@ -1848,7 +1848,8 @@ function messageNode(m, live) {
     // is the only place the difference can show.
     const pn = m.stats.pins;
     if (pn && pn.length) {
-      extra += '  ·  pins ' + pn.map(p => p[0] + '/' + (p[1] / 1e6).toFixed(0) + 'MB').join(' → ');
+      extra += '  ·  pins ' + pn.map(p => p[0] + '/' + (p[1] / 1e6).toFixed(0) + 'MB'
+              + (p.length > 4 ? '/' + (p[3] - p[4]) + 'd' : '')).join(' → ');
     }
     // What the prompt had left sitting in the reuse pool when the reply started. Printed
     // even when it is zero: absent and zero are different answers, and a footer that shows

@@ -134,6 +134,7 @@ class WebGPUPlatform:
         wgs = descriptor.get("workGroups")
         if wgs is not None and int(wgs.get("x", 1) or 1) > _DISPATCH_LIMIT:
             descriptor = self._fold_dispatch(descriptor, wgs)
+        WebGPUPlatform.dispatches += 1
         return gpu.runKernel(descriptor)
 
     def _fold_dispatch(self, descriptor, wgs):
@@ -175,6 +176,11 @@ class WebGPUPlatform:
         out["name"] = folded
         out["workGroups"] = {"x": per, "y": y, "z": planes}
         return out
+
+    # How many dispatches have been issued, ever. Sampled either side of a recording, it says
+    # how long that recording's command list is -- and two recordings of the same graph that
+    # do not agree on that are not the same graph, whatever the source says.
+    dispatches = 0
 
     def beginCapture(self, name):
         # The name matters here: JS replaces the recorded command list for that name, so the

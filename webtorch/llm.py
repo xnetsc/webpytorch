@@ -595,12 +595,18 @@ class _Channels:
 
 
 def _pin_stats():
-    """(buffers, pinned bytes, pool bytes) from the WebGPU allocator, or None off that path."""
+    """(buffers, pinned bytes, pool bytes, dispatches so far), or zeros off the WebGPU path.
+
+    The dispatch counter is what settles whether two recordings of the same graph recorded
+    the same graph. Sampled either side of a recording, its difference is that recording's
+    command list, and a difference there is not a subtlety about buffers -- it is a different
+    set of commands from source that cannot produce one."""
     try:
         from wgpy_backends.webgpu.webgpu_buffer import capture_pin_stats
-        return capture_pin_stats()
+        from wgpy_backends.webgpu.platform import WebGPUPlatform
+        return tuple(capture_pin_stats()) + (int(WebGPUPlatform.dispatches),)
     except Exception:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
 
 
 def _decode_rate(t_first, steps):
@@ -3354,6 +3360,7 @@ class CausalLM:
             # pinned, bytes left in the reuse pool. Same kernels and same dispatch shapes on
             # both sides of a re-record, so if the cost changes there, this is where the
             # difference is.
+            # [buffers, pinned bytes, pool bytes, dispatches after, dispatches before]
             if span["pins"]:
                 out["pins"] = [list(p) for p in span["pins"]]
             if span.get("pool_freed"):
@@ -3408,8 +3415,9 @@ class CausalLM:
         span["pool_freed"] = wt.drop_pooled_buffers()
         self._set_inputs(g0, P)
         wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
+        _d0 = _pin_stats()[3]
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
-        span["pins"].append(_pin_stats())
+        span["pins"].append(_pin_stats() + (_d0,))
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
         span["path"] = "replay"
         dec = self.tok.stream_decoder()
@@ -3426,10 +3434,11 @@ class CausalLM:
                     span["recut"].append(n)
                     self._kv_reserve(pos + 1)
                     self._set_inputs(nxt, pos)
+                    _d0 = _pin_stats()[3]
                     plat.beginCapture("decode")
                     logits_t = self._decode_fwd(); logits_t.numpy()
                     plat.endCapture()
-                    span["pins"].append(_pin_stats())
+                    span["pins"].append(_pin_stats() + (_d0,))
                 else:
                     _tg = time.perf_counter()
                     self._set_inputs(nxt, pos); plat.replay("decode")

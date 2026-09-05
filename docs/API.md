@@ -266,7 +266,7 @@ model as a dict, replaced by each stream:
 | `gpu_ms_curve` | `gpu_ms` per tenth of the reply, in order — ten figures; absent under 20 tokens |
 | `gpu_ms_head` / `gpu_ms_tail` | the first and last of `gpu_ms_curve`, for when only the ends matter |
 | `recaptured_at` | tokens at which the decode graph was rebuilt, because the cache ran out of rows mid-reply; absent if it never was |
-| `pins` | one `[buffers, pinned bytes, pool bytes]` per recording of the decode graph — what that recording ended up holding |
+| `pins` | one `[buffers, pinned bytes, pool bytes, dispatches after, dispatches before]` per recording of the decode graph — what it holds, and how long its command list is |
 | `pool_freed` | bytes the prompt had left in the buffer reuse pool, dropped before the reply began |
 | `path` | `"replay"` — the captured decode step. `"grow"` — the fallback that re-runs a whole forward per token (WebGL, a host-side mixer, an unstacked MoE), and a model on it is slow for a reason no kernel change reaches. |
 
