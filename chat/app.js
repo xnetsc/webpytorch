@@ -2265,7 +2265,21 @@ function normalizeMath(src) {
       .replace(/\$\$((?:(?!\$\$)[\s\S])*?)\$\$/g,
                (all, f) => (/\n/.test(f) && !/\n[ \t]*\n/.test(f)
                             ? '$$' + f.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
-                            : all));
+                            : all))
+      // A fence that lost a dollar. Models write display math with the two ends disagreeing
+      // -- `$` to open and `$$` to close is one this page has actually produced -- and the
+      // balanced rule above cannot see it, so the reader gets the delimiters as text.
+      //
+      // Taken only on evidence that display math was meant, because a lone `$` is a currency
+      // sign far more often than it is a formula: ONE of the two ends must be a real `$$`,
+      // both must stand alone against a line end, and the body must hold neither a blank line
+      // nor another `$$`. `$5` mid-sentence matches none of that.
+      .replace(/(^|\n)(\$\$?)[ \t]*\n([\s\S]*?)\n[ \t]*(\$\$?)(?=\n|$)/g,
+               (all, pre, open, body, close) =>
+                 ((open === '$$' || close === '$$')
+                  && !/\n[ \t]*\n/.test(body) && !/\$\$/.test(body)
+                    ? pre + '$$' + body.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
+                    : all));
   }
   return parts.join('');
 }
