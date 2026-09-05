@@ -445,7 +445,7 @@ json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
             "gpu_ms": _s.get("gpu_ms"), "pick_ms": _s.get("pick_ms"),
             "gpu_ms_head": _s.get("gpu_ms_head"), "gpu_ms_tail": _s.get("gpu_ms_tail"),
             "gpu_ms_curve": _s.get("gpu_ms_curve"),
-            "recaptured_at": _s.get("recaptured_at"), "pins": _s.get("pins"),
+            "recaptured_at": _s.get("recaptured_at"), "pins": _s.get("pins"), "pool_freed": _s.get("pool_freed"),
             "path": _s.get("path")})
 `));
     return JSON.parse(out);

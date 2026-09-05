@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=01aec68716');
+const worker = new Worker('worker.js?v=f3c5b0b2e0');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1849,6 +1849,10 @@ function messageNode(m, live) {
     const pn = m.stats.pins;
     if (pn && pn.length) {
       extra += '  ·  pins ' + pn.map(p => p[0] + '/' + (p[1] / 1e6).toFixed(0) + 'MB').join(' → ');
+    }
+    // What the prompt had left sitting in the reuse pool when the reply started.
+    if (m.stats.pool_freed) {
+      extra += '  ·  pool -' + (m.stats.pool_freed / 1e6).toFixed(0) + 'MB';
     }
     f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1)
                   + ' tok/s' + extra;

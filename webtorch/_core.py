@@ -2104,6 +2104,29 @@ def _kernel_build():
     return _KBUILD["v"]
 
 
+def drop_pooled_buffers():
+    """Destroy what the reuse pool is holding, and return the bytes it gave back.
+
+    The pool is bounded by a total byte budget, and once that is reached `_pool_put` DESTROYS
+    what it is handed instead of keeping it. A prefill allocates its activations in the
+    prompt's shapes, hundreds of them, and fills that budget -- so every decode-shaped buffer
+    returned after it is thrown away, and the budget stays spent on shapes the reply will
+    never ask for again. On a model that already fills the machine, that is half a gigabyte
+    of dead allocation holding weights out of residency for the whole reply.
+
+    Called at the boundary between the two, where the shapes change and nothing in the pool
+    is wanted. No-op off the WebGPU path.
+    """
+    try:
+        from wgpy_backends.webgpu.webgpu_buffer import (
+            release_pooled_buffers, capture_pin_stats)
+    except Exception:
+        return 0
+    before = capture_pin_stats()[2]
+    release_pooled_buffers()
+    return int(before)
+
+
 def kernel_profile():
     """What this device decided about these kernels, as plain data a caller may keep.
 
