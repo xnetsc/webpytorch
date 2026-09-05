@@ -1996,15 +1996,29 @@ def _ggml_shape_for(type_name, N, K, packed):
         ck = (type_name, 1, kind, False)
         if ck in _CHECKED:
             return _CHECKED[ck]
+        # Check at the size a CHECK needs, not at the size this model happens to use.
+        #
+        # `_selfcheck_one` builds N x (NB*blk) random bytes and decodes all of it with the
+        # reference decoder, in numpy, inside wasm. Handed the model's own N and K that is a
+        # 5120 x 5120 matrix -- 26 million values reference-decoded, per variant, to answer a
+        # question about a decode fragment. Measured on a 27B: 36.6s across 36 variants.
+        #
+        # `_selfcheck_shape` already exists for exactly this and is what `_ggml_selfcheck`
+        # uses: an (N, blocks) chosen so the variant is actually reached, N deliberately not
+        # a multiple of the group width so the partial-group guard is exercised, and at least
+        # three blocks per row so an unaligned block offset cannot hide -- the Q3_K bug that
+        # cost half the columns of every tensor. Coverage is what those numbers are for; the
+        # model's own N adds rows, not coverage.
+        shape = _selfcheck_shape(kind, vals) or (int(N), max(3, nb))
         t0 = _t.perf_counter()
         try:
-            _selfcheck_one(type_name, 1, kind, False, int(N), nb)
+            _selfcheck_one(type_name, 1, kind, False, *shape)
             ok = True
         except Exception:
             ok = False
         finally:
             _TUNE_COST["check_s"] += _t.perf_counter() - t0
-        if nb >= 3:
+        if shape[1] >= 3:
             _CHECKED[ck] = ok
         return ok
 
