@@ -375,8 +375,13 @@ async function generate(prompt, opts) {
   const run = newRun();
   // Gated on the run: a generation abandoned by a stop keeps decoding until its own next
   // checkpoint, and those tokens belong to a reply the page has already closed.
-  self.__chunk = (ch, t) => { if (run.current())
+  // `n` is the SDK's own token count at the moment this piece was produced, not a count of
+  // pieces: a token that completes no character, and one whose text is being held back to
+  // decide its channel, both yield nothing. Counting arrivals undercounts the reply and, with
+  // it, the live rate -- badly on CJK text, where the two diverge most.
+  self.__chunk = (ch, t, n) => { if (run.current())
                                 send({ type: 'chunk', channel: ch, text: t,
+                                       n: (n == null ? null : Number(n)),
                                        at: performance.now() }); };
   try {
     const out = await run.race(pyodide.runPythonAsync(`
@@ -431,8 +436,9 @@ if _media is not None:
     js.self.__chunk("content", _txt)
 else:
     _gen = m.generate(messages=_msgs, **_kw) if _msgs else m.generate(_prompt, **_kw)
+    _live = getattr(m, "impl", m)
     for _c in _gen:
-        js.self.__chunk(_c["channel"], _c["text"])
+        js.self.__chunk(_c["channel"], _c["text"], getattr(_live, "stream_n", None))
 _s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
 json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
             "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s"),

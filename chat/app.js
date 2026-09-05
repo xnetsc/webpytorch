@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=ab5e109e33');
+const worker = new Worker('worker.js?v=059af06ab3');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -362,7 +362,10 @@ worker.onmessage = (e) => {
     const live = streaming.live;
     if (live) {
       stopDots(live);                                       // the wait is over
-      live.tokens += 1;
+      // The SDK's own count when this piece was made, not the number of pieces seen: a token
+      // that completes no character yields none, so counting arrivals reads low -- and reads
+      // lowest exactly on the long CJK replies whose speed is being watched.
+      if (m.n != null) live.tokens = m.n; else live.tokens += 1;
       // The worker's stamp, not this thread's: timing the arrivals here counts the cost of
       // rendering the reply and of delivering the message, neither of which the model spent
       // on the token. It is the same quantity the final footer reports, so the number does
@@ -370,13 +373,13 @@ worker.onmessage = (e) => {
       // still in a cache -- then this falls back to the old reading rather than to nothing.
       const now = (m.at != null) ? m.at : performance.now();
       const wall = performance.now();
-      if (!live.t0) live.t0 = now;
+      if (!live.t0) { live.t0 = now; live.n0 = live.tokens; }
       resNoteStep(now);                    // the resource strip reads decode latency from here
       // decode speed = tokens after the first, over the time since the first; updated at
       // most twice a second so the number stays readable
-      if (live.rate && live.tokens >= 2 && (live.tokens === 2 || wall - live.rateT > 500)) {
+      if (live.rate && live.tokens > (live.n0 || 0) && wall - (live.rateT || 0) > 500) {
         live.rateT = wall; live.rate.hidden = false;
-        const sps = (live.tokens - 1) / ((now - live.t0) / 1000);
+        const sps = (live.tokens - (live.n0 || 0)) / ((now - live.t0) / 1000);
         live.rate.textContent = live.tokens + ' tokens · ' + sps.toFixed(1) + ' tok/s';
       }
     }
@@ -2596,7 +2599,7 @@ $('#composer').onsubmit = async (e) => {
   det.ontoggle = () => { if (streaming) streaming.live.touched = true; };
   const ansEl = document.createElement('div'); ansEl.className = 'ans';
   const live = { det, sum, pre, ans: ansEl,
-                 touched: false, collapsed: false, tokens: 0, t0: 0, rateT: 0 };
+                 touched: false, collapsed: false, tokens: 0, n0: 0, t0: 0, rateT: 0 };
   startDots(live, body);                              // until the first token lands
   body.appendChild(live.ans);
   const rate = document.createElement('div');

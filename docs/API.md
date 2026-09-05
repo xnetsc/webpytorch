@@ -242,6 +242,14 @@ and which failure is better depends on what you do next.
     `.stream(prompt, max_new=…) -> iterator[token]`. `GenResult` carries `.text`,
     `.tokens`, `.ttft_s` and `.decode_tok_s`; printing it shows the timings above the text.
 
+### Watching a stream — `model.stream_n`
+
+`.stream(...)` yields text pieces, and **a piece is not a token**: a token that completes no
+character yields nothing, and neither does one whose text is being held back to decide which
+channel it belongs to. Code that counts arrivals is counting pieces, and reads low — worst on
+CJK text, where the two diverge most. `model.stream_n` is the SDK's own count of tokens
+produced so far, readable at any point while the stream runs, and reset when one starts.
+
 ### What a stream leaves behind — `model.last_stream`
 
 `.stream(...)` yields text and nothing else, so the numbers for the reply are left on the

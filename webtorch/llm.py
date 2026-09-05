@@ -3176,8 +3176,10 @@ class CausalLM:
         token boundaries at will, and are held back here rather than leaked into the wrong
         channel. Models without reasoning simply yield everything as "content".
 
-        When the stream ends, `self.last_stream` holds `{n, truncated, ttft_s, tok_s}` —
-        `truncated` says the length limit, not the model, ended the reply."""
+        While the stream runs, `self.stream_n` is how many tokens it has produced -- which is
+        NOT how many pieces it has yielded, so anything showing live progress should read it
+        rather than count. When the stream ends, `self.last_stream` holds the reply's timings;
+        `truncated` there says the length limit, not the model, ended the reply."""
         box = {}
         it = self._stream_raw(prompt, max_new, system, messages, tools, ids, temperature,
                               top_p, top_k, seed, do_sample, repetition_penalty, min_p,
@@ -3232,6 +3234,11 @@ class CausalLM:
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
         t0 = time.perf_counter()
+        # How many tokens this stream has produced so far, readable WHILE it runs. A reader
+        # counting the pieces it receives is not counting tokens: a token that completes no
+        # character yields nothing, and neither does one whose text is being held back to see
+        # which channel it belongs to. Anything reporting live progress needs this instead.
+        self.stream_n = 0
 
         # Where a token's time went, split at the one boundary that decides what to do about
         # it: the GPU step, and everything the host does between steps. A reply that is slow
@@ -3278,7 +3285,7 @@ class CausalLM:
             t_first = time.perf_counter()
             try:
                 while n < max_new and nxt != eot:
-                    piece = dec.push([nxt]); n += 1; steps += 1
+                    piece = dec.push([nxt]); n += 1; steps += 1; self.stream_n = n
                     if piece:
                         yield piece
                     if self._stop_now():
@@ -3311,7 +3318,7 @@ class CausalLM:
         t_first = time.perf_counter()
         try:
             while n < max_new and nxt != eot:
-                piece = dec.push([nxt]); n += 1; steps += 1
+                piece = dec.push([nxt]); n += 1; steps += 1; self.stream_n = n
                 if piece:
                     yield piece
                 if self._stop_now():
