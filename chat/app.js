@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=2bd866ee6f');
+const worker = new Worker('worker.js?v=01aec68716');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1843,6 +1843,13 @@ function messageNode(m, live) {
     // what every later token runs, so it is the first thing to line the cost curve up against.
     const rc = m.stats.recaptured_at;
     if (rc && rc.length) extra += '  ·  recut @ ' + rc.join(' ');
+    // What each recording of the decode graph pinned. Two recordings of the same graph differ
+    // in nothing but the buffers they addressed, so when the cost changes at a re-record this
+    // is the only place the difference can show.
+    const pn = m.stats.pins;
+    if (pn && pn.length) {
+      extra += '  ·  pins ' + pn.map(p => p[0] + '/' + (p[1] / 1e6).toFixed(0) + 'MB').join(' → ');
+    }
     f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1)
                   + ' tok/s' + extra;
     b.appendChild(f);

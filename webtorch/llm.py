@@ -594,6 +594,15 @@ class _Channels:
         return out
 
 
+def _pin_stats():
+    """(buffers, pinned bytes, pool bytes) from the WebGPU allocator, or None off that path."""
+    try:
+        from wgpy_backends.webgpu.webgpu_buffer import capture_pin_stats
+        return capture_pin_stats()
+    except Exception:
+        return (0, 0, 0)
+
+
 def _decode_rate(t_first, steps):
     """Tokens per second of the decode loop, or None when there is nothing to measure.
 
@@ -2979,10 +2988,16 @@ class CausalLM:
                 _load_stage("warming", done=int(c.get("shapes") or 0),
                             total=int(c.get("variants") or 0))
                 import js
+                # The kernel build stamp goes on this line because this line is what gets
+                # quoted back. Three readings today could not be attributed to a version --
+                # "is this the new code?" is not answerable from a tok/s -- and the stamp
+                # that answers it already existed, unprinted.
                 js.console.log(
                     "warm: %d shapes, %d variants | tune %.1fs (build %.1fs, check %.1fs)"
+                    " | kernels %s"
                     % (c.get("shapes", 0), c.get("variants", 0), c.get("tune_s", 0.0),
-                       c.get("build_s", 0.0), c.get("check_s", 0.0)))
+                       c.get("build_s", 0.0), c.get("check_s", 0.0),
+                       wt._kernel_build()[:8]))
             except Exception:
                 pass
         except Exception:
@@ -3291,7 +3306,7 @@ class CausalLM:
         # it: the GPU step, and everything the host does between steps. A reply that is slow
         # because the device is busy and one that is slow because the sampler is are the same
         # number from outside, and they have nothing in common as problems.
-        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": [], "recut": []}
+        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": [], "recut": [], "pins": []}
 
         def _stats(n, truncated, steps, t_first):
             each = span["each"]
@@ -3326,6 +3341,12 @@ class CausalLM:
             # points, that is the cause; if it changes anywhere else, this rules the graph out.
             if span["recut"]:
                 out["recaptured_at"] = list(span["recut"])
+            # What each recording of the decode graph ended up holding: buffers pinned, bytes
+            # pinned, bytes left in the reuse pool. Same kernels and same dispatch shapes on
+            # both sides of a re-record, so if the cost changes there, this is where the
+            # difference is.
+            if span["pins"]:
+                out["pins"] = [list(p) for p in span["pins"]]
             self.last_stream = out
             return out
 
@@ -3369,6 +3390,7 @@ class CausalLM:
         self._set_inputs(g0, P)
         wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
         plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
+        span["pins"].append(_pin_stats())
         self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
         span["path"] = "replay"
         dec = self.tok.stream_decoder()
@@ -3388,6 +3410,7 @@ class CausalLM:
                     plat.beginCapture("decode")
                     logits_t = self._decode_fwd(); logits_t.numpy()
                     plat.endCapture()
+                    span["pins"].append(_pin_stats())
                 else:
                     _tg = time.perf_counter()
                     self._set_inputs(nxt, pos); plat.replay("decode")

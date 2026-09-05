@@ -218,6 +218,18 @@ def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
     return None
 
 
+def capture_pin_stats():
+    """What the pins and the reuse pool hold right now: (buffers, pinned bytes, pool bytes).
+
+    Read at each recording, because the only thing that differs between two recordings of the
+    SAME graph -- same kernels, same workgroups, same dispatch shapes -- is which buffers they
+    ended up addressing. A reply whose per-token cost falls three-fold the moment the graph is
+    re-recorded is a reply where that difference is the whole story, and it is not visible
+    from anywhere else.
+    """
+    return len(_pinned_ids), sum(_pinned_ids.values()), _pool_bytes
+
+
 def release_capture_buffers():
     """Destroy every buffer a recorded capture pinned.
 
