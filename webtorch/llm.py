@@ -3233,10 +3233,18 @@ class CausalLM:
                            frequency_penalty=frequency_penalty, stop=stop)
         t0 = time.perf_counter()
 
+        # Where a token's time went, split at the one boundary that decides what to do about
+        # it: the GPU step, and everything the host does between steps. A reply that is slow
+        # because the device is busy and one that is slow because the sampler is are the same
+        # number from outside, and they have nothing in common as problems.
+        span = {"gpu": 0.0, "pick": 0.0}
+
         def _stats(n, truncated, steps, t_first):
             self.last_stream = {"n": n, "truncated": bool(truncated),
                                 "ttft_s": round(getattr(self, "_stream_ttft", 0.0), 3),
-                                "tok_s": _decode_rate(t_first, steps)}
+                                "tok_s": _decode_rate(t_first, steps),
+                                "gpu_ms": round(span["gpu"] * 1000 / max(1, steps), 2),
+                                "pick_ms": round(span["pick"] * 1000 / max(1, steps), 2)}
             return self.last_stream
 
         # Same capture condition as `generate` -- see `_capturable`.
@@ -3292,9 +3300,16 @@ class CausalLM:
                     logits_t = self._decode_fwd(); logits_t.numpy()
                     plat.endCapture()
                 else:
+                    _tg = time.perf_counter()
                     self._set_inputs(nxt, pos); plat.replay("decode")
+                    span["gpu"] += time.perf_counter() - _tg
                 held.append(nxt)                # row `pos` holds it as of this replay
-                nxt = self._pick(logits_t.numpy()[0]); pos += 1
+                _tp = time.perf_counter()
+                _lg = logits_t.numpy()[0]
+                span["gpu"] += time.perf_counter() - _tp    # the readback waits for the step
+                _tp = time.perf_counter()
+                nxt = self._pick(_lg); pos += 1
+                span["pick"] += time.perf_counter() - _tp
         finally:
             self._kv_commit(held)
         tail = dec.flush()

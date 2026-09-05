@@ -435,7 +435,8 @@ else:
         js.self.__chunk(_c["channel"], _c["text"])
 _s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
 json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
-            "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s")})
+            "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s"),
+            "gpu_ms": _s.get("gpu_ms"), "pick_ms": _s.get("pick_ms")})
 `));
     return JSON.parse(out);
   } finally {

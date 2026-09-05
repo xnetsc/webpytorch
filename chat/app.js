@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=b4b2cacdcb');
+const worker = new Worker('worker.js?v=d9a979d2d3');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1719,7 +1719,16 @@ function messageNode(m, live) {
   // shows live counts while streaming); user messages and failed replies have none
   if (m.role === 'assistant' && m.stats && m.stats.tok_s != null) {
     const f = document.createElement('div'); f.className = 'tokrate';
-    f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1) + ' tok/s';
+    // The split, when there is one: a reply slow because the device is busy and one slow
+    // because the host is between steps read the same from outside and are different
+    // problems. Only shown when a token cost enough to be worth explaining.
+    let extra = '';
+    const g = m.stats.gpu_ms, k = m.stats.pick_ms;
+    if (g != null && k != null && (g + k) >= 20) {
+      extra = '  ·  GPU ' + Number(g).toFixed(0) + ' ms + host ' + Number(k).toFixed(0) + ' ms';
+    }
+    f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1)
+                  + ' tok/s' + extra;
     b.appendChild(f);
   }
   return d;
