@@ -2921,6 +2921,7 @@ class CausalLM:
             # re-run later on the same settled machine. Seventy times, for the same work.
             # One readback here costs one wait instead of hundreds.
             wt.Tensor(np.zeros((1, 1), np.float32)).numpy()
+            _t0 = time.perf_counter()
             seen = set()
             held = []
             for lay in getattr(self, "layers", []) or []:
@@ -2980,6 +2981,7 @@ class CausalLM:
                 except Exception:
                     pass
                 held.clear()
+            _warm_s = time.perf_counter() - _t0
             wt.flash_tune(self.NH, self.NKV, self.HD)
             # What this phase actually spent, broken down, so the next slow load is a table
             # rather than an argument. Timing only; it changes nothing.
@@ -2992,11 +2994,17 @@ class CausalLM:
                 # quoted back. Three readings today could not be attributed to a version --
                 # "is this the new code?" is not answerable from a tok/s -- and the stamp
                 # that answers it already existed, unprinted.
+                # `shapes`/`variants` count what the TUNER did, and a reused profile makes
+                # the tuner do nothing -- which reads as "warming did nothing" and hides the
+                # part that still has to happen. Dispatching each shape is what compiles its
+                # shader, profile or no profile, so what that pass covered is reported on its
+                # own: how many distinct shapes it ran, and how long it took. A load that
+                # reports 0 there is a load whose first reply compiles the kernels.
                 js.console.log(
-                    "warm: %d shapes, %d variants | tune %.1fs (build %.1fs, check %.1fs)"
-                    " | kernels %s"
-                    % (c.get("shapes", 0), c.get("variants", 0), c.get("tune_s", 0.0),
-                       c.get("build_s", 0.0), c.get("check_s", 0.0),
+                    "warm: %d dispatched in %.1fs | tuner %d shapes, %d variants,"
+                    " %.1fs (build %.1fs, check %.1fs) | kernels %s"
+                    % (len(seen), _warm_s, c.get("shapes", 0), c.get("variants", 0),
+                       c.get("tune_s", 0.0), c.get("build_s", 0.0), c.get("check_s", 0.0),
                        wt._kernel_build()[:8]))
             except Exception:
                 pass
