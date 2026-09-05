@@ -2262,11 +2262,14 @@ function normalizeMath(src) {
       // delimiter's own line, so a pattern anchored on `$$\n` never sees it and the whole
       // environment arrives as literal text, backslashes and all.
       //
-      // Collapsing the newlines INSIDE the body is the point of the rule, not tidiness:
-      // `breaks: true` makes the paragraph tokenizer swallow a multi-line run and turn its
-      // newlines into <br>, so marked's block-level `$$` rule never gets a block to match.
-      // Trimming only the ends leaves a two-line formula two lines long, which is the state
-      // that fails to render.
+      // The rule does two things, and it must not require the first to do the second.
+      // Collapsing the newlines INSIDE the body is what makes a multi-line formula render at
+      // all: `breaks: true` makes the paragraph tokenizer swallow the run and turn its
+      // newlines into <br>, so marked's block-level `$$` rule never gets a block to match,
+      // and trimming only the ends leaves a two-line formula two lines long. Rewriting BOTH
+      // ends to exactly two dollars is the other, and it is needed just as much on one line
+      // -- `$$1 + 2 = 3$$$`, all on one line, renders the formula and drops the spare dollar
+      // into the answer beside it. Requiring a newline here is how that shipped.
       //
       // Three guards, because a lone `$` is a currency sign far more often than a fence:
       // the opening run must start a line, the closing run must end one, and one of the two
@@ -2275,8 +2278,8 @@ function normalizeMath(src) {
       // formulas, or two paragraphs around an unpaired fence, not one formula.
       .replace(/(^|\n)([ \t]*)(\$+)((?:(?!\$\$)[\s\S])*?)(\$+)[ \t]*(?=\n|$)/g,
                (all, pre, indent, open, body, close) =>
-                 ((open.length > 1 || close.length > 1)
-                  && /\n/.test(body) && !/\n[ \t]*\n/.test(body)
+                 ((open.length > 1 || close.length > 1) && body.trim()
+                  && !/\n[ \t]*\n/.test(body)
                     ? pre + indent + '$$'
                       + body.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
                     : all));
