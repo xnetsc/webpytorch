@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=d9a979d2d3');
+const worker = new Worker('worker.js?v=e8a0b03202');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1727,6 +1727,10 @@ function messageNode(m, live) {
     if (g != null && k != null && (g + k) >= 20) {
       extra = '  ·  GPU ' + Number(g).toFixed(0) + ' ms + host ' + Number(k).toFixed(0) + ' ms';
     }
+    // Which decode loop ran. `replay` is the captured step; `grow` is the fallback that
+    // re-runs a forward per token, and a model on it is slow for a reason no kernel change
+    // will reach.
+    if (m.stats.path && m.stats.path !== 'replay') extra += '  ·  ' + m.stats.path;
     f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1)
                   + ' tok/s' + extra;
     b.appendChild(f);

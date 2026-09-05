@@ -177,8 +177,12 @@ class WebGPUPlatform:
         return out
 
     def beginCapture(self, name):
+        # The name matters here: JS replaces the recorded command list for that name, so the
+        # buffers the PREVIOUS recording pinned are no longer referenced by anything and must
+        # stop being pinned. Without it every generation pinned a fresh set that was never
+        # released until the model was.
         from wgpy_backends.webgpu.webgpu_buffer import begin_capture_pin
-        begin_capture_pin()
+        begin_capture_pin(name)
         return gpu.beginCapture(name)
 
     def endCapture(self):

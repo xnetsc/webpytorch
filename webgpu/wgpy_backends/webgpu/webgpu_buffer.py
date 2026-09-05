@@ -49,10 +49,44 @@ added_kernels = set()
 # straight. ---
 _capture_depth = 0
 _pinned_ids = {}
+# Pins belong to the RECORDING that made them, and a recording is replaced whenever its
+# name is captured again. Without that, every generation pinned a fresh set of decode
+# intermediates and none was ever unpinned until the model was released: the pool refused
+# them (`_pool_put` returns early on a pinned id), so they could neither be reused nor
+# freed. Measured on a 27B, same prompt and same reply length, only a page reload between:
+# the decode step went 992ms -> 537ms. That is what was accumulating.
+_capture_name = None
+_pins = {}                    # capture name -> {buffer_id: byte length}
+# A buffer whose Python object died while it was pinned. `_pool_put` had to refuse it, so
+# nothing will ever be called for it again -- it is reachable only from here, and this is
+# where it gets freed once the recording that pinned it is gone.
+_orphaned = {}
 
 
-def begin_capture_pin():
-    global _capture_depth
+def begin_capture_pin(name=None):
+    """Start pinning for `name`. Re-recording a name releases the previous recording's pins.
+
+    Released, not destroyed. A buffer pinned by the old recording may still be held by a
+    live Python object -- `_kv_reserve` re-records in the MIDDLE of a generation, while the
+    previous step's logits are still referenced -- and destroying it there would leave that
+    object pointing at a freed id. Unpinned, it takes the ordinary path when it dies. Only
+    the ones that already died while pinned are freed here, because nothing else can.
+    """
+    global _capture_depth, _capture_name
+    if _capture_depth == 0:
+        key = name if name is not None else "?"
+        old = _pins.pop(key, None)
+        if old:
+            for bid in old:
+                _pinned_ids.pop(bid, None)
+                shape = _orphaned.pop(bid, None)
+                if shape is not None:
+                    get_platform().disposeBuffer(bid)
+                    performance_metrics["webgpu.buffer.delete"] += 1
+                    performance_metrics["webgpu.buffer.buffer_count"] -= 1
+                    performance_metrics["webgpu.buffer.buffer_size"] -= shape.byte_length
+        _pins[key] = {}
+        _capture_name = key
     _capture_depth += 1
 
 
@@ -67,11 +101,15 @@ def reset_capture_pins():
     Does NOT dispose anything — the ids still need to be read off first."""
     global _capture_depth
     _capture_depth = 0
+    _pins.clear()
+    _orphaned.clear()
 
 
 def _maybe_pin(buffer_id: int, byte_length: int):
     if _capture_depth > 0:
         _pinned_ids[buffer_id] = byte_length
+        if _capture_name is not None:
+            _pins.setdefault(_capture_name, {})[buffer_id] = byte_length
 
 
 # The pool exists to skip a createBuffer when the next tensor wants a shape we have just
@@ -90,6 +128,10 @@ _pool_bytes = 0
 def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
     global _pool_bytes
     if buffer_id in _pinned_ids:
+        # Its owner is gone but the recording still needs the id, so it can be neither
+        # pooled nor freed now. Remembered here so that whoever releases that recording can
+        # free it -- otherwise this is the last anyone ever hears of it.
+        _orphaned[buffer_id] = texture_shape
         return  # pinned by an active/recorded capture — never recycle
     ids = _pool[texture_shape]
     if (len(ids) >= _POOL_PER_SHAPE
