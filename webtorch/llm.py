@@ -2786,6 +2786,7 @@ class CausalLM:
             # what says the fix is still working -- if some later change gives a first call
             # commands a second one does not have, the load says so by name instead of a reply
             # going three times slower for reasons no one can see.
+            wt._count_dispatch_names(True)
             a = self._dispatch_names()
             self._set_inputs(tok, 0); self._decode_fwd().numpy()
             b = self._dispatch_names()
@@ -2805,6 +2806,7 @@ class CausalLM:
         except Exception:
             pass                      # best effort: a model that cannot do this still loads
         finally:
+            wt._count_dispatch_names(False)
             self._reset_linear_state()
 
     @staticmethod
@@ -3389,8 +3391,7 @@ class CausalLM:
         # it: the GPU step, and everything the host does between steps. A reply that is slow
         # because the device is busy and one that is slow because the sampler is are the same
         # number from outside, and they have nothing in common as problems.
-        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": [], "recut": [],
-                "pins": [], "pool_freed": 0}
+        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": [], "recut": [], "pins": []}
 
         def _stats(n, truncated, steps, t_first):
             each = span["each"]
@@ -3432,8 +3433,6 @@ class CausalLM:
             # [buffers, pinned bytes, pool bytes, dispatches after, dispatches before]
             if span["pins"]:
                 out["pins"] = [list(p) for p in span["pins"]]
-            if span.get("pool_freed"):
-                out["pool_freed"] = int(span["pool_freed"])
             if span.get("prefilled") is not None:
                 out["prefilled"] = int(span["prefilled"])
                 out["prefill_d"] = int(span.get("prefill_d") or 0)
@@ -3484,14 +3483,6 @@ class CausalLM:
         span["prefill_d"] = int(_pin_stats()[3] - _pd0)
         held = list(ids)
         plat = wt._adam_kernel["platform"]
-        # The prompt's buffers are not wanted again, and the pool has a total byte budget:
-        # once a prefill has spent it on prompt shapes, every decode-shaped buffer handed
-        # back is destroyed rather than kept, and the budget stays spent on shapes this reply
-        # will never ask for. What follows is hundreds of steps that must allocate fresh
-        # against a machine the model already fills.
-        #
-        # This is the boundary where the shapes change, so it is where the pool is dropped.
-        span["pool_freed"] = wt.drop_pooled_buffers()
         self._set_inputs(g0, P)
         wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
         _d0 = _pin_stats()[3]

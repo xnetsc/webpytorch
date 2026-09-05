@@ -2104,27 +2104,16 @@ def _kernel_build():
     return _KBUILD["v"]
 
 
-def drop_pooled_buffers():
-    """Destroy what the reuse pool is holding, and return the bytes it gave back.
-
-    The pool is bounded by a total byte budget, and once that is reached `_pool_put` DESTROYS
-    what it is handed instead of keeping it. A prefill allocates its activations in the
-    prompt's shapes, hundreds of them, and fills that budget -- so every decode-shaped buffer
-    returned after it is thrown away, and the budget stays spent on shapes the reply will
-    never ask for again. On a model that already fills the machine, that is half a gigabyte
-    of dead allocation holding weights out of residency for the whole reply.
-
-    Called at the boundary between the two, where the shapes change and nothing in the pool
-    is wanted. No-op off the WebGPU path.
-    """
+def _count_dispatch_names(on):
+    """Count dispatches per kernel name, or stop. Off by default and for a reason: the count
+    is two dictionary operations inside `runKernel`, and on a path that is not replaying a
+    recording -- a prefill, or WebGL -- that is once per dispatch, hundreds of times a token.
+    A load-time diagnosis must not be a tax on every step."""
     try:
-        from wgpy_backends.webgpu.webgpu_buffer import (
-            release_pooled_buffers, capture_pin_stats)
+        from wgpy_backends.webgpu.platform import WebGPUPlatform
+        WebGPUPlatform.count_names = bool(on)
     except Exception:
-        return 0
-    before = capture_pin_stats()[2]
-    release_pooled_buffers()
-    return int(before)
+        pass
 
 
 def kernel_profile():
