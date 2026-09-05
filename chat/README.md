@@ -19,6 +19,11 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   the one holding the model, with output, tracebacks and matplotlib figures inline.
 - **Replies that render.** Markdown, highlighted code, LaTeX via KaTeX, tables — sanitised
   before they reach the DOM — and each block is editable in place.
+- **Change a question, get a new answer.** Editing one of your own messages answers it again,
+  replacing the reply that was under it — an answer to a question that no longer says the same
+  thing is worse than no answer. The old one leaves the screen at once, but it is not written
+  over until a token of the new one actually arrives: a run that fails, or a page that is
+  closed mid-answer, leaves the answer you already had. Later turns are left alone.
 - **Offline.** A service worker keeps the wheels, the wasm and the runtime; the app's own
   files stay network-first, so an update lands as soon as there is a network.
 - **Export / import.** Conversations save as a real `.zip` containing `chat.json`.

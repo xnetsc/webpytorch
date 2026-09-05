@@ -1566,14 +1566,63 @@ function editMessage(m, body) {
   const restore = () => { body.replaceWith(prev); };
   no.onclick = restore;
   ok.onclick = () => {
+    const was = m.content || '';
     m.content = ta.value;
     if (m.role === 'assistant') m.think = m.think === undefined ? undefined : m.think;
+    const conv = current();
+    // The title is this message when this message is the first one, so a changed question
+    // takes the entry in the list with it. Nothing else names a conversation.
+    if (conv && conv.messages[0] === m) conv.title = titleFrom(ta.value);
     saveConvs(); renderConvs(); render();
+    if (m.role === 'user' && ta.value !== was)
+      reanswer(m).catch(e => note('Error: ' + (e && e.message ? e.message : e)));
   };
   ta.addEventListener('keydown', e => {
     if (e.key === 'Escape') restore();
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
   });
+}
+
+// A question that has been changed no longer has an answer: the reply under it was written
+// for what the question used to say. So editing one answers it again, IN PLACE -- the same
+// reply is emptied and written into, not removed and replaced by another. On screen the old
+// answer is gone the instant Save is pressed and the waiting dots take its place, which is
+// what the bubble is for.
+//
+// But the old answer is only gone from the SCREEN. It is held here, and nothing is written
+// to storage until a token has actually arrived, so a generation that fails -- or a page
+// that dies -- before its first token leaves the reader with the answer they already had.
+// Losing a good answer to a failed attempt at a better one is the worse outcome by far.
+//
+// Only that one reply is touched. Later turns were written on top of it and are arguably
+// stale, but they are the reader's conversation, and this was asked to answer a question
+// again, not to throw the rest away.
+async function reanswer(m) {
+  const conv = current();
+  if (!conv) return;
+  const i = conv.messages.indexOf(m);
+  if (i < 0) return;
+  if (streaming) return note('That reply is still being written — wait for it to finish.');
+  if (!modelLoaded) return note('Edit saved. Load a model to answer it again (left panel).');
+  const had = conv.messages[i + 1];
+  const fresh = !had || had.role !== 'assistant';
+  const reply = fresh ? { role: 'assistant', content: '' } : had;
+  if (fresh) conv.messages.splice(i + 1, 0, reply);
+  const held = { content: reply.content, think: reply.think,
+                 toollog: reply.toollog, stats: reply.stats };
+  reply.content = ''; reply.think = undefined;
+  reply.toollog = null; reply.stats = null;
+  render();                                  // the answer leaves the screen now, not later
+  await runTurn(conv, m, reply);
+  // "It worked" is a token, not a message object: a run that threw leaves its reason in
+  // `content`, and a run stopped before the first token leaves nothing at all. Either way
+  // there is no new answer, so the old one comes back and the reason is said out loud.
+  if (reply.stats && reply.stats.n > 0) return;
+  const why = (reply.content || '').trim().split('\n').filter(Boolean).pop();
+  if (fresh) conv.messages.splice(conv.messages.indexOf(reply), 1);
+  else Object.assign(reply, held);
+  saveConvs(); render();
+  note(why || 'No answer came back — the previous one is still here.');
 }
 
 // Remove one message. Emptying a conversation this way removes the conversation -- a
@@ -2582,6 +2631,13 @@ $('#composer').onsubmit = async (e) => {
   if (conv.messages.length === 1) conv.title = titleFrom(text);
   $('#input').value = ''; render(); renderConvs();
 
+  await runTurn(conv, msg);
+};
+
+// One turn: `msg` is the last message in `conv` and is the question being answered.
+// Split out of the send path so the same turn can be run again -- editing a question
+// has to answer the NEW one, and answering is this, not a second copy of it.
+async function runTurn(conv, msg, existing) {
   // The whole conversation goes to the model, not just the last line — that is what makes
   // it a chat. Assistant turns go back WITHOUT their thinking: the reasoning was this
   // model's scratch work for its last answer, not context for the next one.
@@ -2589,8 +2645,9 @@ $('#composer').onsubmit = async (e) => {
   // here — the chat renders Markdown, highlights code and typesets LaTeX, and a model that
   // replies in prose gets none of that. It belongs to the client that does the rendering,
   // so the SDK stays neutral about presentation.
+  const at = conv.messages.indexOf(msg);
   const msgs = [{ role: 'system', content: UI_SYSTEM }];
-  conv.messages.slice(0, -1).forEach(m => msgs.push({
+  conv.messages.slice(0, at).forEach(m => msgs.push({
     role: m.role,
     content: m.role === 'user' ? promptFor(m)
            : (m.think !== undefined ? (m.content || '') : splitThink(m.content).rest),
@@ -2599,12 +2656,20 @@ $('#composer').onsubmit = async (e) => {
 
   for (let i = msgs.length - 1; i > 0; i--) if (!msgs[i].content) msgs.splice(i, 1);
 
-  const reply = { role: 'assistant', content: '' };
-  conv.messages.push(reply);
+  // Answering again REPLACES the reply already there, rather than removing it and adding
+  // another: it is the same answer to the same question, and taking the bubble out and
+  // putting a new one back makes the list jump -- with nowhere for the waiting dots to sit
+  // in between.
+  const reply = existing || { role: 'assistant', content: '' };
+  if (!existing) conv.messages.push(reply);
+  const idx = conv.messages.indexOf(reply);
   // Add the reply bubble directly (not a full render) and wire its live pieces.
   const el = $('#messages');
   const node = messageNode(reply, true);
-  el.appendChild(node); el.scrollTop = el.scrollHeight;
+  node.dataset.idx = idx;
+  const there = el.querySelector('.msg[data-idx="' + idx + '"]');
+  if (there) there.replaceWith(node); else el.appendChild(node);
+  el.scrollTop = el.scrollHeight;
   const body = node.querySelector('.body');
   const det = document.createElement('details'); det.className = 'think';
   const sum = document.createElement('summary'); sum.textContent = 'Thinking…';
@@ -2620,7 +2685,7 @@ $('#composer').onsubmit = async (e) => {
   rate.className = 'tokrate'; rate.hidden = true;
   body.appendChild(rate); live.rate = rate;
   resetLiveRender();                    // the first token of a reply renders immediately
-  streaming = { convId: conv.id, idx: conv.messages.length - 1, live, body };
+  streaming = { convId: conv.id, idx, live, body };
   resStartRun();                       // this reply's latency, not the previous one's
   syncButtons();                                      // Send becomes Stop
 
@@ -2729,8 +2794,15 @@ $('#composer').onsubmit = async (e) => {
   resEndRun();          // the gap to the next reply is not a decode step
   streaming = null;
   syncButtons();                                      // Stop becomes Send again
-  conv.updated = Date.now(); saveConvs(); render();
-};
+  conv.updated = Date.now();
+  // A run that produced nothing is not written. When this is answering a question
+  // AGAIN, what is on disk is still the previous answer -- and that is the one worth
+  // keeping until a real replacement exists, so the blanked reply must never reach
+  // storage even for the moment between here and `reanswer` putting it back.
+  if (!existing || (reply.stats && reply.stats.n > 0)) saveConvs();
+  render();
+}
+
 // The form's submit is the send path; while streaming, the same button stops instead. The
 // worker sets the SDK's cancel flag and `generate` returns the part of the reply that
 // exists, so the stopped answer stays in the conversation.
