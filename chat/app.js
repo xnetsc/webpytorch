@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=cd792c853e');
+const worker = new Worker('worker.js?v=ab5e109e33');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1726,12 +1726,16 @@ function messageNode(m, live) {
     const g = m.stats.gpu_ms, k = m.stats.pick_ms;
     if (g != null && k != null && (g + k) >= 20) {
       extra = '  ·  GPU ' + Number(g).toFixed(0) + ' ms + host ' + Number(k).toFixed(0) + ' ms';
-      // The mean alone cannot say whether a reply was slow throughout or only until it warmed
-      // up, and those need different answers. Show the first and last tenth when they differ
-      // enough to mean something.
-      const h = m.stats.gpu_ms_head, t = m.stats.gpu_ms_tail;
-      if (h != null && t != null && Math.max(h, t) >= 1.25 * Math.min(h, t)) {
-        extra += ' (' + Number(h).toFixed(0) + ' → ' + Number(t).toFixed(0) + ')';
+      // The mean alone cannot say whether a reply was slow throughout, slow until it warmed
+      // up, or slowing as it went, and those want different answers. When the cost actually
+      // moved across the reply, show it moving: one figure per tenth, in order. Shown only
+      // then, so an ordinary reply keeps a one-line footer.
+      const c = m.stats.gpu_ms_curve;
+      if (c && c.length >= 2) {
+        const lo = Math.min.apply(null, c), hi = Math.max.apply(null, c);
+        if (lo > 0 && hi >= 1.25 * lo) {
+          extra += '  ·  ' + c.map((x) => Math.round(x)).join(' ');
+        }
       }
     }
     // Which decode loop ran. `replay` is the captured step; `grow` is the fallback that

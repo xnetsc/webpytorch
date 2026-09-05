@@ -254,13 +254,16 @@ model as a dict, replaced by each stream:
 | `tok_s` | decode rate, first token to last — prompt time excluded |
 | `gpu_ms` | mean per token spent on the device step, including the readback that waits for it |
 | `pick_ms` | mean per token spent on the host between steps: sampling, penalties, constraints |
-| `gpu_ms_head` / `gpu_ms_tail` | `gpu_ms` over the first and last tenth of the reply; absent under 20 tokens |
+| `gpu_ms_curve` | `gpu_ms` per tenth of the reply, in order — ten figures; absent under 20 tokens |
+| `gpu_ms_head` / `gpu_ms_tail` | the first and last of `gpu_ms_curve`, for when only the ends matter |
 | `path` | `"replay"` — the captured decode step. `"grow"` — the fallback that re-runs a whole forward per token (WebGL, a host-side mixer, an unstacked MoE), and a model on it is slow for a reason no kernel change reaches. |
 
-`gpu_ms` against `pick_ms` says *where* a slow reply spent its time; `gpu_ms_head` against
-`gpu_ms_tail` says *when*. A head far above the tail is a reply that was slow only until
-something warmed up — a different problem from one that was slow throughout, and one that a
-mean, or a spread like p90-over-median, reports as normal.
+`gpu_ms` against `pick_ms` says *where* a slow reply spent its time; `gpu_ms_curve` says
+*when*. A curve that starts high and settles is a reply that was slow only until something
+warmed up; one that climbs is a reply paying for its own length; a flat one is a model that
+is simply this fast. Those are three different problems, and a mean tells them apart from
+none of them — nor does a spread like p90-over-median, which reports a slow first tenth as
+perfectly normal because that is exactly where p90 sits.
 - `await webtorch.AutoTokenizer.from_pretrained(path)` → byte-BPE tokenizer
   (`.encode/.decode`); accepts a vocab/merges dir or a `{vocab,merges}` json.
 - `webtorch.TransformerLM(cfg)` / `webtorch.build_lm(cfg, get, linear, tensor)` → the

@@ -3253,9 +3253,15 @@ class CausalLM:
             # different problems. A spread (p90 over median) cannot tell them apart -- a slow
             # first tenth sits just under p90 and reads as perfectly uniform.
             if len(each) >= 20:
-                k = max(1, len(each) // 10)
-                out["gpu_ms_head"] = round(sum(each[:k]) * 1000 / k, 2)
-                out["gpu_ms_tail"] = round(sum(each[-k:]) * 1000 / k, 2)
+                # Ten means, one per tenth of the reply. Two numbers say whether the cost
+                # moved; ten say WHERE -- a ramp that eases off, a cliff at one point, and a
+                # steady climb are three different causes and the first and last token cannot
+                # tell them apart.
+                b = len(each) / 10.0
+                curve = [each[int(i * b):int((i + 1) * b)] for i in range(10)]
+                out["gpu_ms_curve"] = [round(sum(c) * 1000 / len(c), 2) for c in curve if c]
+                out["gpu_ms_head"] = out["gpu_ms_curve"][0]
+                out["gpu_ms_tail"] = out["gpu_ms_curve"][-1]
             self.last_stream = out
             return out
 
