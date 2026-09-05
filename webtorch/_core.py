@@ -2060,6 +2060,37 @@ def tune_cost():
     return dict(_TUNE_COST)
 
 
+_KBUILD = {}
+
+
+def _kernel_build():
+    """A stamp that changes when the KERNELS change, not when a release is cut.
+
+    A profile says what was true of a shader, so it has to stop being trusted when that
+    shader changes -- and a version string does not track that: edit the WGSL, ship it, and
+    a version-stamped profile would still be accepted. So the stamp is a digest of what
+    actually generates the kernels: the source of the generator, and every format's decode
+    fragment. Computed once.
+    """
+    if "v" in _KBUILD:
+        return _KBUILD["v"]
+    import hashlib
+    import inspect
+    h = hashlib.sha1()
+    for fn in (_ggml_src, _ggml_name, _cfg_for):
+        try:
+            h.update(inspect.getsource(fn).encode())
+        except Exception:
+            h.update(b"?")
+    for name in sorted(_GGML_TYPES):
+        dec, helper, vals, blk, tab = _GGML_TYPES[name]
+        h.update(("%s|%s|%s|" % (name, vals, blk)).encode())
+        h.update(str(dec).encode())
+        h.update(str(helper).encode())
+    _KBUILD["v"] = h.hexdigest()[:16]
+    return _KBUILD["v"]
+
+
 def kernel_profile():
     """What this device decided about these kernels, as plain data a caller may keep.
 
@@ -2077,9 +2108,8 @@ def kernel_profile():
     build is stamped here; the DEVICE is the caller's to key on, because what identifies a
     GPU is a browser fact and this file has no business knowing it.
     """
-    from . import __init__ as _pkg          # for the version this profile belongs to
     return {
-        "build": getattr(_pkg, "__version__", "0"),
+        "build": _kernel_build(),
         "tuned": {"|".join(str(x) for x in k): v for k, v in _TUNED.items()},
         "checked": {"|".join(str(x) for x in k): bool(v) for k, v in _CHECKED.items()},
         "dequant_ok": dict(_DEQ_OK),
@@ -2095,8 +2125,7 @@ def use_kernel_profile(profile):
     """
     if not isinstance(profile, dict):
         return 0
-    from . import __init__ as _pkg
-    if str(profile.get("build")) != str(getattr(_pkg, "__version__", "0")):
+    if str(profile.get("build")) != _kernel_build():
         return 0
     n = 0
     for k, v in (profile.get("tuned") or {}).items():

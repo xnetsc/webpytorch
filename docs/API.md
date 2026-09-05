@@ -394,18 +394,66 @@ Getting it wrong does not raise. Every op silently falls back to numpy inside wa
 correct, roughly two orders of magnitude slower. That failure mode is why the SDK owns the
 handshake instead of leaving it to callers, and why the live backend is queryable.
 
-- `webtorch.kernel_profile()` → what this device decided about the GPU kernels, as plain
-  JSON-able data: which thread shape is fastest here, and whether each variant computes the
-  right thing here. Both are properties of a **device**, not of a model or a conversation,
-  and deriving them costs shader compiles and numerical checks at every load — on a 27B,
-  that was the whole of the `warming` stage.
-- `webtorch.use_kernel_profile(profile)` → hand back what `kernel_profile()` returned;
-  returns how many entries were accepted. The SDK does not decide where a profile lives:
-  keep it wherever you keep things, **keyed by the GPU adapter**, since a different device
-  is a different answer. The build is stamped inside the profile and a profile from another
-  build is ignored entirely rather than partially — a kernel changes with the code that
-  generates it, and half-trusting a profile is how a stale verdict outlives the shader it
-  was about. A caller that keeps nothing behaves exactly as before.
+### Kernel profile — pay the measuring once, not once per load
+
+Before a model can run, two things have to be settled about the **GPU kernels**: which
+thread shape is fastest on this device, and whether each variant computes the right thing on
+it (a WGSL shader that fails to compile returns zeros rather than raising, and a kernel that
+does nothing is the fastest one there is — so this is checked, not assumed).
+
+Both answers belong to a **device**. Neither changes between loads, or between models. But
+settling them costs a shader compile and a numerical check per variant, and that is the
+`warming` stage a caller sees: on a 27B it was **107 s**, and on a 0.6B it is ~1.2 s.
+
+So they are offered as data, and where a profile lives is the caller's decision.
+
+```python
+# ---- next load: hand back what the last one worked out. BEFORE loading. ----
+saved = my_store.get(device_key)              # yours; see the key below
+if saved:
+    n = webtorch.use_kernel_profile(saved)    # -> how many entries were accepted
+
+lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/m.gguf")
+
+# ---- after loading: keep what it worked out ----
+my_store.put(device_key, webtorch.kernel_profile())
+```
+
+**Order is the whole of it.** `use_kernel_profile` has to run **before** the load, because
+the load is what does the measuring — called afterwards it is accepted and changes nothing,
+and the time is already spent. `kernel_profile()` is read **after**, when there is something
+to read.
+
+`kernel_profile()` returns a small JSON-able dict — a few hundred bytes, no arrays:
+
+```python
+{"build": "a3f1c9e04b27d8e6",                  # digest of the kernel sources, see below
+ "tuned":      {"ggml_shape|Q4_K|1024|512": "narrow", ...},
+ "checked":    {"Q4_K|1|narrow|False": True, ...},
+ "dequant_ok": {"Q4_K": True, ...}}
+```
+
+**Key your storage by the GPU adapter** — a different device is a different answer, and the
+SDK cannot key it for you because what identifies a GPU is a browser fact. In a worker:
+
+```js
+const a = await navigator.gpu.requestAdapter();
+const i = a.info || {};
+const key = [i.vendor, i.architecture, i.device, i.description].join('/');
+```
+
+The **build** stamp is a digest of what generates the kernels — the generator's own source
+and every format's decode fragment — not a version string. That distinction matters: a
+version only changes when a release is cut, so a shader edited and shipped in between would
+still be matched by a profile describing the *old* shader. A profile whose stamp differs is
+ignored *entirely* rather than partially, because half-trusting one is how a stale verdict
+outlives the shader it was about. `use_kernel_profile` returns `0` in that case, and for
+anything that is not a profile — so a stale or corrupt store costs a measuring pass, never a
+wrong kernel.
+
+Keeping nothing is a supported choice: every load then behaves exactly as it did before this
+existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
+
 - `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
   nothing is. Reading this is the supported way to find out why a machine that should be
   fast is not — the reason is recorded where the failure happened, which is the only way to
