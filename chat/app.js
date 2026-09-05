@@ -1829,6 +1829,10 @@ function messageNode(m, live) {
     // Which decode loop ran. `replay` is the captured step; `grow` is the fallback that
     // re-runs a forward per token, and a model on it is slow for a reason no kernel change
     // will reach.
+    // What the reply ran against. Two replies from the same model at 141 ms and 350 ms a
+    // token are not two speeds, they are two conversation lengths, and the footer cannot be
+    // read without this.
+    if (m.stats.context) extra += '  ·  ' + m.stats.context + ' ctx';
     if (m.stats.path && m.stats.path !== 'replay') extra += '  ·  ' + m.stats.path;
     // Where the decode graph was rebuilt mid-reply. The only event in the loop that replaces
     // what every later token runs, so it is the first thing to line the cost curve up against.
