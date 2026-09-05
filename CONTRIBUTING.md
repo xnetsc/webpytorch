@@ -21,7 +21,9 @@ browser on WebGPU/WebGL (via Pyodide + a modified WgPy backend).
 - **Changing anything under `chat/` — run `scripts/stamp.sh`.** It puts a content hash on
   each local script URL. Without it the browser's own memory cache answers `<script src>`
   with the old file on the first reload after a deploy; the service worker never sees the
-  request, so it cannot help.
+  request, so it cannot help. `.githooks/check-stamp.py` refuses the commit if a stamp does
+  not match the bytes it names — forgetting this costs a whole measurement, because the page
+  keeps running the previous code while looking like it reloaded.
 
 ## Guidelines
 - Public interfaces must be generic or series/task-level (`pipeline`, `AutoModelFor*`,

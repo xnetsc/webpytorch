@@ -57,7 +57,8 @@ git config core.hooksPath .githooks       # once per clone
 
 `.githooks/` holds one check per file and runs them all: `check-wheels.py` is the above,
 `check-docs.py` refuses a commit whose `docs/API.md` contradicts the signatures it
-documents. See [../CONTRIBUTING.md](../CONTRIBUTING.md).
+documents, and `check-stamp.py` refuses one whose `?v=` stamps no longer match the files
+they name. See [../CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ### Two generated files that are easy to forget
 
@@ -73,7 +74,9 @@ scripts/stamp.sh          # after changing anything the page loads from chat/
 a directory — a module missing from it surfaces as an ImportError from inside Pyodide.
 `stamp.sh` puts a content hash on each local script URL (`…/webtorch-main.js?v=01f205aa85`):
 without it the browser's own memory cache answers `<script src>` with the previous file on
-the first reload after a deploy, and the service worker never sees the request.
+the first reload after a deploy, and the service worker never sees the request. This one is
+checked — `check-stamp.py` hashes the staged bytes behind every stamped URL — because the
+failure is invisible: the page works, it is simply not the page that was committed.
 
 ## 2. Pyodide runtime
 Pyodide is NOT vendored: the workers load it from the CDN, pinned in one place
