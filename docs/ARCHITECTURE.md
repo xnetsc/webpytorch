@@ -76,6 +76,14 @@ captured as a WebGPU command graph on the first token and replayed afterwards, s
 CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
 uses a split-K GQA kernel; how far to split is measured at load, not assumed.
 
+A decode step on a small model is bound by how many commands it issues, not by the bytes
+they move: a 0.6B is 0.4 GB, which at this device's ~100 GB/s is 4 ms of the step's 9.7 —
+the rest is 591 dispatches at about 16 µs each. So a dispatch that computes nothing is not
+a rounding error, and one was found by printing the step's kernels by name: `out0 = in0`,
+28 times, one per layer. It came from asking for a layout the tensor already had (see
+`_attn_out`), and `reshape` could not tell, because an axis of length 1 makes the strides
+say non-contiguous when the memory is not.
+
 Its cost splits in two, and only one half is about the model. Measured on a 0.6B: 9.05 ms
 that does not depend on the conversation, plus 0.00223 ms for every token already in it.
 The second term is **reading the cache**, and nothing else — 28 layers × 2 × 8 kv-heads ×

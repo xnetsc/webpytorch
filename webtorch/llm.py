@@ -2892,7 +2892,17 @@ class CausalLM:
     def _attn_out(self, lay, o, T):
         """Attention output -> hidden. Applies the sigmoid output gate when the query projection
         carried one (see `_qkv`), then the output projection."""
-        y = o.permute(1, 0, 2).reshape(T, self.NH * self.HD)
+        # At one position the permute rearranges nothing: `o` is (nh, 1, hd) and laid out
+        # exactly as (1, nh*hd) already is, because an axis of length 1 cannot interleave
+        # anything. Its STRIDES say otherwise, so `reshape` cannot see that and falls back to
+        # copying the whole tensor -- an identity copy, `out0 = in0`, once per layer per
+        # token. On a 0.6B that was 28 of a decode step's 591 dispatches, and a decode step
+        # there is bound by how many commands it issues, not by the bytes they move.
+        #
+        # The elements and their order are identical either way; this only declines to ask
+        # for a layout that is already the one it has.
+        y = (o.reshape(T, self.NH * self.HD) if T == 1
+             else o.permute(1, 0, 2).reshape(T, self.NH * self.HD))
         g = lay.get("_gate")
         if g is not None:
             y = y * g.sigmoid()
