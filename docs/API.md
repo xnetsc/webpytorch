@@ -241,6 +241,26 @@ and which failure is better depends on what you do next.
   - returns a model with `.generate(prompt, max_new=…) -> GenResult` and
     `.stream(prompt, max_new=…) -> iterator[token]`. `GenResult` carries `.text`,
     `.tokens`, `.ttft_s` and `.decode_tok_s`; printing it shows the timings above the text.
+
+### What a stream leaves behind — `model.last_stream`
+
+`.stream(...)` yields text and nothing else, so the numbers for the reply are left on the
+model as a dict, replaced by each stream:
+
+| key | meaning |
+|---|---|
+| `n` / `truncated` | tokens produced, and whether it stopped at `max_new` rather than at an end token |
+| `ttft_s` | seconds to the first token (prompt processing) |
+| `tok_s` | decode rate, first token to last — prompt time excluded |
+| `gpu_ms` | mean per token spent on the device step, including the readback that waits for it |
+| `pick_ms` | mean per token spent on the host between steps: sampling, penalties, constraints |
+| `gpu_ms_head` / `gpu_ms_tail` | `gpu_ms` over the first and last tenth of the reply; absent under 20 tokens |
+| `path` | `"replay"` — the captured decode step. `"grow"` — the fallback that re-runs a whole forward per token (WebGL, a host-side mixer, an unstacked MoE), and a model on it is slow for a reason no kernel change reaches. |
+
+`gpu_ms` against `pick_ms` says *where* a slow reply spent its time; `gpu_ms_head` against
+`gpu_ms_tail` says *when*. A head far above the tail is a reply that was slow only until
+something warmed up — a different problem from one that was slow throughout, and one that a
+mean, or a spread like p90-over-median, reports as normal.
 - `await webtorch.AutoTokenizer.from_pretrained(path)` → byte-BPE tokenizer
   (`.encode/.decode`); accepts a vocab/merges dir or a `{vocab,merges}` json.
 - `webtorch.TransformerLM(cfg)` / `webtorch.build_lm(cfg, get, linear, tensor)` → the

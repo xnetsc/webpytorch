@@ -3237,16 +3237,27 @@ class CausalLM:
         # it: the GPU step, and everything the host does between steps. A reply that is slow
         # because the device is busy and one that is slow because the sampler is are the same
         # number from outside, and they have nothing in common as problems.
-        span = {"gpu": 0.0, "pick": 0.0, "path": "?"}
+        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": []}
 
         def _stats(n, truncated, steps, t_first):
-            self.last_stream = {"n": n, "truncated": bool(truncated),
-                                "ttft_s": round(getattr(self, "_stream_ttft", 0.0), 3),
-                                "tok_s": _decode_rate(t_first, steps),
-                                "path": span["path"],
-                                "gpu_ms": round(span["gpu"] * 1000 / max(1, steps), 2),
-                                "pick_ms": round(span["pick"] * 1000 / max(1, steps), 2)}
-            return self.last_stream
+            each = span["each"]
+            out = {"n": n, "truncated": bool(truncated),
+                   "ttft_s": round(getattr(self, "_stream_ttft", 0.0), 3),
+                   "tok_s": _decode_rate(t_first, steps),
+                   "path": span["path"],
+                   "gpu_ms": round(span["gpu"] * 1000 / max(1, steps), 2),
+                   "pick_ms": round(span["pick"] * 1000 / max(1, steps), 2)}
+            # The mean hides the one shape that changes what to do about a slow reply: an
+            # opening that is slower than the rest. A mean says "the model is slow"; a head
+            # far above the tail says "it was slow until something warmed up", and those are
+            # different problems. A spread (p90 over median) cannot tell them apart -- a slow
+            # first tenth sits just under p90 and reads as perfectly uniform.
+            if len(each) >= 20:
+                k = max(1, len(each) // 10)
+                out["gpu_ms_head"] = round(sum(each[:k]) * 1000 / k, 2)
+                out["gpu_ms_tail"] = round(sum(each[-k:]) * 1000 / k, 2)
+            self.last_stream = out
+            return out
 
         # Same capture condition as `generate` -- see `_capturable`.
         if not self._capturable():
@@ -3269,7 +3280,8 @@ class CausalLM:
                     held.append(nxt)            # its row is written by the call below
                     _tg = time.perf_counter()
                     nxt = self._kv_forward([nxt], pos, cache); pos += 1
-                    span["gpu"] += time.perf_counter() - _tg
+                    _step = time.perf_counter() - _tg
+                    span["gpu"] += _step; span["each"].append(_step)
             finally:
                 self._kv_commit(held)
             tail = dec.flush()
@@ -3298,6 +3310,7 @@ class CausalLM:
                     yield piece
                 if self._stop_now():
                     break                       # just-yielded text satisfies the constraint
+                _step = 0.0
                 if pos >= self.kv_cap:              # out of rows -- see `generate`
                     self._kv_reserve(pos + 1)
                     self._set_inputs(nxt, pos)
@@ -3307,11 +3320,12 @@ class CausalLM:
                 else:
                     _tg = time.perf_counter()
                     self._set_inputs(nxt, pos); plat.replay("decode")
-                    span["gpu"] += time.perf_counter() - _tg
+                    _step += time.perf_counter() - _tg
                 held.append(nxt)                # row `pos` holds it as of this replay
                 _tp = time.perf_counter()
                 _lg = logits_t.numpy()[0]
-                span["gpu"] += time.perf_counter() - _tp    # the readback waits for the step
+                _step += time.perf_counter() - _tp    # the readback waits for the step
+                span["gpu"] += _step; span["each"].append(_step)
                 _tp = time.perf_counter()
                 nxt = self._pick(_lg); pos += 1
                 span["pick"] += time.perf_counter() - _tp

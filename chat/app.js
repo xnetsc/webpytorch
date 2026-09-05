@@ -1726,6 +1726,13 @@ function messageNode(m, live) {
     const g = m.stats.gpu_ms, k = m.stats.pick_ms;
     if (g != null && k != null && (g + k) >= 20) {
       extra = '  ·  GPU ' + Number(g).toFixed(0) + ' ms + host ' + Number(k).toFixed(0) + ' ms';
+      // The mean alone cannot say whether a reply was slow throughout or only until it warmed
+      // up, and those need different answers. Show the first and last tenth when they differ
+      // enough to mean something.
+      const h = m.stats.gpu_ms_head, t = m.stats.gpu_ms_tail;
+      if (h != null && t != null && Math.max(h, t) >= 1.25 * Math.min(h, t)) {
+        extra += ' (' + Number(h).toFixed(0) + ' → ' + Number(t).toFixed(0) + ')';
+      }
     }
     // Which decode loop ran. `replay` is the captured step; `grow` is the fallback that
     // re-runs a forward per token, and a model on it is slow for a reason no kernel change
