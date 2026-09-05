@@ -394,6 +394,18 @@ Getting it wrong does not raise. Every op silently falls back to numpy inside wa
 correct, roughly two orders of magnitude slower. That failure mode is why the SDK owns the
 handshake instead of leaving it to callers, and why the live backend is queryable.
 
+- `webtorch.kernel_profile()` → what this device decided about the GPU kernels, as plain
+  JSON-able data: which thread shape is fastest here, and whether each variant computes the
+  right thing here. Both are properties of a **device**, not of a model or a conversation,
+  and deriving them costs shader compiles and numerical checks at every load — on a 27B,
+  that was the whole of the `warming` stage.
+- `webtorch.use_kernel_profile(profile)` → hand back what `kernel_profile()` returned;
+  returns how many entries were accepted. The SDK does not decide where a profile lives:
+  keep it wherever you keep things, **keyed by the GPU adapter**, since a different device
+  is a different answer. The build is stamped inside the profile and a profile from another
+  build is ignored entirely rather than partially — a kernel changes with the code that
+  generates it, and half-trusting a profile is how a stale verdict outlives the shader it
+  was about. A caller that keeps nothing behaves exactly as before.
 - `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
   nothing is. Reading this is the supported way to find out why a machine that should be
   fast is not — the reason is recorded where the failure happened, which is the only way to

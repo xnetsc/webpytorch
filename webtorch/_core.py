@@ -2060,6 +2060,62 @@ def tune_cost():
     return dict(_TUNE_COST)
 
 
+def kernel_profile():
+    """What this device decided about these kernels, as plain data a caller may keep.
+
+    Two questions are answered at load and both are answers about a DEVICE, not about a
+    conversation: does this kernel variant compute the right thing here, and which thread
+    shape is fastest here. Neither changes between loads. But they cost 36 shader compiles
+    and 36 numerical checks to derive, which on a 27B was the whole of the warming phase --
+    a build-time property, re-derived on the critical path, once per load.
+
+    So they are offered as data. The SDK does not decide where they live: a caller that has
+    somewhere to put them hands them back with `use_kernel_profile` on the next load and
+    pays none of it; a caller that does not is exactly as it was.
+
+    A profile is only valid for the build that produced it and the device that ran it. The
+    build is stamped here; the DEVICE is the caller's to key on, because what identifies a
+    GPU is a browser fact and this file has no business knowing it.
+    """
+    from . import __init__ as _pkg          # for the version this profile belongs to
+    return {
+        "build": getattr(_pkg, "__version__", "0"),
+        "tuned": {"|".join(str(x) for x in k): v for k, v in _TUNED.items()},
+        "checked": {"|".join(str(x) for x in k): bool(v) for k, v in _CHECKED.items()},
+        "dequant_ok": dict(_DEQ_OK),
+    }
+
+
+def use_kernel_profile(profile):
+    """Take back what `kernel_profile` returned. Returns how many entries were accepted.
+
+    A profile from another build is ignored entirely rather than partially: a kernel changes
+    with the code that generates it, and half-trusting one is how a stale verdict outlives
+    the shader it was about.
+    """
+    if not isinstance(profile, dict):
+        return 0
+    from . import __init__ as _pkg
+    if str(profile.get("build")) != str(getattr(_pkg, "__version__", "0")):
+        return 0
+    n = 0
+    for k, v in (profile.get("tuned") or {}).items():
+        parts = k.split("|")
+        if len(parts) == 4 and parts[0] == "ggml_shape":
+            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]))] = v
+            n += 1
+    for k, v in (profile.get("checked") or {}).items():
+        parts = k.split("|")
+        if len(parts) == 4:
+            kind = None if parts[2] == "None" else parts[2]
+            _CHECKED[(parts[0], int(parts[1]), kind, parts[3] == "True")] = bool(v)
+            n += 1
+    for k, v in (profile.get("dequant_ok") or {}).items():
+        _DEQ_OK[str(k)] = bool(v)
+        n += 1
+    return n
+
+
 _GQA_TUNED = {}
 
 def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):

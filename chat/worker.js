@@ -172,6 +172,56 @@ webtorch.set_cancel_probe(lambda: _STOPFLAG[0] != 0)
   send({ type: 'ready' });
 }
 
+// What this DEVICE decided about our kernels: which thread shape is fastest here, and
+// whether each one computes the right thing here. Neither depends on the model or the
+// conversation, and deriving them costs 36 shader compiles and 36 numerical checks -- the
+// whole of the warming phase, measured at 107s on a 27B before it was cut down.
+//
+// So they are kept. The SDK offers them as data and takes them back (`kernel_profile` /
+// `use_kernel_profile`); where they live is this app's decision, which is why the storage is
+// here and not there. Keyed by the adapter, because a different GPU is a different answer --
+// and stamped by build inside the profile, because a different shader is too.
+const KP_DB = 'webtorch-kernel-profile';
+
+async function kpOpen() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open(KP_DB, 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('p');
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+
+async function kpKey() {
+  try {
+    const a = await navigator.gpu.requestAdapter();
+    const i = (a && (a.info || {})) || {};
+    return [i.vendor, i.architecture, i.device, i.description].join('/') || 'unknown';
+  } catch (e) { return null; }        // no adapter, nothing to key on, nothing to keep
+}
+
+async function kpGet(key) {
+  try {
+    const db = await kpOpen();
+    return await new Promise((res) => {
+      const rq = db.transaction('p').objectStore('p').get(key);
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => res(null);
+    });
+  } catch (e) { return null; }
+}
+
+async function kpPut(key, val) {
+  try {
+    const db = await kpOpen();
+    await new Promise((res) => {
+      const tx = db.transaction('p', 'readwrite');
+      tx.objectStore('p').put(val, key);
+      tx.oncomplete = tx.onerror = () => res();
+    });
+  } catch (e) { /* keeping it is an optimisation; failing to is not an error */ }
+}
+
 async function loadModel(repo, file, lmax) {
   await boot();
   const src = file ? `${repo}/${file}` : repo;
@@ -202,6 +252,8 @@ async function loadModel(repo, file, lmax) {
            after: after || null, elapsed: elapsed || 0 });
   };
   stopFlagClear(); intrClear();          // the Python flag is cleared below; these are its twins
+  const kpk = await kpKey();
+  self.__kp = kpk ? await kpGet(kpk) : null;
   const run = newRun();
   const out = await run.race(pyodide.runPythonAsync(`
 import js, webtorch
@@ -213,6 +265,14 @@ webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 webtorch.set_load_progress(
     lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total"),
                               i.get("after"), i.get("elapsed")))
+# What this device worked out last time, if this app kept it.
+try:
+    _kp = js.self.__kp
+    if _kp is not None:
+        _n = webtorch.use_kernel_profile(_kp.to_py() if hasattr(_kp, "to_py") else _kp)
+        js.console.log("kernel profile: reused %d entries" % _n)
+except Exception as _e:
+    pass
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
@@ -239,6 +299,14 @@ getattr(_MODEL["m"], "kind", "")
   // The page uses the model kind to offer (or hide) image inputs before the user tries one.
   // It comes back as this block's value: a top-level name assigned inside an awaited block
   // is local to the coroutine Pyodide wraps it in, so a second runPython could not see it.
+  // Keep what this load worked out, so the next one does not work it out again.
+  if (kpk) {
+    try {
+      const prof = JSON.parse(await pyodide.runPythonAsync(
+        'import json, webtorch\njson.dumps(webtorch.kernel_profile())'));
+      await kpPut(kpk, prof);
+    } catch (e) { /* an optimisation, not a step */ }
+  }
   send({ type: 'status', text: `ready: ${src}` });
   send({ type: 'loaded', id: src, image: out === 'multimodal' });
 }
