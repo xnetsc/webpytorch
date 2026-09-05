@@ -6078,7 +6078,17 @@ def ggml_dequant_ok(type_name):
     # the whole of this: something about registering these kernels is order-dependent, and
     # until that is understood a wrong answer is not worth the speed. They keep the
     # quantised kernel, which agrees with the GEMV exactly at every shape measured.
-    if _GGML_TYPES[type_name][4] is not None:
+    #
+    # `tab is not None` was how that was written, and it does not say it: IQ4_NL and IQ4_XS
+    # decode through a codebook too, an inlined one -- sixteen values packed into four u32s
+    # and staged in workgroup memory by `kvfill` -- so they have no `tab` and fell through.
+    # It cost nothing while their dequant shader would not compile, and the moment that was
+    # fixed they took a path that had never once run for them. Measured immediately, same
+    # machine, same question, same fresh conversation, a 601-token reply: 6.x tok/s with this
+    # path off, 1.x with it on. The unpacked copy is eight times the packed bytes, and this
+    # model already fills the machine; the kernel is not what is slow, the residency it
+    # destroys is. So the test asks what the comment above always meant.
+    if _GGML_TYPES[type_name][4] is not None or "fn kvfill" in _GGML_TYPES[type_name][1]:
         _DEQ_OK[type_name] = False
         return False
     ok = False

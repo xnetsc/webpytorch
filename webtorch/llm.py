@@ -2944,15 +2944,21 @@ class CausalLM:
             # matmul prefers over it, were both built by the first PROMPT instead: this phase
             # reported nothing while the first reply spent seconds before its first token.
             #
-            # Two row counts, because the prefill path branches on the row count and each
-            # branch is a different kernel. Three rows is the first that leaves the decode
-            # GEMV and reaches the batched kernel; `_GGML_DEQ_M` is the threshold above which
-            # it prefers to unpack the weights and run a plain fp32 matmul instead. Warm one
-            # and the other still compiles in front of the reader.
+            # Again with three rows, because the prefill path branches on the row count and
+            # one row reaches only the decode GEMV. Three is the first count that leaves it
+            # for the batched kernel, which the reader's first prompt was compiling instead.
+            #
+            # NOT at `_GGML_DEQ_M` rows, which is the other branch -- the one that unpacks the
+            # weights to fp32 and multiplies them plainly. Warming that would compile it here
+            # rather than in front of the reader, but it would also materialise an unpacked
+            # copy of one tensor per shape during the load, and on a machine the model already
+            # fills, making room for those is what pushes the weights back out. That is the
+            # same trade this file refuses on the prefill path itself; it is not worth taking
+            # at load time to save a compile. Left out until it is measured, not assumed.
             #
             # One shape per distinct (format, N, K), not one per layer, so this is a pass over
             # a few dozen tensors rather than over the model.
-            for m in (3, int(getattr(wt, "_GGML_DEQ_M", 32))):
+            for m in (3,):
                 try:
                     for tname, nt, kt in list(seen):
                         lay = self._shape_owner_of(getattr(self, "layers", []),
