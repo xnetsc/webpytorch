@@ -252,6 +252,11 @@ details.toollog > .ans{font-size:12px;
                     padding:4px 6px;border-radius:6px;cursor:pointer}
 .msg .mtools button:hover{background:var(--code)}
 .msg .mtools .del:hover{color:var(--danger)}
+/* Nothing in a conversation offers to be changed while the page cannot act on the
+   change -- the runtime is still starting, no model is loaded, or a reply is being
+   written. The composer already goes flat in exactly these states; the messages used
+   to stay editable, which let a question be rewritten with no way to answer it. */
+#messages.locked .mtools{display:none}
 
 /* ---- editing a message --------------------------------------------------------------- */
 .editbox{width:100%;min-height:64px;padding:10px 12px;border:1px solid var(--line);

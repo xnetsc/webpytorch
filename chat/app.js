@@ -946,6 +946,20 @@ function syncButtons() {
   $('#input').placeholder = boot ? 'Starting the compute runtime…'
     : off ? 'Load a model in ⚙ Settings to start chatting' : 'Send a message…';
   $('#composer').classList.toggle('locked', off);
+  // The conversation follows the composer. A message that cannot be acted on must not offer
+  // to be changed: editing a question is a request to answer it again, and one accepted while
+  // the page cannot answer leaves a question with a reply to something it no longer says.
+  const msgs = $('#messages');
+  if (msgs) msgs.classList.toggle('locked', off || !!streaming);
+}
+
+// Why the conversation is not accepting changes right now, or '' when it is. One predicate,
+// so the several ways into an editor cannot disagree about it.
+function editLocked() {
+  if (!envReady) return 'Starting the compute runtime — the conversation is read-only until it is up.';
+  if (streaming) return 'A reply is being written — wait for it to finish.';
+  if (!modelLoaded) return 'Load a model first (left panel) — a changed question has to be answered again.';
+  return '';
 }
 function fmt(b) { return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB'; }
 let expected = 0, expectedIsReal = false;
@@ -1551,6 +1565,8 @@ function renderConvs() {
 // message says; code blocks are edited in the block itself (see wireRunButtons), which is
 // why this deliberately does NOT open the Markdown for a reply full of code.
 function editMessage(m, body) {
+  const why = editLocked();
+  if (why) return note(why);
   if (body.querySelector('textarea')) return;                 // already editing
   const prev = body.cloneNode(true);
   const ta = document.createElement('textarea');
@@ -1725,6 +1741,26 @@ function atBottom(el) {
 function keepAtBottom(el, wasFollowing) {
   if (wasFollowing) el.scrollTop = el.scrollHeight;
 }
+
+// Every editor in a conversation opens on a double-click or a focus, so both are caught here
+// rather than in each of them. A guard inside each opener would have to be added again for the
+// next one; this cannot be forgotten, and it also covers the editors that are a `contenteditable`
+// with no opener at all -- a code block, a table cell.
+(function lockEditing() {
+  const el = $('#messages');
+  if (!el) return;
+  el.addEventListener('dblclick', (e) => {
+    const why = editLocked();
+    if (!why) return;
+    e.stopPropagation(); note(why);   // stop the editors, leave selecting a word alone
+  }, true);
+  el.addEventListener('focusin', (e) => {
+    const why = editLocked();
+    if (!why) return;
+    const t = e.target;
+    if (t && t.isContentEditable) { t.blur(); note(why); }
+  });
+})();
 
 function messageNode(m, live) {
   const d = document.createElement('div'); d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
@@ -2507,6 +2543,8 @@ function tableToMd(table, src) {
 // Edit one block in place. Saving rebuilds only this block, so the rest of the message --
 // including any code output already on screen -- is left where it is.
 function editBlock(msg, i, node) {
+  const why = editLocked();
+  if (why) return note(why);
   if (node.querySelector('.blockedit')) return;
   const src = mdBlocks(msg.content)[i] || '';
   const ta = document.createElement('textarea');

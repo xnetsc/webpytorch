@@ -19,6 +19,10 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   the one holding the model, with output, tracebacks and matplotlib figures inline.
 - **Replies that render.** Markdown, highlighted code, LaTeX via KaTeX, tables — sanitised
   before they reach the DOM — and each block is editable in place.
+- **Read-only until it can act.** While the runtime is starting, no model is loaded, or a
+  reply is being written, the conversation stops offering to be changed — the same states in
+  which the composer is already flat. A question rewritten with no way to answer it leaves a
+  reply to something the question no longer says.
 - **Change a question, get a new answer.** Editing one of your own messages answers it again,
   replacing the reply that was under it — an answer to a question that no longer says the same
   thing is worse than no answer. The old one leaves the screen at once, but it is not written
