@@ -3252,6 +3252,10 @@ class CausalLM:
                    "ttft_s": round(getattr(self, "_stream_ttft", 0.0), 3),
                    "tok_s": _decode_rate(t_first, steps),
                    "path": span["path"],
+                   # What the reply ran against. Every cost that scales with the conversation
+                   # scales with this, and a reader comparing two replies cannot tell a slower
+                   # model from a longer conversation without it.
+                   "context": int(P),
                    "gpu_ms": round(span["gpu"] * 1000 / max(1, steps), 2),
                    "pick_ms": round(span["pick"] * 1000 / max(1, steps), 2)}
             # The mean hides the one shape that changes what to do about a slow reply: an

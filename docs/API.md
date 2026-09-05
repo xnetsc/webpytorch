@@ -259,6 +259,7 @@ model as a dict, replaced by each stream:
 |---|---|
 | `n` / `truncated` | tokens produced, and whether it stopped at `max_new` rather than at an end token |
 | `ttft_s` | seconds to the first token (prompt processing) |
+| `context` | tokens of prompt the reply ran against — every cost that scales with the conversation scales with this |
 | `tok_s` | decode rate, first token to last — prompt time excluded |
 | `gpu_ms` | mean per token spent on the device step, including the readback that waits for it |
 | `pick_ms` | mean per token spent on the host between steps: sampling, penalties, constraints |
