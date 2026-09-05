@@ -6017,18 +6017,21 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
 # milliseconds wide and a prefill is hundreds of rows, so measuring it on every load would
 # spend real time to move a boundary nothing lands on.
 #
-# NOT YET MEASURED ON A LARGE MODEL, and that is what this is: the table above is a pair of
-# small shapes (K=1024 N=3072, K=3072 N=1024), where an unpacked copy is a few megabytes. On
-# a 12.2 GB model one weight unpacks to 283 MB, and the copy is written and then read on a
-# machine the model already fills. Measured there, a 66-row prefill took 5.3 s -- 80 ms a
-# row, against 162 ms for a decode step that computes ONE row and reads every weight once.
-# That is about 2.3 GB/s where decode reaches 86.
+# Also measured on a 12.2 GB model, where the table's assumption does not hold -- one weight
+# unpacks to 283 MB there, written and then read on a machine the weights already fill. The
+# threshold was raised out of reach so every prefill kept the quantised kernel, and the same
+# prompt was timed both ways:
 #
-# So this is an A/B, deliberately: the threshold is raised out of reach, which keeps the
-# quantised batched kernel for every prefill. If `first token` falls, the threshold is wrong
-# for models of this size and the right fix is to decide it by the SIZE OF THE COPY rather
-# than by a row count. If it rises, unpacking is earning its keep here and this goes back.
-_GGML_DEQ_M = 1 << 30
+#     unpacking on    66 rows   2627 dispatches   5.3 s   80.3 ms a row
+#     unpacking off   67 rows   1792 dispatches   5.6 s   83.6 ms a row
+#
+# So it is a wash at this size, slightly in favour of unpacking, and 32 stays. What that
+# rules out is more useful than the 4%: the prompt's cost is NOT the unpacked copy. A
+# 67-row prefill reads every weight once, so it should cost what a decode step costs plus
+# arithmetic, and it costs thirty of them. The remaining candidate is the batched kernel
+# itself -- it tops out around 426 GFLOPS against 2117 for a plain fp32 matmul of the same
+# shape, and 67 rows of a 27B is about 3.6 TFLOP.
+_GGML_DEQ_M = 32
 
 # Rows the fp32 matmul wants its input to be a multiple of. Its tiled kernel only runs when
 # they are, and missing it costs seven times -- at K=1024 N=3072, 1850 GFLOPS at M=2816
