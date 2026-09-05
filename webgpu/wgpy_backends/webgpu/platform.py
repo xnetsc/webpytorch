@@ -135,6 +135,8 @@ class WebGPUPlatform:
         if wgs is not None and int(wgs.get("x", 1) or 1) > _DISPATCH_LIMIT:
             descriptor = self._fold_dispatch(descriptor, wgs)
         WebGPUPlatform.dispatches += 1
+        _n = descriptor.get("name")
+        WebGPUPlatform.by_name[_n] = WebGPUPlatform.by_name.get(_n, 0) + 1
         return gpu.runKernel(descriptor)
 
     def _fold_dispatch(self, descriptor, wgs):
@@ -181,6 +183,9 @@ class WebGPUPlatform:
     # how long that recording's command list is -- and two recordings of the same graph that
     # do not agree on that are not the same graph, whatever the source says.
     dispatches = 0
+    # The same count broken down by kernel. A total says two runs of one function differ; the
+    # breakdown says WHICH commands the difference is, which is the question that follows.
+    by_name = {}
 
     def beginCapture(self, name):
         # The name matters here: JS replaces the recorded command list for that name, so the

@@ -268,6 +268,7 @@ model as a dict, replaced by each stream:
 | `recaptured_at` | tokens at which the decode graph was rebuilt, because the cache ran out of rows mid-reply; absent if it never was |
 | `pins` | one `[buffers, pinned bytes, pool bytes, dispatches after, dispatches before]` per recording of the decode graph — what it holds, and how long its command list is |
 | `pool_freed` | bytes the prompt had left in the buffer reuse pool, dropped before the reply began |
+| `prefilled` / `prefill_d` | rows the prompt actually computed (the rest came from the cache), and dispatches issued to do it |
 | `path` | `"replay"` — the captured decode step. `"grow"` — the fallback that re-runs a whole forward per token (WebGL, a host-side mixer, an unstacked MoE), and a model on it is slow for a reason no kernel change reaches. |
 
 `gpu_ms` against `pick_ms` says *where* a slow reply spent its time; `gpu_ms_curve` says

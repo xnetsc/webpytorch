@@ -2781,12 +2781,40 @@ class CausalLM:
         conversation, and this is not one.
         """
         try:
-            self._set_inputs(int(self.eos_ids[0]) if getattr(self, "eos_ids", None) else 0, 0)
-            self._decode_fwd().numpy()
+            tok = int(self.eos_ids[0]) if getattr(self, "eos_ids", None) else 0
+            # Twice, and the two are compared. Once is what the fix needs; the second run is
+            # what says the fix is still working -- if some later change gives a first call
+            # commands a second one does not have, the load says so by name instead of a reply
+            # going three times slower for reasons no one can see.
+            a = self._dispatch_names()
+            self._set_inputs(tok, 0); self._decode_fwd().numpy()
+            b = self._dispatch_names()
+            self._set_inputs(tok, 0); self._decode_fwd().numpy()
+            c = self._dispatch_names()
+            first = {k: b.get(k, 0) - a.get(k, 0) for k in b}
+            again = {k: c.get(k, 0) - b.get(k, 0) for k in c}
+            extra = {k: first.get(k, 0) - again.get(k, 0) for k in first
+                     if first.get(k, 0) != again.get(k, 0)}
+            if extra:
+                import js
+                js.console.log(
+                    "warm: the first decode step dispatched %d commands a second does not: %s"
+                    % (sum(extra.values()),
+                       ", ".join("%s x%d" % (k, v) for k, v in
+                                 sorted(extra.items(), key=lambda kv: -kv[1])[:12])))
         except Exception:
             pass                      # best effort: a model that cannot do this still loads
         finally:
             self._reset_linear_state()
+
+    @staticmethod
+    def _dispatch_names():
+        """Dispatches issued so far, per kernel name. Empty off the WebGPU path."""
+        try:
+            from wgpy_backends.webgpu.platform import WebGPUPlatform
+            return dict(WebGPUPlatform.by_name)
+        except Exception:
+            return {}
 
     # ---- prefill (fresh, fills KV 0..P-1) ----
     def _capturable(self):
@@ -3406,6 +3434,9 @@ class CausalLM:
                 out["pins"] = [list(p) for p in span["pins"]]
             if span.get("pool_freed"):
                 out["pool_freed"] = int(span["pool_freed"])
+            if span.get("prefilled") is not None:
+                out["prefilled"] = int(span["prefilled"])
+                out["prefill_d"] = int(span.get("prefill_d") or 0)
             self.last_stream = out
             return out
 
@@ -3443,7 +3474,14 @@ class CausalLM:
         # first -- the same two points as in `generate`.
         self._kv_reserve(P + min(max_new, self._KV_HEADROOM))
         keep = self._kv_prefix(ids)
+        # What the prompt actually cost, as two numbers rather than one. `ttft_s` alone
+        # cannot separate "every row is expensive" from "something happened once": a turn
+        # that re-uses its prefix computes a handful of rows and a first turn computes all of
+        # them, and the same seconds mean opposite things in the two cases.
+        _pd0 = _pin_stats()[3]
         g0 = self._prefill(ids[keep:], start=keep); self._stream_ttft = time.perf_counter() - t0
+        span["prefilled"] = int(P - keep)
+        span["prefill_d"] = int(_pin_stats()[3] - _pd0)
         held = list(ids)
         plat = wt._adam_kernel["platform"]
         # The prompt's buffers are not wanted again, and the pool has a total byte budget:

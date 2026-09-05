@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=f3c5b0b2e0');
+const worker = new Worker('worker.js?v=6afbe9f77b');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1837,7 +1837,15 @@ function messageNode(m, live) {
     // prompt is processed moves this and nothing else on the line, and without it the whole
     // cost of a turn was being read off a number that excludes it.
     const tt = m.stats.ttft_s;
-    if (tt >= 1) extra += '  ·  first token ' + Number(tt).toFixed(1) + ' s';
+    if (tt >= 1) {
+      extra += '  ·  first token ' + Number(tt).toFixed(1) + ' s';
+      // Rows actually computed, and commands issued to do it. The seconds alone cannot tell
+      // a prompt that was all new from one that re-used its prefix and computed a handful.
+      if (m.stats.prefilled != null) {
+        extra += ' (' + m.stats.prefilled + ' rows'
+               + (m.stats.prefill_d ? ', ' + m.stats.prefill_d + 'd' : '') + ')';
+      }
+    }
     if (m.stats.path && m.stats.path !== 'replay') extra += '  ·  ' + m.stats.path;
     // Where the decode graph was rebuilt mid-reply. The only event in the loop that replaces
     // what every later token runs, so it is the first thing to line the cost curve up against.
