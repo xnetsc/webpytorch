@@ -475,8 +475,9 @@ const i = a.info || {};
 const key = [i.vendor, i.architecture, i.device, i.description].join('/');
 ```
 
-The **build** stamp is a digest of what generates the kernels — the generator's own source
-and every format's decode fragment — not a version string. That distinction matters: a
+The **build** stamp is a digest of what generates the kernels — the generator's own source,
+every format's decode fragment, and every shader template those fragments are pasted into —
+not a version string. That distinction matters: a
 version only changes when a release is cut, so a shader edited and shipped in between would
 still be matched by a profile describing the *old* shader. A profile whose stamp differs is
 ignored *entirely* rather than partially, because half-trusting one is how a stale verdict

@@ -2087,6 +2087,19 @@ def _kernel_build():
         h.update(("%s|%s|%s|" % (name, vals, blk)).encode())
         h.update(str(dec).encode())
         h.update(str(helper).encode())
+    # And every shader the generator pastes those fragments INTO. The templates are
+    # module-level text, so a digest of the generator's own source does not move when one of
+    # them is edited -- and a profile that outlives the shader it describes is a profile that
+    # asserts what the previous version did. It cost exactly that: the dequant template
+    # referred to a thread index it never declared, so the kernel would not compile for the
+    # two formats with a staged codebook, and the stored profile went on recording the
+    # verdict from the broken build after the template was fixed.
+    g = globals()
+    for name in sorted(g):
+        v = g[name]
+        if isinstance(v, str) and ("@compute" in v or "@group(" in v or "\nfn " in v):
+            h.update(name.encode())
+            h.update(v.encode())
     _KBUILD["v"] = h.hexdigest()[:16]
     return _KBUILD["v"]
 
@@ -5673,12 +5686,23 @@ fn ACC4(k: u32, v: vec4<f32>) {
 
 _GGML_DEQ_MAIN = """
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  // The staged-codebook fill is written once, for the two-dimensional decode kernels, and
+  // addresses its thread as `lx + ly * WGX`. This workgroup is one-dimensional, so it says
+  // so in those terms rather than carrying a second copy of the fill.
+  let lx = lid.x;
+  let ly = 0u;
+  // Before the range guard, not after it: the fill ends in a `workgroupBarrier`, and a
+  // barrier is only valid where every invocation in the workgroup reaches it. An output
+  // width that is not a multiple of 64 sends the tail invocations home at that guard, and
+  // with the barrier below it the shader is invalid -- which is a compile failure, and a
+  // compile failure on this path is silent: the dispatch produces zeros.
+HELPERINIT
   let n = gid.x;
   if (n >= gm.N) { return; }
   nrow = n;
 WOFFINIT
-HELPERINIT
   let base = 0u;
   let nb = gm.K / BLKVALS;
   for (var b: u32 = 0u; b < nb; b = b + 1u) {
