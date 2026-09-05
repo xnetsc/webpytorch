@@ -74,9 +74,7 @@ of the work decides the time.
 with a single row the unpacking would cost more than the multiply. The whole step is
 captured as a WebGPU command graph on the first token and replayed afterwards, so per-token
 CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
-uses a split-K GQA kernel; how far to split is measured at load, not assumed — **including
-whether to split at all**, since splitting costs a second dispatch per layer and a short scan
-does not need the parallelism it buys.
+uses a split-K GQA kernel; how far to split is measured at load, not assumed.
 
 Its cost splits in two, and only one half is about the model. Measured on a 0.6B: 9.05 ms
 that does not depend on the conversation, plus 0.00223 ms for every token already in it.
@@ -84,10 +82,9 @@ The second term is **reading the cache**, and nothing else — 28 layers × 2 ×
 128 dims is 224 KB per context token in fp32, so at a context of 3632 one step streams
 833 MB, in 8.11 ms. That is 102.7 GB/s, which is *faster* than anything else here reaches
 (the general fp32 matmul streams 62–79 GB/s on the same device) and the split factor is
-already chosen by measurement from 1/4/8/16/32 at every context bucket. (It was 4/8/16/32:
-four ways to split and no way to decline. A 0.6B at a 66-token context therefore split
-anyway, paying an extra dispatch in each of its 28 layers — 591 a step against 567 — and its
-step went 6.69 ms to 9.89 ms.) There was no kernel
+already chosen by measurement from 4/8/16/32 at every context bucket. Not splitting was
+offered as a fifth candidate and measured worse even on a 0.6B at a 66-token context — 563
+dispatches at 11.40 ms against 591 at 9.89 — so splitting earns the dispatch it costs. There was no kernel
 left to improve, so the bytes had to go: **K and V are stored as halves**, two to a `u32`,
 unpacked in the shader with `unpack2x16float` — core WGSL needing no device feature, and
 `unpackHalf2x16` is the GLSL spelling of the same thing. Measured end to end on the 0.6B at
@@ -144,9 +141,10 @@ held 3477 dispatches against 1749 for the same graph recorded again mid-reply, a
 the difference for every token until it was replaced. Two rules were learned the hard way and are enforced in `bench`: batch
 24 dispatches per sync, or you measure the 1–2 ms readback instead of the kernel; and
 interleave the candidates, because the same configuration measured 7.61 ms and 4.49 ms in
-one session when run in blocks. Both rules apply to `gqa_tune` as well, and the first one
-was not applied there for a while — it timed one dispatch per candidate, so it measured the
-sync, and the extra dispatch a split costs is exactly what that drowns out. Where measurement said a knob does not pay (`_GGML_KSG`,
+one session when run in blocks. The first rule does NOT carry over to `gqa_tune`: applied
+there it chose a configuration 14% slower in a real step, because 24 identical attention
+dispatches back to back are not a decode step, where each sits between the layer's other
+work. Where measurement said a knob does not pay (`_GGML_KSG`,
 widening `_SMALL_N`) it is *not* made dynamic, and the negative result is recorded next to
 the constant so it is not rediscovered.
 

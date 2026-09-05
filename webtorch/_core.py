@@ -2172,21 +2172,29 @@ def use_kernel_profile(profile):
 
 _GQA_TUNED = {}
 
-def gqa_tune(nh, nkv, hd, n, candidates=(1, 4, 8, 16, 32), rounds=5):
+def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
     """Pick the split factor for this device at this context length, by running them.
 
     Cheap enough to do at load: it times the attention kernel alone, not a whole step. The
     answer is remembered per (shape, context bucket) -- `n` is bucketed by powers of four,
     because the ranking moves with the order of magnitude of the scan and not with a token.
 
-    **1 is a candidate**, and it is the one that was missing. Splitting costs a second
-    dispatch per attention layer -- the partials and then the merge -- and it buys parallelism
-    that a short scan does not need. The four factors offered were four ways to split and no
-    way to decline, so a model that wanted to decline could not: a 0.6B at a 66-token context
-    ran 591 dispatches a step against 567 before splitting was turned on, one extra per layer
-    for 28 layers, and its step went from 6.69 ms to 9.89 ms. The commit that turned splitting
-    on says what it is for -- it flattens the context curve -- and a context of 66 has no
-    curve to flatten.
+    NOT splitting was offered as a candidate and MEASURED WORSE, so the four factors stand.
+    The reasoning for offering it was sound and wrong: a split costs a second dispatch per
+    attention layer, so a 0.6B at a 66-token context runs 591 a step against 563 without one,
+    and a scan of 66 keys does not obviously need the parallelism. Run both on the device:
+
+        split      591 dispatches   9.89-10.02 ms a step
+        no split   563 dispatches   11.40 ms a step
+
+    Splitting wins even here, and by more than the dispatch it costs.
+
+    Batching the timings 24 to a sync -- the rule this file states next to the other tuner --
+    was tried with it and is NOT used here either: it is what made the tuner choose the
+    slower option. Twenty-four identical attention dispatches back to back are not a decode
+    step, where each one sits between the layer's other work, and the ranking it produces
+    does not hold there. One dispatch per timing measures a sync it should not, and measures
+    the right thing anyway; that is worth knowing rather than assuming from the other tuner.
     """
     global _GQA_SPLIT, _GQA_SPLIT_ON
     import time as _t
@@ -2213,22 +2221,14 @@ def gqa_tune(nh, nkv, hd, n, candidates=(1, 4, 8, 16, 32), rounds=5):
             o.numpy()                                   # warm and settle
         best, best_ms = was, None
         times = {sp: [] for sp in candidates}
-        # Many dispatches per sync, for the reason this file states next to the other tuner
-        # and had not applied here: a readback is 1-2 ms and this kernel is a fraction of
-        # one, so one dispatch per timing measures the sync. That is not a small error -- it
-        # is the whole measurement, and it made the ranking noise. The cost of the extra
-        # dispatch a split needs is precisely what was being drowned out, so the tuner kept
-        # choosing to split on a model that a split makes slower.
-        REP = 24
+        # One dispatch per timing, deliberately -- see the docstring. Batching them 24 to a
+        # sync was tried, and it chose the option that is 14% slower in a real step.
         for _ in range(rounds):
             for sp in candidates:
                 _set_split(sp)
                 t0 = _t.perf_counter()
-                o = None
-                for _r in range(REP):
-                    o = gqa_decode(q, kc, vc, mask, 1.0, valid=n)
-                o.numpy()
-                times[sp].append((_t.perf_counter() - t0) / REP)
+                gqa_decode(q, kc, vc, mask, 1.0, valid=n).numpy()
+                times[sp].append(_t.perf_counter() - t0)
         for sp, xs in times.items():
             xs.sort()
             med = xs[len(xs) // 2]
