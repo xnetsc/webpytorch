@@ -1833,6 +1833,11 @@ function messageNode(m, live) {
     // token are not two speeds, they are two conversation lengths, and the footer cannot be
     // read without this.
     if (m.stats.context) extra += '  ·  ' + m.stats.context + ' ctx';
+    // Time to the first token: the prompt, not the reply. A change that only touches how the
+    // prompt is processed moves this and nothing else on the line, and without it the whole
+    // cost of a turn was being read off a number that excludes it.
+    const tt = m.stats.ttft_s;
+    if (tt >= 1) extra += '  ·  first token ' + Number(tt).toFixed(1) + ' s';
     if (m.stats.path && m.stats.path !== 'replay') extra += '  ·  ' + m.stats.path;
     // Where the decode graph was rebuilt mid-reply. The only event in the loop that replaces
     // what every later token runs, so it is the first thing to line the cost curve up against.
