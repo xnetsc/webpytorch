@@ -122,7 +122,12 @@ cost 3.4 s, more than the cliff it was fixing.
 
 **Nothing above is hardcoded on faith.** `tune(key, candidates, apply, bench, check)` runs
 the real kernel over the candidates at load time and keeps what measured fastest, per shape
-(`_warm_shapes`). Two rules were learned the hard way and are enforced in `bench`: batch
+(`_warm_shapes`). That phase runs every distinct `(format, N, K)` at **three row counts**,
+not one: a shader compiles on its first dispatch rather than when it is registered, and the
+prefill path branches on the row count — one row reaches the decode GEMV, three the batched
+kernel, `_GGML_DEQ_M` the one that unpacks the weights and runs a plain fp32 matmul. Warming
+only the first left the other two to compile in front of the reader, as seconds before the
+first token of the first reply. Two rules were learned the hard way and are enforced in `bench`: batch
 24 dispatches per sync, or you measure the 1–2 ms readback instead of the kernel; and
 interleave the candidates, because the same configuration measured 7.61 ms and 4.49 ms in
 one session when run in blocks. Where measurement said a knob does not pay (`_GGML_KSG`,

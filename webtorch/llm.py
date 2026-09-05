@@ -2885,6 +2885,18 @@ class CausalLM:
         self._gcache = cache
         return cache, 0
 
+    @staticmethod
+    def _shape_owner_of(layers, type_name, nt, kt):
+        """One layer that has this (format, N, K), or None. The warm pass keeps shapes, not
+        layers, so getting back to something callable takes a second look."""
+        for lay in layers or []:
+            for v in lay.values():
+                if (getattr(v, "packed", None) is not None and hasattr(v, "Kt")
+                        and v.type_name == type_name
+                        and int(v.Nt) == int(nt) and int(v.Kt) == int(kt)):
+                    return v
+        return None
+
     def _warm_shapes(self):
         """Run each distinct quantised matmul shape once, so the tuner settles during the
         load instead of during the first reply. Best-effort: a model whose weights are not
@@ -2924,6 +2936,35 @@ class CausalLM:
             if held:
                 held[-1].numpy()
             held.clear()
+            # And once more with a BATCH, because the two are different kernels and only one
+            # of them was being built here. A shader compiles on its first dispatch, not when
+            # it is registered, so a variant nothing dispatched during the load is one the
+            # reader waits for -- and the row count above is 1, which reaches the decode GEMV
+            # and nothing else. The batched kernel, and the unpacking path that a wide enough
+            # matmul prefers over it, were both built by the first PROMPT instead: this phase
+            # reported nothing while the first reply spent seconds before its first token.
+            #
+            # Two row counts, because the prefill path branches on the row count and each
+            # branch is a different kernel. Three rows is the first that leaves the decode
+            # GEMV and reaches the batched kernel; `_GGML_DEQ_M` is the threshold above which
+            # it prefers to unpack the weights and run a plain fp32 matmul instead. Warm one
+            # and the other still compiles in front of the reader.
+            #
+            # One shape per distinct (format, N, K), not one per layer, so this is a pass over
+            # a few dozen tensors rather than over the model.
+            for m in (3, int(getattr(wt, "_GGML_DEQ_M", 32))):
+                try:
+                    for tname, nt, kt in list(seen):
+                        lay = self._shape_owner_of(getattr(self, "layers", []),
+                                                   tname, nt, kt)
+                        if lay is None:
+                            continue
+                        held.append(lay(wt.Tensor(np.zeros((m, int(kt)), np.float32))))
+                    if held:
+                        held[-1].numpy()
+                except Exception:
+                    pass
+                held.clear()
             wt.flash_tune(self.NH, self.NKV, self.HD)
             # What this phase actually spent, broken down, so the next slow load is a table
             # rather than an argument. Timing only; it changes nothing.

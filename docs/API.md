@@ -438,6 +438,11 @@ Both answers belong to a **device**. Neither changes between loads, or between m
 settling them costs a shader compile and a numerical check per variant, and that is the
 `warming` stage a caller sees: on a 27B it was **107 s**, and on a 0.6B it is ~1.2 s.
 
+A profile shortens that stage by skipping the *checks*, not the *compiles*: a shader is
+compiled by its first dispatch, so the variants are still dispatched once each during
+warming. That is deliberate — the alternative is a load that looks instant and a first reply
+that waits seconds before its first token.
+
 So they are offered as data, and where a profile lives is the caller's decision.
 
 ```python
