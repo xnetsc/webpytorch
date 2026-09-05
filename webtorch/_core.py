@@ -2172,12 +2172,21 @@ def use_kernel_profile(profile):
 
 _GQA_TUNED = {}
 
-def gqa_tune(nh, nkv, hd, n, candidates=(4, 8, 16, 32), rounds=5):
+def gqa_tune(nh, nkv, hd, n, candidates=(1, 4, 8, 16, 32), rounds=5):
     """Pick the split factor for this device at this context length, by running them.
 
     Cheap enough to do at load: it times the attention kernel alone, not a whole step. The
     answer is remembered per (shape, context bucket) -- `n` is bucketed by powers of four,
     because the ranking moves with the order of magnitude of the scan and not with a token.
+
+    **1 is a candidate**, and it is the one that was missing. Splitting costs a second
+    dispatch per attention layer -- the partials and then the merge -- and it buys parallelism
+    that a short scan does not need. The four factors offered were four ways to split and no
+    way to decline, so a model that wanted to decline could not: a 0.6B at a 66-token context
+    ran 591 dispatches a step against 567 before splitting was turned on, one extra per layer
+    for 28 layers, and its step went from 6.69 ms to 9.89 ms. The commit that turned splitting
+    on says what it is for -- it flattens the context curve -- and a context of 66 has no
+    curve to flatten.
     """
     global _GQA_SPLIT, _GQA_SPLIT_ON
     import time as _t
