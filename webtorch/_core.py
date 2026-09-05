@@ -6069,8 +6069,6 @@ def ggml_dequant_ok(type_name):
     property the fast path claims. A format that disagrees keeps the quantised path: slower,
     and right.
     """
-    if type_name in _DEQ_OK:
-        return _DEQ_OK[type_name]
     # A format that decodes through a codebook has twice been measured returning the buffer
     # a DIFFERENT format left behind -- the signature of a kernel that did not run -- and
     # twice done so intermittently, passing the same comparison moments earlier. The binding
@@ -6088,9 +6086,17 @@ def ggml_dequant_ok(type_name):
     # path off, 1.x with it on. The unpacked copy is eight times the packed bytes, and this
     # model already fills the machine; the kernel is not what is slow, the residency it
     # destroys is. So the test asks what the comment above always meant.
+    #
+    # Asked BEFORE the remembered answer, not after. A profile records what a device
+    # measured; it cannot grant a path this file refuses, and it was doing exactly that --
+    # `use_kernel_profile` writes `_DEQ_OK` directly, so a profile saved by the build where
+    # these formats slipped through went on re-enabling them under the build that fixed it.
+    # The refusal is policy. Only the measurement below is cacheable.
     if _GGML_TYPES[type_name][4] is not None or "fn kvfill" in _GGML_TYPES[type_name][1]:
         _DEQ_OK[type_name] = False
         return False
+    if type_name in _DEQ_OK:
+        return _DEQ_OK[type_name]
     ok = False
     try:
         vals = int(_GGML_TYPES[type_name][2])
