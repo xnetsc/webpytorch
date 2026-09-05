@@ -1969,19 +1969,44 @@ def _ggml_shape_for(type_name, N, K, packed):
     xd = _contig(Tensor(np.zeros((1, int(K)), np.float32)).data)
     state = {"kind": fallback}
 
+    import time as _t
+
     def apply(kind):
         state["kind"] = kind
         k = (type_name, 1, kind, False)
         if k not in _ggml_k["added"]:
+            t0 = _t.perf_counter()
             _ggml_add(type_name, 1, kind, False)
             _ggml_k["added"].add(k)
+            _TUNE_COST["build_s"] += _t.perf_counter() - t0
+            _TUNE_COST["variants"] += 1
 
     def check(kind):
+        # The check validates a KERNEL, and a kernel is (format, mode, thread shape, moe) --
+        # it does not depend on N or K, which only size the test data. But this is called per
+        # (shape, candidate), so the same handful of kernels is re-verified once per shape:
+        # measured on a 0.6B, 24 checks for 6 distinct kernels, and 5.20s of the 6.40s the
+        # whole tuning phase cost. On a 27B it is 96 checks for 36 kernels.
+        #
+        # So the answer is remembered per kernel -- but ONLY when it was reached with the
+        # coverage the check itself demands. `_selfcheck_one` explains why three blocks per
+        # row is the minimum: with one, every block offset is zero and a decode fragment that
+        # reads a word directly looks correct while being wrong everywhere else. A pass with
+        # thinner coverage than that answers for itself and for nothing after it.
+        ck = (type_name, 1, kind, False)
+        if ck in _CHECKED:
+            return _CHECKED[ck]
+        t0 = _t.perf_counter()
         try:
             _selfcheck_one(type_name, 1, kind, False, int(N), nb)
-            return True
+            ok = True
         except Exception:
-            return False
+            ok = False
+        finally:
+            _TUNE_COST["check_s"] += _t.perf_counter() - t0
+        if nb >= 3:
+            _CHECKED[ck] = ok
+        return ok
 
     # Many dispatches per sync. A readback costs 1-2ms on this stack and one decode matmul
     # costs tens of microseconds, so timing them one at a time measures the readback and
@@ -2002,8 +2027,23 @@ def _ggml_shape_for(type_name, N, K, packed):
             o = _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"])
         o.get()
 
-    return tune(key, ("narrow", "shortk", None), apply, bench, check=check,
-                default=fallback)
+    _t0 = _t.perf_counter()
+    try:
+        return tune(key, ("narrow", "shortk", None), apply, bench, check=check,
+                    default=fallback)
+    finally:
+        _TUNE_COST["tune_s"] += _t.perf_counter() - _t0
+        _TUNE_COST["shapes"] += 1
+
+
+_CHECKED = {}
+_TUNE_COST = {"tune_s": 0.0, "build_s": 0.0, "check_s": 0.0,
+              "shapes": 0, "variants": 0}
+
+
+def tune_cost():
+    """Where the load's tuning time went, since the process started. Timing only."""
+    return dict(_TUNE_COST)
 
 
 _GQA_TUNED = {}

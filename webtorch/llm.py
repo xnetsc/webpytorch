@@ -2925,6 +2925,19 @@ class CausalLM:
                 held[-1].numpy()
             held.clear()
             wt.flash_tune(self.NH, self.NKV, self.HD)
+            # What this phase actually spent, broken down, so the next slow load is a table
+            # rather than an argument. Timing only; it changes nothing.
+            try:
+                c = wt.tune_cost()
+                _load_stage("warming", done=int(c.get("shapes") or 0),
+                            total=int(c.get("variants") or 0))
+                import js
+                js.console.log(
+                    "warm: %d shapes, %d variants | tune %.1fs (build %.1fs, check %.1fs)"
+                    % (c.get("shapes", 0), c.get("variants", 0), c.get("tune_s", 0.0),
+                       c.get("build_s", 0.0), c.get("check_s", 0.0)))
+            except Exception:
+                pass
         except Exception:
             pass
 
