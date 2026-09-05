@@ -2213,12 +2213,22 @@ def gqa_tune(nh, nkv, hd, n, candidates=(1, 4, 8, 16, 32), rounds=5):
             o.numpy()                                   # warm and settle
         best, best_ms = was, None
         times = {sp: [] for sp in candidates}
+        # Many dispatches per sync, for the reason this file states next to the other tuner
+        # and had not applied here: a readback is 1-2 ms and this kernel is a fraction of
+        # one, so one dispatch per timing measures the sync. That is not a small error -- it
+        # is the whole measurement, and it made the ranking noise. The cost of the extra
+        # dispatch a split needs is precisely what was being drowned out, so the tuner kept
+        # choosing to split on a model that a split makes slower.
+        REP = 24
         for _ in range(rounds):
             for sp in candidates:
                 _set_split(sp)
                 t0 = _t.perf_counter()
-                gqa_decode(q, kc, vc, mask, 1.0, valid=n).numpy()
-                times[sp].append(_t.perf_counter() - t0)
+                o = None
+                for _r in range(REP):
+                    o = gqa_decode(q, kc, vc, mask, 1.0, valid=n)
+                o.numpy()
+                times[sp].append((_t.perf_counter() - t0) / REP)
         for sp, xs in times.items():
             xs.sort()
             med = xs[len(xs) // 2]

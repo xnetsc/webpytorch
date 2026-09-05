@@ -144,7 +144,9 @@ held 3477 dispatches against 1749 for the same graph recorded again mid-reply, a
 the difference for every token until it was replaced. Two rules were learned the hard way and are enforced in `bench`: batch
 24 dispatches per sync, or you measure the 1–2 ms readback instead of the kernel; and
 interleave the candidates, because the same configuration measured 7.61 ms and 4.49 ms in
-one session when run in blocks. Where measurement said a knob does not pay (`_GGML_KSG`,
+one session when run in blocks. Both rules apply to `gqa_tune` as well, and the first one
+was not applied there for a while — it timed one dispatch per candidate, so it measured the
+sync, and the extra dispatch a split costs is exactly what that drowns out. Where measurement said a knob does not pay (`_GGML_KSG`,
 widening `_SMALL_N`) it is *not* made dynamic, and the negative result is recorded next to
 the constant so it is not rediscovered.
 
