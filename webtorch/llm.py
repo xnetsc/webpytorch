@@ -2796,13 +2796,22 @@ class CausalLM:
             again = {k: c.get(k, 0) - b.get(k, 0) for k in c}
             extra = {k: first.get(k, 0) - again.get(k, 0) for k in first
                      if first.get(k, 0) != again.get(k, 0)}
+            import js
             if extra:
-                import js
                 js.console.log(
                     "warm: the first decode step dispatched %d commands a second does not: %s"
                     % (sum(extra.values()),
                        ", ".join("%s x%d" % (k, v) for k, v in
                                  sorted(extra.items(), key=lambda kv: -kv[1])[:12])))
+            # And what one settled step is made of, by kernel. A step's cost is its commands,
+            # and "591 against 567" says only that four and twenty went somewhere; this says
+            # which kernels they are. Printed once, at load, from the second run -- the one
+            # with nothing left to register.
+            js.console.log("decode step: %d dispatches | %s"
+                           % (sum(again.values()),
+                              "  ".join("%s x%d" % (k, v) for k, v in
+                                        sorted(again.items(), key=lambda kv: -kv[1])
+                                        if v)))
         except Exception:
             pass                      # best effort: a model that cannot do this still loads
         finally:
