@@ -129,7 +129,14 @@ kernel. Warming only the first left the batched kernel to compile in front of th
 The third branch, at `_GGML_DEQ_M` rows, unpacks the weights to fp32 and is deliberately
 **not** warmed: building it here would also materialise an unpacked copy per shape during
 the load, and on a machine the model already fills, making room for those is what pushes the
-weights back out. Two rules were learned the hard way and are enforced in `bench`: batch
+weights back out.
+
+Feeding the weights one at a time is not the same as running a step, so a **whole decode
+step** runs at the end of `_init_state` as well (`_warm_decode_step`), outside any recording.
+Whatever a first `_decode_fwd` does that a later one does not, it must not do it while the
+decode graph is being recorded: measured on a dense 27B, the first recording of that graph
+held 3477 dispatches against 1749 for the same graph recorded again mid-reply, and replayed
+the difference for every token until it was replaced. Two rules were learned the hard way and are enforced in `bench`: batch
 24 dispatches per sync, or you measure the 1–2 ms readback instead of the kernel; and
 interleave the candidates, because the same configuration measured 7.61 ms and 4.49 ms in
 one session when run in blocks. Where measurement said a knob does not pay (`_GGML_KSG`,

@@ -2746,6 +2746,47 @@ class CausalLM:
                 probe = wt.gqa_decode(wt.Tensor(np.zeros((NH, 1, HD), np.float32)),
                                       self.Kc[0], self.Vc[0], self.mask_b, 1.0, ctl=self.ctl)
                 self._fused_attn = probe is not None
+            self._warm_decode_step()
+
+    def _warm_decode_step(self):
+        """Run one decode step here, where nothing is recording.
+
+        A kernel is registered the first time a matmul of its shape runs, and registering it
+        RUNS it: the numerical self-check that guards against a shader which compiled to
+        nothing dispatches the kernel it is checking. If the first such shape is reached
+        inside `beginCapture`, those dispatches are recorded into the decode graph -- and a
+        recorded graph is replayed in full for every token of the reply.
+
+        Measured on a dense 27B, the same graph from the same source, recorded twice in one
+        reply -- once at the start and once when the cache ran out of rows:
+
+            first recording   6990 buffers   3477 dispatches
+            re-recording      3524 buffers   1749 dispatches
+
+        1749 is what this model needs; the repository's own record for it after the fused
+        SwiGLU landed is 1759. The first recording carries 1728 more, which is 27 x 64 --
+        one layer's worth of commands, times its layer count -- and replays them for every
+        token until the second recording replaces it. That token is where the per-token cost
+        falls three-fold and stays down.
+
+        What exactly those 1728 are has not been pinned down. What is certain is that they
+        are recorded by the FIRST `_decode_fwd` and not by a later one, so running one before
+        anything is recording is what keeps them out of the graph. `_warm_shapes` cannot do
+        it: it runs before the state a decode step needs exists, and it feeds the weights one
+        at a time rather than running the step, so nothing between them -- the recurrent
+        scan, the fused attention at one position, the elementwise chain at one row -- is
+        reached at the shape a decode step uses.
+
+        The recurrent layers advance their state, so it is put back: that state belongs to a
+        conversation, and this is not one.
+        """
+        try:
+            self._set_inputs(int(self.eos_ids[0]) if getattr(self, "eos_ids", None) else 0, 0)
+            self._decode_fwd().numpy()
+        except Exception:
+            pass                      # best effort: a model that cannot do this still loads
+        finally:
+            self._reset_linear_state()
 
     # ---- prefill (fresh, fills KV 0..P-1) ----
     def _capturable(self):
