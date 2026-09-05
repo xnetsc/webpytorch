@@ -2247,38 +2247,33 @@ function normalizeMath(src) {
     parts[i] = parts[i]
       .replace(/\\\[([\s\S]*?)\\\]/g, (_, f) => '$$' + f.trim() + '$$')
       .replace(/\\\(([\s\S]*?)\\\)/g, (_, f) => '$' + f.trim() + '$')
-      // Any `$$ … $$` that spans lines, put on one line. Two things this has to get right,
-      // both from what models actually emit:
+      // Display math that spans lines, put on one line -- however many dollars the model
+      // put on each end.
       //
-      //   * The opener is not always followed by a newline. `$$\begin{aligned}` opens an
-      //     aligned block on the same line, and a pattern anchored on `$$\n` never sees it --
-      //     the whole environment arrived as literal text, delimiters and all.
-      //   * The newlines INSIDE the body have to go too. Trimming only the ends leaves a
-      //     two-line formula two lines long, which is the state that fails to render.
+      // Two reasons this is a RUN of dollars rather than a pair of them. The count is not
+      // reliable: one model in one afternoon opened with `$` and closed with `$$`, and
+      // opened with `$$` and closed with `$$$`, and the leftover dollar lands in the answer
+      // as text. And the newline is not reliable either -- `$$\begin{aligned}` opens on the
+      // delimiter's own line, so a pattern anchored on `$$\n` never sees it and the whole
+      // environment arrives as literal text, backslashes and all.
       //
-      // The body may not itself contain `$$`: one reply wrote
-      //     $$\n<formula> $$\n$$\n<formula>\n$$
-      // -- the first block closing at the end of its own line -- and a pattern without that
-      // guard ran straight through the boundary, truncating the first formula and leaving
-      // the second as literal delimiters. A body containing a blank line is left alone as
-      // well: that is two paragraphs around an unpaired `$$`, not a formula.
-      .replace(/\$\$((?:(?!\$\$)[\s\S])*?)\$\$/g,
-               (all, f) => (/\n/.test(f) && !/\n[ \t]*\n/.test(f)
-                            ? '$$' + f.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
-                            : all))
-      // A fence that lost a dollar. Models write display math with the two ends disagreeing
-      // -- `$` to open and `$$` to close is one this page has actually produced -- and the
-      // balanced rule above cannot see it, so the reader gets the delimiters as text.
+      // Collapsing the newlines INSIDE the body is the point of the rule, not tidiness:
+      // `breaks: true` makes the paragraph tokenizer swallow a multi-line run and turn its
+      // newlines into <br>, so marked's block-level `$$` rule never gets a block to match.
+      // Trimming only the ends leaves a two-line formula two lines long, which is the state
+      // that fails to render.
       //
-      // Taken only on evidence that display math was meant, because a lone `$` is a currency
-      // sign far more often than it is a formula: ONE of the two ends must be a real `$$`,
-      // both must stand alone against a line end, and the body must hold neither a blank line
-      // nor another `$$`. `$5` mid-sentence matches none of that.
-      .replace(/(^|\n)(\$\$?)[ \t]*\n([\s\S]*?)\n[ \t]*(\$\$?)(?=\n|$)/g,
-               (all, pre, open, body, close) =>
-                 ((open === '$$' || close === '$$')
-                  && !/\n[ \t]*\n/.test(body) && !/\$\$/.test(body)
-                    ? pre + '$$' + body.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
+      // Three guards, because a lone `$` is a currency sign far more often than a fence:
+      // the opening run must start a line, the closing run must end one, and one of the two
+      // must carry at least two dollars. `it costs $5 today\nand $10 tomorrow` fails all
+      // three. A body containing a `$$` run of its own is left alone as well -- that is two
+      // formulas, or two paragraphs around an unpaired fence, not one formula.
+      .replace(/(^|\n)([ \t]*)(\$+)((?:(?!\$\$)[\s\S])*?)(\$+)[ \t]*(?=\n|$)/g,
+               (all, pre, indent, open, body, close) =>
+                 ((open.length > 1 || close.length > 1)
+                  && /\n/.test(body) && !/\n[ \t]*\n/.test(body)
+                    ? pre + indent + '$$'
+                      + body.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
                     : all));
   }
   return parts.join('');
