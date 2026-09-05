@@ -2154,15 +2154,25 @@ function normalizeMath(src) {
     parts[i] = parts[i]
       .replace(/\\\[([\s\S]*?)\\\]/g, (_, f) => '$$' + f.trim() + '$$')
       .replace(/\\\(([\s\S]*?)\\\)/g, (_, f) => '$' + f.trim() + '$')
-      // The body may not itself contain `$$`, and the closer may sit at the end of the
-      // formula's own line. Both come from what models actually emit: one wrote
+      // Any `$$ … $$` that spans lines, put on one line. Two things this has to get right,
+      // both from what models actually emit:
+      //
+      //   * The opener is not always followed by a newline. `$$\begin{aligned}` opens an
+      //     aligned block on the same line, and a pattern anchored on `$$\n` never sees it --
+      //     the whole environment arrived as literal text, delimiters and all.
+      //   * The newlines INSIDE the body have to go too. Trimming only the ends leaves a
+      //     two-line formula two lines long, which is the state that fails to render.
+      //
+      // The body may not itself contain `$$`: one reply wrote
       //     $$\n<formula> $$\n$$\n<formula>\n$$
-      // -- the first block closed on its own line's end -- and a pattern that only looked
-      // for a newline before the closer ran straight THROUGH that boundary, swallowing the
-      // `$$` between the two blocks. The first formula came out truncated and the second
-      // was left as literal `$$` delimiters in the reply.
-      .replace(/\$\$[ \t]*\n((?:(?!\$\$)[\s\S])*?)\s*\$\$/g,
-               (_, f) => '$$' + f.trim() + '$$');
+      // -- the first block closing at the end of its own line -- and a pattern without that
+      // guard ran straight through the boundary, truncating the first formula and leaving
+      // the second as literal delimiters. A body containing a blank line is left alone as
+      // well: that is two paragraphs around an unpaired `$$`, not a formula.
+      .replace(/\$\$((?:(?!\$\$)[\s\S])*?)\$\$/g,
+               (all, f) => (/\n/.test(f) && !/\n[ \t]*\n/.test(f)
+                            ? '$$' + f.trim().replace(/[ \t]*\n[ \t]*/g, ' ') + '$$'
+                            : all));
   }
   return parts.join('');
 }
