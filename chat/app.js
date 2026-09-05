@@ -1850,8 +1850,11 @@ function messageNode(m, live) {
     if (pn && pn.length) {
       extra += '  ·  pins ' + pn.map(p => p[0] + '/' + (p[1] / 1e6).toFixed(0) + 'MB').join(' → ');
     }
-    // What the prompt had left sitting in the reuse pool when the reply started.
-    if (m.stats.pool_freed) {
+    // What the prompt had left sitting in the reuse pool when the reply started. Printed
+    // even when it is zero: absent and zero are different answers, and a footer that shows
+    // nothing for both makes "the pool was empty" indistinguishable from "this build predates
+    // the field" -- which cost a reading.
+    if (m.stats.pool_freed != null) {
       extra += '  ·  pool -' + (m.stats.pool_freed / 1e6).toFixed(0) + 'MB';
     }
     f.textContent = (m.stats.n || 0) + ' tokens · ' + Number(m.stats.tok_s).toFixed(1)
