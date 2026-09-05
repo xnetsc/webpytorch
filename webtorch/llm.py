@@ -3244,7 +3244,7 @@ class CausalLM:
         # it: the GPU step, and everything the host does between steps. A reply that is slow
         # because the device is busy and one that is slow because the sampler is are the same
         # number from outside, and they have nothing in common as problems.
-        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": []}
+        span = {"gpu": 0.0, "pick": 0.0, "path": "?", "each": [], "recut": []}
 
         def _stats(n, truncated, steps, t_first):
             each = span["each"]
@@ -3269,6 +3269,12 @@ class CausalLM:
                 out["gpu_ms_curve"] = [round(sum(c) * 1000 / len(c), 2) for c in curve if c]
                 out["gpu_ms_head"] = out["gpu_ms_curve"][0]
                 out["gpu_ms_tail"] = out["gpu_ms_curve"][-1]
+            # Where the decode graph was re-recorded, in tokens. It happens when the cache
+            # runs out of rows mid-reply, and it is the only thing in the loop that REPLACES
+            # what every later step runs. If the per-token cost changes shape at one of these
+            # points, that is the cause; if it changes anywhere else, this rules the graph out.
+            if span["recut"]:
+                out["recaptured_at"] = list(span["recut"])
             self.last_stream = out
             return out
 
@@ -3325,6 +3331,7 @@ class CausalLM:
                     break                       # just-yielded text satisfies the constraint
                 _step = 0.0
                 if pos >= self.kv_cap:              # out of rows -- see `generate`
+                    span["recut"].append(n)
                     self._kv_reserve(pos + 1)
                     self._set_inputs(nxt, pos)
                     plat.beginCapture("decode")
