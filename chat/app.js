@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=7c91621170');
+const worker = new Worker('worker.js?v=06075690da');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -1811,9 +1811,13 @@ function messageNode(m, live) {
     // because the host is between steps read the same from outside and are different
     // problems. Only shown when a token cost enough to be worth explaining.
     let extra = '';
+    // Shown whenever both are known, at any speed. The threshold that used to hide this
+    // below 20 ms had it backwards: the faster the model, the larger the share the host
+    // takes, and hiding the split exactly there is hiding it where it decides the answer.
     const g = m.stats.gpu_ms, k = m.stats.pick_ms;
-    if (g != null && k != null && (g + k) >= 20) {
-      extra = '  ·  GPU ' + Number(g).toFixed(0) + ' ms + host ' + Number(k).toFixed(0) + ' ms';
+    if (g != null && k != null) {
+      const dp = (g + k) < 20 ? 2 : 0;      // a 6 ms step is not "6 ms + 2 ms"
+      extra = '  ·  GPU ' + Number(g).toFixed(dp) + ' ms + host ' + Number(k).toFixed(dp) + ' ms';
       // The mean alone cannot say whether a reply was slow throughout, slow until it warmed
       // up, or slowing as it went, and those want different answers. When the cost actually
       // moved across the reply, show it moving: one figure per tenth, in order. Shown only

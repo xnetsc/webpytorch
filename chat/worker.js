@@ -442,6 +442,7 @@ else:
 _s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
 json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
             "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s"),
+            "context": _s.get("context"),
             "gpu_ms": _s.get("gpu_ms"), "pick_ms": _s.get("pick_ms"),
             "gpu_ms_head": _s.get("gpu_ms_head"), "gpu_ms_tail": _s.get("gpu_ms_tail"),
             "gpu_ms_curve": _s.get("gpu_ms_curve"),
