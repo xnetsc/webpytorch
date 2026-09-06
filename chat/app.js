@@ -662,7 +662,7 @@ function showSlowNote(rate, gb, lim) {
 // and nothing that reaches a conversation, a file, or anything typed.
 const DBG_ON_KEY = 'webtorch.dbgEnabled';
 const DBG_URL_KEY = 'webtorch.dbgUrl';
-const DBG_URL_DEFAULT = 'wss://broker.hivemq.com:8884/mqtt';
+const DBG_URL_DEFAULT = 'wss://test.mosquitto.org:8081';
 // 128 bits of it, because the topic is the only thing standing between a public broker and
 // this page's diagnostics: it has to be unguessable, and it has to end.
 //
