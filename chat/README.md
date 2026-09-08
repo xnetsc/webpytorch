@@ -19,6 +19,11 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   the one holding the model, with output, tracebacks and matplotlib figures inline.
 - **Replies that render.** Markdown, highlighted code, LaTeX via KaTeX, tables — sanitised
   before they reach the DOM — and each block is editable in place.
+- **A tool round is its own block.** A reply built over several tool calls keeps a blank line
+  between the rounds, so a round that ends in a code fence and one that opens with another
+  cannot merge into a token that is neither. And a round that is nothing but one
+  ```` ```markdown ```` fence is unwrapped — a model handing back "the markdown" inside a code
+  block meant the markdown, not a picture of it.
 - **Enter belongs to the input method first.** Typing Chinese, Japanese or Korean assembles
   characters in the field and Enter is how the input method accepts them — so Enter does not
   send while a composition is open, and Escape does not close an editor around one.

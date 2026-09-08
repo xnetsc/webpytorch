@@ -2268,6 +2268,23 @@ const MD_ATTR = ['aria-hidden', 'style', 'class', 'encoding', 'displaystyle', 's
 //
 // Code is left exactly as written -- a fenced block or a span of inline code that happens to
 // contain `$$` means the characters, not a formula.
+// A reply that is nothing but one ```markdown fence is a wrapper, not content.
+//
+// Models do this -- they are asked for markdown and hand back the markdown IN a code block --
+// and taken at face value the whole answer renders as source: no headings, no typeset
+// formulas, backslashes on show. Unwrapped only when the fence spans the ENTIRE text and
+// says markdown, because a reply that is one markdown code block and nothing else cannot be
+// a reply that MEANT to show markdown source; anything with a word outside the fence is left
+// exactly as it is.
+function unfenceMarkdown(text) {
+  const m = /^\s*(`{3,})(?:markdown|md)[ \t]*\n([\s\S]*?)\n?\1\s*$/i.exec(String(text || ''));
+  if (!m) return text;
+  // A fence ends at the FIRST line that closes it, so a body containing one is not one
+  // wrapper -- it is two blocks that happen to start and end the text, and unwrapping them
+  // would splice their insides together with the fences between them left as prose.
+  return new RegExp('^' + m[1] + '[ \\t]*$', 'm').test(m[2]) ? text : m[2];
+}
+
 function normalizeMath(src) {
   const parts = String(src).split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/g);
   for (let i = 0; i < parts.length; i += 2) {          // odd indices are the code spans
@@ -2825,6 +2842,16 @@ async function runTurn(conv, msg, existing) {
                      err && err.message);
         r = await call('generate', opts);
       }
+      // A round's text is a block of its own, and used to be glued to the previous round's
+      // with nothing between them. A round that ends in a code fence and one that opens with
+      // another then merge into a single six-backtick token, which is neither a valid closer
+      // nor a clean opener -- so every fence after it takes the wrong role. Seen: the first
+      // round rendered as a code block with "``````markdown" as its last line, the second
+      // rendered normally, and a leftover opener left an empty block at the end.
+      if (round && reply.content && !/\n\n$/.test(reply.content)) {
+        reply.content += /\n$/.test(reply.content) ? '\n' : '\n\n';
+        streamedLen = reply.content.length;
+      }
       const raw = reply.content.slice(streamedLen);      // this round's reply, nothing else
       streamedLen = reply.content.length;
       const prefix = reply.content.slice(0, streamedLen - raw.length);
@@ -2833,7 +2860,7 @@ async function runTurn(conv, msg, existing) {
       // printed as prose. Reading a model's own call format is the SDK's job, not this
       // page's -- see `toolcall.py` and the tokenizer's `tool_call_format`.
       const scan = await call('toolScan', { text: raw, tools: toolDefs() });
-      const shown = scan.shown;                          // prose kept, protocol removed
+      const shown = unfenceMarkdown(scan.shown);         // prose kept, protocol removed
       if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) {
         // No round comes back around to tidy this one, so it tidies itself.
         reply.content = prefix + shown;
