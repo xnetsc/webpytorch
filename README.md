@@ -7,12 +7,20 @@
 **No server. No install. No native runtime.**
 PyTorch-compatible, on the GPU, in Python — inside the page.
 
+## ▶ [Try it now — it runs in your browser](https://xnetsc.github.io/webpytorch/chat/)
+
+<sub>Nothing to install and nothing uploaded: the weights go to your browser's own cache and
+the model runs on your GPU. Start with <b>Qwen3-0.6B (0.4 GB)</b> and you are chatting in
+under a minute; the multi-gigabyte models are the same page, just a longer download. Needs
+WebGPU for the fast path — WebGL is a working fallback, not a broken state.</sub>
+
 <img src="images/chat-desktop.png" alt="webtorch chat: a 30B MoE answering in the browser, with typeset LaTeX and highlighted code" width="900">
 
 <sub>Qwen3-30B-A3B answering in a tab — 13.8 GB of weights, 32 tok/s, nothing installed.</sub>
 
-[Quickstart](#quickstart) · [What it does](#what-it-does) · [Speed](#speed) ·
-[The chat app](#the-chat-app) · [Docs](docs/API.md)
+[**Live demo**](https://xnetsc.github.io/webpytorch/chat/) · [Quickstart](#quickstart) ·
+[What it does](#what-it-does) · [Speed](#speed) · [The chat app](#the-chat-app) ·
+[Docs](docs/API.md)
 
 </div>
 
@@ -124,6 +132,8 @@ than reading the weights does.
 ## The chat app
 
 A complete local chat client lives in [`chat/`](chat/) — the SDK driving a real interface.
+It is deployed as it stands: **[open it](https://xnetsc.github.io/webpytorch/chat/)**, and
+everything below is a page you can use rather than a screenshot of one.
 
 <table>
 <tr>
