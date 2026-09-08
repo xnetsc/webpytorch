@@ -21,9 +21,14 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   before they reach the DOM — and each block is editable in place.
 - **A tool round is its own block.** A reply built over several tool calls keeps a blank line
   between the rounds, so a round that ends in a code fence and one that opens with another
-  cannot merge into a token that is neither. And a round that is nothing but one
-  ```` ```markdown ```` fence is unwrapped — a model handing back "the markdown" inside a code
-  block meant the markdown, not a picture of it.
+  cannot merge into a token that is neither. That newline is the only thing the app puts
+  between two generations; neither round's own text is touched.
+- **Rendering never edits the record.** A reply that is nothing but one ```` ```markdown ````
+  fence is displayed unwrapped — a model handing back "the markdown" inside a code block meant
+  the markdown, not a picture of it — but the message keeps exactly what the model produced.
+  When what is shown differs from what is stored, per-block editing is not offered: those
+  blocks are addressed by index into the stored text, and offering an editor whose indices
+  point somewhere else is worse than offering none.
 - **Enter belongs to the input method first.** Typing Chinese, Japanese or Korean assembles
   characters in the field and Enter is how the input method accepts them — so Enter does not
   send while a composition is open, and Escape does not close an editor around one.

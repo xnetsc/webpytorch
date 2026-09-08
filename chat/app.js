@@ -2661,6 +2661,11 @@ function fillBody(b, msg, live) {
         rest: msg.content || '',
         open: !(msg.content || '') }
     : splitThink((msg && msg.content) || '');
+  // Unwrapped for DISPLAY only, on the way out -- `msg.content` keeps exactly what the model
+  // produced. A reply that is nothing but one ```markdown fence is a wrapper, and rendering
+  // it as written shows the answer as source: no headings, no typeset formulas, backslashes
+  // on show. Repairing the reading is allowed; repairing the record is not.
+  const shown = unfenceMarkdown(rest);
   if (live && live.det) {                                            // in-place update
     if (think !== null && !live.det.parentNode) {
       b.prepend(live.det);                                           // thinking appeared mid-stream
@@ -2675,7 +2680,7 @@ function fillBody(b, msg, live) {
       }
     }
     if (msg.toollog && msg.toollog.length) setToollogLive(live, msg.toollog);
-    setRenderedLive(live.ans, rest);      // no msg: a reply still arriving is not editable
+    setRenderedLive(live.ans, shown);     // no msg: a reply still arriving is not editable
     // A page built mid-reply appears in the reply as it is written, after the answer so far.
     // Rebuilt only when what it should SHOW changes -- how many pages, and whether the
     // reader has opened them. Counting `.webtab` cannot tell the icon from an empty panel,
@@ -2702,7 +2707,14 @@ function fillBody(b, msg, live) {
   if (msg && msg.toollog && msg.toollog.length) b.appendChild(toollogNode(msg.toollog));
   const ans = document.createElement('div');
   ans.className = 'ans';
-  setRendered(ans, rest, live ? null : msg);
+  // Blocks are editable only when the blocks ON SCREEN are the blocks IN THE RECORD.
+  // `setBlock` writes back by index into `mdBlocks(msg.content)`, so the moment the rendered
+  // text differs from the stored one -- an unwrapped fence here, or a legacy message whose
+  // thinking still lives inside `content` -- the indices mean different blocks and editing
+  // one would overwrite another. Rendering without `msg` keeps the same block layout and
+  // simply offers no per-block editor; the ✎ button still edits the message, which is the
+  // real text.
+  setRendered(ans, shown, (live || !msg || shown !== msg.content) ? null : msg);
   b.appendChild(ans);
   const web = webPanelFor(msg);
   if (web) b.appendChild(web);
@@ -2860,7 +2872,7 @@ async function runTurn(conv, msg, existing) {
       // printed as prose. Reading a model's own call format is the SDK's job, not this
       // page's -- see `toolcall.py` and the tokenizer's `tool_call_format`.
       const scan = await call('toolScan', { text: raw, tools: toolDefs() });
-      const shown = unfenceMarkdown(scan.shown);         // prose kept, protocol removed
+      const shown = scan.shown;                          // prose kept, protocol removed
       if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) {
         // No round comes back around to tidy this one, so it tidies itself.
         reply.content = prefix + shown;
