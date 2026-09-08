@@ -40,7 +40,25 @@ const gpuInit = webtorch.initMain(worker, { backendOrder: BACKEND_ORDER })
   .then(r => r.backend, () => 'cpu');
 let seq = 0; const pending = new Map();
 // Conversations live in IndexedDB so the sidebar survives a reload.
-// Each: {id, title, messages:[{role, content, attachments:[{kind,name,text,dataUrl}]}], updated}
+// Each: {id, title, updated,
+//        messages:[{role, content, attachments:[{kind,name,text,dataUrl}], meta}]}
+//
+// `meta` is what the PAGE knows about a message, as opposed to what the message says. It is
+// there so that a new thing worth remembering does not become a new field on the message and
+// a new thing every reader of a message has to know about. Two rules make it safe to put
+// anything in:
+//
+//   - it never reaches the model. The history sent to `generate` is rebuilt from `role` and
+//     `content` alone (see `runTurn`), so nothing here can end up in a prompt.
+//   - it is never rendered as text. `content` is what was said; meta only changes how that
+//     text is laid out on the way to the screen, never what it reads as.
+//
+// It is stored and exported with the message, so it has to survive `JSON.stringify`.
+//
+// `meta.offsets` is a group with a rule of its own: everything in it points INTO `content`
+// by character position. Editing the text moves every character after the edit, so the whole
+// group is dropped when that happens -- see `forgetOffsets`. Anything that is not a position
+// in the text does not belong in it, and survives an edit.
 //
 // NOT localStorage, which is where they used to be: it holds about 5 MB per origin, stores
 // only strings, and every write is synchronous on the UI thread. One conversation with a
@@ -1584,6 +1602,7 @@ function editMessage(m, body) {
   ok.onclick = () => {
     const was = m.content || '';
     m.content = ta.value;
+    if (m.content !== was) forgetOffsets(m);
     if (m.role === 'assistant') m.think = m.think === undefined ? undefined : m.think;
     const conv = current();
     // The title is this message when this message is the first one, so a changed question
@@ -1626,9 +1645,9 @@ async function reanswer(m) {
   const reply = fresh ? { role: 'assistant', content: '' } : had;
   if (fresh) conv.messages.splice(i + 1, 0, reply);
   const held = { content: reply.content, think: reply.think,
-                 toollog: reply.toollog, stats: reply.stats };
+                 toollog: reply.toollog, stats: reply.stats, meta: reply.meta };
   reply.content = ''; reply.think = undefined;
-  reply.toollog = null; reply.stats = null;
+  reply.toollog = null; reply.stats = null; reply.meta = null;
   render();                                  // the answer leaves the screen now, not later
   await runTurn(conv, m, reply);
   // "It worked" is a token, not a message object: a run that threw leaves its reason in
@@ -2268,6 +2287,48 @@ const MD_ATTR = ['aria-hidden', 'style', 'class', 'encoding', 'displaystyle', 's
 //
 // Code is left exactly as written -- a fenced block or a span of inline code that happens to
 // contain `$$` means the characters, not a formula.
+// `msg.meta`, made on demand -- and one of its groups, if asked for. Messages arrive from
+// generation, from storage and from an import, so none of them is guaranteed to have one.
+function metaOf(msg, group) {
+  const meta = msg.meta || (msg.meta = {});
+  return group ? (meta[group] || (meta[group] = {})) : meta;
+}
+
+// Everything in `meta.offsets` is a character position in `content`. Text that has been
+// edited by hand has moved every character after the edit, and there is no way to carry a
+// position across that -- a boundary that lands mid-sentence is worse than no boundary --
+// so the group goes. Nothing else in `meta` is touched: a note that is not a position in
+// the text is still true after the text changes.
+function forgetOffsets(msg) { if (msg && msg.meta) delete msg.meta.offsets; }
+
+// What a reply SHOWS, from what it stores.
+//
+// The record holds each tool round's text exactly as the model produced it, concatenated,
+// plus the offsets where one round handed over to the next. A blank line between them is a
+// reading decision, not something anyone said, so it is made here.
+//
+// The offsets index the STORED text, so they are only trusted when what is being rendered IS
+// the stored text -- a legacy message whose thinking still lives inside `content` is rendered
+// from a shorter string, and an offset into that means a different place. Empty pieces are
+// dropped rather than joined: a round that produced nothing after its call left a boundary
+// with no text behind it, and joining that would open the answer with a blank line.
+function shownText(msg, text) {
+  const off = msg && msg.content === text && msg.meta && msg.meta.offsets;
+  const cuts = (off && Array.isArray(off.rounds)) ? off.rounds : null;
+  if (!cuts || !cuts.length) return unfenceMarkdown(text);
+  const parts = [];
+  let at = 0;
+  for (const c of cuts) {
+    if (c > at && c <= text.length) { parts.push(text.slice(at, c)); at = c; }
+  }
+  parts.push(text.slice(at));
+  // Exactly one blank line between rounds, whatever a round happened to end with. Leading
+  // NEWLINES go and leading spaces stay: four spaces at the start of a round is an indented
+  // code block, and eating them would turn it into a paragraph.
+  return parts.map(t => unfenceMarkdown(t).replace(/^\n+|\s+$/g, ''))
+              .filter(Boolean).join('\n\n');
+}
+
 // A reply that is nothing but one ```markdown fence is a wrapper, not content.
 //
 // Models do this -- they are asked for markdown and hand back the markdown IN a code block --
@@ -2665,7 +2726,7 @@ function fillBody(b, msg, live) {
   // produced. A reply that is nothing but one ```markdown fence is a wrapper, and rendering
   // it as written shows the answer as source: no headings, no typeset formulas, backslashes
   // on show. Repairing the reading is allowed; repairing the record is not.
-  const shown = unfenceMarkdown(rest);
+  const shown = shownText(msg, rest);
   if (live && live.det) {                                            // in-place update
     if (think !== null && !live.det.parentNode) {
       b.prepend(live.det);                                           // thinking appeared mid-stream
@@ -2830,6 +2891,22 @@ async function runTurn(conv, msg, existing) {
     let r = null;
     let streamedLen = reply.content.length;
     for (let round = 0; ; round++) {
+      // Where this round begins, kept as an offset rather than as a separator written into
+      // the text. A round's text is a block of its own -- glued to the previous round's with
+      // nothing between them, a round ending in a code fence and one opening with another
+      // merge into a single six-backtick token, which is neither a valid closer nor a clean
+      // opener, and every fence after it takes the wrong role. But a blank line is not
+      // something the model said, so it belongs on the way to the screen and not in the
+      // record: `shownText` puts it back here.
+      //
+      // Taken BEFORE the round runs, because this is the length of everything already
+      // tidied -- the same string the round's own `prefix` will be. Taken after, it would be
+      // the end of the round's raw text, which the tool scan is about to shorten.
+      if (round && streamedLen) {
+        const off = metaOf(reply, 'offsets');
+        const rounds = off.rounds || (off.rounds = []);
+        if (rounds[rounds.length - 1] !== streamedLen) rounds.push(streamedLen);
+      }
       const opts = Object.assign({ messages: msgs, images: imgs, prompt: promptFor(msg) },
                                  genOpts());
       const withTools = toolsEnabled();
@@ -2853,16 +2930,6 @@ async function runTurn(conv, msg, existing) {
         console.warn('webtorch: this model rejected tool definitions, continuing without:',
                      err && err.message);
         r = await call('generate', opts);
-      }
-      // A round's text is a block of its own, and used to be glued to the previous round's
-      // with nothing between them. A round that ends in a code fence and one that opens with
-      // another then merge into a single six-backtick token, which is neither a valid closer
-      // nor a clean opener -- so every fence after it takes the wrong role. Seen: the first
-      // round rendered as a code block with "``````markdown" as its last line, the second
-      // rendered normally, and a leftover opener left an empty block at the end.
-      if (round && reply.content && !/\n\n$/.test(reply.content)) {
-        reply.content += /\n$/.test(reply.content) ? '\n' : '\n\n';
-        streamedLen = reply.content.length;
       }
       const raw = reply.content.slice(streamedLen);      // this round's reply, nothing else
       streamedLen = reply.content.length;
