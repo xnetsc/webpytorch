@@ -1959,6 +1959,10 @@ const UI_SYSTEM = [
   'Put code in fenced blocks with a language tag (```python).',
   'Write mathematics as LaTeX: $inline$ and $$display$$.',
   'Use tables, lists and headings where they make the answer clearer.',
+  // A tool result is already on screen, in a panel beside the reply. Small models imitate
+  // their context and start the next round by re-typing the result they were just handed;
+  // this costs the reader nothing to ignore but costs the model a good share of its reply.
+  'A tool result is already shown to the reader: use it to answer, never repeat it back.',
 ].join(' ');
 
 const PYPKG_KEY = 'webtorch.pyPackages';
@@ -2315,7 +2319,7 @@ function forgetOffsets(msg) { if (msg && msg.meta) delete msg.meta.offsets; }
 function shownText(msg, text) {
   const off = msg && msg.content === text && msg.meta && msg.meta.offsets;
   const cuts = (off && Array.isArray(off.rounds)) ? off.rounds : null;
-  if (!cuts || !cuts.length) return unfenceMarkdown(text);
+  if (!cuts || !cuts.length) return dropEchoedResults(unfenceMarkdown(text), msg);
   const parts = [];
   let at = 0;
   for (const c of cuts) {
@@ -2325,8 +2329,48 @@ function shownText(msg, text) {
   // Exactly one blank line between rounds, whatever a round happened to end with. Leading
   // NEWLINES go and leading spaces stay: four spaces at the start of a round is an indented
   // code block, and eating them would turn it into a paragraph.
-  return parts.map(t => unfenceMarkdown(t).replace(/^\n+|\s+$/g, ''))
-              .filter(Boolean).join('\n\n');
+  const joined = parts.map(t => unfenceMarkdown(t).replace(/^\n+|\s+$/g, ''))
+                      .filter(Boolean).join('\n\n');
+  return dropEchoedResults(joined, msg);
+}
+
+// A block that is nothing but a tool result the reader already has.
+//
+// Small models imitate their context. Handed a result and asked to continue, one begins the
+// next round by re-typing it inside a fence -- and it is genuinely typed, not copied: the
+// reply that prompted this had spaces after every colon where the string it was given had
+// none, and closed the object with one brace too many. So it is the model's own text and it
+// stays in the record. But the panel above the answer already holds that result, verbatim
+// and correctly formatted, which makes the copy in the answer pure noise -- and it is what
+// makes a tool round that worked look broken.
+//
+// Only an ACTUAL match is dropped. Each fenced block is compared against the results THIS
+// message recorded, whitespace ignored, and it goes only when one string is the other plus
+// a short tail -- room for the stray brace, not for a different document. A block that
+// merely looks like a dump is left alone; so is one long enough to be interesting but not
+// recorded here. And if dropping would leave nothing, nothing is dropped: a reader who
+// asked to see the raw output gets it.
+const _ECHO_MIN = 40;                    // shorter than this, a match is not evidence
+const _ECHO_SLACK = 8;                   // the tail one side may have that the other has not
+function dropEchoedResults(text, msg) {
+  const got = ((msg && msg.toollog) || []).map(t => String(t.result == null ? '' : t.result)
+                                                      .replace(/\s+/g, ''))
+                                          .filter(s => s.length >= _ECHO_MIN);
+  if (!got.length) return text;
+  let dropped = 0;
+  const out = String(text).replace(
+    /(^|\n)[ \t]*```[^\n]*\n([\s\S]*?)\n?[ \t]*```[ \t]*(?=\n|$)/g,
+    (all, pre, body) => {
+      const b = body.replace(/\s+/g, '');
+      if (b.length < _ECHO_MIN) return all;
+      const hit = got.some(g => (g.startsWith(b) || b.startsWith(g))
+                                && Math.abs(g.length - b.length) <= _ECHO_SLACK);
+      if (!hit) return all;
+      dropped++;
+      return pre;
+    });
+  const left = out.replace(/\n{3,}/g, '\n\n').trim();
+  return (dropped && left) ? left : text;
 }
 
 // A reply that is nothing but one ```markdown fence is a wrapper, not content.
