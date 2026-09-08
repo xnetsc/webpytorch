@@ -76,13 +76,17 @@ captured as a WebGPU command graph on the first token and replayed afterwards, s
 CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
 uses a split-K GQA kernel; how far to split is measured at load, not assumed.
 
-A decode step on a small model is bound by how many commands it issues, not by the bytes
-they move: a 0.6B is 0.4 GB, which at this device's ~100 GB/s is 4 ms of the step's 9.7 —
-the rest is 591 dispatches at about 16 µs each. So a dispatch that computes nothing is not
-a rounding error, and one was found by printing the step's kernels by name: `out0 = in0`,
-28 times, one per layer. It came from asking for a layout the tensor already had (see
-`_attn_out`), and `reshape` could not tell, because an axis of length 1 makes the strides
-say non-contiguous when the memory is not.
+Printing a decode step by kernel name is how you find work that is not work. On a 0.6B it
+showed `out0 = in0` — an identity copy — 28 times, one per layer, from asking for a layout
+the tensor already had (see `_attn_out`); `reshape` could not tell, because an axis of
+length 1 makes the strides say non-contiguous when the memory is not. That one is removed
+because it computes nothing, which is reason enough.
+
+It is NOT removed on the theory that the step is bound by its command count. That theory
+was tested here and failed: fusing a MoE layer's gate and up into one weight and one
+dispatch moved the step from 35.62 ms to 35.57 (see `llm.py`). A 0.6B step reads 0.4 GB in
+9.7 ms, which is ~41 GB/s against a device that reaches ~100 — so the headroom is in what
+the quantised GEMV does per value, not in how many times it is asked.
 
 Its cost splits in two, and only one half is about the model. Measured on a 0.6B: 9.05 ms
 that does not depend on the conversation, plus 0.00223 ms for every token already in it.
