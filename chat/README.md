@@ -19,6 +19,9 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   the one holding the model, with output, tracebacks and matplotlib figures inline.
 - **Replies that render.** Markdown, highlighted code, LaTeX via KaTeX, tables — sanitised
   before they reach the DOM — and each block is editable in place.
+- **Enter belongs to the input method first.** Typing Chinese, Japanese or Korean assembles
+  characters in the field and Enter is how the input method accepts them — so Enter does not
+  send while a composition is open, and Escape does not close an editor around one.
 - **Read-only until it can act.** While the runtime is starting, no model is loaded, or a
   reply is being written, the conversation stops offering to be changed — the same states in
   which the composer is already flat. A question rewritten with no way to answer it leaves a

@@ -1594,6 +1594,7 @@ function editMessage(m, body) {
       reanswer(m).catch(e => note('Error: ' + (e && e.message ? e.message : e)));
   };
   ta.addEventListener('keydown', e => {
+    if (imeKey(e)) return;
     if (e.key === 'Escape') restore();
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
   });
@@ -2040,6 +2041,7 @@ function wireRunButtons(root, msg) {
       });
       // Enter must not end the edit and Tab must indent -- this is a code box, not a form.
       code.addEventListener('keydown', (e) => {
+        if (imeKey(e)) return;
         if (e.key === 'Tab') {
           e.preventDefault();
           document.execCommand('insertText', false, '    ');
@@ -2468,6 +2470,7 @@ function wireCell(msg, i, table, cell) {
       commitTable(msg, i, table);
     });
     cell.addEventListener('keydown', (e) => {
+      if (imeKey(e)) return;
       if (e.key === 'Escape') cell.blur();
       if (e.key === 'Enter') { e.preventDefault(); cell.blur(); }   // a row is one line
     });
@@ -2522,6 +2525,7 @@ function openCellEditor(msg, i, table, cell, kind) {
   };
   box.addEventListener('click', (e) => e.stopPropagation());
   inp.addEventListener('keydown', (e) => {
+    if (imeKey(e)) return;
     if (e.key === 'Escape') close(was);
     if (e.key === 'Enter') ok.click();
   });
@@ -2613,10 +2617,23 @@ function editBlock(msg, i, node) {
     saveConvs(); render();
   };
   ta.addEventListener('keydown', e => {
+    if (imeKey(e)) return;
     if (e.key === 'Escape') redraw();
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
   });
 }
+
+// A keystroke an input method is using is not a keystroke for this page.
+//
+// Typing Chinese, Japanese or Korean goes through a composition: the characters being
+// assembled sit in the field, and Enter is how the input method ACCEPTS them. A page that
+// treats that Enter as its own sends a half-typed message -- which is what this did -- and
+// the same Escape that cancels a composition would close the editor around it.
+//
+// `isComposing` is the standard signal; `keyCode === 229` is the same fact from engines
+// that report a composing key through the legacy code instead. Both, because between them
+// they cover every browser this page runs in.
+function imeKey(e) { return !!(e.isComposing || e.keyCode === 229); }
 
 function fillBody(b, msg, live) {
   // `msg.think` is present once anything arrived on the thinking channel; `undefined` means
@@ -2893,6 +2910,7 @@ $('#send').addEventListener('click', e => {
   note('Stopping…');
 });
 $('#input').addEventListener('keydown', e => {
+  if (imeKey(e)) return;                   // the input method is accepting characters
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#composer').requestSubmit(); }
 });
 $('#newChat').onclick = () => { attachments = []; renderAttachments(); newConv();
