@@ -19,9 +19,9 @@ browser on WebGPU/WebGL (via Pyodide + a modified WgPy backend).
   a directory, so the browser bootstrap fetches `webtorch/modules.json`. Forget it and the
   module simply is not there, and you learn about it as an ImportError from inside Pyodide.
 - **Changing anything under `chat/` — run `scripts/stamp.sh`.** It puts a content hash on
-  each local script URL. Without it the browser's own memory cache answers `<script src>`
-  with the old file on the first reload after a deploy; the service worker never sees the
-  request, so it cannot help. `.githooks/check-stamp.py` refuses the commit if a stamp does
+  each local script URL **and the stylesheet's**. Without it the browser's own memory cache
+  answers `<script src>` or `<link href>` with the old file on the first reload after a
+  deploy; the service worker never sees the request, so it cannot help. `.githooks/check-stamp.py` refuses the commit if a stamp does
   not match the bytes it names — forgetting this costs a whole measurement, because the page
   keeps running the previous code while looking like it reloaded.
 

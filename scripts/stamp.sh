@@ -25,7 +25,14 @@ stamp_worker() {                   # file, worker-file-name, real-path
   v=$(h "$3")
   perl -0pi -e "s{new Worker\('\Q$2\E(\?v=[0-9a-f]+)?'\)}{new Worker('$2?v=$v')}g" "$1"
 }
+# A stylesheet is cached exactly as a script is, and a page whose CSS is one version behind
+# is a page whose layout is one version behind. It arrives through `href`, not `src`.
+stamp_href() {                     # file, path-as-written, real-path
+  v=$(h "$3")
+  perl -0pi -e "s{href=\"\Q$2\E(\?v=[0-9a-f]+)?\"}{href=\"$2?v=$v\"}g" "$1"
+}
 
+stamp_href chat/index.html "style.css"                     chat/style.css
 stamp_html chat/index.html "../dist/wgpy-main.js"          dist/wgpy-main.js
 stamp_html chat/index.html "../webtorch/js/webtorch-main.js" webtorch/js/webtorch-main.js
 stamp_html chat/index.html "zip.js"                        chat/zip.js
@@ -36,5 +43,5 @@ stamp_worker chat/app.js   "pyworker.js"                   chat/pyworker.js
 stamp_html chat/index.html "app.js"                        chat/app.js
 
 echo "stamped:"
-grep -o 'src="[^"]*?v=[0-9a-f]*"' chat/index.html | sed 's/^/  /'
+grep -oE '(src|href)="[^"]*\?v=[0-9a-f]*"' chat/index.html | sed 's/^/  /'
 grep -o "new Worker('[^']*')" chat/app.js | sed 's/^/  /'

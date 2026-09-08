@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
-<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="style.css?v=4b266da4f6" />
 
 <!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
      `crossorigin` is required, not cosmetic: this page is served with
@@ -42,6 +42,10 @@
     <div class="side-bottom">
       <div id="miniStatus" class="hint">no model loaded</div>
       <button id="openSettings" class="wide" disabled title="Waiting for the runtime…">⚙ Settings</button>
+      <!-- Where the page says what it is. A visitor who has just watched a model answer in
+           their own tab has one obvious next question, and it should not need a search. -->
+      <a class="srclink" href="https://github.com/xnetsc/webpytorch"
+         target="_blank" rel="noopener noreferrer">webtorch on GitHub ↗</a>
     </div>
   </aside>
 
@@ -243,6 +247,18 @@
     <p class="hint">Export saves every conversation as a real .zip containing JSON.</p>
   </section>
   <section class="tab-panel" id="tab-support" hidden>
+    <div class="grp">
+      <h3>What this is</h3>
+      <p class="hint">This page is a demo of <strong>webtorch</strong>, a PyTorch-compatible
+        SDK that runs in a browser tab: the weights go to this browser's own cache, the
+        layers run on your GPU through WebGPU, and the whole thing is CPython compiled to
+        WebAssembly. There is no server doing the work — close the tab and nothing of yours
+        is anywhere else.</p>
+      <p class="hint">Source, issues and documentation:
+        <a href="https://github.com/xnetsc/webpytorch" target="_blank"
+           rel="noopener noreferrer">github.com/xnetsc/webpytorch</a>. This chat app is one
+        of its examples, and it is in the repository as <code>chat/</code>.</p>
+    </div>
     <div class="grp">
       <h3>Remote diagnostics</h3>
       <p class="hint">When something goes wrong on your machine and not on ours, this is how

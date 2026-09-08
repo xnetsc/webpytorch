@@ -31,7 +31,8 @@ import sys
 # Where a stamped URL can appear. Each entry is (file that does the referencing, regex whose
 # `url` group is the path as written and whose `v` group is the stamp).
 SOURCES = [
-    ('chat/index.html', re.compile(r'src="(?P<url>[^"?]+)\?v=(?P<v>[0-9a-f]+)"')),
+    ('chat/index.html',
+     re.compile(r'(?:src|href)="(?P<url>[^"?]+)\?v=(?P<v>[0-9a-f]+)"')),
     ('chat/app.js', re.compile(r"new Worker\('(?P<url>[^'?]+)\?v=(?P<v>[0-9a-f]+)'\)")),
 ]
 

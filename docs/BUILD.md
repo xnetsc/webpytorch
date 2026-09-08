@@ -72,7 +72,7 @@ scripts/stamp.sh          # after changing anything the page loads from chat/
 
 `webtorch/modules.json` is the list the browser bootstrap fetches, because a page cannot list
 a directory — a module missing from it surfaces as an ImportError from inside Pyodide.
-`stamp.sh` puts a content hash on each local script URL (`…/webtorch-main.js?v=01f205aa85`):
+`stamp.sh` puts a content hash on each local script URL and on the stylesheet's (`…/webtorch-main.js?v=01f205aa85`, `style.css?v=…`):
 without it the browser's own memory cache answers `<script src>` with the previous file on
 the first reload after a deploy, and the service worker never sees the request. This one is
 checked — `check-stamp.py` hashes the staged bytes behind every stamped URL — because the
