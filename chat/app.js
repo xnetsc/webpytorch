@@ -522,34 +522,61 @@ function warnWebglFallback(sdkWhy) {
   dlg.showModal();
 }
 
+// What stopped the GPU backend, as far as the page can see for itself.
+//
+// `title` is set only when there is something the READER can do about it, and then it is
+// the first thing they read -- ahead of what the fallback costs, and ahead of the runtime's
+// own account. That account comes last whenever the page has one of its own, because it is
+// downstream of it: a page that cannot be isolated never installs the GPU backend, so the
+// runtime can only report the package it then failed to import -- which reads as a missing
+// dependency and sent a reader looking for one. It leads only when the page sees nothing
+// wrong, since then it is the only account there is.
+//
+// Decided by capability, never by user-agent. The case that prompted this was a browser
+// built into a chat app, and matching that app's name would cover that app; asking whether
+// the capability exists covers every browser that leaves it out. The ORDER is part of the
+// decision: a page on plain HTTP has no service worker API either, and telling a reader who
+// is already in Chrome to open the page in Chrome would be worse than saying nothing.
+function gpuBlocker(f) {
+  if (f.fileMode) return { title: null, cause:
+    'This page was opened as a file. Serve the folder over HTTP instead \u2014 a file:// page '
+    + 'cannot be cross-origin isolated, and without that the GPU backend cannot start.' };
+  if (!f.secure) return { title: 'Open this page over HTTPS', cause:
+    'It was loaded over plain HTTP from an address that is not this device, and browsers '
+    + 'only allow the shared memory the GPU backend runs on over HTTPS or on localhost.' };
+  if (!f.isolated && f.noSW) return { title: 'Open this page in Safari or Chrome', cause:
+    'This browser does not allow service workers. This site needs one to switch on the '
+    + 'shared memory the GPU backend runs on, so here everything would run on the CPU. '
+    + 'Browsers built into other apps often leave service workers out; Safari and Chrome '
+    + 'have them.' };
+  if (!f.isolated) return { title: null, cause:
+    'This page is not cross-origin isolated, so SharedArrayBuffer is unavailable and the '
+    + 'GPU backend cannot start. The server must send Cross-Origin-Opener-Policy: '
+    + 'same-origin and Cross-Origin-Embedder-Policy, or the bundled service worker must be '
+    + 'allowed to add them.'
+    + (f.swFailed ? ' The service worker failed to register: ' + f.swFailed : '') };
+  if (!f.webgpu) return { title: null, cause:
+    'This browser reports no WebGPU. Chrome or Edge 113+, or Safari 18+, have it; Firefox '
+    + 'does not yet enable it by default.' };
+  return { title: null, cause: 'WebGPU is present but the backend did not start.',
+           runtimeLeads: true };
+}
+
 function warnCpuFallback(name, sdkWhy) {
   if (sessionStorage.getItem('webtorch.cpuWarned')) return;   // once per session
   sessionStorage.setItem('webtorch.cpuWarned', '1');
-  const why = [];
-  // What the SDK recorded at the point it gave up, which is the only account of the real
-  // cause; everything after it is what the page can see for itself.
-  if (sdkWhy) why.push('The runtime reports: ' + sdkWhy + '.');
-  if (window.__coiFileMode) {
-    why.push('This page was opened as a file. Serve the folder over HTTP instead — ' +
-             'a file:// page cannot be cross-origin isolated, and without that the GPU ' +
-             'backend cannot start.');
-  } else if (!window.crossOriginIsolated) {
-    why.push('This page is not cross-origin isolated, so SharedArrayBuffer is unavailable ' +
-             'and the GPU backend cannot start. The server must send ' +
-             'Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy, ' +
-             'or the bundled service worker must be allowed to add them.');
-    if (window.__coiNoSW) why.push('This browser has no service worker support to fall back on.');
-    if (window.__coiSWFailed) why.push('The service worker failed to register: ' + window.__coiSWFailed);
-  } else if (!ENV.webgpu) {
-    why.push('This browser reports no WebGPU. Chrome or Edge 113+, or Safari 18+, ' +
-             'have it; Firefox does not yet enable it by default.');
-  } else {
-    why.push('WebGPU is present but the backend did not start. The browser console will ' +
-             'have the reason.');
-  }
+  const b = gpuBlocker({
+    fileMode: !!window.__coiFileMode, secure: !!window.isSecureContext,
+    isolated: !!window.crossOriginIsolated, noSW: !!window.__coiNoSW,
+    swFailed: window.__coiSWFailed || null, webgpu: !!ENV.webgpu,
+  });
+  const said = sdkWhy ? 'The runtime reports: ' + sdkWhy + '.' : '';
+  const why = b.runtimeLeads
+    ? [b.cause, said || 'The browser console will have the reason.']
+    : [b.cause, said];
   const dlg = document.createElement('dialog');
   dlg.className = 'cpuwarn';
-  const h = document.createElement('h2'); h.textContent = 'Running on the CPU';
+  const h = document.createElement('h2'); h.textContent = b.title || 'Running on the CPU';
   const p1 = document.createElement('p');
   // Speed is the smaller half of this. With a GPU backend the weights live in GPU buffers
   // and the WASM heap holds almost nothing; without one they are numpy arrays inside that
@@ -562,10 +589,12 @@ function warnCpuFallback(name, sdkWhy) {
     + 'roughly ' + CPU_MAX_GB + ' GB runs out of memory while loading rather than running '
     + 'slowly. Under that size it does run, at minutes per reply rather than seconds \u2014 '
     + 'a small model that would answer at a hundred tokens a second manages well under one.';
-  const p2 = document.createElement('p'); p2.className = 'why'; p2.textContent = why.join(' ');
+  const p2 = document.createElement('p'); p2.className = 'why';
+  p2.textContent = why.filter(Boolean).join(' ');
   const diag = {
     backend: name || 'unknown',
     reason: sdkWhy || null,
+    secureContext: !!window.isSecureContext,
     crossOriginIsolated: !!window.crossOriginIsolated,
     sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
     navigatorGPU: !!navigator.gpu,
@@ -594,7 +623,10 @@ function warnCpuFallback(name, sdkWhy) {
       .then(() => { cp.textContent = 'Copied'; }, () => { cp.textContent = 'Copy failed'; });
   };
   bar.append(ok, cp);
-  dlg.append(h, p1, p2, det, bar);
+  // With something to do, the reason for it follows the title directly and what the fallback
+  // costs comes after -- a reader about to switch browsers does not need that part first.
+  // Without, the cost leads and the reason stays the footnote it was.
+  if (b.title) dlg.append(h, p2, p1, det, bar); else dlg.append(h, p1, p2, det, bar);
   document.body.appendChild(dlg);
   dlg.showModal();
 }
