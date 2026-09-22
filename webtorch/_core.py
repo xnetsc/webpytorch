@@ -592,6 +592,64 @@ def _gelu_data(d):
     return out
 
 
+_GEGLU_WGSL = """@group(0) @binding(0) var<storage,read_write> o: array<f32>;
+@group(0) @binding(1) var<storage,read> s: array<f32>;
+struct GMeta { rows: u32, half: u32, }
+@group(0) @binding(2) var<storage,read> gm: GMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x;
+  let n = gm.rows * gm.half;
+  if (i >= n) { return; }
+  let r = i / gm.half;
+  let c = i % gm.half;
+  let base = r * gm.half * 2u;
+  let x = s[base + c];
+  let u = clamp((x + 0.044715 * x * x * x) * 0.7978845608028654, -15.0, 15.0);
+  o[i] = x * (tanh(u) + 1.0) * 0.5 * s[base + gm.half + c];
+}
+"""
+_geglu_k = {"added": False}
+
+
+def geglu_split(x, half):
+    """A gated MLP's activation, reading the two halves where they already are.
+
+    `Wi` produces one tensor of width `2 * half`; the transformed half and the gating half
+    are slices of it. Written as slices, each one is a strided COPY -- the backend has no
+    view of a half-row -- so the activation costs two full copies of the tensor before any
+    arithmetic happens. On a 28-layer encoder those two copies measured as much time as the
+    three QKV copies put together.
+
+    This reads both halves out of the one tensor and writes the result, so nothing is copied
+    and the activation is a single dispatch. Returns None where there is no fused backend,
+    so the caller keeps its expression.
+    """
+    if not _adam_backend_ready():
+        return None
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    rows = 1
+    for d in xd.shape[:-1]:
+        rows *= int(d)
+    width = int(xd.shape[-1])
+    if width != 2 * int(half):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _geglu_k["added"]:
+        plat.addKernel("geglu", {"source": _GEGLU_WGSL,
+                                 "bindingTypes": ["storage", "read-only-storage",
+                                                  "read-only-storage"]})
+        _geglu_k["added"] = True
+    out = _empty((rows, int(half)))
+    meta = _adam_kernel["make_meta"]((rows, int(half)), "u4,u4")
+    n = rows * int(half)
+    plat.runKernel({"name": "geglu",
+                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    shape = tuple(xd.shape[:-1]) + (int(half),)
+    return Tensor(out.reshape(*shape))
+
+
 def gelu(x):
     if _adam_backend_ready():
         out = Tensor(_gelu_data(x.data), x.requires_grad, (x,), "gelu")

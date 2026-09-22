@@ -243,9 +243,20 @@ class TextEncoder(wt.Module):
                 # Gated: the first half is transformed, the second half multiplies it. The
                 # order is not guessable from the shape -- it is the reference's `chunk(2)`
                 # with the activation on the FIRST piece.
-                a = wt._slice_last(y, 0, self.cfg.ffn)
-                b = wt._slice_last(y, self.cfg.ffn, 2 * self.cfg.ffn)
-                y = self.act(a) * b
+                #
+                # Taken whole where the backend can. Sliced, each half is a strided COPY of
+                # half the tensor before any arithmetic runs, and those two copies measured
+                # as costly as the three QKV copies together. The fused form reads both
+                # halves where they already are; it carries no gradient, so training keeps
+                # the slices.
+                g = (None if (y.requires_grad or self.act is not gelu)
+                     else wt.geglu_split(y, self.cfg.ffn))
+                if g is not None:
+                    y = g
+                else:
+                    a = wt._slice_last(y, 0, self.cfg.ffn)
+                    b = wt._slice_last(y, self.cfg.ffn, 2 * self.cfg.ffn)
+                    y = self.act(a) * b
             else:
                 y = self.act(y)
             return self._lin(y, p + "Wo")
