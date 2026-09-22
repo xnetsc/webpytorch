@@ -557,3 +557,12 @@ iframe.jsview{width:100%;border:1px solid var(--line);border-radius:6px;
 .dans .sure{margin-top:8px;font-size:13px;color:var(--mut)}
 .dans .sure b{color:var(--fg);font-weight:600}
 .dans .escalate{margin-top:6px;font-size:13px;color:#b4690e}
+
+/* The files inside a multi-file model, folded away until asked for. */
+#cacheList details.files{margin:-4px 0 8px 10px}
+#cacheList details.files summary{cursor:pointer;color:var(--mut);font-size:12px;padding:2px 0}
+#cacheList .file{display:flex;align-items:center;gap:8px;padding:3px 0 3px 12px;font-size:12px}
+#cacheList .file .fk{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#cacheList .file .fs{color:var(--mut);white-space:nowrap}
+#cacheList .file .partial{color:#b4690e}

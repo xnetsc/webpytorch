@@ -53,8 +53,10 @@ def _label(directory, sample_key, n_files=1):
     if n_files and n_files > 1:
         # A repository is named by itself. Naming it after one of its files -- whichever
         # happened to sort first -- reads as if that file were the model, and the same repo
-        # then appears several times over under several different names.
-        return "%s (%d files)" % (name, n_files)
+        # then appears several times over under several different names. How many files
+        # there are is not part of its name either: that is a fact about it, for whoever
+        # lists it to place where it belongs.
+        return name
     return "%s (%s)" % (name, sample_key.rsplit("/", 1)[-1])
 
 

@@ -1470,6 +1470,40 @@ async function refreshCache() {
         refreshCache();
       };
       d.append(k, ex, del); el.appendChild(d);
+      // A model made of several files can be opened up. "4 files" answers how many, not
+      // which -- and which is the question someone asks when a model is bigger than they
+      // expected, or when one piece of it did not finish. Each row says what it is, how
+      // big it is, and whether it is all there; deleting one is possible because a single
+      // bad file is a thing you fix, not a reason to re-download the whole model.
+      if (g.files > 1) {
+        const det = document.createElement('details'); det.className = 'files';
+        const sum = document.createElement('summary');
+        sum.textContent = g.files + ' files';
+        det.appendChild(sum);
+        const byKey = new Map((c.items || []).map(i => [i.key, i]));
+        g.keys.slice().sort().forEach(key => {
+          const it = byKey.get(key) || {};
+          const row = document.createElement('div'); row.className = 'file';
+          const nm = document.createElement('span'); nm.className = 'fk';
+          // The path INSIDE the model, which is the part that identifies the file; the
+          // repository part is already on the line above.
+          nm.textContent = key.slice(g.name.length).replace(/^\//, '') || key;
+          nm.title = key;
+          const sz = document.createElement('span'); sz.className = 'fs';
+          sz.textContent = fmt(it.size || 0) + (it.complete === false ? ' · ⚠ incomplete' : '');
+          if (it.complete === false) sz.classList.add('partial');
+          const fx = document.createElement('button'); fx.textContent = 'delete';
+          fx.dataset.blocked = '0';
+          fx.dataset.title0 = 'Remove just this file';
+          fx.onclick = async () => {
+            if (storeBusy) return;
+            await call('cacheDelete', { key });
+            refreshCache();
+          };
+          row.append(nm, sz, fx); det.appendChild(row);
+        });
+        el.appendChild(det);
+      }
     });
     applyStoreState();          // a freshly built list starts in the state that is true now
   } catch (e) { $('#cacheList').innerHTML = '<p class="hint">cache unavailable: ' + e.message + '</p>'; }
