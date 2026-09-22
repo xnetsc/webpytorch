@@ -6,8 +6,18 @@
  * tensor op onto numpy inside wasm — so the backend that actually came up is probed and
  * returned rather than assumed.
  *
- * Load after dist/wgpy-worker.js and the Pyodide loader, then:
- *     const { pyodide, backend } = await webtorch.initWorker({ baseURL: '../' });
+ * Load after dist/wgpy-worker.js, then:
+ *     const { pyodide, backend, tasks } = await webtorch.initWorker({ baseURL: '../' });
+ *
+ * `tasks` is how a page stops work that is already running. See the block above it for why
+ * that cannot be a message. The caller wraps what it dispatches and what it cancels; the
+ * shared memory, the interrupt buffer, the cancel probe and the runtime's figures are set
+ * up here, because every caller needs all of them and the order they go up in is not
+ * obvious from the outside.
+ *
+ * This module talks to its other half over messages carrying `__webtorch`. A host with its
+ * own `onmessage` should ignore those:
+ *     onmessage = (e) => { if (e.data && e.data.__webtorch) return; ... }
  */
 (function (root) {
   const wt = root.webtorch || (root.webtorch = {});
@@ -50,11 +60,187 @@
   }
 
   /**
+   * Was this the SDK's own cancellation, rather than something going wrong?
+   *
+   * A stop is not an error, and a host that cannot tell them apart reports one as the
+   * other -- which is how a stopped reply used to end with an "Error:" line under the
+   * half-written answer the stop had just preserved. The rejection crosses between the two
+   * contexts as a message string, so the test is on the text; hosts ask this instead of
+   * matching it themselves.
+   */
+  wt.isCancelled = function (e) {
+    return /webtorch: cancelled by request/.test(String((e && e.message) || e || ''));
+  };
+
+  // ---- stopping work, and reading what the runtime holds ------------------------------
+  //
+  // Both of these are shared memory rather than messages, for the same reason: while Python
+  // is running, this worker's thread is inside that one call and `onmessage` does not run at
+  // all. A stop sent as a message arrives after the thing it was stopping has finished, and
+  // a request for the runtime's figures was measured outstanding for 51 seconds while the
+  // display showed numbers from before the reply began. A shared array is read by the other
+  // side whenever it likes, with nothing queued behind the work.
+  //
+  // All of it degrades. Without cross-origin isolation there is no SharedArrayBuffer, the
+  // allocations fail, and a cancel falls back to the message path -- which works, and only
+  // arrives late.
+  function shared(Ctor, bytes) {
+    try { return new Ctor(new SharedArrayBuffer(bytes)); } catch (e) { return null; }
+  }
+  // The cooperative flag. Read, not raised on, at the SDK's own checkpoints -- between
+  // tokens, between reads -- so work that ends on it keeps what it has already produced.
+  const STOP = shared(Int32Array, 4);
+  // The escalation, for work that will not stop because it is not looking. Pyodide checks
+  // this from the interpreter's eval loop, so a SIGINT here raises KeyboardInterrupt inside
+  // whatever is running without that code polling anything. The other half writes it only
+  // after the cooperative flag has had its moment.
+  const INTR = shared(Uint8Array, 1);
+  // [0] bytes held  [1] peak  [2] buffer count  [3] wasm heap  [4] when it was written.
+  //
+  // Float64 because bytes held pass what an f32 counts exactly, and these are independent
+  // scalars -- a torn read costs one stale frame and nothing more, so no atomics. [4] exists
+  // because the writer is not always running: these are written from the matmul, so when a
+  // reply ends they stop, and the last value written is that reply's peak. It would stand as
+  // if it were current while several gigabytes are handed back, so the reader compares this
+  // stamp against its own and takes whichever is newer.
+  const STAT = shared(Float64Array, 40);
+
+  // Only what is actually held. A page cannot read the device's GPU utilisation, the
+  // process's CPU, or anything about paging -- there is no Web API for any of it -- so
+  // nothing here pretends to. Called from the matmul, many times a layer, so it is three
+  // stores and a property read.
+  root.__gpustat = function (held, peak, n) {
+    if (!STAT) return;
+    STAT[0] = held; STAT[1] = peak; STAT[2] = n; STAT[4] = Date.now();
+    try {
+      const m = root.pyodide && root.pyodide._module && root.pyodide._module.HEAP8;
+      if (m) STAT[3] = m.byteLength;
+    } catch (e) { /* leave the last value */ }
+  };
+
+  // A stop that already worked leaves a loaded gun behind. The other half escalates a short
+  // time after the cooperative flag, and the cooperative flag usually wins -- so the byte is
+  // often still set when there is no longer anything to interrupt. Pyodide raises at its
+  // NEXT checkpoint whatever that happens to be, and the next thing to run is the event
+  // loop's own scheduling, where nothing is awaiting anything: it surfaces as an uncaught
+  // PythonError whose traceback is entirely webloop.py, describing the machinery rather than
+  // anything the person did.
+  //
+  // `leave` closes the common case; this absorbs the window that clearing cannot cover,
+  // because the other half's timer can fire a microsecond after it. A KeyboardInterrupt with
+  // no command running IS the stop that already succeeded, and reporting it as a failure
+  // would be reporting the thing working.
+  let depth = 0;
+  root.addEventListener('unhandledrejection', function (e) {
+    if (depth > 0) return;
+    const m = String((e.reason && (e.reason.message || e.reason.toString())) || '');
+    if (!/KeyboardInterrupt/.test(m)) return;
+    if (INTR) { try { INTR[0] = 0; } catch (err) {} }
+    e.preventDefault();
+  });
+
+  // Ending the WAIT, which is not the same as ending the WORK.
+  //
+  // The flag ends the work, but only where the work looks at it, and a load whose bytes are
+  // already cached does not reach a checkpoint for a long time -- measured at 19 seconds.
+  // Racing the work against a promise that a cancel rejects gives the answer back at once:
+  // the caller is free to act while the abandoned work winds itself down on its own.
+  //
+  // What that costs is having to ignore the abandoned run, which is what `current` is for:
+  // it is still running, it may still finish, and none of that may be reported as the
+  // current one.
+  let epoch = 0;
+  const waiting = new Set();
+  function fireCancel() {
+    for (const rej of waiting) { try { rej(new Error('webtorch: cancelled by request')); } catch (e) {} }
+    waiting.clear();
+  }
+  const tasks = {
+    /** Buffers the page half needs. Sent for it; hosts do not touch these. */
+    _channels: function () {
+      return { stop: STOP && STOP.buffer, intr: INTR && INTR.buffer,
+               stat: STAT && STAT.buffer };
+    },
+    /**
+     * A command is running: while one is, a KeyboardInterrupt belongs to it.
+     *
+     * The other half is told, because the escalation must only ever be aimed at work that
+     * exists. Cancelling while nothing runs used to arm it anyway, and the interrupt then
+     * landed in whatever came NEXT -- measured directly: a cancel with an idle worker, then
+     * a plain `sum(range(200000))`, and that sum was the thing that died.
+     */
+    enter: function () {
+      if (depth++ === 0) root.postMessage({ __webtorch: 'busy' });
+    },
+    /**
+     * That command is over. Clearing the interrupt byte here is not enough on its own: the
+     * other half arms a TIMER when it cancels, and a command that ends inside the grace
+     * period leaves that timer to fire into whatever runs next. A cancelled generation
+     * returns in about 14ms against a 120ms grace, so the timer landed in the abandoned
+     * work every time -- as a KeyboardInterrupt raised inside the tokenizer, reported to
+     * the person as a traceback where their half-written answer should have been.
+     *
+     * So the other half is told, and disarms. The escalation then only ever fires for work
+     * that really did not end, which is what it is for.
+     */
+    leave: function () {
+      depth = Math.max(0, depth - 1);
+      if (depth > 0) return;
+      if (INTR) { try { INTR[0] = 0; } catch (e) {} }
+      root.postMessage({ __webtorch: 'idle' });
+    },
+    /**
+     * Start a cancellable operation. Clears any stop left over from the last one -- a stale
+     * cancel must not land on work that has only just begun.
+     *
+     *     const task = tasks.begin();
+     *     const out = await task.until(pyodide.runPythonAsync(...));
+     *     if (!task.current()) return;        // a newer operation has taken over
+     */
+    begin: function () {
+      if (STOP) Atomics.store(STOP, 0, 0);
+      if (INTR) { try { INTR[0] = 0; } catch (e) {} }
+      const mine = ++epoch;
+      let rejector;
+      const cancelled = new Promise(function (_, rej) { rejector = rej; waiting.add(rej); });
+      cancelled.catch(function () {});     // raced, so this rejection is expected
+      return {
+        current: function () { return epoch === mine; },
+        cancelled: function () { return !!(STOP && Atomics.load(STOP, 0)); },
+        until: function (work) {
+          return Promise.race([
+            work.finally(function () { waiting.delete(rejector); }),
+            cancelled,
+          ]);
+        },
+      };
+    },
+    /**
+     * Cancel from inside this context. The page half calls this over the private channel,
+     * so a host only needs it for a cancel of its own making.
+     */
+    cancel: function () {
+      if (STOP) Atomics.store(STOP, 0, 1);
+      fireCancel();
+      // Where there is no shared memory the message IS the cancel, and by the time it
+      // arrives the interpreter is free -- so the SDK's own flag has to be set in Python.
+      if (!STOP && root.pyodide) {
+        try { root.pyodide.runPythonAsync('import webtorch; webtorch.cancel()'); }
+        catch (e) { /* nothing better to try */ }
+      }
+    },
+  };
+  wt.tasks = tasks;
+  root.addEventListener('message', function (e) {
+    if (e.data && e.data.__webtorch === 'cancel') tasks.cancel();
+  });
+
+  /**
    * Boot everything. Options (all optional):
    *   baseURL        prefix for dist/ and webtorch/ (default '../')
    *   pyodideIndexURL  where to load Pyodide from (default: the CDN, see PYODIDE_URL)
    *   onStatus       (text) => void, progress for the UI
-   * Resolves to { pyodide, backend } where backend is what actually came up:
+   * Resolves to { pyodide, backend, tasks } where backend is what actually came up:
    * 'webgpu' | 'webgl' | 'cpu'.
    */
   wt.initWorker = async function (opts) {
@@ -75,6 +261,10 @@
     }
 
     say('starting Python…');
+    // The loader too, if the host has not brought it: it has to come from the same place
+    // Pyodide itself does, and a host that gets that pair out of step gets a mismatch it
+    // cannot read from the error. A host that loaded it already is left alone.
+    if (typeof loadPyodide === 'undefined') importScripts(idx + 'pyodide.js');
     const pyodide = await loadPyodide({ indexURL: idx, stdout: opts.stdout, stderr: opts.stderr });
     root.pyodide = pyodide;
     await pyodide.loadPackage(['micropip', 'numpy']);
@@ -111,12 +301,28 @@
     }
     await pyodide.runPythonAsync('import sys; sys.path.insert(0, "/")');
 
+    // Point the SDK's own cancellation at the shared flag. Reading it is one index into
+    // shared memory, which is what lets the check sit in a per-token loop; without it the
+    // SDK has no way to be told anything while it is running.
+    if (STOP) {
+      pyodide.globals.set('__webtorch_stop', STOP);
+      await pyodide.runPythonAsync(
+        'import webtorch\nwebtorch.set_cancel_probe(lambda: __webtorch_stop[0] != 0)\n');
+    }
+    if (INTR) {
+      // An older Pyodide has no interrupt buffer; the cooperative flag is then all there is.
+      try { pyodide.setInterruptBuffer(INTR); } catch (e) { /* cooperative only */ }
+    }
+    // Hand the page half what it reads and writes. One message, once, before anything the
+    // host sends -- a cancel that arrives before this has nothing to store into.
+    root.postMessage({ __webtorch: 'channels', channels: tasks._channels() });
+
     // What is actually live, not what was requested.
     let backend = 'cpu';
     try {
       backend = await pyodide.runPythonAsync('import webtorch; webtorch.backend()');
     } catch (e) { console.warn('webtorch: backend probe failed:', e); }
     say('ready (' + backend + ')');
-    return { pyodide: pyodide, backend: backend };
+    return { pyodide: pyodide, backend: backend, tasks: tasks };
   };
 })(self);

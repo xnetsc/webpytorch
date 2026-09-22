@@ -10,7 +10,6 @@
 //
 importScripts('./pyodide-version.js');
 const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
-importScripts(PYODIDE_URL + 'pyodide.js');
 importScripts('../dist/wgpy-worker.js');
 importScripts('../webtorch/js/webtorch-worker.js');
 
@@ -28,100 +27,13 @@ const send = (m) => postMessage(m);
 //
 // SharedArrayBuffer needs cross-origin isolation, which this page already requires for
 // everything else. Where it is missing the message path still works as it did.
-let STOP = null;
-try { STOP = new Int32Array(new SharedArrayBuffer(4)); } catch (e) { STOP = null; }
+// Stopping, and the runtime's figures, both live in the SDK -- see `tasks` in
+// webtorch/js/webtorch-worker.js. What used to be here was the shared flag, the interrupt
+// buffer, the stats array, the stray-interrupt absorber and the run epoch: about ninety
+// lines that every caller of this SDK would have had to write, and get right, before a Stop
+// button worked at all. `tasks` is obtained from `initWorker` below.
+let tasks = null;
 
-// The runtime's own figures, in shared memory rather than in messages.
-//
-// The worker is single-threaded, so while a reply is being written it cannot answer a
-// request for them -- one was measured outstanding for 51 seconds, with the panel showing
-// numbers from before the reply began. Messages would work, but they tie how fresh the
-// display is to how often this side decides to send; a shared array leaves that to the
-// reader, which is where it belongs. Float64 because bytes held pass what an f32 counts
-// exactly, and the values are independent scalars, so a torn read costs one stale frame and
-// nothing more -- no atomics needed for that.
-//   [0] bytes held   [1] peak   [2] buffer count   [3] wasm heap   [4] when it was written
-//
-// [4] exists because the writer is not always running. These are written from the matmul,
-// so when a reply ends they stop -- and the last value written is the peak of that reply,
-// which then stands as if it were current while several gigabytes are handed back. The
-// reader compares this stamp against its own polled reply and takes whichever is newer.
-let STAT = null;
-try { STAT = new Float64Array(new SharedArrayBuffer(40)); } catch (e) { STAT = null; }
-
-// The escalation, for work that will not stop because it is not looking.
-//
-// The flag below is cooperative: it ends a decode loop between tokens and a load at its IO
-// checkpoints, and it is the right stop where it lands, because the work gets to finish
-// tidily -- a generation keeps the tokens it has. But between checkpoints nothing is
-// looking, and a load whose bytes are already cached goes a long way between them.
-//
-// This is what stops that. Pyodide checks this buffer from the interpreter's own eval loop,
-// so writing SIGINT here raises KeyboardInterrupt inside whatever Python is running,
-// without that code having to poll anything. The page raises it only after the polite flag
-// has had its moment.
-let INTR = null;
-try { INTR = new Uint8Array(new SharedArrayBuffer(1)); } catch (e) { INTR = null; }
-function intrClear() { if (INTR) INTR[0] = 0; }
-
-// A stop that already worked leaves a loaded gun behind. The page escalates by writing
-// SIGINT into this buffer 120ms after the polite flag, and the polite flag usually wins --
-// so the byte is often still set when there is no longer anything to interrupt. Pyodide
-// raises at its NEXT checkpoint whatever that happens to be, and the next thing to run is
-// the event loop's own scheduling, where nothing is awaiting anything: it surfaces as an
-// uncaught PythonError whose traceback is entirely webloop.py, describing the machinery
-// rather than anything the person did.
-//
-// Cleared below the moment a command ends, which closes the common case, and absorbed here
-// for the window that clear cannot cover -- the page's timer can fire a microsecond after
-// it. A KeyboardInterrupt with no command running IS the stop that already succeeded, and
-// reporting it as a failure would be reporting the thing working.
-function isStrayInterrupt(reason) {
-  if (cmdDepth > 0) return false;
-  const m = String((reason && (reason.message || reason.toString())) || '');
-  return /KeyboardInterrupt/.test(m);
-}
-let cmdDepth = 0;
-self.addEventListener('unhandledrejection', (e) => {
-  if (!isStrayInterrupt(e.reason)) return;
-  intrClear();
-  e.preventDefault();
-});
-
-// Ending the WAIT, which is not the same as ending the WORK.
-//
-// The flag above ends the work, but only where the work looks at it: a decode loop between
-// tokens, a load at its IO checkpoints. Between two checkpoints nothing looks, and a load
-// whose bytes are already cached does not reach one for a long time -- measured at 19
-// seconds. Racing the work against a promise that a stop rejects gives the answer back
-// immediately: the page is free to act on the stop while the abandoned work winds itself
-// down at its own next checkpoint.
-//
-// What that costs is having to ignore the abandoned run. It is still running, it will still
-// stream tokens and may still finish a load, and none of that may be reported as the
-// current one -- hence the epoch: only the newest run may speak.
-let runEpoch = 0;
-const stopWaiters = new Set();
-function newRun() {
-  const mine = ++runEpoch;
-  let rejector;
-  const stopped = new Promise((_, rej) => { rejector = rej; stopWaiters.add(rej); });
-  stopped.catch(() => {});                 // raced, so this promise's rejection is expected
-  return {
-    epoch: mine,
-    current: () => runEpoch === mine,
-    race: (work) => Promise.race([
-      work.finally(() => stopWaiters.delete(rejector)),
-      stopped,
-    ]),
-  };
-}
-function stopWaitersFire() {
-  for (const rej of stopWaiters) { try { rej(new Error('stopped')); } catch (e) {} }
-  stopWaiters.clear();
-}
-function stopFlagRaise() { if (STOP) Atomics.store(STOP, 0, 1); stopWaitersFire(); }
-function stopFlagClear() { if (STOP) Atomics.store(STOP, 0, 0); }
 const log = (t) => send({ type: 'log', text: t });
 
 
@@ -133,6 +45,7 @@ async function boot() {
     onStatus: (t) => send({ type: 'status', text: t }),
   });
   pyodide = r.pyodide;
+  tasks = r.tasks;
   // Model files come from ModelScope, fetched directly: its `resolve` route and the CDN it
   // redirects to send `Access-Control-Allow-Origin: *` and allow Range, so a cross-origin
   // isolated page can stream them. The SDK does the ranged reads and its own persistent cache.
@@ -142,22 +55,6 @@ webtorch.set_io_read(webtorch.modelscope_read())
 webtorch.set_io_write(webtorch.default_io_write)
 _MODEL = {"m": None, "id": None}
 `);
-  // Point the SDK at the shared flag, so a stop is seen at the next checkpoint rather than
-  // at the next message. Reading it is one index into shared memory, which is what lets this
-  // sit in a per-token loop.
-  if (STOP) {
-    pyodide.globals.set('_STOPFLAG', STOP);
-    await pyodide.runPythonAsync(`
-import webtorch
-webtorch.set_cancel_probe(lambda: _STOPFLAG[0] != 0)
-`);
-    send({ type: 'stopbuf', buf: STOP.buffer });
-  }
-  if (STAT) send({ type: 'statbuf', buf: STAT.buffer });
-  if (INTR) {
-    try { pyodide.setInterruptBuffer(INTR); send({ type: 'intrbuf', buf: INTR.buffer }); }
-    catch (e) { INTR = null; }           // an older Pyodide: the polite flag is all there is
-  }
   // When it is not the GPU, ask the SDK why. The reason is recorded at the point of failure
   // rather than inferred here, which is the only way to tell a missing WebGPU from a page
   // that is simply not cross-origin isolated.
@@ -251,11 +148,10 @@ async function loadModel(repo, file, lmax) {
     send({ type: 'stage', stage, done: done || 0, total: total || 0,
            after: after || null, elapsed: elapsed || 0 });
   };
-  stopFlagClear(); intrClear();          // the Python flag is cleared below; these are its twins
   const kpk = await kpKey();
   self.__kp = kpk ? await kpGet(kpk) : null;
-  const run = newRun();
-  const out = await run.race(pyodide.runPythonAsync(`
+  const run = tasks.begin();
+  const out = await run.until(pyodide.runPythonAsync(`
 import js, webtorch
 src = _src
 lmax = int(_lmax)
@@ -383,7 +279,6 @@ json.dumps({"ok": bool(_m is not None and _m.tools_supported())})`);
 
 async function generate(prompt, opts) {
   // A stop asked for during the LAST reply must not end this one before it starts.
-  stopFlagClear(); intrClear();
   await pyodide.runPythonAsync('import webtorch; webtorch.cancel(False)');
   if (!ready || !pyodide) throw new Error('no runtime');
   const imgs = await decodeImages((opts || {}).images);
@@ -398,7 +293,7 @@ async function generate(prompt, opts) {
   // reply -- and the delivery latency of the message itself -- inside the tok/s it was
   // reporting for the model. Only differences between these stamps are ever used, so
   // the worker having its own time origin does not matter.
-  const run = newRun();
+  const run = tasks.begin();
   // Gated on the run: a generation abandoned by a stop keeps decoding until its own next
   // checkpoint, and those tokens belong to a reply the page has already closed.
   // `n` is the SDK's own token count at the moment this piece was produced, not a count of
@@ -410,7 +305,7 @@ async function generate(prompt, opts) {
                                        n: (n == null ? null : Number(n)),
                                        at: performance.now() }); };
   try {
-    const out = await run.race(pyodide.runPythonAsync(`
+    const out = await run.until(pyodide.runPythonAsync(`
 import json, js
 m = _MODEL["m"]
 if m is None:
@@ -704,7 +599,7 @@ if _MODEL["m"] is not None:
 // fetch, control is in the JS event loop and the interpreter is free, so this sets the flag
 // now and the load sees it at its next checkpoint.
 function stopLoad() {
-  stopFlagRaise();                       // lands at the next checkpoint, message or not
+  if (tasks) tasks.cancel();             // lands at the next checkpoint, message or not
   if (!ready || !pyodide) return;
   try {
     const wt = pyodide.pyimport('webtorch');
@@ -722,17 +617,6 @@ function stopLoad() {
 // pretends to: the GPU figure is the backend's own ledger of buffers it asked for and has
 // not returned, and the heap figure is the WASM memory Python is living in. Cheap enough
 // to call on a timer: two property reads and a tuple.
-// Three stores. Called from the matmul, so it runs many times a layer, and costs little
-// enough there that it does not need to be rationed.
-self.__gpustat = (held, peak, n) => {
-  if (!STAT) return;
-  STAT[0] = held; STAT[1] = peak; STAT[2] = n; STAT[4] = Date.now();
-  try {
-    const m = pyodide && pyodide._module && pyodide._module.HEAP8;
-    if (m) STAT[3] = m.byteLength;
-  } catch (e) { /* leave the last value */ }
-};
-
 function runtimeStats() {
   const out = { gpuBytes: null, gpuPeak: null, gpuBuffers: null, wasmBytes: null,
                 loaded: !!ready };
@@ -758,26 +642,17 @@ function runtimeStats() {
 }
 
 onmessage = async (e) => {
+  // The SDK's two halves talk over this same port. Those messages are not commands and
+  // carry no id, so answering them would post a result nobody asked for.
+  if (e.data && e.data.__webtorch) return;
   const { id, cmd, args } = e.data;
-  cmdDepth++;
+  // Before `boot` there is nothing to enter: `tasks` arrives with the SDK.
+  if (tasks) tasks.enter();
   try {
     let res = null;
     if (cmd === 'boot') await boot();
     else if (cmd === 'load') await loadModel(args.repo, args.file, args.lmax);
     else if (cmd === 'stopLoad') stopLoad();
-    // Stop a reply mid-flight. The same flag the loader uses, read (not raised on) between
-    // tokens, so `generate` returns the part of the answer that already exists.
-    //
-    // The shared flag is the stop. This message cannot be what does it -- while a generation
-    // runs, this handler does not get to run at all -- so by the time we are here the page
-    // has already stored into shared memory and the decode loop has already seen it. The
-    // Python call below is only for a page with no SharedArrayBuffer, where the message is
-    // all there is.
-    else if (cmd === 'stopGen') {
-      stopFlagRaise();
-      if (!STOP) await pyodide.runPythonAsync('import webtorch; webtorch.cancel()');
-      res = true;
-    }
     else if (cmd === 'generate') res = await generate(args.prompt, args);
     else if (cmd === 'decide') res = await decide(args.state, args.questions);
   else if (cmd === 'toolsSupported') res = await toolsSupported();
@@ -812,7 +687,6 @@ onmessage = async (e) => {
   } finally {
     // Whatever this command was, nothing is running now, so an interrupt still armed here
     // has no work left to land on -- only the interpreter's own plumbing.
-    cmdDepth--;
-    if (cmdDepth === 0) intrClear();
+    if (tasks) tasks.leave();
   }
 };

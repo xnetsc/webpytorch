@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=9a8b3e059c');
+const worker = new Worker('worker.js?v=1016d1240a');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -36,8 +36,12 @@ const BACKEND_ORDER = (() => {
   if (want === 'cpu') return [];
   return ['webgpu', 'webgl'];
 })();
+// `tasks` is the SDK's: stopping work that is already running, and reading what the runtime
+// holds. Both go through shared memory inside the SDK, because a worker that is running
+// Python does not reach `onmessage` until it finishes.
+let tasks = null;
 const gpuInit = webtorch.initMain(worker, { backendOrder: BACKEND_ORDER })
-  .then(r => r.backend, () => 'cpu');
+  .then(r => { tasks = r.tasks; return r.backend; }, () => 'cpu');
 let seq = 0; const pending = new Map();
 // Conversations live in IndexedDB so the sidebar survives a reload.
 // Each: {id, title, updated,
@@ -262,39 +266,10 @@ function call(cmd, args) {
   gpuInit.then(() => worker.postMessage({ id, cmd, args }));
   return p;
 }
-// The worker's stop flag, shared memory rather than a message. See `stopFlagRaise` there:
-// while a generation or a load is running, the worker's thread is inside one call and does
-// not reach `onmessage` at all, so a stop that travels as a message cannot arrive until the
-// thing it is stopping has finished. Storing into this is seen at the SDK's next checkpoint.
-let stopFlag = null;
-let intrBuf = null;
-let escalateT = null;
-
-// Two stops, in order of politeness.
-//
-// The flag is cooperative and is the one worth having: the work ends at its own next
-// checkpoint, so a reply keeps the tokens it has already produced. But a checkpoint is only
-// reached if the work is looking, and a load whose bytes are cached goes a long way between
-// looks -- measured at 19 seconds of a worker that answers nothing.
-//
-// So if the flag has not been acted on shortly, interrupt the interpreter itself. Pyodide
-// reads this buffer from its own eval loop and raises KeyboardInterrupt inside whatever is
-// running, which does not depend on that code checking anything. `endStop` is called when
-// the work does end, so the escalation only fires when it genuinely did not.
-// Long enough for the polite stop to win where it can, short enough not to be a wait. A
-// generation notices the flag between tokens and has been measured at 4-19ms; this is an
-// order of magnitude above that, and everything past it was not going to notice at all.
-const STOP_GRACE_MS = 120;
-function askStop() {
-  if (stopFlag) Atomics.store(stopFlag, 0, 1);
-  if (!intrBuf) return;
-  clearTimeout(escalateT);
-  escalateT = setTimeout(() => { try { intrBuf[0] = 2; } catch (e) {} }, STOP_GRACE_MS);
-}
-function endStop() {
-  clearTimeout(escalateT); escalateT = null;
-  if (intrBuf) { try { intrBuf[0] = 0; } catch (e) {} }
-}
+// Stopping used to be about forty lines here: a shared flag, an interrupt buffer, a grace
+// timer and the escalation between them. It is `tasks.cancel()` now -- the SDK owns all of
+// it, because every caller needs a Stop button and none of that is about this page.
+function askStop() { if (tasks) tasks.cancel(); }
 
 // A click picks the message a browser belongs to, and moves that browser into place. Only
 // a click does this: the passive reading of "current" must not scroll anything.
@@ -310,11 +285,9 @@ document.addEventListener('click', (e) => {
 
 worker.onmessage = (e) => {
   const m = e.data;
-  if (m.type === 'stopbuf') { stopFlag = new Int32Array(m.buf); return; }
-  if (m.type === 'intrbuf') { intrBuf = new Uint8Array(m.buf); return; }
+  if (m.__webtorch) return;                     // the SDK's two halves, not a reply to us
   if (m.type === 'result') {
     const p = pending.get(m.id); pending.delete(m.id);
-    endStop();                                  // it ended; nothing left to escalate to
     if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
   } else if (m.type === 'status') {
     $('#modelStatus').textContent = m.text;
@@ -414,7 +387,6 @@ worker.onmessage = (e) => {
       keepAtBottom(el, follow);
     }
   }
-  else if (m.type === 'statbuf') { res.buf = new Float64Array(m.buf); return; }
   else if (m.type === 'log') { console.log('[py]', m.text); }
   else if (m.type === 'storageFull') { offerDirectory(m.key); }
   else if (m.type === 'migrate') {
@@ -3363,7 +3335,14 @@ async function runTurn(conv, msg, existing) {
     reply.stats = r || null;                    // final n / tok_s for the footer line
     checkSlow(r);
   } catch (err) {
-    reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
+    // A stop is not a failure. What it leaves behind is the answer as far as it got, which
+    // is the thing the person asked to keep -- putting an "Error:" line under it says the
+    // opposite of what happened.
+    if (!webtorch.isCancelled(err)) {
+      reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
+    } else if (!reply.content.trim()) {
+      reply.content = '(stopped before the reply began)';
+    }
   } finally { stopDots(live); resetLiveRender(); }
   resEndRun();          // the gap to the next reply is not a decode step
   streaming = null;
@@ -3384,7 +3363,6 @@ $('#send').addEventListener('click', e => {
   if (!streaming) return;                       // idle: let the form submit as usual
   e.preventDefault();
   askStop();                                    // takes effect now, not when the worker is free
-  call('stopGen').catch(() => {});
   note('Stopping…');
 });
 $('#input').addEventListener('keydown', e => {
@@ -4277,9 +4255,11 @@ function resRead() {
   // busy, and nothing writes the shared array while it is idle. Taking the array
   // unconditionally is how a reply's peak stayed on screen after the memory behind it had
   // been handed back.
-  if (res.buf && res.buf[0] && res.buf[4] >= (res.statsAt || 0)) {
-    res.stats = { gpuBytes: res.buf[0], gpuPeak: res.buf[1], gpuBuffers: res.buf[2],
-                  wasmBytes: res.buf[3] || (res.stats && res.stats.wasmBytes) || null };
+  const live = tasks && tasks.resources();
+  if (live && live.at >= (res.statsAt || 0)) {
+    res.stats = { gpuBytes: live.gpuBytes, gpuPeak: live.gpuPeak,
+                  gpuBuffers: live.gpuBuffers,
+                  wasmBytes: live.wasmBytes || (res.stats && res.stats.wasmBytes) || null };
   }
   // Not expired on a clock. A reply that just finished slowly is exactly what someone is
   // looking at the strip about, and blanking the reading a minute later takes the answer

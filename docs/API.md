@@ -609,8 +609,11 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
 const worker = new Worker('worker.js');
 // Picks the first backend this browser can actually provide and tells the worker.
 // Hold every message to the worker until it resolves.
-const { backend } = await webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] });
+const { backend, tasks } = await webtorch.initMain(worker, { backendOrder: ['webgpu', 'webgl'] });
 console.log('compute:', backend);            // 'webgpu' | 'webgl' | 'cpu'
+
+// The two halves talk over the same port. Ignore what is theirs:
+worker.onmessage = (e) => { if (e.data && e.data.__webtorch) return; /* … */ };
 ```
 
 - `backendOrder` — preference order; entries the browser cannot provide are skipped.
@@ -622,18 +625,68 @@ console.log('compute:', backend);            // 'webgpu' | 'webgl' | 'cpu'
 backend wheel and the package modules, in the order they require:
 
 ```js
-importScripts('../lib/pyodide/pyodide.js');
 importScripts('../dist/wgpy-worker.js');
 importScripts('../webtorch/js/webtorch-worker.js');
 
-const { pyodide, backend } = await webtorch.initWorker({
+const { pyodide, backend, tasks } = await webtorch.initWorker({
   baseURL: '../',                            // prefix for dist/ and webtorch/
+  pyodideIndexURL: '../lib/pyodide/',        // optional; a CDN release by default
   onStatus: (t) => postMessage({ type: 'status', text: t }),
 });
 ```
 
 `backend` is what actually came up, probed after the fact — not what was requested. The
-module list lives in the bootstrap, so callers do not track it.
+module list lives in the bootstrap, so callers do not track it. The Pyodide loader is
+brought in here too, from the same place Pyodide itself comes from, unless you loaded it
+yourself.
+
+### Stopping work, and what the runtime holds  (`tasks`)
+
+A worker that is running Python does not reach `onmessage` at all until it finishes, so a
+stop sent as a message arrives after the thing it was stopping, and a request for the
+runtime's figures was measured outstanding for 51 seconds. Both therefore travel through
+shared memory. None of that is yours to arrange: `initMain` and `initWorker` each hand back
+a `tasks` object, and the two halves find each other.
+
+**Page** (`initMain`):
+
+```js
+tasks.cancel();            // stop whatever the worker is doing, now, while it is busy
+tasks.resources();         // {gpuBytes, gpuPeak, gpuBuffers, wasmBytes, at} | null
+webtorch.isCancelled(err); // was this the stop, or something going wrong?
+```
+
+`cancel()` is two stops in order of politeness. The cooperative one first, which lets the
+work end at its own next checkpoint and keep what it has already produced — a stopped reply
+keeps its tokens. Then, only if that has not landed and only while the worker is actually
+busy, the interpreter is interrupted, for work that is not looking: a load whose bytes are
+already cached was measured going 19 seconds between checkpoints.
+
+`resources()` reports only figures that are really held. A page cannot read the device's GPU
+utilisation, the process's CPU, or anything about paging — there is no Web API for any of
+them — so nothing is reported for them. `at` is when the worker last wrote them; compare it
+against the last set you displayed, because the writer runs from the matmul and stops when a
+reply does.
+
+**Worker** (`initWorker`): wrap what you dispatch, and what can be cancelled.
+
+```js
+onmessage = async (e) => {
+  if (e.data && e.data.__webtorch) return;   // the SDK's own half
+  tasks.enter();                             // a command is running
+  try {
+    const task = tasks.begin();              // …and this part of it can be cancelled
+    const out = await task.until(pyodide.runPythonAsync(code));
+    if (!task.current()) return;             // a newer operation has taken over
+  } finally { tasks.leave(); }
+};
+```
+
+`until()` rejects as soon as a cancel arrives, rather than when the abandoned work finally
+notices — that work winds down on its own, and `current()` is how you tell that what it
+eventually produces is no longer wanted. The rejection is the SDK's own, so test it with
+`webtorch.isCancelled(err)` and report a stop as a stop: a cancelled reply that ends with an
+"Error:" line under it says the opposite of what happened.
 
 **From Python** — the same question, answerable inside the runtime:
 
