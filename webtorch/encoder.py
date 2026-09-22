@@ -156,10 +156,58 @@ class TextEncoder(wt.Module):
     def _has(self, name):
         return name in self.have
 
+    def _packed(self, name):
+        """The weight as packed half precision, built once, or None when it cannot be.
+
+        Only this copy is kept: building it from the source array and dropping the array
+        leaves ONE copy of the weight on the device at half the width, so the model takes
+        half the memory rather than one and a half times it. A weight that cannot be packed
+        (a width that is not a multiple of eight) falls back and is kept as f32.
+        """
+        key = (name, "f16")
+        if key in self._ten:
+            return self._ten[key]
+        if self._ten.get((name, "nof16")):
+            return None
+        # Asked BEFORE the source array is dropped, and asked in full: packing a weight the
+        # matmul will then refuse throws the only copy away and leaves the fallback with
+        # nothing to read. So every condition that path checks is checked here -- the
+        # backend, and the widths it needs -- rather than discovering one of them later.
+        src = self._src.get(name)
+        if src is None or not wt._adam_backend_ready():
+            return None
+        n_out, n_in = self.shape_of[name]
+        if n_out % 64 or n_in % 4 or n_out % 8:
+            self._ten[(name, "nof16")] = True
+            return None
+        packed = wt.pack_f16_weight(np.ascontiguousarray(_f32(src).T))
+        if packed is None:
+            self._ten[(name, "nof16")] = True
+            return None
+        t = Tensor(packed)
+        self._ten[key] = t
+        self._src.pop(name, None)
+        return t
+
     def _lin(self, x, name):
         """`y = x @ W^T + b`, with the file's own layout: checkpoints store Linear weights as
-        (out, in), and the transpose happens once, when the tensor is built."""
-        y = x.matmul(self._t(name + ".weight", transposed=True))
+        (out, in).
+
+        The weight is read at half width where the backend can do it. What a matmul spends
+        here is dominated by reading the weight -- 1.23 GB of them for one pass of a 421M
+        encoder -- and halving that measured 1.33x across the four shapes in a layer, with
+        the answer moving in the fourth decimal at most. Anything training keeps the f32
+        path, which is also where a weight that will not pack ends up.
+        """
+        wn = name + ".weight"
+        y = None
+        if not x.requires_grad:
+            pk = self._packed(wn)
+            if pk is not None:
+                n_out, n_in = self.shape_of[wn]
+                y = wt.matmul_f16w(x, pk, n_in, n_out)
+        if y is None:
+            y = x.matmul(self._t(wn, transposed=True))
         return y + self._t(name + ".bias") if self._has(name + ".bias") else y
 
     def _norm(self, x, name):

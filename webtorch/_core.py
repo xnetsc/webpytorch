@@ -647,6 +647,139 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 _qkv_k = {"added": False}
 
 
+_MM_F16W_WGSL = """
+@group(0) @binding(0) var<storage,read> array_a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> array_b: array<vec4<u32>>;
+@group(0) @binding(2) var<storage,read_write> array_c: array<vec4<f32>>;
+struct CMeta { M: u32, N: u32, K: u32, G: u32, }
+@group(0) @binding(3) var<storage,read> cmeta: CMeta;
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let M = cmeta.M; let N = cmeta.N; let K = cmeta.K; let G = cmeta.G;
+  let ND4 = N >> 2u; let ND8 = N >> 3u; let KD4 = K >> 2u;
+  let x = gid.x; let y = gid.y; let g = gid.z;
+  let row = y * 4u;
+  if (x * 8u >= N || row >= M) { return; }
+  let per = (KD4 + G - 1u) / G;
+  let k0 = g * per;
+  var k1 = k0 + per; if (k1 > KD4) { k1 = KD4; }
+  let i0 = row;
+  let i1 = select(row, row + 1u, row + 1u < M);
+  let i2 = select(row, row + 2u, row + 2u < M);
+  let i3 = select(row, row + 3u, row + 3u < M);
+  var s00 = vec4<f32>(); var s01 = vec4<f32>(); var s02 = vec4<f32>(); var s03 = vec4<f32>();
+  var s10 = vec4<f32>(); var s11 = vec4<f32>(); var s12 = vec4<f32>(); var s13 = vec4<f32>();
+  for (var k: u32 = k0; k < k1; k = k + 1u) {
+    let a0 = array_a[i0 * KD4 + k]; let a1 = array_a[i1 * KD4 + k];
+    let a2 = array_a[i2 * KD4 + k]; let a3 = array_a[i3 * KD4 + k];
+    for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+      let pk = array_b[(k * 4u + j) * ND8 + x];
+      let lo = vec4<f32>(unpack2x16float(pk.x), unpack2x16float(pk.y));
+      let hi = vec4<f32>(unpack2x16float(pk.z), unpack2x16float(pk.w));
+      let av = vec4<f32>(a0[j], a1[j], a2[j], a3[j]);
+      s00 = vec4<f32>(av.x) * lo + s00; s01 = vec4<f32>(av.y) * lo + s01;
+      s02 = vec4<f32>(av.z) * lo + s02; s03 = vec4<f32>(av.w) * lo + s03;
+      s10 = vec4<f32>(av.x) * hi + s10; s11 = vec4<f32>(av.y) * hi + s11;
+      s12 = vec4<f32>(av.z) * hi + s12; s13 = vec4<f32>(av.w) * hi + s13;
+    }
+  }
+  let sl = g * M * ND4;
+  array_c[sl + x*2u+0u + (row+0u)*ND4] = s00;
+  array_c[sl + x*2u+1u + (row+0u)*ND4] = s10;
+  if (row+1u < M) { array_c[sl + x*2u+0u+(row+1u)*ND4] = s01; array_c[sl + x*2u+1u+(row+1u)*ND4] = s11; }
+  if (row+2u < M) { array_c[sl + x*2u+0u+(row+2u)*ND4] = s02; array_c[sl + x*2u+1u+(row+2u)*ND4] = s12; }
+  if (row+3u < M) { array_c[sl + x*2u+0u+(row+3u)*ND4] = s03; array_c[sl + x*2u+1u+(row+3u)*ND4] = s13; }
+}
+"""
+
+_MM_REDUCE_WGSL = """
+@group(0) @binding(0) var<storage,read_write> o: array<f32>;
+@group(0) @binding(1) var<storage,read> p: array<f32>;
+struct RMeta { n: u32, G: u32, }
+@group(0) @binding(2) var<storage,read> rm: RMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= rm.n) { return; }
+  var s: f32 = 0.0;
+  for (var g: u32 = 0u; g < rm.G; g = g + 1u) { s = s + p[g * rm.n + i]; }
+  o[i] = s;
+}
+"""
+_mmf16_k = {"added": False}
+
+
+def pack_f16_weight(w):
+    """A weight matrix as half precision, two values to a word.
+
+    Kept in an f32-typed buffer because that is the only element type this backend allocates;
+    the bits are what matter, and the shader binds the same memory as `array<vec4<u32>>` and
+    unpacks it. `shader-f16` is not needed for this -- `unpack2x16float` is core WGSL -- so it
+    does not depend on a device feature that may not be there.
+
+    Halves what a matmul reads, which on a 421M encoder is 1.23 GB of weights per pass. `w`
+    is (K, N) as the maths wants it, N a multiple of 8.
+    """
+    K, N = int(w.shape[0]), int(w.shape[1])
+    if N % 8:
+        return None
+    h = np.ascontiguousarray(w, dtype=np.float16).reshape(K, N).view(np.uint16)
+    u = (h[:, 1::2].astype(np.uint32) << 16) | h[:, 0::2].astype(np.uint32)
+    return np.ascontiguousarray(u.view(np.float32))
+
+
+def _mm_split_groups(M, N):
+    """How many ways to cut the K loop.
+
+    Cutting it raises the number of workgroups, and that only matters when there are too few
+    to fill the device. Measured at M=69: N=3072 gives 144 groups and splitting is a wash
+    (1.05x at best); N=1024 gives 48 and splitting by four is 1.5x. So it is decided by the
+    group count, not by a preference -- and above the threshold it stays at one, where the
+    reduction pass is not paid for at all.
+    """
+    groups = (int(N) // 64) * ((int(M) + 31) // 32)
+    return 4 if groups < 128 else 1
+
+
+def matmul_f16w(x, wpacked, K, N):
+    """`x @ w` with w held as packed half precision. Returns None without a GPU backend."""
+    if not _adam_backend_ready():
+        return None
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    M = 1
+    for d in xd.shape[:-1]:
+        M *= int(d)
+    K, N = int(K), int(N)
+    if int(xd.shape[-1]) != K or N % 64 or K % 4:
+        return None
+    plat = _adam_kernel["platform"]
+    if not _mmf16_k["added"]:
+        plat.addKernel("mm_f16w", {"source": _MM_F16W_WGSL,
+                                   "bindingTypes": ["read-only-storage", "read-only-storage",
+                                                    "storage", "read-only-storage"]})
+        plat.addKernel("mm_f16w_reduce", {"source": _MM_REDUCE_WGSL,
+                                          "bindingTypes": ["storage", "read-only-storage",
+                                                           "read-only-storage"]})
+        _mmf16_k["added"] = True
+    wd = wpacked.data if isinstance(wpacked, Tensor) else wpacked
+    G = _mm_split_groups(M, N)
+    part = _empty((G * M, N))
+    meta = _adam_kernel["make_meta"]((M, N, K, G), "u4,u4,u4,u4")
+    plat.runKernel({"name": "mm_f16w",
+                    "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
+                                part.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": G}})
+    lead = tuple(xd.shape[:-1])
+    if G == 1:
+        return Tensor(part.reshape(*(lead + (N,))))
+    out = _empty((M, N))
+    rmeta = _adam_kernel["make_meta"]((M * N, G), "u4,u4")
+    plat.runKernel({"name": "mm_f16w_reduce",
+                    "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
+                    "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(out.reshape(*(lead + (N,))))
+
+
 def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
     """One of q, k or v, taken out of a fused projection and laid out for attention.
 
