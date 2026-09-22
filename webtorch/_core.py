@@ -4879,10 +4879,7 @@ _GGML_GEMM_PRE = """
 // than on the weights the pass exists to read. It is why the batched path ran at a tenth of
 // the decode path's bandwidth, and why widening the rows made it worse rather than better.
 var<workgroup> xs4: array<f32, XS4SZ>;
-var<private> a0: f32;
-var<private> a1: f32;
-var<private> a2: f32;
-var<private> a3: f32;
+GDECLA
 var<private> mb: u32;
 var<private> mn: u32;
 var<private> kbase: u32;
@@ -4897,20 +4894,13 @@ fn ACC(k: u32, v: f32) {
   if (!live) { return; }
   let s = xsoff + (k - kbase);
   a0 = a0 + xs4[s] * v;
-  if (mn > 1u) { a1 = a1 + xs4[s + BLKVALS] * v; }
-  if (mn > 2u) { a2 = a2 + xs4[s + 2u * BLKVALS] * v; }
-  if (mn > 3u) { a3 = a3 + xs4[s + 3u * BLKVALS] * v; }
+GACCB
 }
 fn ACC4(k: u32, v: vec4<f32>) {
   if (!live) { return; }
   let s = xsoff + (k - kbase);
   a0 = a0 + dot(vec4<f32>(xs4[s], xs4[s + 1u], xs4[s + 2u], xs4[s + 3u]), v);
-  if (mn > 1u) { let c = s + BLKVALS;
-    a1 = a1 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
-  if (mn > 2u) { let c = s + 2u * BLKVALS;
-    a2 = a2 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
-  if (mn > 3u) { let c = s + 3u * BLKVALS;
-    a3 = a3 + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], xs4[c + 3u]), v); }
+GACC4B
 }
 """
 
@@ -4933,14 +4923,14 @@ GEMMINIT
   // Each lane row owns four output rows of its own. From `workgroup_id`, so the loop below
   // -- which contains barriers -- has a bound every lane agrees on; the per-lane part is the
   // row group, which only selects data.
-  let mgroup = wgid.z * (4u * KSGu);
-  let mbu = mgroup + ly * 4u;
+  let mgroup = wgid.z * (MROWu * KSGu);
+  let mbu = mgroup + ly * MROWu;
   let anyrow = mgroup < gm.M;
   mb = mbu;
-  mn = select(0u, min(4u, gm.M - mbu), mbu < gm.M);
+  mn = select(0u, min(MROWu, gm.M - mbu), mbu < gm.M);
   nrow = n;
-  a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
-  xsoff = ly * 4u * BLKVALS;
+GINITA
+  xsoff = ly * MROWu * BLKVALS;
   live = (n < gm.N);
   let base = 0u;
   let nb = gm.K / BLKVALS;
@@ -4955,9 +4945,7 @@ GEMMINIT
       for (var t: u32 = lx; t < BLKVALS; t = t + 64u) {
         let sx = mbu * gm.K + kbase + t;
         xs4[xsoff + t] = select(0.0, x[sx], mn > 0u);
-        xs4[xsoff + BLKVALS + t] = select(0.0, x[sx + gm.K], mn > 1u);
-        xs4[xsoff + 2u * BLKVALS + t] = select(0.0, x[sx + 2u * gm.K], mn > 2u);
-        xs4[xsoff + 3u * BLKVALS + t] = select(0.0, x[sx + 3u * gm.K], mn > 3u);
+GSTAGE
       }
       workgroupBarrier();
 """
@@ -4968,9 +4956,7 @@ _GGML_GEMM_TAIL = """
   }
   if (live) {
     if (mn > 0u) { outp[mbu * gm.N + n] = a0; }
-    if (mn > 1u) { outp[(mbu + 1u) * gm.N + n] = a1; }
-    if (mn > 2u) { outp[(mbu + 2u) * gm.N + n] = a2; }
-    if (mn > 3u) { outp[(mbu + 3u) * gm.N + n] = a3; }
+GWRITE
   }
 }
 """
@@ -4991,31 +4977,42 @@ _GGML_GEMM_TAIL = """
 # lanes buy more rows and pay for them in repeated decode. Sharing the DECODED block through
 # workgroup memory is what would actually cut it, and that is a different kernel.
 #
-# What that kernel has to look like, with the constraints worked out, so whoever writes it
-# does not start from the beginning:
+# That is where this stopped for a while, and the conclusion was wrong in a way worth
+# keeping: sharing the decoded block IS one way to raise the reuse, but it is not the only
+# one and it is by far the harder one. Decoding once per WORKGROUP needs 64 columns of a
+# 256-value block staged, 64 KB against a 16 KB budget, so the block has to be walked in
+# K-chunks -- which means splitting every one of the 28 decode fragments, since each of them
+# decodes a whole block as one unit.
 #
-#   The reuse today is four: one thread owns one column and four rows, so a value it decodes
-#   feeds four outputs. The aim is to decode a weight tile ONCE per workgroup, into workgroup
-#   memory, and have every thread read it -- which turns the decode from per-thread into
-#   per-workgroup and lets the arithmetic per decoded value rise with the tile.
+# Decoding once per THREAD and using it more times needs none of that, and it was sitting in
+# the same kernel the whole time as a literal `4u`: see `_GGML_MROW` below. Widening the
+# lanes fails because each new lane re-decodes; widening the ROWS ONE THREAD OWNS does not,
+# because the thread already has the value in a register.
 #
-#   The budget is what shapes it. A whole block for the 64 columns a workgroup covers is
-#   64 * 256 * 4 = 64 KB of workgroup memory, and the limit is usually 16 KB, so the block has
-#   to be walked in K-chunks rather than staged whole. One arrangement that fits:
+# The other half of it was a guard, not a tile. `ACC` tested `mn > i` before each row's
+# multiply -- MROW-1 branches in the innermost loop in this file -- to skip rows a partial
+# group does not have. It never protected a result: those rows are staged as 0.0 and dropped
+# at the write. Removing the test is a third of the kernel on its own.
 #
-#       64 threads as 8x8, each owning 8 columns x 4 rows = 32 accumulators in registers
-#       workgroup covers 64 columns x 32 rows
-#       per K-chunk of 32 values:  weights 64*32*4 = 8 KB,  activations 32*32*4 = 4 KB
+# Together, clean reload on each side, whole 28-layer prefill forced onto this kernel:
 #
-#   12 KB, inside the limit, and a decoded value then feeds 32 outputs instead of 4 -- eight
-#   times the arithmetic per decode, which is the ratio the two measurements above say is
-#   missing.
+#     T        before    after
+#     512      1290.8    670.8   ms     1.92x
+#     1536     4296.4   2366.0   ms     1.82x
 #
-#   Two things to be careful of, both already documented in this file and both silent:
-#   `_ggml_src`'s substitutions have an order (a placeholder that arrives after its own
-#   substitution has run is left in the source and compiles to nothing), and a compile
-#   failure on these paths does not raise -- the dispatch produces zeros. The ggml self-check
-#   against the numpy reference, format by format, is what catches both.
+# and per format at N=3072 K=1024 M=512, which is what a 27B actually runs on (84% of its
+# elements are i-quants, and i-quants never take the unpacking path in `ggml_matmul`):
+#
+#     IQ1_S 9.613 -> 4.988   IQ2_XXS 8.295 -> 4.495   IQ3_XXS 6.060 -> 4.175
+#     IQ3_S 5.728 -> 4.063   IQ2_XS  5.633 -> 4.025   IQ2_S   5.520 -> 4.013
+#     IQ4_XS 5.335 -> 4.038
+#
+# Two things to be careful of if the tiled version is ever written after all, both already
+# documented in this file and both silent: `_ggml_src`'s substitutions have an order (a
+# placeholder that arrives after its own substitution has run is left in the source and
+# compiles to nothing), and a compile failure on these paths does not raise -- the dispatch
+# produces zeros. The ggml self-check against the numpy reference, format by format, is what
+# catches both, and it only catches them for a shape it actually builds.
 # Row groups (of 4 rows each) per workgroup on the batched path. A workgroup covers 4*KSG
 # activation rows, so the weights it reads serve that many -- which divides the weight
 # traffic by 4*KSG and looks like the obvious lever for prefill.
@@ -5036,6 +5033,51 @@ _GGML_GEMM_TAIL = """
 # So KSG is deliberately NOT a tuned knob -- measuring it on every load would cost time to
 # rediscover a number that does not matter.
 _GGML_KSG = 1
+
+# Output rows per THREAD on the batched path -- the axis KSG is not, and the one that pays.
+#
+# KSG adds lane rows, which are other THREADS, and each of them decodes the weight block
+# again: total decode work is (threads) * K = N*M*K / MROW whatever KSG is, which is exactly
+# why the sweep above came out flat. Rows per thread is the other axis. One thread decodes a
+# value once and accumulates it into MROW rows, so the decode is amortized MROW ways.
+#
+# Measured, Q4_K 3072x1024, interleaved medians, GFLOPS at M = 512:
+#
+#     MROW      4       8      12      16
+#     ms     5.295   4.618   4.182   4.327
+#     GF       608     697     770     744
+#
+# and the more expensive the format's decode, the more it buys -- Q6_K goes 386 -> 649
+# GFLOPS over the same range, IQ2_S 721 -> 839. 16 turns back down: the staged activations
+# are KSG * MROW * BLKVALS floats, 16 KB at MROW = 16, and a workgroup that large leaves too
+# few resident to hide anything. 12 is the peak, and it is not the memory limit that puts it
+# there, so `_GGML_XS_BUDGET` is a guard rather than the thing being traded against.
+#
+# It does NOT hold at small M, because a row group is padded up to MROW whether the rows
+# exist or not and the padding is accumulated as zeros:
+#
+#     M          3      4      8     16     32     69    512   1536
+#     MROW=4  0.525  0.586  0.264  0.275  0.423  0.798  5.160  16.19  ms
+#     MROW=12 0.825  0.829  0.331  0.340  0.394  0.676  4.055  11.79  ms
+#
+# 1.57x the wrong way below the crossover and 0.73x the right way above it, so this is a
+# routing decision with a measured threshold, not a knob to leave at one value.
+_GGML_MROW = 12
+_GGML_MROW_SMALL = 4
+_GGML_MROW_MIN_M = 32
+# Bytes of workgroup memory the staged activations may take. The WebGPU guaranteed minimum
+# for the whole workgroup is 16384; the codebook staging next door is 64 bytes when it is on
+# at all, and the rest is slack left deliberately -- an allocation that exactly meets a limit
+# is one driver's rounding away from a silent zero-filled kernel, which on this path is not
+# an error but a buffer of zeros.
+_GGML_XS_BUDGET = 12288
+
+
+def _ggml_mrow(vals, M):
+    """Output rows per thread for a batched call of this many rows on this format."""
+    r = _GGML_MROW if M >= _GGML_MROW_MIN_M else _GGML_MROW_SMALL
+    return max(1, min(r, _GGML_XS_BUDGET // (4 * _GGML_KSG * max(1, vals))))
+
 
 # GEMV (decode, batch of one): the shape where the naive kernel loses. Two things fix it,
 # both of which ggml blocks happen to suit. Blocks are independent, so KS rows of threads
@@ -6161,7 +6203,7 @@ _GGML_DEQ_TAIL = """
 """
 
 
-def _ggml_src(type_name, mode, cfg=None, moe=False):
+def _ggml_src(type_name, mode, cfg=None, moe=False, mrow=None):
     """`mode`: 1 or 2 for the decode kernel with that many rows, 0 for the batched one.
     `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
     expert from an index buffer instead of being bound to one expert's weights."""
@@ -6198,8 +6240,36 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
     # in XLOAD1 and XBAS, XSCOMMON brings in ACCDECL1 -- and a placeholder that arrives after
     # its own substitution has run is left in the source, which compiles to nothing and reads
     # as a numerically broken kernel.
+    mrow = 4 if mrow is None else mrow
+    # The batched kernel's rows-per-thread, expanded here rather than carried as a shader
+    # constant: every one of these fragments is a different LENGTH at a different `mrow`, so
+    # there is nothing to parameterise at runtime. They go near the front of the list for the
+    # same reason XSFILL does -- what they expand to still contains BLKVALS.
+    _ai = range(1, mrow)
     subs = [("XSFILL", _XS_FILL_V4 if vec_win else _XS_FILL_F32),
             ("XSCOMMON", _XS_COMMON),
+            ("GDECLA", "\n".join("var<private> a%d: f32;" % i for i in range(mrow))),
+            # No `mn >` guard on these, and that is worth a third of the kernel. The rows
+            # a group does not have are staged as 0.0 by the loop below, so accumulating
+            # them adds nothing and the tail drops them anyway -- the guard was never
+            # protecting a result, it was skipping a multiply, and it put MROW-1 branches
+            # in the innermost loop in the file to do it. Q4_K at M=512: 8.198ms guarded
+            # against 5.392ms unguarded at the same MROW=4, before any of the widening
+            # below. Verified unguarded against the numpy reference on all 28 formats.
+            ("GACCB", "\n".join(
+                "  a%d = a%d + xs4[s + %du * BLKVALS] * v;" % (i, i, i) for i in _ai)),
+            ("GACC4B", "\n".join(
+                ("  { let c = s + %du * BLKVALS;\n"
+                 "    a%d = a%d + dot(vec4<f32>(xs4[c], xs4[c + 1u], xs4[c + 2u], "
+                 "xs4[c + 3u]), v); }") % (i, i, i) for i in _ai)),
+            ("GINITA", "  " + " ".join("a%d = 0.0;" % i for i in range(mrow))),
+            ("GSTAGE", "\n".join(
+                "        xs4[xsoff + %du * BLKVALS + t] = select(0.0, x[sx + %du * gm.K], "
+                "mn > %du);" % (i, i, i) for i in _ai)),
+            ("GWRITE", "\n".join(
+                "    if (mn > %du) { outp[(mbu + %du) * gm.N + n] = a%d; }" % (i, i, i)
+                for i in _ai)),
+            ("MROWu", "%uu" % mrow),
             ("ACCDECL1", "var<private> acc1: f32;" if two else ""),
             ("ACCBODY1", (("  let j1 = i + %du;\n"
                            "  acc1 = acc1 + xs[j1 >> 2u][j1 & 3u] * v;" % xrow) if vec_win
@@ -6235,7 +6305,7 @@ def _ggml_src(type_name, mode, cfg=None, moe=False):
             # Four rows of one block, for each block in flight. 8KB at the widest format,
             # which every device allows; a workgroup allocation that does not fit fails to
             # COMPILE, and a failed compile here is silent -- the kernel just writes zeros.
-            ("XS4SZ", str(_GGML_KSG * 4 * vals)),
+            ("XS4SZ", str(_GGML_KSG * mrow * vals)),
             # Literally `0u`, not `ly`: a workgroup of height one makes them equal, but the
             # uniformity analysis is syntactic and `lid.y` is non-uniform whatever the shape.
             ("BSTART", "0u" if _GGML_KSG == 1 else "ly"),
@@ -6309,7 +6379,7 @@ def _selfcheck_shape(kind, vals):
     return (n, nb) if _shape_kind(n, nb * vals, vals) == kind else None
 
 
-def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
+def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False, mrow=_AUTO):
     """Multiply a few random blocks and compare against the reference dequantizer.
 
     A WGSL compile error surfaces as a console warning and a buffer full of zeros, not as an
@@ -6326,6 +6396,14 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
         _selfcheck_one(type_name, mode, None, moe, *(_selfcheck_shape(None, vals)
                                                      or (_SMALL_N + 64, 3)))
         return
+    if mode == 0 and mrow is _AUTO:
+        # Both sides of the row-group crossover, because they are two different kernels and
+        # a batch only ever lands on one of them. Checking the one this session happened to
+        # want leaves the other to be discovered by a user.
+        vals = _GGML_TYPES[type_name][2]
+        for r in sorted({_ggml_mrow(vals, 1), _ggml_mrow(vals, _GGML_MROW_MIN_M)}):
+            _ggml_selfcheck(type_name, mode, small, moe, r)
+        return
     if small is _AUTO and mode == 1:
         vals = _GGML_TYPES[type_name][2]
         for kind in ("narrow", "shortk", None):
@@ -6335,12 +6413,14 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False):
         return
     if small is _AUTO:
         small = None
+    if mrow is _AUTO:
+        mrow = None
     vals = _GGML_TYPES[type_name][2]
     shape = _selfcheck_shape(small, vals) or (_SMALL_N + 64, 3)
-    _selfcheck_one(type_name, mode, small, moe, *shape)
+    _selfcheck_one(type_name, mode, small, moe, *shape, mrow=mrow)
 
 
-def _selfcheck_one(type_name, mode, small, moe, N, NB):
+def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None):
     """One (thread shape, N, blocks) against the reference. Raises on a mismatch."""
     from . import ggufload as G
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
@@ -6374,7 +6454,24 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
         break
     else:
         raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
-    M = mode if mode else 3
+    # The batched path is checked at more than two ROW GROUPS, not at three rows. A
+    # workgroup covers `mrow * KSG` rows and each of a thread's rows is its own accumulator
+    # and its own guarded write, so M = 3 leaves every accumulator above the third untouched
+    # -- the kernel would pass while eight of its twelve output rows were dead.
+    #
+    # The M also has to ROUTE to the variant being checked, or the check builds one kernel
+    # and measures another; it is stepped up by whole row groups until it does, which leaves
+    # the last group partial and exercises the `mn` clamp at the same time.
+    if mode:
+        M = mode
+    else:
+        M = 2 * mrow + 1
+        for _ in range(64):
+            if _ggml_mrow(vals, M) == mrow:
+                break
+            M += mrow
+        else:
+            raise RuntimeError("no batch size routes %s to mrow=%d" % (type_name, mrow))
     x = rng.standard_normal((M, K)).astype(np.float32)
     raw = raw + b"\x00" * ((-len(raw)) % 4)     # a block is not always a whole number of u32
     pk = ggml_transpose(xp.asarray(np.frombuffer(raw, np.int32)), N, NB * blk)
@@ -6399,9 +6496,9 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
         out_t = _ggml_run_gl(xp.asarray(x), pk, type_name, K, N, eidx=eidx,
                              eslot=(eslot or 0), estride=estride)
     else:
-        key = (type_name, mode, small, moe, _GGML_KSG if mode == 0 else 0)
+        key = (type_name, mode, small, moe, (_GGML_KSG, mrow) if mode == 0 else 0)
         if key not in _ggml_k["added"]:
-            _ggml_add(type_name, mode, small, moe)
+            _ggml_add(type_name, mode, small, moe, mrow)
             _ggml_k["added"].add(key)
         out_t = _ggml_run(xf=xp.asarray(x), packed=pk, type_name=type_name,
                           K=K, N=N, small=small, eidx=eidx,
@@ -6452,9 +6549,19 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB):
 # So it is a wash at this size, slightly in favour of unpacking, and 32 stays. What that
 # rules out is more useful than the 4%: the prompt's cost is NOT the unpacked copy. A
 # 67-row prefill reads every weight once, so it should cost what a decode step costs plus
-# arithmetic, and it costs thirty of them. The remaining candidate is the batched kernel
-# itself -- it tops out around 426 GFLOPS against 2117 for a plain fp32 matmul of the same
-# shape, and 67 rows of a 27B is about 3.6 TFLOP.
+# arithmetic, and it costs thirty of them. The remaining candidate was the batched kernel
+# itself, and it was -- see `_GGML_MROW`, which took it from about 400 GFLOPS to about 780.
+#
+# 32 still stays, and the reason is now a measurement rather than an inheritance. Unpacking
+# still wins above it, by less than it did: at N=3072 K=1024, unpacking against the widened
+# quantised kernel is 1.112 vs 1.700 ms at M=32, 2.742 vs 4.325 at M=512 and 6.303 vs 12.407
+# at M=1536 -- 1.5x to 2.0x, where it used to be about 5x.
+#
+# Whether the threshold itself should MOVE was asked and not answered: across M = 4..64 the
+# two paths come within 20% of each other and the numbers stop being monotone in M (M = 64
+# measured faster than M = 32 on the same code), which means that region is bounded by host
+# enqueue in this harness and not by either kernel. A threshold is not worth moving on a
+# measurement that cannot see what it is measuring.
 _GGML_DEQ_M = 32
 
 # Rows the fp32 matmul wants its input to be a multiple of. Its tiled kernel only runs when
@@ -6478,11 +6585,14 @@ def _matmul_row_align():
 def ggml_dequant(packed, type_name, K, N):
     """A packed ggml tensor as a plain (K, N) fp32 matrix, on the device.
 
-    For the batched path only. Measured on this machine, same shape (1536x1024x3072) and the
-    same arithmetic: the quantised kernel tops out at 426 GFLOPS while a plain fp32 matmul
-    does 2117 -- five times, and the device is plainly not what limits the first. Unpacking
-    once and multiplying fast beats unpacking inside the multiply, as soon as there are
-    enough rows to pay for the unpacking.
+    For the batched path only, and only for formats `ggml_dequant_ok` allows -- an i-quant
+    keeps the quantised kernel whatever the row count, which is most of a 27B.
+
+    Unpacking once and multiplying fast beats unpacking inside the multiply, as soon as there
+    are enough rows to pay for the unpacking. The margin used to be about five times and is
+    now 1.5x to 2.0x, because the quantised kernel was widened (see `_GGML_MROW`): at
+    N=3072 K=1024, 2.742 ms unpacked against 4.325 packed at M=512, 6.303 against 12.407 at
+    M=1536. Still a clear win, and still only for the formats that can take it.
 
     Decode is not reimplemented here; `_ggml_src(mode=3)` reuses each format's own fragment.
     """
@@ -6616,9 +6726,13 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     # (Output was exact, max abs difference 0.0 at M=3, 7 and 16, so this is purely about
     # speed.)
     #
-    # Prefill is 61% MLP and runs at about 0.6 GB/s against the decode path's 100+. The fix
-    # is a GEMM that tiles K into workgroup memory and keeps its accumulators in registers,
-    # not a different way to call the one that exists.
+    # Prefill is 61% MLP and runs at about 0.6 GB/s against the decode path's 100+.
+    #
+    # The numbers above are from before `_GGML_MROW`, which nearly doubled this kernel --
+    # a whole 28-layer prefill forced onto it went 1290.8 -> 670.8 ms at T=512. They are
+    # kept because what they rule out has not changed: routing a batch through the two-row
+    # decode kernel still loses on the copies the routing costs, whatever the batched
+    # kernel is worth.
     if _webgl_ready() and not _adam_backend_ready():
         moe = eidx is not None
         moedec = moe and m <= 2
@@ -6657,11 +6771,17 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         return of if bias is None else of + bias
     small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
     moe = eidx is not None
-    key = (type_name, mode, small, moe, _GGML_KSG if mode == 0 else 0)
+    # Rows per thread is chosen from the batch here, so a short prefill and a long one get
+    # different kernels rather than one compromise that is wrong at both ends. It is part of
+    # the variant key for the same reason the thread shape is: two kernels that differ only
+    # in a compile-time constant are two pipelines, and sharing a name between them means
+    # the second silently runs the first.
+    mrow = _ggml_mrow(_GGML_TYPES[type_name][2], m) if mode == 0 else None
+    key = (type_name, mode, small, moe, (_GGML_KSG, mrow) if mode == 0 else 0)
     if key not in _ggml_k["added"]:
-        _ggml_add(type_name, mode, small, moe)
+        _ggml_add(type_name, mode, small, moe, mrow)
         _ggml_k["added"].add(key)           # set before the check: it calls back in here
-        _ggml_selfcheck(type_name, mode, small, moe)
+        _ggml_selfcheck(type_name, mode, small, moe, mrow)
     of = _ggml_run(xf, packed, type_name, K, N, small=small,
                    eidx=eidx, eslot=eslot, estride=estride, xper=xper)
     return of if bias is None else of + bias
@@ -6682,7 +6802,7 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, mode, small=None, moe=False):
+def _ggml_add(type_name, mode, small=None, moe=False, mrow=None):
     plat = _adam_kernel["platform"]
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if moe:
@@ -6690,11 +6810,12 @@ def _ggml_add(type_name, mode, small=None, moe=False):
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
     cfg = _cfg_for(small, _GGML_TYPES[type_name][2])
-    plat.addKernel(_ggml_name(type_name, mode, small=small, moe=moe),
-                   {"source": _ggml_src(type_name, mode, cfg, moe=moe), "bindingTypes": binds})
+    plat.addKernel(_ggml_name(type_name, mode, small=small, moe=moe, mrow=mrow),
+                   {"source": _ggml_src(type_name, mode, cfg, moe=moe, mrow=mrow),
+                    "bindingTypes": binds})
 
 
-def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
+def _ggml_name(type_name, mode, orw=None, small=None, moe=False, mrow=None):
     # ORW and the thread shape are compile-time constants in the shader, so a kernel is
     # identified by them too -- otherwise a second variant would silently reuse the first
     # one's pipeline.
@@ -6707,8 +6828,9 @@ def _ggml_name(type_name, mode, orw=None, small=None, moe=False):
                                   "" if o <= 1 else "_r%d" % o,
                                   "_%s" % small if small else "",
                                   "_e" if moe else "",
-                                  "" if (mode != 0 or _GGML_KSG == 1)
-                                  else "_g%d" % _GGML_KSG)
+                                  "" if mode != 0 else
+                                  ("" if _GGML_KSG == 1 else "_g%d" % _GGML_KSG)
+                                  + ("" if (mrow or 4) == 4 else "_m%d" % mrow))
 
 
 # ==== the small fused decode kernels, on WebGL ==========================================
@@ -7535,12 +7657,13 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     if small is _AUTO:
         small = _shape_kind(N, K, vals) if mode == 1 else None
     moe = eidx is not None
+    mrow = _ggml_mrow(vals, M) if mode == 0 else None
     # Asking for a variant nobody built is the same silent failure the self-check exists to
     # catch: the platform does not know the name, runs nothing, and leaves the output buffer
     # zeroed -- which reads as a numerically wrong kernel. It cost a full sweep reported as
     # "168 of 168 formats broken" while the model beside it generated perfectly.
     if (type_name, mode, small, moe,
-            _GGML_KSG if mode == 0 else 0) not in _ggml_k["added"]:
+            (_GGML_KSG, mrow) if mode == 0 else 0) not in _ggml_k["added"]:
         raise RuntimeError("ggml kernel variant %r was never built -- go through ggml_matmul, "
                            "or pass the same `small` it derives (_AUTO works)"
                            % ((type_name, mode, small, moe),))
@@ -7548,7 +7671,7 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     # one row per slot for the caller to weight and sum. Batched prefill keeps z for its own
     # row blocking and takes a slot at a time.
     slots = int(eidx.size) if (moe and mode == 1) else 1
-    name = _ggml_name(type_name, mode, small=small, moe=moe)
+    name = _ggml_name(type_name, mode, small=small, moe=moe, mrow=mrow)
     plat = _adam_kernel["platform"]
     of = _empty((slots * M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, (K // vals) * blk, estride, eslot,
@@ -7562,8 +7685,8 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     plat.runKernel({"name": name, "tensors": bufs,
                     "workGroups": {"x": ((_gemv_groups(N, mode, vals, small)
                                           if M <= 2 else (N + 63) // 64)), "y": 1,
-                                   "z": slots if M <= 2 else (M + 4 * _GGML_KSG - 1)
-                                                              // (4 * _GGML_KSG)}})
+                                   "z": slots if M <= 2 else
+                                   (M + mrow * _GGML_KSG - 1) // (mrow * _GGML_KSG)}})
     return of
 
 

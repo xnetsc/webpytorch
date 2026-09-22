@@ -117,9 +117,15 @@ about any of this.
 **Prefill** does the opposite twice over:
 
 - Above `_GGML_DEQ_M` rows the weights *are* unpacked, once, and the plain fp32 matmul runs
-  on them. Measured on this machine that kernel sustains 2117 GFLOPS against the quantised
-  kernel's 426 — the quantised one is not bandwidth-bound, it is bound by unpacking the same
-  weights again for every row. Above a few dozen rows, paying once is 4.8× cheaper.
+  on them — but only for formats `ggml_dequant_ok` allows. Every i-quant is excluded, which
+  is 84% of a 27B's elements, so for that model this is not the prefill path at all.
+- The quantised kernel it falls back to was bound by decoding the same weight again for
+  every output row. One thread owned four rows, so a decoded value fed four multiplies; it
+  now owns twelve (`_GGML_MROW`), and the per-row guard that put eleven branches in the
+  innermost loop is gone because the rows a partial group lacks are staged as zero anyway.
+  A whole 28-layer prefill forced onto this kernel went 1290.8 → 670.8 ms at T=512 and
+  4296.4 → 2366.0 at T=1536; per format it is 1.2× to 1.9×, biggest where the decode is
+  most expensive. Unpacking still wins where it is allowed, by 1.5–2.0× rather than 5×.
 - Attention materialises the score matrix `_ATTN_CHUNK` queries at a time (above
   `_ATTN_CHUNK_MIN_T` tokens) instead of streaming it. A flash kernel avoids writing the
   scores down but runs at 94 GFLOPS here; the chunked form spends more memory traffic in
