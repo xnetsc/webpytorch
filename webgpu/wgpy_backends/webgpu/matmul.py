@@ -275,6 +275,188 @@ array_c[x * 2u + 1u + (y * 4u + 3u) * ND4] = sum13;
     return out
 
 
+def _matmul_n64k4_check(
+    lhs: ndarray, rhs: ndarray, out: Optional[ndarray] = None
+) -> bool:
+    """The same tiled kernel, without the requirement on M.
+
+    `_matmul_m32n64k4` is six to seven times faster than the generic kernel and takes only
+    row counts that are a multiple of 32. A row count is the one thing a caller does not get
+    to choose: it is the number of tokens in the sequence, or the batch it was handed. An
+    encoder reading 249 tokens measured 6.55 ms on the generic kernel and 0.90 ms on the
+    tiled one at 256 -- three percent more arithmetic for a seventh of the time -- so what
+    was keeping nearly every call on the slow path was the shape of the check, not the work.
+    """
+    m, k = lhs.shape
+    _, n = rhs.shape
+    return (
+        n % 64 == 0
+        and k % 4 == 0
+        and lhs.flags.c_contiguous_full
+        and rhs.flags.c_contiguous_full
+        and (out is None or out.flags.c_contiguous_full)
+    )
+
+
+def _matmul_n64k4(
+    lhs: ndarray, rhs: ndarray, out: Optional[ndarray] = None
+) -> ndarray:
+    m, k = lhs.shape
+    _, n = rhs.shape
+    kernel_name = f"matmul_n64k4"
+    if kernel_name not in added_kernels:
+        get_platform().addKernel(
+            kernel_name,
+            {
+                "source": """@group(0) @binding(0)
+var<storage,read> array_a: array<vec4<f32>>;
+
+@group(0) @binding(1)
+var<storage,read> array_b: array<vec4<f32>>;
+
+@group(0) @binding(2)
+var<storage,read_write> array_c: array<vec4<f32>>;
+
+struct CMeta {
+M: u32,
+N: u32,
+K: u32,
+}
+
+@group(0) @binding(3)
+var<storage,read> cmeta: CMeta;
+
+@compute @workgroup_size(8,8,1)
+fn main(
+@builtin(global_invocation_id) global_id: vec3<u32>
+) {
+let M: u32 = cmeta.M;
+let N: u32 = cmeta.N;
+let K: u32 = cmeta.K;
+let MD4: u32 = M >> 2;
+let ND4: u32 = N >> 2;
+let KD4: u32 = K >> 2;
+var x: u32 = global_id.x;
+var y: u32 = global_id.y;
+// This kernel does not require M to be a multiple of 32. The row a thread starts at is
+// checked once; the other three are CLAMPED rather than branched on, so the inner loop
+// stays exactly as it was and a row past the end merely re-reads the first one. What that
+// thread computes for it is never stored -- see the guards at the bottom.
+let row: u32 = y * 4u;
+if (x * 8u >= N || row >= M) {
+return;
+}
+let i0: u32 = row;
+let i1: u32 = select(row, row + 1u, row + 1u < M);
+let i2: u32 = select(row, row + 2u, row + 2u < M);
+let i3: u32 = select(row, row + 3u, row + 3u < M);
+var sum00: vec4<f32> = vec4<f32>();
+var sum01: vec4<f32> = vec4<f32>();
+var sum02: vec4<f32> = vec4<f32>();
+var sum03: vec4<f32> = vec4<f32>();
+var sum10: vec4<f32> = vec4<f32>();
+var sum11: vec4<f32> = vec4<f32>();
+var sum12: vec4<f32> = vec4<f32>();
+var sum13: vec4<f32> = vec4<f32>();
+for(var k: u32 = 0u; k < KD4; k = k + 1u) {
+var arow0: vec4<f32> = array_a[i0 * KD4 + k];
+var arow1: vec4<f32> = array_a[i1 * KD4 + k];
+var arow2: vec4<f32> = array_a[i2 * KD4 + k];
+var arow3: vec4<f32> = array_a[i3 * KD4 + k];
+var brow: vec4<f32>;
+brow = array_b[(k * 4u + 0u) * ND4 + x * 2u + 0u];
+sum00 = vec4<f32>(arow0.x) * brow + sum00;
+sum01 = vec4<f32>(arow1.x) * brow + sum01;
+sum02 = vec4<f32>(arow2.x) * brow + sum02;
+sum03 = vec4<f32>(arow3.x) * brow + sum03;
+brow = array_b[(k * 4u + 0u) * ND4 + x * 2u + 1u];
+sum10 = vec4<f32>(arow0.x) * brow + sum10;
+sum11 = vec4<f32>(arow1.x) * brow + sum11;
+sum12 = vec4<f32>(arow2.x) * brow + sum12;
+sum13 = vec4<f32>(arow3.x) * brow + sum13;
+
+brow = array_b[(k * 4u + 1u) * ND4 + x * 2u + 0u];
+sum00 = vec4<f32>(arow0.y) * brow + sum00;
+sum01 = vec4<f32>(arow1.y) * brow + sum01;
+sum02 = vec4<f32>(arow2.y) * brow + sum02;
+sum03 = vec4<f32>(arow3.y) * brow + sum03;
+brow = array_b[(k * 4u + 1u) * ND4 + x * 2u + 1u];
+sum10 = vec4<f32>(arow0.y) * brow + sum10;
+sum11 = vec4<f32>(arow1.y) * brow + sum11;
+sum12 = vec4<f32>(arow2.y) * brow + sum12;
+sum13 = vec4<f32>(arow3.y) * brow + sum13;
+
+brow = array_b[(k * 4u + 2u) * ND4 + x * 2u + 0u];
+sum00 = vec4<f32>(arow0.z) * brow + sum00;
+sum01 = vec4<f32>(arow1.z) * brow + sum01;
+sum02 = vec4<f32>(arow2.z) * brow + sum02;
+sum03 = vec4<f32>(arow3.z) * brow + sum03;
+brow = array_b[(k * 4u + 2u) * ND4 + x * 2u + 1u];
+sum10 = vec4<f32>(arow0.z) * brow + sum10;
+sum11 = vec4<f32>(arow1.z) * brow + sum11;
+sum12 = vec4<f32>(arow2.z) * brow + sum12;
+sum13 = vec4<f32>(arow3.z) * brow + sum13;
+
+brow = array_b[(k * 4u + 3u) * ND4 + x * 2u + 0u];
+sum00 = vec4<f32>(arow0.w) * brow + sum00;
+sum01 = vec4<f32>(arow1.w) * brow + sum01;
+sum02 = vec4<f32>(arow2.w) * brow + sum02;
+sum03 = vec4<f32>(arow3.w) * brow + sum03;
+brow = array_b[(k * 4u + 3u) * ND4 + x * 2u + 1u];
+sum10 = vec4<f32>(arow0.w) * brow + sum10;
+sum11 = vec4<f32>(arow1.w) * brow + sum11;
+sum12 = vec4<f32>(arow2.w) * brow + sum12;
+sum13 = vec4<f32>(arow3.w) * brow + sum13;
+}
+array_c[x * 2u + 0u + (row + 0u) * ND4] = sum00;
+array_c[x * 2u + 1u + (row + 0u) * ND4] = sum10;
+if (row + 1u < M) {
+array_c[x * 2u + 0u + (row + 1u) * ND4] = sum01;
+array_c[x * 2u + 1u + (row + 1u) * ND4] = sum11;
+}
+if (row + 2u < M) {
+array_c[x * 2u + 0u + (row + 2u) * ND4] = sum02;
+array_c[x * 2u + 1u + (row + 2u) * ND4] = sum12;
+}
+if (row + 3u < M) {
+array_c[x * 2u + 0u + (row + 3u) * ND4] = sum03;
+array_c[x * 2u + 1u + (row + 3u) * ND4] = sum13;
+}
+}
+""",
+                "bindingTypes": [
+                    "read-only-storage",
+                    "read-only-storage",
+                    "storage",
+                    "read-only-storage",
+                ],
+            },
+        )
+        added_kernels.add(kernel_name)
+    meta = create_meta_buffer_from_structure((m, n, k), "u4,u4,u4")
+    if out is None:
+        out = ndarray((m, n), lhs.dtype)
+    else:
+        assert out.flags.c_contiguous_full
+
+    get_platform().runKernel(
+        {
+            "name": kernel_name,
+            "tensors": [
+                lhs.buffer.buffer_id,
+                rhs.buffer.buffer_id,
+                out.buffer.buffer_id,
+                meta.buffer_id,
+            ],
+            # Rounded UP: the last group covers the rows that do not fill it, and the guards
+            # in the kernel keep it from writing past the end.
+            "workGroups": {"x": int(n // 64), "y": int((m + 31) // 32), "z": 1},
+        }
+    )
+
+    return out
+
+
 def matmul_impl(lhs: ndarray, rhs: ndarray, out: Optional[ndarray] = None) -> ndarray:
     # 2D only
     m, k = lhs.shape
@@ -282,6 +464,8 @@ def matmul_impl(lhs: ndarray, rhs: ndarray, out: Optional[ndarray] = None) -> nd
     assert k == k2
     if _matmul_m32n64k4_check(lhs, rhs, out):
         return _matmul_m32n64k4(lhs, rhs, out)
+    if _matmul_n64k4_check(lhs, rhs, out):
+        return _matmul_n64k4(lhs, rhs, out)
     return _matmul_generic(lhs, rhs, out)
 
 

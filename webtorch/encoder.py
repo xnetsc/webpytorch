@@ -218,8 +218,16 @@ class TextEncoder(wt.Module):
             v = self._lin(x, p + "v_proj").reshape(T, h, hd)
         cos, sin = self._rope_tables(T, kind)
         # rope wants (..., T, hd): put heads first so T is the second-to-last axis
-        q = wt.apply_rope(q.permute(1, 0, 2), cos, sin)        # (h, T, hd)
-        k = wt.apply_rope(k.permute(1, 0, 2), cos, sin)
+        q, k = q.permute(1, 0, 2), k.permute(1, 0, 2)          # (h, T, hd)
+        # One dispatch each where the backend has the fused form. Written out of primitives
+        # this is eight dispatches per tensor per layer -- the largest block of them left in
+        # the pass once the matmuls stopped being the whole of the time. The fused kernel
+        # carries no gradient, so anything training keeps the expression.
+        fq = None if (q.requires_grad or k.requires_grad) else wt.rope_decode(q, cos, sin, hd, hd, T)
+        if fq is not None:
+            q, k = fq, wt.rope_decode(k, cos, sin, hd, hd, T)
+        else:
+            q, k = wt.apply_rope(q, cos, sin), wt.apply_rope(k, cos, sin)
         v = v.permute(1, 0, 2)
         scores = bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))
         o = bmm(softmax(scores + mask), v)                     # (h, T, hd)
