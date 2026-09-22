@@ -68,6 +68,76 @@ function isFixed(url) {
   } catch (e) { return false; }
 }
 
+// ---- cleaning up, which is the other half of caching ------------------------------------
+//
+// Every file this page serves carries a content hash in its query (`app.js?v=327c024b76`),
+// and a cache is keyed by the WHOLE url. So each deploy writes a new entry and leaves the
+// old one behind for ever: measured on the deployed page before this existed, 52 entries for
+// the SDK's 27 Python modules, none of which could ever be matched again. A cache that only
+// grows is not a cache, it is a slow leak with a hit rate.
+//
+// So a write evicts its own older versions. Same origin, same path, different query means an
+// earlier build of the same file, and there is no reason to keep one: this bucket is
+// network-first, so the only thing a stale entry can do is answer when the network is gone,
+// and answering with last month's code is worse than not answering.
+async function dropOlderVersions(c, url) {
+  const me = new URL(url);
+  const olds = (await c.keys()).filter(function (r) {
+    const u = new URL(r.url);
+    return u.origin === me.origin && u.pathname === me.pathname && u.search !== me.search;
+  });
+  for (const r of olds) await c.delete(r);
+  return olds.length;
+}
+
+// The same rule applied to what is already there, once per worker update. A path with more
+// than one entry is a path whose versions have piled up; drop them all rather than guess
+// which is current, because network-first will put the right one back on the next load and
+// the only thing lost in between is offline coverage for those files.
+async function sweepVersions(c) {
+  const byPath = {};
+  for (const r of await c.keys()) {
+    const u = new URL(r.url);
+    (byPath[u.origin + u.pathname] || (byPath[u.origin + u.pathname] = [])).push(r);
+  }
+  let n = 0;
+  for (const k of Object.keys(byPath)) {
+    if (byPath[k].length < 2) continue;
+    for (const r of byPath[k]) { await c.delete(r); n++; }
+  }
+  return n;
+}
+
+// Code that does not exist any more.
+//
+// A write only ever evicts its OWN path, so a file deleted from the project is never reached
+// by it: nothing requests that path again, so nothing writes it, so the copy sits there for
+// ever. This page has deleted two service-worker-adjacent files and a whole worker in the
+// last day, and every browser that ever loaded them still had them -- and would still have
+// SERVED them, because this bucket falls back to the cache when the network says no, and a
+// 404 is the network saying no.
+//
+// A worker activating IS a new deploy, so that is when to ask. One conditional request per
+// same-origin entry, a few dozen, mostly 304s; anything the server no longer has goes. Only
+// our own origin, because what a CDN chooses to keep is not ours to police.
+async function sweepDeleted(c) {
+  const mine = (await c.keys()).filter(function (r) {
+    return new URL(r.url).origin === self.location.origin;
+  });
+  let gone = 0;
+  const LANES = 6;                        // enough to not be slow, few enough to not be rude
+  await Promise.all(Array.from({ length: LANES }, async function (_, lane) {
+    for (let i = lane; i < mine.length; i += LANES) {
+      const r = mine[i];
+      try {
+        const res = await fetch(new Request(r.url, { cache: 'no-cache' }));
+        if (res.status === 404 || res.status === 410) { await c.delete(r); gone++; }
+      } catch (e) { /* offline: a file we cannot ask about is not a file we may delete */ }
+    }
+  }));
+  return gone;
+}
+
 // `res.body` is spoken for the moment the response is returned, so the copy has to be taken
 // before the write is even scheduled: by the time `caches.open` resolves, cloning throws and
 // the entry is silently never written. That is exactly what happened once -- the caches
@@ -76,9 +146,19 @@ function isFixed(url) {
 function keep(ctx, cacheName, url, res) {
   if (!res || !res.ok || res.type === 'opaque') return res;   // opaque: unreadable, poison
   var copy = res.clone();
-  ctx.keepUntil(caches.open(cacheName).then(function (c) {
-    return c.put(url, copy);
-  }).catch(function () { /* over quota, or not storable */ }));
+  ctx.keepUntil(caches.open(cacheName).then(async function (c) {
+    try {
+      await c.put(url, copy);
+    } catch (err) {
+      // Out of room, most likely. Swallowing it means the cache quietly stops working and
+      // the page gets slower with no way to find out, so the page is told -- it is the only
+      // thing here that can say anything to anyone.
+      webtorch.sendToPage({ kind: 'cache-full', url: url,
+                            error: String((err && err.name) || err) });
+      return;
+    }
+    await dropOlderVersions(c, url);
+  }).catch(function () { /* the cache itself is unavailable; nothing to do about it here */ }));
   return res;
 }
 
@@ -113,21 +193,36 @@ webtorch.handleFetch(function (req, ctx) {
   return isFixed(req.url) ? fromCache(req, ctx) : fromNetwork(req, ctx);
 });
 
-// Old generations, and anything filed under FIXED that no longer qualifies as fixed.
+// Everything that has to go: old generations, anything filed under FIXED that no longer
+// qualifies as fixed, and versions that piled up before a write was evicting its own.
 self.addEventListener('activate', function (e) {
-  e.waitUntil(
-    caches.keys().then(function (names) {
-      return Promise.all(names.map(function (n) {
-        if (/^webtorch-(fixed|app)-/.test(n) && n !== FIXED && n !== APP) return caches.delete(n);
-      }));
-    }).then(function () {
-      return caches.open(FIXED).then(function (c) {
-        return c.keys().then(function (reqs) {
-          return Promise.all(reqs.map(function (r) {
-            if (!isFixed(r.url)) return c.delete(r);
-          }));
-        });
-      });
-    }).catch(function () { /* nothing here is worth failing activation over */ })
-  );
+  e.waitUntil((async function () {
+    try {
+      for (const n of await caches.keys()) {
+        if (/^webtorch-(fixed|app)-/.test(n) && n !== FIXED && n !== APP) await caches.delete(n);
+      }
+      const fixed = await caches.open(FIXED);
+      for (const r of await fixed.keys()) { if (!isFixed(r.url)) await fixed.delete(r); }
+      const app = await caches.open(APP);
+      const stale = await sweepVersions(app);
+      const gone = await sweepDeleted(app) + await sweepDeleted(fixed);
+      if (stale || gone) {
+        console.log('cache-sw: dropped ' + stale + ' stale versions and '
+                    + gone + ' files that no longer exist');
+        webtorch.sendToPage({ kind: 'cache-swept', staleVersions: stale, deleted: gone });
+      }
+    } catch (err) { /* nothing here is worth failing activation over */ }
+  })());
+});
+
+// What the page may ask. Only what the page cannot find out for itself: the names are ours.
+webtorch.onPageMessage(async function (msg, reply) {
+  if (!msg || msg.ask !== 'caches') return;
+  const out = { buckets: {}, total: 0 };
+  for (const name of [FIXED, APP]) {
+    const c = await caches.open(name);
+    const n = (await c.keys()).length;
+    out.buckets[name] = n; out.total += n;
+  }
+  reply(out);
 });

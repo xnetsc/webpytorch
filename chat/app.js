@@ -24,6 +24,23 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
+// What our half of the service worker has to say. Two things it cannot deal with alone:
+// the browser refusing to keep any more (the page is the only thing here that can tell
+// anyone), and what it dropped on a new deploy (worth seeing in the log when a stale file
+// is suspected). Drains whatever arrived before this file was parsed.
+window.onSwNote = function (m) {
+  if (!m) return;
+  if (m.kind === 'cache-full') {
+    console.warn('[sw] the browser would not cache ' + m.url + ' (' + m.error + ')');
+    storeStatus('The browser is out of room for cached files — clearing some models will '
+              + 'let the page load faster again.', true);
+  } else if (m.kind === 'cache-swept') {
+    console.log('[sw] dropped ' + m.staleVersions + ' stale versions and '
+              + m.deleted + ' files that no longer exist');
+  }
+};
+(window.__swNotes || []).forEach(window.onSwNote);
+
 // Which Pyodide, and this page's own cache-busting token.
 //
 // Both are the page's, not the SDK's. The version is the content hash `scripts/stamp.sh`

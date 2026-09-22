@@ -343,8 +343,17 @@
      `cache-sw.js` is ours and rides inside it: what this page caches and how. Called here
      rather than from app.js because a first visit reloads, and reloading after the page has
      been built is a flash of a page that is about to disappear. -->
-<script>webtorch.installServiceWorker({ baseURL: '../', handler: 'cache-sw.js' });</script>
+<script>
+// Buffered, because this has to run before app.js -- a first visit reloads, and reloading
+// after the page is built is a flash of a page about to disappear -- and app.js is what
+// knows how to show anything.
+window.__swNotes = [];
+webtorch.installServiceWorker({
+  baseURL: '../', handler: 'cache-sw.js',
+  onMessage: function (m) { (window.onSwNote || window.__swNotes.push.bind(window.__swNotes))(m); },
+});
+</script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=7eb509bab7"></script>
+<script src="app.js?v=64d0de8bf9"></script>
 </body>
 </html>
