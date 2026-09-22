@@ -644,6 +644,28 @@ goes out through the isolation headers. A mistake in your handler can make the p
 stale. It cannot make it fall back to the CPU. (Precedence, not a sandbox: your code shares
 the worker's global and could still break things it has no business touching.)
 
+**Talking between your two halves.** The worker's own `message` port is sealed: a handler
+that calls `addEventListener('message', …)` or sets `self.onmessage` gets an error naming the
+alternative. A service worker outlives the page, is shared by every tab and is the only thing
+keeping the document isolated — it is not a place for a second protocol nobody can see. There
+is one channel, and both ends are declared when the worker is created:
+
+```js
+// index.html — the page's end, given at install
+webtorch.installServiceWorker({
+  handler: 'cache-sw.js',
+  onMessage: (data) => { … },
+});
+webtorch.sendToHandler({ ask: 'something' });      // page  -> handler
+
+// cache-sw.js — the handler's end, registered when its file loads
+webtorch.onPageMessage((data, reply) => { reply({ … }); });
+webtorch.sendToPage({ … });                        // handler -> every window
+```
+
+Everything else a service worker can listen for is still yours — `activate` for cache
+cleanup, for one — because none of it can take a response away from the SDK's fetch listener.
+
 `webtorch.isolate(response)` and `webtorch.ISOLATION_HEADERS` are exported from
 `webtorch/js/webtorch-coi.js` for a host that insists on owning the registration itself.
 

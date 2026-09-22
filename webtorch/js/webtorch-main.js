@@ -99,14 +99,44 @@
   // `webtorch.handleFetch` in webtorch-sw.js for what that code looks like and for what it
   // is and is not allowed to do.
   //
+  // `onMessage` is the page's end of the one channel that handler may talk over. Both ends
+  // are declared here, with the worker -- the handler's end when its file loads, the page's
+  // end in this call -- and the raw `message` events are sealed off inside the worker so
+  // there is no second way.
+  //
   // Resolves to what happened, rather than throwing: 'isolated' (nothing needed),
   // 'reloading' (a reload is on its way), 'registered' (worker is in place, isolation lands
   // next load), or a reason it cannot work -- 'no-service-worker', 'not-served',
   // 'still-not-isolated', or 'failed: …'.
   const RELOAD_ONCE = 'webtorch.sw.reloaded';
 
+  /**
+   * Send to the host's half inside the service worker. It arrives at whatever that half
+   * passed to `webtorch.onPageMessage`.
+   *
+   * The pair exists because a service worker's `message` port is sealed to the host's
+   * handler: a worker that outlives the page and is shared by every tab, and that is the
+   * only thing keeping the document isolated, is not a place for a second protocol nobody
+   * can see. One typed channel, both ends declared up front.
+   */
+  wt.sendToHandler = async function (data) {
+    if (!navigator.serviceWorker) throw new Error('webtorch: no service worker here');
+    const reg = await navigator.serviceWorker.ready;
+    const target = navigator.serviceWorker.controller || reg.active;
+    if (!target) throw new Error('webtorch: no active service worker to send to');
+    target.postMessage({ __wtsw: 1, data: data });
+  };
+
   wt.installServiceWorker = async function (opts) {
     opts = opts || {};
+    // The page's end of that channel, declared here and not later, so both halves of a
+    // host's service-worker code are fixed at the moment the worker is created.
+    if (opts.onMessage && navigator.serviceWorker) {
+      navigator.serviceWorker.addEventListener('message', function (e) {
+        const d = e.data;
+        if (d && d.__wtsw === 1) opts.onMessage(d.data);
+      });
+    }
     const base = new URL(opts.baseURL || '../', location.href).href;
     const url = base + 'webtorch-sw.js'
               + (opts.handler ? '?handler=' + encodeURIComponent(
