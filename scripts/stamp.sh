@@ -37,7 +37,6 @@ stamp_html chat/index.html "../dist/wgpy-main.js"          dist/wgpy-main.js
 stamp_html chat/index.html "../webtorch/js/webtorch-main.js" webtorch/js/webtorch-main.js
 stamp_html chat/index.html "zip.js"                        chat/zip.js
 stamp_html chat/index.html "app.js"                        chat/app.js
-stamp_worker chat/app.js   "worker.js"                     chat/worker.js
 stamp_worker chat/app.js   "pyworker.js"                   chat/pyworker.js
 # app.js changed if a worker stamp moved, so its own stamp is taken last
 stamp_html chat/index.html "app.js"                        chat/app.js

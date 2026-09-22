@@ -82,6 +82,180 @@
     return /webtorch: cancelled by request/.test(String((e && e.message) || e || ''));
   };
 
+  // ---- the whole SDK, as functions ------------------------------------------------------
+  //
+  // `initMain`/`initWorker` above are the low-level pair: they hand back a Pyodide and leave
+  // the crossing to the caller. `start` is the one to reach for. It creates the worker from
+  // a script this package ships, so a host writes no worker at all, and returns an object
+  // whose methods are the SDK -- arguments marshalled, Python run, results parsed, and the
+  // SDK's own progress hooks delivered as ordinary callbacks.
+  //
+  // Options, all optional: `baseURL`, `backendOrder`/`requireGpu` (as `initMain`),
+  // `pyodideIndexURL`, `version` (passed through to the files this package serves, for a
+  // host whose caching is a URL that changes with the bytes), and `rememberTuning` -- which
+  // lets the SDK keep what it measured about this GPU so the next load does not measure it
+  // again. That last one is off by default: leaving something behind in a browser's storage
+  // is the host's call, not the SDK's, and so is caching a model (install a writer with
+  // `run("webtorch.set_io_write(webtorch.default_io_write)")` if that is what you want).
+  //
+  //     const wt = await webtorch.start({ baseURL: '../' });
+  //     const m  = await wt.load('org/repo/file.gguf', { onProgress: p => … });
+  //     const r  = await wt.generate('hello', { onToken: t => … });
+  //
+  // Anything this does not wrap is still reachable: `wt.run(code, vars)` executes Python in
+  // the same runtime with values from the page bound as globals, which is where policy that
+  // is genuinely the host's -- where models are fetched from, for one -- belongs.
+  let nextId = 1;
+
+  wt.start = async function (opts) {
+    opts = opts || {};
+    // Made absolute against the PAGE before it is handed over. `baseURL` is written the way
+    // a caller thinks of it -- from the page -- but the worker script resolves its own
+    // `importScripts` against where IT sits, which is inside this package. '../' then means
+    // two different directories on the two sides, and the worker silently failed to load
+    // the backend from a path one level too deep.
+    const base = new URL(opts.baseURL || '../', location.href).href;
+    // Passed through to the worker script and to the package files, and used for nothing
+    // else. Caching is the host's: this is only how a host that versions its URLs says so.
+    const v = opts.version ? ('&v=' + encodeURIComponent(opts.version)) : '';
+    const worker = new Worker(base + 'webtorch/js/webtorch-host.js?base='
+                              + encodeURIComponent(base) + v);
+    const pending = new Map();          // call id -> {resolve, reject, on}
+    const listeners = {};               // name -> [fn], for events not tied to a call
+
+    worker.addEventListener('message', function (e) {
+      const d = e.data;
+      if (!d || (d.__wt !== 'reply' && d.__wt !== 'event')) return;
+      const p = pending.get(d.id);
+      if (d.__wt === 'event') {
+        // A call's own callback first; otherwise whoever is listening for that name. An
+        // event with id 0 belongs to no call -- status and log during boot.
+        const own = p && p.on && p.on[d.name];
+        if (own) { own(d.data); return; }
+        for (const fn of listeners[d.name] || []) fn(d.data);
+        return;
+      }
+      pending.delete(d.id);
+      if (!p) return;
+      d.ok ? p.resolve(d.value) : p.reject(new Error(d.value));
+    });
+
+    const { backend, tasks } = await wt.initMain(worker, opts);
+
+    function call(method, args, on) {
+      const id = nextId++;
+      const p = new Promise(function (resolve, reject) {
+        pending.set(id, { resolve: resolve, reject: reject, on: on || null });
+      });
+      worker.postMessage({ __wt: 'call', id: id, method: method, args: args || {} });
+      return p;
+    }
+    // Callbacks are passed inline with the other options, because that is where a caller
+    // thinks of them; they are pulled out here rather than crossing as messages, which they
+    // cannot do.
+    function split(o, names) {
+      const on = {}, rest = {};
+      for (const k of Object.keys(o || {})) {
+        const ev = names[k];
+        if (ev) { on[ev] = o[k]; } else { rest[k] = o[k]; }
+      }
+      return [rest, on];
+    }
+
+    const api = {
+      /** 'webgpu' | 'webgl' | 'cpu' -- what ops will really run on. */
+      backend: backend,
+      /** Why it is not the GPU, recorded where it failed. Null when it is. */
+      reason: null,
+
+      /** Stop whatever is running, now, while the worker is busy. See `tasks.cancel`. */
+      cancel: function () { tasks.cancel(); },
+      /** What the runtime holds right now, straight out of shared memory. */
+      resources: function () { return tasks.resources(); },
+      /** Was this the stop, rather than something going wrong? */
+      isCancelled: wt.isCancelled,
+
+      /** Listen for events that belong to no particular call: 'status', 'log'. */
+      on: function (name, fn) {
+        (listeners[name] || (listeners[name] = [])).push(fn);
+        return api;
+      },
+
+      /** Python in the same runtime, with `vars` bound as globals. The escape hatch. */
+      run: function (code, vars) { return call('run', { code: code, vars: vars || {} }); },
+
+      /**
+       * Load a model. `source` is whatever the installed reader takes; `file` names one
+       * inside a repo. Returns {id, kind, surface} -- `surface` is the model's own account
+       * of what it takes and returns, so a caller builds itself from that rather than from
+       * a table of its own.
+       */
+      load: function (source, o) {
+        const [rest, on] = split(o, { onProgress: 'progress', onStage: 'stage',
+                                      onStatus: 'status' });
+        return call('load', { source: source, file: rest.file,
+                              maxContext: rest.maxContext }, on);
+      },
+      release: function () { return call('release'); },
+      /** Stop a load. Separate from `cancel` only because a suspended load can be told directly. */
+      stopLoading: function () { return call('stopLoad'); },
+
+      /**
+       * Generate. Every option the SDK takes is forwarded by name -- temperature, top_p,
+       * stop, tools, and the rest -- and one left out keeps the model's own default.
+       * `onToken({channel, text, n, at})` arrives as the reply is written.
+       */
+      generate: function (prompt, o) {
+        const [rest, on] = split(o, { onToken: 'token' });
+        const images = rest.images; delete rest.images;
+        return call('generate', { prompt: prompt, options: rest, images: images }, on);
+      },
+      /** Score structured questions against a structured state, for a model that decides. */
+      decide: function (state, questions) { return call('decide', { state: state, questions: questions }); },
+
+      /** What the model can be asked about its own output. */
+      tools: {
+        supported: function () { return call('toolsSupported'); },
+        calls: function (text, list) { return call('toolCalls', { text: text, tools: list }); },
+        result: function (c, content) { return call('toolResult', { call: c, content: content }); },
+        suggest: function (name, args, list) { return call('toolSuggest', { name: name, args: args, tools: list }); },
+        round: function (text, calls, results) { return call('toolRound', { text: text, calls: calls, results: results }); },
+        render: function (name, args, list) { return call('toolRender', { name: name, args: args, tools: list }); },
+      },
+      splitReasoning: function (text) { return call('splitReasoning', { text: text }); },
+
+      /** Model files this browser is keeping. */
+      cache: {
+        list: function () { return call('cacheList'); },
+        delete: function (key) { return call('cacheDelete', { key: key }); },
+        clear: function () { return call('cacheClear'); },
+        /** Into a file the caller picked; the handle can only come from a page. */
+        export: function (keys, handle, o) {
+          const [, on] = split(o, { onProgress: 'exporting' });
+          return call('cacheExport', { keys: keys, handle: handle }, on);
+        },
+        import: function (handle, name) { return call('cacheImport', { handle: handle, name: name }); },
+        migrate: function (directory, o) {
+          const [, on] = split(o, { onProgress: 'migrating' });
+          return call('cacheMigrate', { directory: directory }, on);
+        },
+        /** Be told when the browser refuses to keep any more. */
+        watch: function (fn) { return call('watchStorage', {}, { storageFull: fn }); },
+      },
+
+      /** The runtime's figures when it is idle; `resources()` is the same while it is busy. */
+      stats: function () { return call('stats'); },
+    };
+
+    // Boot now, so `backend` and `reason` are answers rather than promises by the time this
+    // returns -- a caller that has to ask twice will forget once.
+    const started = await call('start', { pyodideIndexURL: opts.pyodideIndexURL,
+                                          rememberTuning: !!opts.rememberTuning });
+    api.backend = started.backend;
+    api.reason = started.reason || null;
+    return api;
+  };
+
   // How long the cooperative stop gets before the interpreter is interrupted.
   //
   // Long enough for it to win where it can, short enough not to be a wait: a generation

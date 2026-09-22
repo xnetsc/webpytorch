@@ -32,9 +32,10 @@
   // without the manifest, and is only ever a floor.
   const FALLBACK = ["__init__.py", "_core.py", "_sdk.py", "audiofe.py", "backend.py", "cosyvoice.py", "detection.py", "ggufload.py", "hfcompat.py", "iqtables.py", "linear_attn.py", "llm.py", "lm_engine.py", "multimodal.py", "onnxrt.py", "portable.py", "quantize.py", "torchshim.py", "tts.py", "vl.py", "webenv.py", "webio.py"];
 
-  async function moduleList(base) {
+  async function moduleList(base, version) {
     try {
-      const r = await fetch(base + 'webtorch/modules.json');
+      const r = await fetch(base + 'webtorch/modules.json'
+                            + (version ? '?v=' + encodeURIComponent(version) : ''));
       if (r.ok) {
         const m = (await r.json()).modules;
         if (Array.isArray(m) && m.length) return m;
@@ -50,13 +51,23 @@
     if (e.data && e.data.__webtorch === 'backend') announced(e.data.backend);
   });
 
-  async function text(u) {
-    // Bust the HTTP cache: the package files change constantly during development, and a
-    // stale copy here means the browser is running code that no longer exists on disk --
-    // which is indistinguishable from a bug, and much harder to find.
-    const r = await fetch(u + (u.includes('?') ? '&' : '?') + 'v=' + Date.now(), {cache: 'no-store'});
-    if (!r.ok) throw new Error(u + ': ' + r.status);
-    return r.text();
+  // How the package's own files are fetched: ordinarily, so whatever the host serves them
+  // with decides whether they are cached.
+  //
+  // This used to append `v=Date.now()` and `cache: 'no-store'` to every one of them, which
+  // began as a development convenience -- an edited module that the browser answers from
+  // cache is indistinguishable from a bug, and much harder to find -- and shipped as a
+  // policy: 27 files and 1.3MB re-fetched on every page load of every host, forever, with
+  // no way to turn it off. Caching and cache-busting belong to whoever serves the files.
+  // A host that wants a URL which changes when the bytes do passes `version` (this project
+  // has `scripts/stamp.sh`, which is exactly that); a host that sets cache headers instead
+  // passes nothing.
+  function text(u, version) {
+    const url = version ? (u + (u.includes('?') ? '&' : '?') + 'v=' + encodeURIComponent(version)) : u;
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(u + ': ' + r.status);
+      return r.text();
+    });
   }
 
   /**
@@ -130,12 +141,21 @@
   // because the other half's timer can fire a microsecond after it. A KeyboardInterrupt with
   // no command running IS the stop that already succeeded, and reporting it as a failure
   // would be reporting the thing working.
+  //
+  // Narrow on purpose. This is a global handler on someone else's context, and swallowing
+  // an error the host wanted to see is worse than showing one it did not: so it fires only
+  // when the interrupt byte is STILL SET, which means the raise came from the escalation
+  // this file wrote and nothing has consumed it. A KeyboardInterrupt from anywhere else --
+  // the host's own, a library's -- passes straight through.
   let depth = 0;
   root.addEventListener('unhandledrejection', function (e) {
-    if (depth > 0) return;
+    if (depth > 0 || !INTR) return;
+    let armed = false;
+    try { armed = INTR[0] !== 0; } catch (err) { return; }
+    if (!armed) return;
     const m = String((e.reason && (e.reason.message || e.reason.toString())) || '');
     if (!/KeyboardInterrupt/.test(m)) return;
-    if (INTR) { try { INTR[0] = 0; } catch (err) {} }
+    try { INTR[0] = 0; } catch (err) {}
     e.preventDefault();
   });
 
@@ -239,6 +259,9 @@
    * Boot everything. Options (all optional):
    *   baseURL        prefix for dist/ and webtorch/ (default '../')
    *   pyodideIndexURL  where to load Pyodide from (default: the CDN, see PYODIDE_URL)
+   *   version        appended to the package's own file URLs, for a host whose cache
+   *                  policy is a URL that changes with the bytes. Omitted, they are
+   *                  fetched plainly and the host's cache headers decide.
    *   onStatus       (text) => void, progress for the UI
    * Resolves to { pyodide, backend, tasks } where backend is what actually came up:
    * 'webgpu' | 'webgl' | 'cpu'.
@@ -288,8 +311,8 @@
     // fetch that actually failed -- and if even one module is missing the SDK is not
     // whatever the caller thinks it is anyway.
     const missing = [];
-    for (const m of await moduleList(base)) {
-      try { pyodide.FS.writeFile('webtorch/' + m, await text(base + 'webtorch/' + m)); }
+    for (const m of await moduleList(base, opts.version)) {
+      try { pyodide.FS.writeFile('webtorch/' + m, await text(base + 'webtorch/' + m, opts.version)); }
       catch (e) { missing.push(m + ' (' + (e && e.message || e) + ')'); }
     }
     if (missing.length) {

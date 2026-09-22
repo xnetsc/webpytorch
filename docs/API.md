@@ -599,6 +599,56 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   tell a browser without WebGPU from a page that is merely not cross-origin isolated.
 - `webtorch.__version__` — the SDK version string.
 
+### One call, no worker  (`webtorch.start`)
+
+The SDK is Python in a worker, so everything you do with it crosses a message boundary.
+`start` crosses it for you: it creates the worker from a script this package ships, brings up
+the backend, Pyodide and the package, and hands back functions.
+
+```html
+<script src="../dist/wgpy-main.js"></script>
+<script src="../webtorch/js/webtorch-main.js"></script>
+```
+```js
+const wt = await webtorch.start({ baseURL: '../' });
+
+const info = await wt.load('org/repo/file.gguf', {
+  onProgress: (p) => bar(p.bytes, p.total),      // bytes read
+  onStage:    (s) => say(s.stage),               // warming / checking / proving
+});
+const r = await wt.generate('hello', { max_new: 200, onToken: (t) => show(t.text) });
+
+wt.cancel();                 // stops work that is already running, now
+wt.resources();              // {gpuBytes, gpuPeak, gpuBuffers, wasmBytes, at} | null
+await wt.run(code, vars);    // any Python, with page values bound as globals
+```
+
+Also on it: `release()`, `stopLoading()`, `decide(state, questions)`, `splitReasoning(text)`,
+`stats()`, `tools.{supported,calls,result,suggest,round,render}` and
+`cache.{list,delete,clear,export,import,migrate,watch}`.
+
+`info.surface` is the model's own account of what it takes and returns — build your interface
+from that rather than from a table of model kind → controls.
+
+**What `start` does not decide.** Anything that is a policy rather than a mechanism stays
+with you, and is off unless you ask:
+
+| | how to say yes |
+|---|---|
+| where model files come from | `wt.run('webtorch.set_io_read(webtorch.modelscope_read())')` |
+| whether they are cached at all | `wt.run('webtorch.set_io_write(webtorch.default_io_write)')` |
+| keeping what this GPU measured | `start({ rememberTuning: true })` |
+| how your files are cached | `start({ version })` — appended to the package's own file URLs, for a host whose cache policy is a URL that changes with the bytes. Leave it out and they are fetched plainly, so your server's headers decide. |
+
+The SDK sets no cache headers, registers no service worker and writes nothing to browser
+storage on its own. It used to force `cache: 'no-store'` and a timestamp onto every one of
+its own module fetches, which began as a development convenience and shipped as a policy:
+1.3MB re-fetched on every load of every host, and — measured on the deployed page — 52
+service-worker cache entries written per visit under URLs that could never be matched again.
+
+**The low-level pair** — `initMain` / `initWorker` — is still there for a host that wants to
+own its own worker. `start` is built on them.
+
 **Main thread** — load `dist/wgpy-main.js`, then `webtorch/js/webtorch-main.js`:
 
 ```html

@@ -24,9 +24,19 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=1016d1240a');
-// One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
-// must not be spoken to, so `call` waits on it.
+// Which Pyodide, and this page's own cache-busting token.
+//
+// Both are the page's, not the SDK's. The version is the content hash `scripts/stamp.sh`
+// already wrote onto the SDK's own script tag -- reused rather than invented, so one run of
+// that script keeps the page and the SDK's Python files in step. A host that caches by
+// headers instead passes nothing and the SDK fetches them plainly.
+const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
+const SDK_VERSION = (() => {
+  const el = document.querySelector('script[src*="webtorch-main.js"]');
+  const m = el && /[?&]v=([^&]+)/.exec(el.getAttribute('src') || '');
+  return m ? m[1] : null;
+})();
+
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
 // backend the reporter actually had. Without it, the best available wins.
 const BACKEND_ORDER = (() => {
@@ -36,13 +46,34 @@ const BACKEND_ORDER = (() => {
   if (want === 'cpu') return [];
   return ['webgpu', 'webgl'];
 })();
-// `tasks` is the SDK's: stopping work that is already running, and reading what the runtime
-// holds. Both go through shared memory inside the SDK, because a worker that is running
-// Python does not reach `onmessage` until it finishes.
-let tasks = null;
-const gpuInit = webtorch.initMain(worker, { backendOrder: BACKEND_ORDER })
-  .then(r => { tasks = r.tasks; return r.backend; }, () => 'cpu');
-let seq = 0; const pending = new Map();
+// The SDK brings up its own worker, Python, the backend and the crossing between them, and
+// hands back functions. This page has no worker file and no RPC of its own.
+//
+// What is decided HERE, because it is this page's to decide and not the SDK's: which
+// backends to try, which Pyodide release, where model files come from, whether they are
+// cached at all, and whether anything about this device is kept between visits.
+let wt = null;
+const sdk = webtorch.start({
+  baseURL: '../',
+  backendOrder: BACKEND_ORDER,
+  pyodideIndexURL: PYODIDE_URL,
+  version: SDK_VERSION,            // this page's cache-busting, not the SDK's
+  rememberTuning: true,            // keep what this GPU worked out, so reloads are quick
+}).then(async (w) => {
+  wt = w;
+  w.on('status', (t) => {
+    $('#modelStatus').textContent = t;
+    $('#miniStatus').textContent = String(t).split('\n')[0].slice(0, 60);
+  });
+  w.on('log', (t) => console.log('[py]', t));
+  // Where models come from, and that they are kept. Both are this page's policy: the SDK
+  // offers a reader and a writer and installs neither.
+  await w.run('import webtorch\n'
+            + 'webtorch.set_io_read(webtorch.modelscope_read())\n'
+            + 'webtorch.set_io_write(webtorch.default_io_write)\n');
+  showBackend(w.backend, w.reason);
+  return w;
+});
 // Conversations live in IndexedDB so the sidebar survives a reload.
 // Each: {id, title, updated,
 //        messages:[{role, content, attachments:[{kind,name,text,dataUrl}], meta}]}
@@ -260,16 +291,10 @@ function envSummary() {
                                     : '');
 }
 
-function call(cmd, args) {
-  const id = ++seq;
-  const p = new Promise((res, rej) => pending.set(id, { res, rej }));
-  gpuInit.then(() => worker.postMessage({ id, cmd, args }));
-  return p;
-}
 // Stopping used to be about forty lines here: a shared flag, an interrupt buffer, a grace
-// timer and the escalation between them. It is `tasks.cancel()` now -- the SDK owns all of
-// it, because every caller needs a Stop button and none of that is about this page.
-function askStop() { if (tasks) tasks.cancel(); }
+// timer and the escalation between them. It is one call now -- the SDK owns all of it,
+// because every caller needs a Stop button and none of that is about this page.
+function askStop() { if (wt) wt.cancel(); }
 
 // A click picks the message a browser belongs to, and moves that browser into place. Only
 // a click does this: the passive reading of "current" must not scroll anything.
@@ -283,30 +308,26 @@ document.addEventListener('click', (e) => {
   alignCurrentWeb();
 });
 
-worker.onmessage = (e) => {
-  const m = e.data;
-  if (m.__webtorch) return;                     // the SDK's two halves, not a reply to us
-  if (m.type === 'result') {
-    const p = pending.get(m.id); pending.delete(m.id);
-    if (p) (m.error ? p.rej(new Error(m.error)) : p.res(m.res));
-  } else if (m.type === 'status') {
-    $('#modelStatus').textContent = m.text;
-    $('#miniStatus').textContent = m.text.split('\n')[0].slice(0, 60);
-  }
-  else if (m.type === 'exporting') {
-    // Reported WHERE THE EXPORT WAS STARTED. `#progressText` lives in the Model panel and
-    // the export button in the Storage one, so an export watched from Storage showed
-    // nothing at all -- and since the picked file stays at zero bytes until close (the
-    // browser writes a temporary and swaps it in), there was no sign anywhere that it was
-    // working. Eighty seconds of that reads as a failure.
-    const pct = m.total ? ' of ' + fmt(m.total) : '';
-    storeStatus('Writing ' + fmt(m.bytes) + pct
-              + ' — the file appears on disk when this finishes.');
-  }
-  else if (m.type === 'progress') { if (m.total) { expected = m.total; expectedIsReal = true; }
+// Reported WHERE THE EXPORT WAS STARTED. `#progressText` lives in the Model panel and the
+// export button in the Storage one, so an export watched from Storage showed nothing at all
+// -- and since the picked file stays at zero bytes until close (the browser writes a
+// temporary and swaps it in), there was no sign anywhere that it was working. Eighty seconds
+// of that reads as a failure.
+function onExporting(m) {
+  const pct = m.total ? ' of ' + fmt(m.total) : '';
+  storeStatus('Writing ' + fmt(m.bytes) + pct
+            + ' — the file appears on disk when this finishes.');
+}
+
+// What the worker used to send as messages arrives as callbacks now: the SDK delivers its
+// own progress hooks, and this page says what to do with each. Same code, no protocol.
+
+function onLoadProgress(m) { if (m.total) { expected = m.total; expectedIsReal = true; }
     if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
-    showProgress(m.bytes, m.rate, m.dlRate); }
-  else if (m.type === 'stage') {
+    showProgress(m.bytes, m.rate, m.dlRate);
+}
+
+function onLoadStage(m) {
     if (m.stage === 'reading' || !stageLog.length && m.after === null) stageLog = [];
     // The byte meter has stopped and the load has not. Say which of the remaining steps is
     // running, in the words of what it is FOR rather than the function's name: someone
@@ -331,18 +352,22 @@ worker.onmessage = (e) => {
     } else {
       setBarBusy(false);
     }
-  }
-  else if (m.type === 'loaded') {
+}
+
+function afterLoad(m) {
+  const imageOK = !!(m.surface && m.surface.takes && m.surface.takes.images);
     setBarBusy(false);
     if (stageLog.length) console.log('load stages: ' + stageLog.join(' · '));
     probeTools();            // asked once per model, before any reply needs the answer
-    modelLoaded = true; modelImage = !!m.image;
+    modelLoaded = true; modelImage = !!imageOK;
     applySurface(m.surface || null);
     // Done is done: leaving the last mid-load fraction on screen reads as a load that
     // stalled just short of the end.
     if (lastLoadedBytes) $('#progressText').textContent = 'loaded ' + fmt(lastLoadedBytes);
-    setBar(1); syncButtons(); refreshCache(); }
-  else if (m.type === 'chunk') {
+    setBar(1); syncButtons(); refreshCache();
+}
+
+function onToken(m) {
     // One decoded token. Append it to the message being streamed and update that message's
     // DOM in place — no full re-render per token, and the thinking box keeps whatever state
     // the person left it in.
@@ -386,32 +411,27 @@ worker.onmessage = (e) => {
       fillBody(streaming.body, reply, streaming.live);
       keepAtBottom(el, follow);
     }
-  }
-  else if (m.type === 'log') { console.log('[py]', m.text); }
-  else if (m.type === 'storageFull') { offerDirectory(m.key); }
-  else if (m.type === 'migrate') {
-    $('#progressText').textContent = 'moving to disk · ' + fmt(m.bytes);
-  }
-  else if (m.type === 'backend') {
-    ENV.backend = m.name;
+}
+
+function showBackend(name, why) {
+    ENV.backend = name;
     // The runtime is up: this is the point everything else was waiting for.
     envReady = true;
     $('#openSettings').disabled = false;
     syncButtons();
     // A CPU fallback is the difference between seconds and minutes per reply, so it is
     // stated rather than left for the user to infer from the wait.
-    $('#envInfo').textContent = envSummary() + (m.name === 'cpu'
+    $('#envInfo').textContent = envSummary() + (name === 'cpu'
       ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
-      : m.name === 'webgl'
+      : name === 'webgl'
       ? ' — compute: WebGL (no WebGPU here; about ' + WEBGL_SLOWDOWN + ' slower)'
-      : ' — compute: ' + m.name);
-    if (m.name === 'webgl') warnWebglFallback(m.why || null);
+      : ' — compute: ' + name);
+    if (name === 'webgl') warnWebglFallback(why || null);
     // Only for no GPU at all. WebGL is a GPU backend -- slower than WebGPU, but a dialog
     // headed "Running on the CPU" would be simply false, and the slow-reply note covers a
     // backend that is working and still not fast enough.
-    if (m.name === 'cpu') warnCpuFallback(m.name, m.why);
-  }
-};
+    if (name === 'cpu') warnCpuFallback(name, why);
+}
 // No GPU backend. This is worth interrupting for: the difference is roughly three hundred
 // times, and it is invisible until someone has waited out a reply. A line in Settings was
 // not enough -- a report came in of 0.5 tok/s on an M4 Pro, a machine that should manage
@@ -1359,7 +1379,7 @@ $('#loadBtn').onclick = async () => {
     $('#loadBtn').textContent = 'Stopping…';
     $('#loadBtn').disabled = true;
     askStop();                                  // shared memory, so a busy worker still sees it
-    call('stopLoad');
+    wt && wt.stopLoading();
     return;
   }
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
@@ -1384,7 +1404,8 @@ $('#loadBtn').onclick = async () => {
     loading = false; $('#loadBtn').textContent = 'Load'; $('#loadBtn').title = '';
     return;
   }
-  try { await call('load', { repo, file, lmax: lmaxValue() }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
+  try { afterLoad(await (await sdk).load(repo, { file, maxContext: lmaxValue(),
+                                               onProgress: onLoadProgress, onStage: onLoadStage })); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) {
     // The SDK raises one distinctive message for a stop the person asked for; that is a
     // normal ending, not a failure — say so, and put the meter back where it started.
@@ -1399,7 +1420,7 @@ $('#loadBtn').onclick = async () => {
   finally { loading = false; $('#loadBtn').textContent = 'Load model'; syncButtons(); }
 };
 $('#releaseBtn').onclick = async () => {
-  await call('release'); modelLoaded = false; modelImage = false; setBar(0);
+  await (await sdk).release(); modelLoaded = false; modelImage = false; setBar(0);
   $('#progressText').textContent = ''; syncButtons();
   note('Model released. Its files stay cached, so loading it again is fast.');
 };
@@ -1408,7 +1429,7 @@ $('#releaseBtn').onclick = async () => {
 async function refreshCache() {
   try {
     if (storeBusy) return;          // rebuilding the list mid-export would re-enable it
-    const c = await call('cacheList');
+    const c = await (await sdk).cache.list();
     const el = $('#cacheList'); el.innerHTML = '';
     if (!(c.groups || []).length) { el.innerHTML = '<p class="hint">nothing cached yet</p>'; return; }
     const head = document.createElement('p'); head.className = 'hint';
@@ -1438,7 +1459,7 @@ async function refreshCache() {
       del.dataset.title0 = 'Remove these files from the cache';
       del.onclick = async () => {
         if (storeBusy) return;
-        for (const key of g.keys) await call('cacheDelete', { key });
+        for (const key of g.keys) await (await sdk).cache.delete(key);
         refreshCache();
       };
       d.append(k, ex, del); el.appendChild(d);
@@ -1469,7 +1490,7 @@ async function refreshCache() {
           fx.dataset.title0 = 'Remove just this file';
           fx.onclick = async () => {
             if (storeBusy) return;
-            await call('cacheDelete', { key });
+            await (await sdk).cache.delete(key);
             refreshCache();
           };
           row.append(nm, sz, fx); det.appendChild(row);
@@ -1546,7 +1567,7 @@ async function exportModel(g) {
   setStoreBusy(true);
   storeStatus('Preparing to write <code>' + name.replace(/[&<>]/g, '') + '</code>…');
   try {
-    const n = await call('exportModel', { keys: g.keys, handle });
+    const n = await (await sdk).cache.export(g.keys, handle, { onProgress: onExporting });
     storeStatus('Exported <code>' + name.replace(/[&<>]/g, '') + '</code> — ' + fmt(n)
               + ' written.');
     note('Exported ' + name + ' — ' + fmt(n) + ' written.');
@@ -1574,7 +1595,8 @@ async function offerDirectory(key) {
   try {
     const dir = await window.showDirectoryPicker({ mode: 'readwrite' });
     note('Moving cached models to the folder…');
-    await call('migrate', { dir });
+    await (await sdk).cache.migrate(dir, { onProgress: (m) =>
+      { $('#progressText').textContent = 'moving to disk · ' + fmt(m.bytes); } });
     note('Done. Models are kept in that folder from now on.');
     refreshCache();
   } catch (e) { note('Not moved: ' + e.message); }
@@ -1627,7 +1649,7 @@ async function localPick(which, onCancel) {
           types: [{ description: 'GGUF model', accept: { 'application/octet-stream': ['.gguf'] } }],
         }))[0];
     const name = dir ? handle.name : await localFileId(handle);
-    const names = JSON.parse(await call('importModel', { handle, name }));
+    const names = await (await sdk).cache.import(handle, name);
     if (!names.length) {
       note('No model files found in that ' + (dir ? 'folder' : 'file') + '.');
       onCancel(); return;
@@ -1758,7 +1780,7 @@ const TAB_KEY = 'webtorch.settingsTab';
 })();
 
 $('#refreshCache').onclick = refreshCache;
-$('#clearCache').onclick = async () => { if (confirm('Delete every cached model file?')) { await call('cacheClear'); refreshCache(); } };
+$('#clearCache').onclick = async () => { if (confirm('Delete every cached model file?')) { await (await sdk).cache.clear(); refreshCache(); } };
 
 // ---- attachments / tools ----
 function addAttachment(a) { attachments.push(a); renderAttachments(); }
@@ -3262,7 +3284,7 @@ async function runTurn(conv, msg, existing) {
         opts.require_known_tools = true;
       }
       try {
-        r = await call('generate', opts);
+        r = await (await sdk).generate(opts.prompt, { ...opts, onToken });
       } catch (err) {
         // The probe says this model takes tools; if sending them fails anyway, that is the
         // template disagreeing with the probe. Drop them and answer -- a turn lost to a
@@ -3273,7 +3295,7 @@ async function runTurn(conv, msg, existing) {
         delete opts.tools;
         console.warn('webtorch: this model rejected tool definitions, continuing without:',
                      err && err.message);
-        r = await call('generate', opts);
+        r = await (await sdk).generate(opts.prompt, { ...opts, onToken });
       }
       const raw = reply.content.slice(streamedLen);      // this round's reply, nothing else
       streamedLen = reply.content.length;
@@ -3282,7 +3304,7 @@ async function runTurn(conv, msg, existing) {
       // runs have to come from the same reading of the text, or a call the loop missed gets
       // printed as prose. Reading a model's own call format is the SDK's job, not this
       // page's -- see `toolcall.py` and the tokenizer's `tool_call_format`.
-      const scan = await call('toolScan', { text: raw, tools: toolDefs() });
+      const scan = await (await sdk).tools.calls(raw, toolDefs());
       const shown = scan.shown;                          // prose kept, protocol removed
       if (!toolsEnabled() || round >= MAX_TOOL_ROUNDS) {
         // No round comes back around to tidy this one, so it tidies itself.
@@ -3314,7 +3336,7 @@ async function runTurn(conv, msg, existing) {
       // Whether the calls travel as structured `tool_calls` or as the model's own text is
       // a property of its template, so the SDK builds these turns -- this page only says
       // what happened.
-      (await call('toolRound', { text: shown, calls, results })).forEach(m => msgs.push(m));
+      (await (await sdk).tools.round(shown, calls, results)).forEach(m => msgs.push(m));
       // The call and its result go to a folded side panel, NOT into the answer text.
       // Putting the trace in the answer taught the model to imitate it as content: with a
       // real trace in its history it next "called" a tool by writing a forged one --
@@ -3406,7 +3428,7 @@ let modelTakesTools = null;      // null = not asked yet
 async function probeTools() {
   modelTakesTools = null;
   try {
-    const r = await call('toolsSupported');
+    const r = await (await sdk).tools.supported();
     modelTakesTools = !!(r && r.ok);
   } catch (e) { modelTakesTools = false; }
   return modelTakesTools;
@@ -3463,8 +3485,7 @@ async function runToolCall(c) {
     // The evidence comes from the SDK (`suggest_tool`); the threshold and the fallback
     // order are THIS page's policy, because what to do about a call that named nothing is
     // a product question, not a fact about the model.
-    const ranked = await call('toolSuggest',
-                              { name: c.name, args: c.args || {}, tools: toolDefs() });
+    const ranked = await (await sdk).tools.suggest(c.name, c.args || {}, toolDefs());
     const pick = (ranked[0] && ranked[0].name_score >= 0.5 && ranked[0].name)
               || (ranked.find(r => r.args_match) || {}).name
               || (TOOLS[0] && TOOLS[0].def.function.name);
@@ -3473,8 +3494,7 @@ async function runToolCall(c) {
     // the model's OWN arguments. Handing back JSON to a model whose format is the XML one
     // would correct the name and break the call.
     const fixed = guess
-      ? await call('toolRender', { name: guess.def.function.name, args: c.args || {},
-                                   tools: toolDefs() })
+      ? await (await sdk).tools.render(guess.def.function.name, c.args || {}, toolDefs())
       : '';
     return 'there is no tool called "' + c.name + '". These exist, with their arguments:\n'
          + listed + '\n\nYour call again, with the name corrected — send this:\n' + fixed;
@@ -4255,7 +4275,7 @@ function resRead() {
   // busy, and nothing writes the shared array while it is idle. Taking the array
   // unconditionally is how a reply's peak stayed on screen after the memory behind it had
   // been handed back.
-  const live = tasks && tasks.resources();
+  const live = wt && wt.resources();
   if (live && live.at >= (res.statsAt || 0)) {
     res.stats = { gpuBytes: live.gpuBytes, gpuPeak: live.gpuPeak,
                   gpuBuffers: live.gpuBuffers,
@@ -4332,17 +4352,18 @@ function resRender() {
 }
 
 async function resTick() {
-  if (worker) {
-    // The worker is single-threaded, so this request queues behind whatever it is doing: a
+  if (wt) {
+    // The runtime is single-threaded, so this request queues behind whatever it is doing: a
     // reply in progress can hold it for twenty seconds, and until it answers the numbers on
     // screen are from before that reply started. Showing them anyway is how a leak that
     // climbed to 20GB read as "flat" -- so the panel says the figure is held rather than
-    // presenting a stale one as current.
+    // presenting a stale one as current. (`wt.resources()` is the same figures WHILE it is
+    // busy, straight out of shared memory; `resRead` prefers whichever is newer.)
     if (res.pending && Date.now() - res.pending < 30000) return;   // one outstanding is enough
     const asked = Date.now();
     res.pending = asked;
     try {
-      const v = await call('stats');
+      const v = await wt.stats();
       if (res.pending === asked) { res.stats = v; res.statsAt = Date.now(); res.pending = 0; }
     } catch (e) { res.pending = 0; /* gone: keep the last, still marked by age */ }
   }
@@ -4571,7 +4592,7 @@ $('#dRun').onclick = async () => {
   const btn = $('#dRun'); btn.disabled = true; $('#dTiming').textContent = 'thinking…';
   const t0 = performance.now();
   try {
-    const res = await call('decide', { state, questions });
+    const res = await (await sdk).decide(state, questions);
     // Label each answer with the question that produced it: the ids are this page's own.
     Object.keys(res.answers || {}).forEach(k => {
       if (questions[k]) res.answers[k].instructions = questions[k].instructions;
@@ -4615,7 +4636,7 @@ loadConvs().then(() => {
 });
 detectEnv().then(() => { fillPresets(); wireGpuMem(); });
 // Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
-call('armStorage', {}).catch(() => {});
+sdk.then(w => w.cache.watch((m) => offerDirectory(m.key))).catch(() => {});
 wirePython();
 wireDebug();
 wireResources();
@@ -4625,7 +4646,7 @@ setTimeout(dbgStart, 2500);
 // runtime starting up is what the person is actually waiting for.
 setTimeout(pyStart, 1200);
 note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
-call('boot').then(refreshCache).catch(e => {
+sdk.then(refreshCache).catch(e => {
   $('#modelStatus').textContent = 'runtime failed: ' + e.message;
   $('#openSettings').disabled = false;        // a dead runtime must not lock the UI shut
 });
