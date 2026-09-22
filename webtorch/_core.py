@@ -551,9 +551,70 @@ class ReLU(Module):
         return x.relu()
 
 
+_GELU_WGSL = """@group(0) @binding(0) var<storage,read_write> o: array<f32>;
+@group(0) @binding(1) var<storage,read> s: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x;
+  if (i >= arrayLength(&s)) { return; }
+  let x = s[i];
+  let u = clamp((x + 0.044715 * x * x * x) * 0.7978845608028654, -15.0, 15.0);
+  o[i] = x * (tanh(u) + 1.0) * 0.5;
+}
+"""
+_geluk = {"added": False}
+
+
+def _gelu_data(d):
+    """One dispatch for the whole activation.
+
+    Composed from primitives it is eleven: three multiplies for the cube, two more and an
+    add for the inner term, a min and a max to bound it, the tanh, an add, and two more
+    multiplies. On a 28-layer encoder that measured 332 dispatches for 30 calls -- a fifth of
+    everything the model issued, for one activation function.
+
+    The bound is inside the kernel for the same reason it is outside: a tanh built from
+    exponentials returns NaN once its argument is large enough to overflow, and the cubic
+    gets there from x = 11.
+    """
+    plat = _adam_kernel["platform"]
+    if not _geluk["added"]:
+        plat.addKernel("gelu_fwd", {"source": _GELU_WGSL,
+                                    "bindingTypes": ["storage", "read-only-storage"]})
+        _geluk["added"] = True
+    dc = _contig(d); out = _empty(dc.shape)
+    n = 1
+    for sh in dc.shape:
+        n *= int(sh)
+    plat.runKernel({"name": "gelu_fwd",
+        "tensors": [out.buffer.buffer_id, dc.buffer.buffer_id],
+        "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    return out
+
+
 def gelu(x):
+    if _adam_backend_ready():
+        out = Tensor(_gelu_data(x.data), x.requires_grad, (x,), "gelu")
+
+        def _backward():
+            # Only built when something is training. The derivative of the same tanh form:
+            # 0.5(1+t) + 0.5*x*(1-t^2)*du/dx, with u bounded exactly as the forward bounds it
+            # so the two agree at the ends.
+            if x.requires_grad:
+                xd = x.data
+                a, c = 0.044715, 0.7978845608028654
+                u = xp.minimum(xp.maximum((xd + a * xd * xd * xd) * c, -15.0), 15.0)
+                t = xp.tanh(u)
+                du = c * (1.0 + 3.0 * a * xd * xd)
+                x._accum(out.grad * (0.5 * (1.0 + t) + 0.5 * xd * (1.0 - t * t) * du))
+        out._setback(_backward)
+        return out
+    return _gelu_composed(x)
+
+
+def _gelu_composed(x):
     # tanh approximation (as used in GPT). Composed from autograd primitives, so
-    # it works on both backends; a fused kernel is a later optimization.
+    # it works on every backend; WebGPU takes the fused kernel above instead.
     c = 0.7978845608028654  # sqrt(2/pi)
     x3 = x * x * x
     inner = (x + x3 * 0.044715) * c
