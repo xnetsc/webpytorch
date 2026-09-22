@@ -3137,6 +3137,27 @@ def chunked_attention(q, k, v, start=0, scale=None, chunk=None):
     if scale is None:
         scale = 1.0 / (float(hd) ** 0.5)
     CH = int(chunk or _ATTN_CHUNK)
+    # Padding the key extent to a multiple of 64 here does NOT pay, and the reason it looks
+    # like it should is instructive.
+    #
+    # `lim` below is clamped to S, so on the LAST chunk of any prefill the clamp cancels the
+    # rounding exactly -- and counted in a browser, 896 of a generation's matmul dispatches
+    # were landing on the generic kernel because of it (n % 64 == 1 on one matmul, k % 4 == 1
+    # on the other). Padding k and v to a multiple of 64 once per call does move all 896 onto
+    # the tiled kernel; that was verified, `matmul` went to zero. And in isolation those 896
+    # matmuls measured 557ms against 281ms, a clean 2x.
+    #
+    # End to end it is WORSE. At a 2385-token prompt, three samples each way, not overlapping:
+    #
+    #     padded     7.88  7.28  7.84 s to first token
+    #     unpadded   6.43  6.42  6.51 s
+    #
+    # About 1.3s slower, for matmuls that are twice as fast. The copy the padding needs -- two
+    # `cat`s of the whole K and V per layer, plus a wider `_contig` slice on every head -- costs
+    # more than the kernel saves. Measured at 500 tokens too, where it is a wash.
+    #
+    # So the clamp stays. The dispatches it sends to the generic kernel are a real cost, but
+    # the way to get them back is not to copy K and V to buy alignment.
     qg = q.reshape(nkv, rep * T, hd)
     kt = transpose_last2(k)
     parts = []
