@@ -295,17 +295,36 @@ class DecisionModel(wt.Module):
         files, so a different decision model with different question types describes itself
         differently and the same interface still fits.
         """
+        # Each type is described in the words someone deciding what to ask would use, not in
+        # the model's. `choice`, `score` and `noul` are what the model calls them and what
+        # the request must say, but nobody outside knows what "noul" is, and an interface
+        # that prints it has handed the reader a puzzle. The plain name and the one-line
+        # explanation belong here, with the thing that knows what the type does, rather than
+        # in a table kept by whichever application happens to draw the form.
+        described = {
+            "choice": {"label": "Pick one", "min": 2, "needs": "options", "options": "named",
+                       "help": "Name the things it may choose between. It answers with one "
+                               "of them and says how likely each was.",
+                       "asks_for": "the options to choose between",
+                       "answer": "one of the options, with a probability for each"},
+            "score":  {"label": "Rate on a scale", "min": 2, "needs": "levels",
+                       "options": "ordered",
+                       "help": "Describe the levels in order, lowest first. It answers with "
+                               "where on that scale this lands.",
+                       "asks_for": "the levels of the scale, in order",
+                       "answer": "where it lands on the scale"},
+            "noul":   {"label": "How likely is this true?", "min": 2, "needs": None,
+                       "options": "fixed",
+                       "help": "Write a statement. It answers with how likely that statement "
+                               "is to hold, from 0 to 100%.",
+                       "asks_for": "nothing -- just the statement",
+                       "answer": "how likely the statement is to hold, in [0, 1]"},
+        }
         types = {}
         for t in self.cfg.qtypes:
-            if t == "choice":
-                types[t] = {"needs": "options", "options": "named", "min": 2,
-                            "answer": "one of the options, with a probability for each"}
-            elif t == "score":
-                types[t] = {"needs": "levels", "options": "ordered", "min": 2,
-                            "answer": "an expected level on the scale"}
-            else:
-                types[t] = {"needs": None, "options": "fixed", "min": 2,
-                            "answer": "how likely the statement is to hold, in [0, 1]"}
+            types[t] = dict(described.get(t) or {
+                "label": t, "min": 2, "needs": None, "options": "fixed",
+                "help": "", "asks_for": "", "answer": ""})
         return {
             "kind": "decision",
             "takes": {"state": {"kinds": ["text", "json"]},

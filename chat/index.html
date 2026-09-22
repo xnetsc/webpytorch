@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
-<link rel="stylesheet" href="style.css?v=ac3f0ff8a0" />
+<link rel="stylesheet" href="style.css?v=ef453e3356" />
 
 <!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
      `crossorigin` is required, not cosmetic: this page is served with
@@ -81,16 +81,26 @@
          asked at once all come from the SDK, so a different decision model reshapes this
          without a line changing here. -->
     <div id="decision" hidden>
-      <label class="dlabel" for="dState">The situation</label>
-      <textarea id="dState" rows="7" placeholder="Paste the state to judge — plain text or JSON."></textarea>
       <div class="drow">
-        <label class="dlabel">Questions</label>
+        <label class="dlabel" for="dState">1 · What happened</label>
+        <button type="button" id="dExample" class="linky">Fill in an example</button>
+      </div>
+      <p class="dhelp">Describe the situation you want judged — an email, a support ticket,
+        a form someone filled in. Anything you would hand a colleague and ask “what do you
+        make of this?”. Plain writing is fine.</p>
+      <textarea id="dState" rows="7"
+        placeholder="e.g. A customer writes: we were billed twice for the same invoice…"></textarea>
+
+      <div class="drow">
+        <label class="dlabel">2 · What you want to know</label>
         <span id="dLimits" class="hint"></span>
       </div>
+      <p class="dhelp">Ask in your own words. This model does not write back — it answers
+        each question with an answer and how likely it thinks that answer is.</p>
       <div id="dqList"></div>
       <div class="drow">
-        <button type="button" id="dAdd">+ question</button>
-        <button type="button" id="dRun" class="primary">Answer</button>
+        <button type="button" id="dAdd">+ another question</button>
+        <button type="button" id="dRun" class="primary">Get answers</button>
         <span id="dTiming" class="hint"></span>
       </div>
       <div id="dAnswers"></div>
@@ -329,6 +339,6 @@
 <script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
 <script src="../webtorch/js/webtorch-main.js?v=01f205aa85"></script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=c7d55040a4"></script>
+<script src="app.js?v=290ed6cd5b"></script>
 </body>
 </html>

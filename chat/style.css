@@ -542,3 +542,18 @@ iframe.jsview{width:100%;border:1px solid var(--line);border-radius:6px;
    stacked on top of each other. The panel scrolls, so nothing here should be shrinking. */
 #decision > *{flex:0 0 auto}
 #decision textarea{min-height:8.5em}
+
+/* Plain-language scaffolding for the decision panel: the numbered steps, the one-line
+   explanations under them, and an answer stated as a sentence before it is stated as bars. */
+#decision .dhelp{margin:-4px 0 2px;font-size:13px;color:var(--mut);line-height:1.5;max-width:64ch}
+#decision .linky{margin-left:auto;background:none;border:0;color:var(--accent,#2f9e75);
+  cursor:pointer;font:inherit;font-size:13px;text-decoration:underline}
+.dq .needs{font-size:12px;color:var(--mut);line-height:1.5}
+.dq .optlabel{font-size:12px;color:var(--mut);margin:2px 0 0}
+.dans .asked{font-size:13px;color:var(--mut);margin:0 0 4px}
+.dans .verdict{font-size:22px;font-weight:600;margin:0 0 2px;line-height:1.25}
+.dans .says{font-size:13px;margin:0 0 8px;color:var(--fg)}
+.dans .others{font-size:12px;color:var(--mut);margin:8px 0 2px}
+.dans .sure{margin-top:8px;font-size:13px;color:var(--mut)}
+.dans .sure b{color:var(--fg);font-weight:600}
+.dans .escalate{margin-top:6px;font-size:13px;color:#b4690e}

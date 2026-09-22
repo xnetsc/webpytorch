@@ -615,18 +615,28 @@ function addQuestion(type) {
   const row = document.createElement('div'); row.className = 'dq';
   const head = document.createElement('div'); head.className = 'dqhead';
   const sel = document.createElement('select');
+  // The wire name goes in the value and the plain name on screen. "noul" is what the
+  // request has to say and it means nothing to anyone reading a form.
   types.forEach(t => { const o = document.createElement('option');
-                       o.value = t.name; o.textContent = t.name; sel.appendChild(o); });
+                       o.value = t.name; o.textContent = t.label || t.name; sel.appendChild(o); });
   sel.value = type || types[0].name;
   const ins = document.createElement('input');
-  ins.className = 'dqins'; ins.placeholder = 'What to decide…';
+  ins.className = 'dqins';
   const del = document.createElement('button');
   del.type = 'button'; del.className = 'dqdrop'; del.textContent = '×'; del.title = 'Remove';
   del.onclick = () => { row.remove(); if (!list.children.length) addQuestion(); };
   head.append(sel, ins, del);
   const body = document.createElement('div');
   row.append(head, body);
-  const paint = () => paintCriteria(body, types.find(t => t.name === sel.value));
+  const paint = () => {
+    const spec = types.find(t => t.name === sel.value) || {};
+    // The prompt in the box changes with the type, because what to write there changes:
+    // one takes a question, one takes a statement.
+    ins.placeholder = spec.name === 'noul'
+      ? 'Write it as a statement — “the customer was charged twice”'
+      : 'Ask it in plain words — “which team should handle this?”';
+    paintCriteria(body, spec);
+  };
   sel.onchange = paint; paint();
   list.appendChild(row);
 }
@@ -635,24 +645,28 @@ function addQuestion(type) {
 // page has never heard of still gets the right one.
 function paintCriteria(body, spec) {
   body.textContent = '';
-  if (!spec || !spec.needs) {
-    const p = document.createElement('div'); p.className = 'needs';
-    p.textContent = spec && spec.answer ? spec.answer : 'no options to give';
-    body.appendChild(p);
-    return;
-  }
+  const help = document.createElement('div'); help.className = 'needs';
+  help.textContent = (spec && spec.help) || '';
+  if (help.textContent) body.appendChild(help);
+  if (!spec || !spec.needs) return;
   const named = spec.options === 'named';
+  const cap = document.createElement('div'); cap.className = 'optlabel';
+  cap.textContent = named
+    ? 'The things it may choose between:'
+    : 'The levels, lowest first:';
+  body.appendChild(cap);
   const wrap = document.createElement('div');
   const add = document.createElement('button');
-  add.type = 'button'; add.textContent = named ? '+ option' : '+ level';
+  add.type = 'button'; add.textContent = named ? '+ another option' : '+ another level';
   const one = (nm, ds) => {
     const o = document.createElement('div'); o.className = 'opt';
     if (named) {
-      const n = document.createElement('input'); n.placeholder = 'name'; n.value = nm || '';
+      const n = document.createElement('input');
+      n.placeholder = 'short name'; n.value = nm || '';
       o.appendChild(n);
     }
     const d = document.createElement('input');
-    d.placeholder = named ? 'what it means (optional)' : 'what this level means';
+    d.placeholder = named ? 'what it covers (helps it choose)' : 'what this level means';
     d.value = ds || '';
     const x = document.createElement('button');
     x.type = 'button'; x.className = 'dqdrop'; x.textContent = '×';
@@ -693,37 +707,119 @@ function readQuestions() {
   return out;
 }
 
+// An answer said in words first, and only then in numbers.
+//
+// What comes back is a probability distribution, and printed as one it tells a reader who
+// did not ask for statistics nothing: "1.2429" is not an answer to "how urgent is this".
+// So each card leads with the thing itself -- the option it picked, the level it landed on,
+// whether the statement holds -- then how sure it is in a word, and the distribution last
+// for anyone who wants it.
+//
+// Turning a probability into a word is a judgement, and it is made HERE rather than in the
+// SDK: the SDK reports the number and refuses to decide what counts as sure, which is right,
+// because the threshold depends on what the answer is for. The number is always printed
+// beside the word so nothing is hidden behind it.
+function sureness(p) {
+  if (p >= 0.85) return 'very sure';
+  if (p >= 0.6) return 'fairly sure';
+  if (p >= 0.4) return 'unsure';
+  return 'barely more than a guess';
+}
+
+// How SPREAD the odds are, which is a different question from how likely the winner is, and
+// has to be worded as one. Said as sureness it contradicts the headline: a statement given
+// an 84% chance came out as "barely more than a guess", because 84/16 across two answers is
+// a wide spread and a confident answer at the same time. Both numbers were right; the
+// sentence putting them together was not.
+function spread(c) {
+  if (c >= 0.7) return 'a clear winner';
+  if (c >= 0.4) return 'a fairly clear lead';
+  if (c >= 0.15) return 'close between the top answers';
+  return 'very close — the odds are spread';
+}
+
+function likelihood(p) {
+  if (p >= 0.9) return 'Almost certainly yes';
+  if (p >= 0.7) return 'Probably yes';
+  if (p >= 0.55) return 'Leaning yes';
+  if (p > 0.45) return 'Could go either way';
+  if (p > 0.3) return 'Leaning no';
+  if (p > 0.1) return 'Probably no';
+  return 'Almost certainly no';
+}
+
 function renderAnswers(answers) {
   const host = $('#dAnswers'); host.textContent = '';
   Object.entries(answers || {}).forEach(([qid, a]) => {
     const box = document.createElement('div'); box.className = 'dans';
-    const h = document.createElement('h4');
-    h.textContent = (a.instructions || qid) + '  ·  ' + a.type;
-    const v = document.createElement('div'); v.className = 'verdict';
-    v.textContent = a.choice !== undefined ? a.choice
-                  : a.score !== undefined ? a.score
-                  : (a.noul !== undefined ? (a.noul * 100).toFixed(1) + '%' : '');
-    box.append(h, v);
-    Object.entries(a.probabilities || {}).forEach(([k, p]) => {
-      // Scoped class names. The first version used `bar`, `nm`, `tr`, `fl` -- and `.bar`
-      // already belongs to the load progress bar, whose height and `overflow: hidden` won,
-      // flattening every probability row to five pixels.
-      const bar = document.createElement('div'); bar.className = 'dbar';
-      const nm = document.createElement('span'); nm.className = 'dname'; nm.textContent = k;
-      const tr = document.createElement('span'); tr.className = 'dtrack';
-      const fl = document.createElement('span'); fl.className = 'dfill';
-      fl.style.width = Math.round(p * 100) + '%';
-      tr.appendChild(fl);
-      const pc = document.createElement('span'); pc.className = 'dpct';
-      pc.textContent = (p * 100).toFixed(1) + '%';
-      bar.append(nm, tr, pc); box.appendChild(bar);
-    });
-    const meta = document.createElement('div'); meta.className = 'meta';
-    // Confidence is reported beside the answer because a probability on its own does not
-    // say whether the model was deciding or guessing.
-    meta.textContent = 'confidence ' + (a.confidence != null ? (a.confidence * 100).toFixed(0) + '%' : '—')
-                     + (a.act_probability != null ? '  ·  would answer ' + (a.act_probability * 100).toFixed(0) + '%' : '');
-    box.appendChild(meta);
+    const asked = document.createElement('p'); asked.className = 'asked';
+    asked.textContent = a.instructions || qid;
+    const verdict = document.createElement('div'); verdict.className = 'verdict';
+    const says = document.createElement('p'); says.className = 'says';
+    const probs = Object.entries(a.probabilities || {});
+    const top = probs.slice().sort((x, y) => y[1] - x[1])[0];
+
+    if (a.choice !== undefined) {
+      verdict.textContent = a.choice;
+      says.textContent = 'It picked this one, and is ' + sureness(top ? top[1] : 0)
+                       + ' (' + Math.round((top ? top[1] : 0) * 100) + '%).';
+    } else if (a.score !== undefined) {
+      // The score is an expected level, so it usually sits BETWEEN two of the levels that
+      // were written. Naming the nearest one answers the question; saying which way it
+      // leans keeps the number from being thrown away.
+      const legend = a.legend || {};
+      const near = Math.round(a.score);
+      verdict.textContent = legend[String(near)] || ('level ' + near);
+      // On an ordered scale the balance of the odds and the single most likely level are
+      // different things, and they often land on different rungs: here the weight sat on
+      // "soon" while the balance came out at "normal". Shown side by side without a word
+      // they read as a contradiction, so the sentence names both.
+      const peak = top && (legend[top[0]] || top[0]);
+      says.textContent = (peak && peak !== verdict.textContent)
+        ? 'That is where the balance of the odds falls. The single most likely one is “'
+          + peak + '” at ' + Math.round(top[1] * 100) + '%.'
+        : 'That is both the most likely level and where the balance falls.';
+    } else {
+      const p = a.noul != null ? a.noul : 0;
+      verdict.textContent = likelihood(p);
+      says.textContent = 'It puts the chance at ' + (p * 100).toFixed(0) + '%.';
+    }
+    box.append(asked, verdict, says);
+
+    if (probs.length > 1) {
+      const cap = document.createElement('div'); cap.className = 'others';
+      cap.textContent = 'How it split the odds';
+      box.appendChild(cap);
+      probs.forEach(([k, p]) => {
+        const bar = document.createElement('div'); bar.className = 'dbar';
+        const nm = document.createElement('span'); nm.className = 'dname';
+        nm.textContent = (a.legend && a.legend[k]) ? a.legend[k] : k;
+        nm.title = nm.textContent;
+        const tr = document.createElement('span'); tr.className = 'dtrack';
+        const fl = document.createElement('span'); fl.className = 'dfill';
+        fl.style.width = Math.round(p * 100) + '%';
+        tr.appendChild(fl);
+        const pc = document.createElement('span'); pc.className = 'dpct';
+        pc.textContent = (p * 100).toFixed(1) + '%';
+        bar.append(nm, tr, pc); box.appendChild(bar);
+      });
+    }
+
+    // Only where it adds something. For a yes/no the headline percentage already IS the
+    // strength of the answer, and a second number beside it only invites the reader to
+    // reconcile two things that are not the same measure.
+    if (a.noul === undefined && a.confidence != null) {
+      const sure = document.createElement('div'); sure.className = 'sure';
+      sure.innerHTML = 'The odds: <b>' + spread(a.confidence) + '</b>';
+      box.appendChild(sure);
+    }
+    // Only worth saying when it is not the usual answer: the model's own read that this one
+    // should go to a person instead.
+    if (a.act_probability != null && a.act_probability < 0.8) {
+      const esc = document.createElement('div'); esc.className = 'escalate';
+      esc.textContent = 'It is not comfortable answering this one on its own — worth a human look.';
+      box.appendChild(esc);
+    }
     host.appendChild(box);
   });
 }
@@ -4393,7 +4489,59 @@ $('#exportBtn').onclick = async () => {
   a.download = 'webtorch-chat-' + Date.now() + '.zip';
   a.click(); URL.revokeObjectURL(a.href);
 };
-// ---- the decision panel's two actions ------------------------------------------------
+// ---- the decision panel's actions ----------------------------------------------------
+// A worked example, because the shape of this is far easier to see filled in than to read
+// about. The scenario is the page's -- sample content, not something the SDK should invent
+// -- while which question types exist and what each needs still come from the model.
+const DECISION_EXAMPLE = {
+  state:
+    'A customer emailed support:\n\n' +
+    '"We were billed 249.00 EUR on the 3rd of September and again on the 4th, for what '
+    + 'looks like the same invoice (INV-2026-09-118). The second charge still shows as '
+    + 'pending. We have not changed our plan this month. Can you confirm the duplicate will '
+    + 'drop off, and refund it if not? This is the second billing problem since July."\n\n'
+    + 'Account: business plan, customer for 29 months, 2 other tickets open.',
+  questions: [
+    { type: 'choice', ins: 'Which team should handle this?',
+      options: [['billing', 'payments, invoices, refunds and charges'],
+                ['technical', 'the product is not working as documented'],
+                ['account', 'seats, plans, permissions and ownership']] },
+    { type: 'noul', ins: 'The customer was charged twice for the same invoice.', options: [] },
+    { type: 'score', ins: 'How urgently does this need answering?',
+      options: [['', 'no rush — some time this week'],
+                ['', 'normal — within a couple of days'],
+                ['', 'soon — today'],
+                ['', 'urgent — within the hour']] },
+  ],
+};
+
+$('#dExample').onclick = () => {
+  const have = new Set(qTypes().map(t => t.name));
+  $('#dState').value = DECISION_EXAMPLE.state;
+  $('#dqList').textContent = '';
+  $('#dAnswers').textContent = '';
+  $('#dTiming').textContent = '';
+  // Only the questions this model actually takes: the example is a demonstration, not a
+  // promise about what any decision model can answer.
+  DECISION_EXAMPLE.questions.filter(q => have.has(q.type)).forEach(q => {
+    addQuestion(q.type);
+    const row = $('#dqList').lastElementChild;
+    row.querySelector('select').value = q.type;
+    row.querySelector('select').dispatchEvent(new Event('change'));
+    row.querySelector('.dqins').value = q.ins;
+    const spec = qTypes().find(t => t.name === q.type) || {};
+    const addBtn = [...row.querySelectorAll('button')].find(b => /another/.test(b.textContent));
+    while (row.querySelectorAll('.opt').length < q.options.length && addBtn) addBtn.click();
+    const rows = row.querySelectorAll('.opt');
+    q.options.forEach((o, i) => {
+      if (!rows[i]) return;
+      const f = rows[i].querySelectorAll('input');
+      if (spec.options === 'named') { f[0].value = o[0]; if (f[1]) f[1].value = o[1]; }
+      else { f[0].value = o[1]; }
+    });
+  });
+};
+
 $('#dAdd').onclick = () => addQuestion();
 $('#dRun').onclick = async () => {
   if (!modelLoaded) return note('Load a model first (left panel).');
