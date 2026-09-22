@@ -88,14 +88,28 @@ void main() {{
     int oj = flat_idx - oi * N;
     if (oi >= M) {{ return; }}
     // One output per fragment, two dependent texelFetches per multiply, no reuse of either
-    // operand. That is the cost, and it is not the loop around it: hoisting the texture
-    // width and the row bases out of the loop and unrolling it four ways measured 1446 ms
-    // against 1445 ms on a 28-layer encoder -- nothing, so it was taken back out.
+    // operand. About 34 GFLOPS, against 1246 on WebGPU, and 89% of a decision on this
+    // backend is these matmuls. Two ways of attacking that were tried and BOTH lost:
     //
-    // 89% of a decision on this backend is these matmuls, at about 34 GFLOPS against 1246
-    // on WebGPU. Getting that back needs several outputs per fragment, so a row of the left
-    // operand is fetched once and used four times -- and that means an RGBA output texture,
-    // which is wgpy's texture layout rather than this shader.
+    //   Hoisting the texture width and the row bases out of the loop and unrolling it four
+    //   ways: 1446 ms against 1445 on a 28-layer encoder. Nothing. The compiler was already
+    //   doing it, or the cost is entirely the dependent fetches.
+    //
+    //   RGBA textures on both operands and the output, so a fragment computes four outputs
+    //   and a row of the left operand is fetched once for all of them -- five fetches per
+    //   sixteen multiply-adds instead of thirty-two. It is bit-identical (verified, max
+    //   difference exactly zero at three sizes) and it is SLOWER at every size:
+    //
+    //       M = 69     9.50 ms -> 13.83 ms   (211968 fragments -> 52992)
+    //       M = 256   39.33 ms -> 42.00 ms
+    //       M = 1024 148.83 ms -> 191.00 ms
+    //
+    //   Four outputs per fragment is four times fewer fragments, and what that costs in
+    //   parallelism is more than the fetches save. Consecutive fragments reading consecutive
+    //   elements already share cache lines, so "fewer fetches" was never "less traffic".
+    //
+    // So this stays as it is. What is left is a different algorithm rather than a better
+    // shader, and nobody should spend an afternoon rediscovering either of the above.
     float s = 0.0;
     for (int k = 0; k < K; k++) {{
         s += get_tex_lhs(oi, k) * get_tex_rhs(k, oj);
