@@ -82,6 +82,80 @@
     return /webtorch: cancelled by request/.test(String((e && e.message) || e || ''));
   };
 
+  // ---- the service worker the SDK needs ---------------------------------------------------
+  //
+  // Call this as early on the page as you can, before anything that wants the GPU:
+  //
+  //     webtorch.installServiceWorker({ handler: 'cache-sw.js' });
+  //
+  // It registers the worker that shipped with this package and, on a first visit, reloads
+  // once so the document is served through it. Everything about WHY -- which headers, the
+  // claim/controller race, the reload that must happen at most once -- is in here. A host
+  // that sets the isolation headers on its own server does not need to call it at all.
+  //
+  // `handler` is optional and is the host's own service-worker-environment code: caching,
+  // offline, whatever a host would have written its own worker for. A client has exactly one
+  // controller, so there is only one worker to have; this is how a host gets into it. See
+  // `webtorch.handleFetch` in webtorch-sw.js for what that code looks like and for what it
+  // is and is not allowed to do.
+  //
+  // Resolves to what happened, rather than throwing: 'isolated' (nothing needed),
+  // 'reloading' (a reload is on its way), 'registered' (worker is in place, isolation lands
+  // next load), or a reason it cannot work -- 'no-service-worker', 'not-served',
+  // 'still-not-isolated', or 'failed: …'.
+  const RELOAD_ONCE = 'webtorch.sw.reloaded';
+
+  wt.installServiceWorker = async function (opts) {
+    opts = opts || {};
+    const base = new URL(opts.baseURL || '../', location.href).href;
+    const url = base + 'webtorch-sw.js'
+              + (opts.handler ? '?handler=' + encodeURIComponent(
+                  new URL(opts.handler, location.href).pathname) : '');
+
+    // Opened as a file rather than served. There is no response to add headers to and no
+    // service worker to add them with, so SharedArrayBuffer cannot exist -- and the module
+    // fetches would be blocked by the origin anyway. Said plainly, because the symptom
+    // otherwise is a silent fall back to the CPU.
+    if (location.protocol === 'file:' || location.protocol === 'data:') return 'not-served';
+    if (!navigator.serviceWorker) return 'no-service-worker';
+
+    if (self.crossOriginIsolated) {
+      // Already isolated, by this worker on an earlier load or by the server's own headers.
+      // Nothing is urgent, and no reload is needed -- but register anyway, because the host's
+      // handler wants to be in place for the next load.
+      try { sessionStorage.removeItem(RELOAD_ONCE); } catch (e) { /* private mode */ }
+      try { await navigator.serviceWorker.register(url); } catch (e) { /* not urgent */ }
+      return 'isolated';
+    }
+
+    // Read BEFORE registering. The moment the worker activates, `clients.claim()` sets
+    // `navigator.serviceWorker.controller` -- so reading it afterwards says only that a
+    // worker EXISTS, not that it served THIS document. That race decides everything: this
+    // load's document response already went out without the headers, and no amount of
+    // claiming changes it. If claim wins and the check reads the controller, the reload is
+    // skipped and the first visit stays on the CPU until somebody refreshes by hand. (Seen
+    // for real: a phone reporting a service worker and `crossOriginIsolated: false` at once.)
+    const hadController = !!navigator.serviceWorker.controller;
+    let reg;
+    try { reg = await navigator.serviceWorker.register(url); }
+    catch (err) { return 'failed: ' + String((err && err.message) || err); }
+    if (hadController) return 'registered';   // this load was already served by a worker
+
+    // A reload helps at most once. If it did not produce isolation, reloading again never
+    // will, and without this guard a broken setup reloads for ever.
+    let reloaded = false;
+    try { reloaded = !!sessionStorage.getItem(RELOAD_ONCE); } catch (e) { /* private mode */ }
+    if (self.crossOriginIsolated) return 'isolated';        // meanwhile, nothing left to do
+    if (reloaded) return 'still-not-isolated';
+    try { sessionStorage.setItem(RELOAD_ONCE, '1'); } catch (e) { /* private mode */ }
+    if (reg.active) { location.reload(); return 'reloading'; }
+    const sw = reg.installing || reg.waiting;
+    if (sw) sw.addEventListener('statechange', function (e) {
+      if (e.target.state === 'activated') location.reload();
+    });
+    return 'reloading';
+  };
+
   // ---- the whole SDK, as functions ------------------------------------------------------
   //
   // `initMain`/`initWorker` above are the low-level pair: they hand back a Pyodide and leave

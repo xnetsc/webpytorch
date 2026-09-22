@@ -335,10 +335,15 @@
   <div class="row"><button id="camShot" class="primary">Capture</button><button id="camCancel">Cancel</button></div>
 </dialog>
 
-<script src="../coi-serviceworker.js"></script>
 <script src="pyodide-version.js"></script>
 <script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
-<script src="../webtorch/js/webtorch-main.js?v=34b7a1ced8"></script>
+<script src="../webtorch/js/webtorch-main.js?v=f628f35195"></script>
+<!-- The SDK needs the document cross-origin isolated or the model runs on the CPU. On a
+     static host that means a service worker, and a client has only one, so it is the SDK's.
+     `cache-sw.js` is ours and rides inside it: what this page caches and how. Called here
+     rather than from app.js because a first visit reloads, and reloading after the page has
+     been built is a flash of a page that is about to disappear. -->
+<script>webtorch.installServiceWorker({ baseURL: '../', handler: 'cache-sw.js' });</script>
 <script src="zip.js?v=eadad49463"></script>
 <script src="app.js?v=7eb509bab7"></script>
 </body>

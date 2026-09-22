@@ -599,6 +599,54 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   tell a browser without WebGPU from a page that is merely not cross-origin isolated.
 - `webtorch.__version__` — the SDK version string.
 
+### The service worker  (`webtorch.installServiceWorker`)
+
+The SDK needs the document cross-origin isolated, or `SharedArrayBuffer` is unavailable and
+the whole model runs on the CPU — about thirty times slower, with nothing said. If you can
+set response headers on your server, set these two and skip this section:
+
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+
+If you cannot (GitHub Pages and other static hosts), only a service worker can add them, and
+only one that **controls the document** — a client has exactly one controller. So the SDK
+ships that worker and registers it for you:
+
+```html
+<script src="../webtorch/js/webtorch-main.js"></script>
+<script>webtorch.installServiceWorker({ baseURL: '../', handler: 'cache-sw.js' });</script>
+```
+
+Call it as early as you can: a first visit has to reload once, and reloading after the page
+is built is a flash of a page about to disappear. It resolves to what happened rather than
+throwing — `'isolated'`, `'reloading'`, `'registered'`, or a reason (`'no-service-worker'`,
+`'not-served'`, `'still-not-isolated'`, `'failed: …'`).
+
+**`handler` is your own service-worker code.** Caching, offline, whatever you would have
+written your own worker for — there is only one worker to have, so this is how you get into
+it. The file is loaded inside the SDK's worker and registers one function:
+
+```js
+// cache-sw.js — yours
+webtorch.handleFetch(async (request, ctx) => {
+  const hit = await caches.match(request.url);
+  if (hit) return hit;                      // a Response serves it
+  const res = await fetch(request);
+  ctx.keepUntil(caches.open('mine').then(c => c.put(request.url, res.clone())));
+  return res;                               // return nothing to fall through to the network
+});
+```
+
+You get a `Request`, not the `FetchEvent`, and that is deliberate. The SDK adds its own fetch
+listener **before** loading your file, and the first `respondWith` wins, so nothing in your
+file can take the response away from it; every answer — including the ones you produce —
+goes out through the isolation headers. A mistake in your handler can make the page slow or
+stale. It cannot make it fall back to the CPU. (Precedence, not a sandbox: your code shares
+the worker's global and could still break things it has no business touching.)
+
+`webtorch.isolate(response)` and `webtorch.ISOLATION_HEADERS` are exported from
+`webtorch/js/webtorch-coi.js` for a host that insists on owning the registration itself.
+
 ### One call, no worker  (`webtorch.start`)
 
 The SDK is Python in a worker, so everything you do with it crosses a message boundary.
