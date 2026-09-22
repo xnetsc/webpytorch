@@ -3,22 +3,17 @@
  * Two jobs, one worker, because a page can only be controlled by one and both need to sit
  * in front of the same requests.
  *
- * wgpy needs SharedArrayBuffer, and SharedArrayBuffer needs the document to be
- * cross-origin isolated -- which normally means two response headers. A static host like
- * GitHub Pages cannot send them, so a service worker adds them to every response it
- * proxies. Without this the page silently falls back to running the whole model on the CPU.
+ * The SDK needs SharedArrayBuffer, which needs the document to be cross-origin isolated,
+ * which normally means two response headers. A static host like GitHub Pages cannot send
+ * them, so this adds them to every response it proxies; without it the page silently falls
+ * back to running the whole model on the CPU.
  *
- * COEP is `require-corp` because that is the one value every engine that implements the
- * policy implements. `credentialless` asks for the same isolation without checking the
- * cross-origin fetches, which sounded better -- model weights come from ModelScope and
- * Pyodide from a CDN -- but WebKit does not know the value at all: the header is ignored,
- * the document is not isolated, and every iPhone and Safari lands on the CPU fallback
- * without a warning (measured: `credentialless` served straight or through this worker
- * leaves WebKit un-isolated, while `require-corp` isolates it). require-corp blocks
- * nothing this page loads: jsdelivr answers with CORS and CORP, ModelScope and PyPI with
- * CORS, and the CDN script and stylesheet tags already ask for it with `crossorigin`.
- * Headers are only ADDED when the response has none -- a server that sets its own is the
- * authority.
+ * WHICH headers is not decided here -- see `webtorch/js/webtorch-coi.js`, which is the SDK's
+ * and is imported below. The split is deliberate: a host can build a service worker, a scope
+ * and a caching policy on its own, and cannot work out from first principles that COEP has
+ * to be `require-corp` rather than `credentialless` (it is a measurement on WebKit, and
+ * getting it wrong is invisible except on iPhones). Whatever the host can build fully stays
+ * here; the rest is asked for.
  *
  * The cache is for Python. Pyodide has none of its own: `loadPackage` fetches the wheel from
  * `indexURL` every time, and the only thing between a reload and downloading numpy again is
@@ -80,28 +75,15 @@ if (typeof window === 'undefined') {
   self.addEventListener('install', () => self.skipWaiting());
   // (activate is below, with the cache cleanup)
 
-  // Add the isolation headers, but only to a response that has none of its own.
-  function isolate(res) {
-    if (res.status === 0) return res;                    // opaque: nothing to re-wrap
-    if (res.headers.get('Cross-Origin-Embedder-Policy')) return res;   // the server decided
-    const headers = new Headers(res.headers);
-    // require-corp, not credentialless. The two isolate identically where both are known,
-    // but WebKit -- and therefore EVERY browser on an iPhone -- implements only
-    // require-corp; handed credentialless it behaves as if the header were absent. Measured
-    // on WebKit with a plain server response and with this worker supplying the headers:
-    //   Cross-Origin-Embedder-Policy: require-corp    -> crossOriginIsolated = true
-    //   Cross-Origin-Embedder-Policy: credentialless  -> crossOriginIsolated = false
-    // The cost of require-corp -- every cross-origin response must carry CORS or CORP --
-    // is paid already: see the file header for why nothing this page loads is blocked.
-    headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
-    headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-    return new Response(res.body, {
-      status: res.status, statusText: res.statusText, headers: headers,
-    });
-  }
+  // The headers come from the SDK, because which response makes SharedArrayBuffer work is
+  // the SDK's knowledge and not this file's: the choice of `require-corp` over
+  // `credentialless` is a measurement on WebKit, and a host writing this from first
+  // principles gets it wrong in a way that shows up only on iPhones, as a silent CPU
+  // fallback. What is OURS is the worker, the scope, and everything below about what to
+  // cache and how -- none of which the SDK can see.
+  importScripts('webtorch/js/webtorch-coi.js');
+  const isolate = self.webtorch.isolate;
 
-  // The clone is taken RIGHT HERE, synchronously, before anything reads the body.
-  // Cloning inside the promise instead looks equivalent and is not: `isolate` builds a new
   // Response from `res.body` on the way out, and by the time `caches.open` resolves the body
   // is already spoken for, so the clone throws and the entry is silently never written. That
   // is exactly what happened -- the caches stayed empty while everything looked fine.
