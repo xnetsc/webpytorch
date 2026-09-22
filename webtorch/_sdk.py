@@ -217,6 +217,32 @@ class Model:
     def __repr__(self):
         return "<webtorch.Model kind=%s impl=%s>" % (self.kind, type(self.impl).__name__)
 
+    def surface(self):
+        """What this model takes and returns, in the terms a caller works in.
+
+        An application that puts an interface in front of a model has to know what to ask
+        for -- a box to type in, a place to attach a picture, a list of questions -- and the
+        only thing that knows is the model. Without this, the application ends up holding a
+        table from model kind to interface, which is a copy of knowledge the SDK already has
+        and is wrong the day a new kind appears.
+
+        A model that describes itself is asked; anything else is described from what it can
+        actually do, so every model answers this, not only the new ones.
+        """
+        impl = self.__dict__.get("impl")
+        own = getattr(impl, "surface", None)
+        if callable(own):
+            return own()
+        if self.kind in ("causal-lm", "multimodal"):
+            return {"kind": "chat",
+                    "takes": {"text": {"role": "prompt"},
+                              "images": self.kind == "multimodal",
+                              "tools": bool(getattr(impl, "tool_call_format", None))},
+                    "returns": {"stream": "tokens"}}
+        return {"kind": self.kind,
+                "takes": {"text": {"role": "input"}},
+                "returns": {"value": self.kind}}
+
     # inference verbs, in the order they are tried by the unified `infer`
     _VERBS = ("generate", "run", "synth", "detect", "transcribe", "classify", "encode")
 
@@ -374,6 +400,15 @@ async def _load_uncached(source, task, dtype, encoder, kw):
             vopt = {k: kw[k] for k in ("lmax", "bits") if kw.get(k) is not None}
             return Model(_apply_gen_defaults(
                 await vl.VLCausalLM.from_qwen2_5_vl(src, **vopt), kw), "multimodal")
+    # A model that answers questions instead of writing text. Asked before the decoder
+    # loader because the two are told apart by what the checkpoint CONTAINS -- an encoder
+    # and a scorer -- and that costs one ranged read of the file's index; guessing from the
+    # directory's name would get a model nobody has published yet wrong.
+    if not src.endswith(".gguf"):
+        from . import decision as _decision
+        dm = await _decision.load_decision(src, **kw)
+        if dm is not None:
+            return Model(dm, "decision")
     lm = await AutoModelForCausalLM.from_pretrained(
         src, dtype=dtype, **{k: kw[k] for k in _LLM_OPTS if k in kw and k != "dtype"})
     lm = _apply_gen_defaults(lm, kw)

@@ -24,7 +24,7 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
-const worker = new Worker('worker.js?v=06075690da');
+const worker = new Worker('worker.js?v=9a8b3e059c');
 // One SDK call brings up the GPU backend's main-thread half. Until it resolves the worker
 // must not be spoken to, so `call` waits on it.
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
@@ -175,6 +175,11 @@ const PRESETS = [
   { gb: 11.5, label: 'gpt-oss-20B · MoE · Q3_K_M', repo: 'unsloth/gpt-oss-20b-GGUF', file: 'gpt-oss-20b-Q3_K_M.gguf' },
   { gb: 13.8, label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
   { gb: 13.8, label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
+  // Not a chat model: it writes nothing, and answers typed questions with calibrated
+  // probabilities instead. It is in the same list because the picker loads models, not
+  // chats -- what the page then puts on screen comes from what the model says it takes.
+  { gb: 0.8,  label: 'Laya · decision model · answers questions, writes nothing',
+    repo: 'convaiinnovations/laya', file: '' },
   { gb: 0,    label: '— custom (type a repo/file below) —', repo: '', file: '' },
 ];
 

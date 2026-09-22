@@ -316,6 +316,99 @@ m = await webtorch.load("/models/decoder", encoder="my-vision")   # or Multimoda
 print(m.generate("Describe this.", media=img))
 ```
 
+## Decision models — typed questions instead of text
+
+Some models do not write. They read a situation once and return, for each question asked, a
+probability over the answers the CALLER named. There is no token stream, no sampling and no
+stopping rule, so nothing in the decoder engine applies; what runs is one encoder pass and a
+scorer.
+
+`webtorch.load` recognises one from the checkpoint rather than the name — a file carrying an
+encoder and a scorer is a decision model, which costs one ranged read of the safetensors
+index — and `Model.kind` is then `"decision"`.
+
+```python
+m = await webtorch.load("convaiinnovations/laya")     # kind == "decision"
+
+out = m.decide(
+    {"ticket": "TCK-4471", "body": "billed twice for the same invoice…"},   # state: text or JSON
+    {
+      "route":  {"type": "choice", "instructions": "Which team should own this?",
+                 "criteria": {"billing": "payment and refunds",
+                              "technical": "product faults",
+                              "account": "seats and plans"}},
+      "dupe":   {"type": "noul",  "instructions": "The customer was charged twice.",
+                 "criteria": None},
+      "urgent": {"type": "score", "instructions": "How urgent is this?",
+                 "criteria": ["no rush", "normal", "elevated", "high", "critical"]},
+    })
+
+out["answers"]["route"]["choice"]          # "billing"
+out["answers"]["route"]["probabilities"]   # {"billing": 0.9086, "technical": 0.0474, …}
+out["answers"]["route"]["confidence"]      # 0.664  — 1 minus the normalised entropy
+out["answers"]["dupe"]["noul"]             # 0.9466 — how likely the statement holds
+out["answers"]["urgent"]["score"]          # the expected level on the scale given
+```
+
+Three question types, which are the MODEL's vocabulary, read from its files rather than
+invented here: `choice` (pick one of the options named), `score` (place it on an ordered
+scale), `noul` (how likely a statement holds, in `[0, 1]`). Options are input, not classes —
+they are written into the sequence behind a marker token and scored there — so a caller may
+name any options without retraining.
+
+Every answer carries its whole distribution, not only the winner, and the SDK makes no
+decision with it: it does not pick a threshold, does not turn a probability into a yes, and
+does not choose what to ask.
+
+- `m.decide(state, questions)` / `m(state, questions)` — `{"answers": {...}, "usage": {...}}`
+- `m.surface()` — see below.
+
+### What a model takes, from the model  (`Model.surface`)
+
+- `surface()` — what this model takes and returns, in the terms a caller works in.
+
+An application that puts an interface in front of a model has to know what to ask for: a box
+to type in, a place to attach a picture, a list of questions. The only thing that knows is
+the model. Without this an application keeps its own table from model kind to interface,
+which is a copy of knowledge the SDK already has and is wrong the day a new kind appears.
+
+```python
+(await webtorch.load("Qwen/Qwen3-0.6B")).surface()
+# {"kind": "chat", "takes": {"text": …, "images": False, "tools": False},
+#  "returns": {"stream": "tokens"}}
+
+(await webtorch.load("convaiinnovations/laya")).surface()
+# {"kind": "decision",
+#  "takes": {"state": {"kinds": ["text", "json"]},
+#            "questions": {"types": {"choice": {...}, "score": {...}, "noul": {...}},
+#                          "max": 6}},
+#  "returns": {"per_question": ["probabilities", "confidence", "act_probability"]},
+#  "limits": {"sequence_tokens": 512, "question_tokens": 192, "option_tokens": 48}}
+```
+
+A model that describes itself is asked; anything else is described from what it can do, so
+every model answers this, not only the new ones.
+
+### Bidirectional encoders  (`webtorch.TextEncoder`, `webtorch.EncoderConfig`)
+
+The engine underneath, generic the same way `lm_engine` is for decoders: a config and a
+checkpoint go in and no model is named.
+
+- `EncoderConfig(cfg)` — an HF `config.json` read into shapes. Sizes, per-layer attention
+  types, local-window width, one rope frequency per attention type, activation and epsilon
+  all come from the file.
+- `TextEncoder(cfg, weights, prefix="encoder.")` — build it. `encode(ids, valid=None)`
+  returns one vector per position.
+
+What a config does not state is read from the WEIGHTS, because the tensors that exist and
+their shapes say what the graph is more reliably than any field: fused versus split QKV, a
+gated MLP (an `mlp.Wi` with twice `intermediate_size` rows), which norms carry a bias, and
+which layers have a pre-attention norm at all.
+
+- `DecisionModel(enc_cfg, dec_cfg, weights, tokenizer, mask_id, cls_id, sep_id, pad_id)`,
+  `DecisionConfig(cfg, qtypes=None)` — the pieces `load()` assembles; a caller that builds
+  its own may use them directly.
+
 ## Quantizer  (`webtorch.Quantizer`)
 - `await Quantizer.stream(read_tensor, has_tensor, names, write_shard, bits=4, group_size=128, shard_bytes=…)`
   — **IO-free** streaming core; all callbacks are async and awaited. Returns a manifest

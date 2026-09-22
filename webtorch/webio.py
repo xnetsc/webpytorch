@@ -651,7 +651,9 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
         total = known.get(name)
         want = None if length is None else length - got
         data = await get(name, offset + got, want)
-        if total is None and want is not None and len(data) < want:
+        # See the same inference in the hub reader below: a short answer ends the file, and
+        # so does a read that asked for no length -- what came back is the rest of it.
+        if total is None and (want is None or len(data) < want):
             total = offset + got + len(data)
             known[name] = total
         await write_cache(name, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
@@ -2265,8 +2267,12 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         want = None if length is None else length - got
         data = await get(url, offset + got, want)
         # A short answer means the file ends here -- often the only way to learn its length,
-        # since a cross-origin host need not expose Content-Length.
-        if total is None and want is not None and len(data) < want:
+        # since a cross-origin host need not expose Content-Length. A read that asked for no
+        # length at all ends the file too: what came back IS the rest of it. Without that
+        # second case a whole-file read leaves the entry with no known size, and an entry
+        # with no size can never be marked complete -- which is why small configs fetched in
+        # one go sat in the cache reading "incomplete" forever while being entirely present.
+        if total is None and (want is None or len(data) < want):
             total = offset + got + len(data)
             known[url] = total
         await write_cache(url, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)

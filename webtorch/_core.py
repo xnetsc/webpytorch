@@ -318,6 +318,12 @@ class Tensor:
     def tanh(self):
         return self._unary(xp.tanh(self.data), lambda g, o: (1.0 - o * o) * g, "tanh")
 
+    def clamp(self, lo, hi):
+        """Bound the values, with the gradient stopped outside the bounds."""
+        d = xp.minimum(xp.maximum(self.data, lo), hi)
+        inside = ((self.data > lo).astype(np.float32) * (self.data < hi).astype(np.float32))
+        return self._unary(d, lambda g, o: inside * g, "clamp")
+
     def sigmoid(self):
         return self._unary(1.0 / (1.0 + xp.exp(-self.data)), lambda g, o: o * (1.0 - o) * g, "sigmoid")
 
@@ -542,7 +548,18 @@ def gelu(x):
     c = 0.7978845608028654  # sqrt(2/pi)
     x3 = x * x * x
     inner = (x + x3 * 0.044715) * c
-    return x * (inner.tanh() + 1.0) * 0.5
+    # The argument is bounded before the tanh, and that is load-bearing rather than tidy.
+    # `tanh` saturates long before fp32 runs out of range -- it is 1.0 for any argument past
+    # about 9.1 -- but a backend that computes it from exponentials overflows first. On
+    # WebGPU `tanh` returns NaN once its argument passes roughly 40, and the cubic above
+    # reaches that from x = 11, so `gelu(11)` came back NaN where the answer is 11.0. It
+    # turned one hidden row into NaN halfway through a 28-layer encoder, and nothing before
+    # that point looked wrong. Measured, both backends, x = 1 .. 50.
+    #
+    # Clamping costs nothing in accuracy: every value it touches would have produced exactly
+    # +/-1 anyway. It was never noticed because the models this repo runs use SwiGLU, so the
+    # GPU path through here had not been exercised.
+    return x * (inner.clamp(-15.0, 15.0).tanh() + 1.0) * 0.5
 
 
 def silu(x):

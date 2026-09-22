@@ -75,6 +75,36 @@ def _matmul_row_align():
 _UNSET = object()
 
 
+def pretok_pattern(tj):
+    """The pre-tokenization pattern a `tokenizer.json` asks for, or None when it says nothing.
+
+    Two shapes appear. A `Split` pre-tokenizer carries the pattern as a literal string, which
+    is what the later GPT-4/Qwen-style files do -- that string is the answer, whatever it says.
+    A bare `ByteLevel` with `use_regex` carries no string: in the `tokenizers` library that
+    node IS the GPT-2 pattern, so a file that names it is asking for GPT-2 even though it
+    never spells it out. `use_regex: false` means no splitting at all.
+
+    Read rather than inferred from the model: two models from the same family can ship
+    different tokenizers, and the file is the only thing that knows which."""
+    def walk(node):
+        if not isinstance(node, dict):
+            return None
+        t = node.get("type")
+        if t == "Sequence":
+            for sub_node in (node.get("pretokenizers") or []):
+                got = walk(sub_node)
+                if got is not None:
+                    return got
+            return None
+        if t == "Split":
+            pat = (node.get("pattern") or {})
+            return pat.get("Regex") or pat.get("String") or None
+        if t == "ByteLevel":
+            return BPETokenizer.PRETOK_GPT2 if node.get("use_regex", True) else None
+        return None
+    return walk((tj or {}).get("pre_tokenizer"))
+
+
 class BPETokenizer:
     """Byte-level BPE (vocab + merges), with the special tokens and chat format discovered
     from the model itself.
@@ -85,8 +115,21 @@ class BPETokenizer:
     vocabulary contains. A model using none of the known conventions still works through a
     plain `role: content` transcript."""
 
+    # How the text is cut up BEFORE merges are applied. Two are in circulation and they
+    # disagree about digits and about a space before one: GPT-2 takes " 3" as one piece
+    # (` ?\p{N}+`), the later GPT-4/Qwen pattern takes digits one at a time and leaves the
+    # space to its own rule. Picking the wrong one does not fail -- it silently produces a
+    # different, longer token sequence, which is a different input to the model.
+    #
+    # Which one a model wants is stated in its `tokenizer.json`, so it is read from there
+    # (see `pretok_pattern`) rather than assumed.
+    PRETOK_GPT2 = (r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+"
+                   r"|\s+(?!\S)|\s+")
+    PRETOK_GPT4 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+                   r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+
     def __init__(self, vocab, merges, eos_ids=None, chat_format=None,
-                 chat_template=None, control=None):
+                 chat_template=None, control=None, pattern=None):
         self.enc = vocab
         self._callfmt = _UNSET          # see `tool_call_format`; derived once, on demand
         self._toolshape = _UNSET        # see `tools_shape`
@@ -119,10 +162,14 @@ class BPETokenizer:
         self.ranks = {tuple(m.split()): i for i, m in enumerate(merges)}
         try:
             import regex as _re
-            pat = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            pat = pattern or self.PRETOK_GPT4
         except Exception:
+            # `re` has no \p{...}; this is the ASCII reading of whichever pattern was asked
+            # for, and it differs from it outside ASCII.
             import re as _re
-            pat = r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+"
+            pat = (r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+"
+                   if (pattern or self.PRETOK_GPT4) == self.PRETOK_GPT2 else
+                   r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]+|\s+")
         self.re = _re; self.pat = _re.compile(pat)
         for t, i in self.SPECIALS.items():
             self.dec[i] = t
@@ -1185,6 +1232,7 @@ class CausalLM:
         except Exception:
             pass
         tj = await webio.read_json(self.base + "tokenizer.json")
+        self._pretok = pretok_pattern(tj)
         mdl = tj.get("model") or {}
         vocab = dict(mdl.get("vocab") or {})
         added = []
@@ -1227,7 +1275,8 @@ class CausalLM:
                     pass
         ctrl = ctrl or extra
         tok = BPETokenizer(vocab, merges, eos_ids=eos,
-                           chat_template=tc.get("chat_template"), control=ctrl)
+                           chat_template=tc.get("chat_template"), control=ctrl,
+                           pattern=getattr(self, "_pretok", None))
         await tok.prepare_template()
         await self._load_gen_defaults()
         return tok

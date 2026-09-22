@@ -291,7 +291,9 @@ finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
     webtorch.set_load_progress(None)
-getattr(_MODEL["m"], "kind", "")
+import json as _json
+_json.dumps({"kind": getattr(_MODEL["m"], "kind", ""),
+             "surface": _MODEL["m"].surface()})
 `));
   // Abandoned by a stop while it was still running: it may well have gone on to finish, but
   // the person asked for it to end and something newer may already have started.
@@ -308,7 +310,12 @@ getattr(_MODEL["m"], "kind", "")
     } catch (e) { /* an optimisation, not a step */ }
   }
   send({ type: 'status', text: `ready: ${src}` });
-  send({ type: 'loaded', id: src, image: out === 'multimodal' });
+  // What the model says it takes and returns. The page builds itself from this instead of
+  // keeping its own table of model kind -> interface, which was one boolean wide and had no
+  // room for a model that is not a chat at all.
+  const info = JSON.parse(out);
+  send({ type: 'loaded', id: src, kind: info.kind, surface: info.surface,
+         image: !!(info.surface && info.surface.takes && info.surface.takes.images) });
 }
 
 // Attached images become real pixels for the model. A data URL means nothing to the
@@ -339,6 +346,25 @@ async function decodeImages(urls) {
 // shape its template reads, how it writes a call, how a result reaches it: the SDK settles
 // all of that inside `generate(tools=...)` and the tool methods, and none of it comes up
 // here. A page that branched on any of it would be making decisions about a chat template.
+// Ask a decision model. One pass, no stream: there is nothing to show as it arrives, so the
+// answer comes back whole. The questions travel as they were written -- this does not decide
+// what to ask, how many options to offer or what any probability means.
+async function decide(state, questions) {
+  if (!ready || !pyodide) throw new Error('no runtime');
+  self.__decide_in = JSON.stringify({ state: state, questions: questions });
+  const out = await pyodide.runPythonAsync(`
+import js, json, webtorch
+_req = json.loads(js.self.__decide_in)
+_m = _MODEL["m"]
+if _m is None:
+    raise RuntimeError("load a model first")
+if not hasattr(_m, "decide"):
+    raise RuntimeError("this model answers by writing text, not by scoring questions")
+json.dumps(_m.decide(_req["state"], _req["questions"]))
+`);
+  return JSON.parse(out);
+}
+
 async function toolsSupported() {
   if (!ready || !pyodide) return { ok: false };
   try {
@@ -753,6 +779,7 @@ onmessage = async (e) => {
       res = true;
     }
     else if (cmd === 'generate') res = await generate(args.prompt, args);
+    else if (cmd === 'decide') res = await decide(args.state, args.questions);
   else if (cmd === 'toolsSupported') res = await toolsSupported();
     else if (cmd === 'py') { await boot(); res = await pyodide.runPythonAsync(args.code); }
     else if (cmd === 'stats') res = runtimeStats();

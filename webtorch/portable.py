@@ -34,7 +34,7 @@ __all__ = ["export_model", "import_model", "model_groups"]
 _ZIP64_LIMIT = 0xFFFFFFFF
 
 
-def _label(directory, sample_key):
+def _label(directory, sample_key, n_files=1):
     """A short human-readable name for a group.
 
     Hub URLs put the repo before a revision marker ("/resolve/<rev>", "/blob/<rev>"), so
@@ -50,7 +50,37 @@ def _label(directory, sample_key):
     else:
         parts = parts[-2:]
     name = "/".join(p for p in parts if p not in ("models", "api", "v1")) or directory
+    if n_files and n_files > 1:
+        # A repository is named by itself. Naming it after one of its files -- whichever
+        # happened to sort first -- reads as if that file were the model, and the same repo
+        # then appears several times over under several different names.
+        return "%s (%d files)" % (name, n_files)
     return "%s (%s)" % (name, sample_key.rsplit("/", 1)[-1])
+
+
+def _repo_of(key):
+    """The model a cached file belongs to.
+
+    Not the directory it sits in. A model served as a repository keeps its pieces in
+    subdirectories -- `encoder/config.json`, `tokenizer/tokenizer.json` -- and grouping by
+    the nearest directory files them as three different models, which is what the cache
+    listing showed: one entry per folder, each looking like a separate download.
+
+    Hub URLs mark where the repository ends: everything after `/resolve/<revision>/` is a
+    path INSIDE the model. Cutting there keeps a model whole however deeply its files are
+    nested. A key that carries no such marker has no repository to speak of, so it falls
+    back to its directory and a single file remains its own group.
+    """
+    for marker in ("/resolve/", "/blob/", "/raw/"):
+        at = key.find(marker)
+        if at < 0:
+            continue
+        rest = key[at + len(marker):]
+        cut = rest.find("/")                       # the revision, then the path inside it
+        if cut >= 0:
+            return key[:at + len(marker) + cut]
+        return key
+    return key.rsplit("/", 1)[0] if "/" in key else key
 
 
 async def model_groups(cache_dir=None):
@@ -63,8 +93,8 @@ async def model_groups(cache_dir=None):
     groups = {}
     for e in items:
         key = e["key"]
-        name = key.rsplit("/", 1)[0] if "/" in key else key
-        g = groups.setdefault(name, {"name": name, "label": _label(name, key),
+        name = _repo_of(key)
+        g = groups.setdefault(name, {"name": name, "label": None, "sample": key,
                                      "keys": [], "size": 0, "total": 0, "files": 0,
                                      "complete": True, "partial": []})
         g["keys"].append(key)
@@ -76,6 +106,8 @@ async def model_groups(cache_dir=None):
         if not e["complete"]:
             g["complete"] = False
             g["partial"].append(key)
+    for g in groups.values():
+        g["label"] = _label(g["name"], g.pop("sample"), g["files"])
     return sorted(groups.values(), key=lambda g: g["name"])
 
 
