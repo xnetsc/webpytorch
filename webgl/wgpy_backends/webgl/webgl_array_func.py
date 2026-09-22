@@ -84,14 +84,21 @@ return texelFetch(tex_rhs, ivec2(x, y), 0).r;
 
 void main() {{
     int flat_idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
-    if (flat_idx >= BB * M * N) {{ return; }}
-    int b = flat_idx / (M * N);
-    int rem = flat_idx - b * (M * N);
-    int oi = rem / N;
-    int oj = rem - oi * N;
+    int oi = flat_idx / N;
+    int oj = flat_idx - oi * N;
+    if (oi >= M) {{ return; }}
+    // One output per fragment, two dependent texelFetches per multiply, no reuse of either
+    // operand. That is the cost, and it is not the loop around it: hoisting the texture
+    // width and the row bases out of the loop and unrolling it four ways measured 1446 ms
+    // against 1445 ms on a 28-layer encoder -- nothing, so it was taken back out.
+    //
+    // 89% of a decision on this backend is these matmuls, at about 34 GFLOPS against 1246
+    // on WebGPU. Getting that back needs several outputs per fragment, so a row of the left
+    // operand is fetched once and used four times -- and that means an RGBA output texture,
+    // which is wgpy's texture layout rather than this shader.
     float s = 0.0;
-    for (int kk = 0; kk < K; kk++) {{
-        s += get_lhs(b, oi, kk) * get_rhs(b, kk, oj);
+    for (int k = 0; k < K; k++) {{
+        s += get_tex_lhs(oi, k) * get_tex_rhs(k, oj);
     }}
     fragColor = s;
 }}
@@ -209,9 +216,40 @@ void main() {{
     int oi = flat_idx / N;
     int oj = flat_idx - oi * N;
     if (oi >= M) {{ return; }}
+    // The texture width and the row bases do not change across k, and the flat index walks
+    // by a constant stride -- so they are computed once and stepped, rather than recomputed
+    // (with a division each) on every one of K iterations. Four at a time, because the two
+    // fetches per multiply are dependent reads and the loop overhead was a real share of
+    // them at K in the thousands.
+    int lw = textureSize(tex_lhs, 0).x;
+    int rw = textureSize(tex_rhs, 0).x;
+    int lf = oi * LHS_STRIDE_0;
+    int rf = oj * RHS_STRIDE_1;
     float s = 0.0;
-    for (int k = 0; k < K; k++) {{
-        s += get_tex_lhs(oi, k) * get_tex_rhs(k, oj);
+    int k = 0;
+    for (; k + 4 <= K; k += 4) {{
+        int ly0 = lf / lw; int ry0 = rf / rw;
+        s += texelFetch(tex_lhs, ivec2(lf - ly0 * lw, ly0), 0).r
+           * texelFetch(tex_rhs, ivec2(rf - ry0 * rw, ry0), 0).r;
+        lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
+        int ly1 = lf / lw; int ry1 = rf / rw;
+        s += texelFetch(tex_lhs, ivec2(lf - ly1 * lw, ly1), 0).r
+           * texelFetch(tex_rhs, ivec2(rf - ry1 * rw, ry1), 0).r;
+        lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
+        int ly2 = lf / lw; int ry2 = rf / rw;
+        s += texelFetch(tex_lhs, ivec2(lf - ly2 * lw, ly2), 0).r
+           * texelFetch(tex_rhs, ivec2(rf - ry2 * rw, ry2), 0).r;
+        lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
+        int ly3 = lf / lw; int ry3 = rf / rw;
+        s += texelFetch(tex_lhs, ivec2(lf - ly3 * lw, ly3), 0).r
+           * texelFetch(tex_rhs, ivec2(rf - ry3 * rw, ry3), 0).r;
+        lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
+    }}
+    for (; k < K; k++) {{
+        int ly = lf / lw; int ry = rf / rw;
+        s += texelFetch(tex_lhs, ivec2(lf - ly * lw, ly), 0).r
+           * texelFetch(tex_rhs, ivec2(rf - ry * rw, ry), 0).r;
+        lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
     }}
     fragColor = s;
 }}
