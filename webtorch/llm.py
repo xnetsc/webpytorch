@@ -75,6 +75,45 @@ def _matmul_row_align():
 _UNSET = object()
 
 
+def pretok_style(tj):
+    """How a `tokenizer.json` cuts text up, when it does not do it with a regex.
+
+    Two families of BPE are in circulation and they are not interchangeable. Byte-level BPE
+    splits with a regex and maps bytes through a printable alphabet. The other -- what
+    SentencePiece-trained vocabularies use -- replaces every space with one marker character,
+    prepends it, and splits there; its merges are over CHARACTERS, not mapped bytes, and a
+    character outside the vocabulary falls back to its bytes as `<0xAB>` tokens.
+
+    Reading a Metaspace file as byte-level does not fail. It returns different tokens: on a
+    256k multilingual vocabulary, measured, "Hello world" came out as three tokens instead of
+    two and eight Chinese characters as twenty-four instead of six. That is a different input
+    to the model, silently.
+
+    Returns `{"mark", "prepend"}` for that family, or None for byte-level.
+    """
+    def walk(node):
+        if not isinstance(node, dict):
+            return None
+        if node.get("type") == "Sequence":
+            for sub_node in (node.get("pretokenizers") or []):
+                got = walk(sub_node)
+                if got is not None:
+                    return got
+            return None
+        if node.get("type") == "Metaspace":
+            return {"mark": node.get("replacement") or "\u2581",
+                    "prepend": node.get("prepend_scheme", "always") != "never"}
+        return None
+    got = walk((tj or {}).get("pre_tokenizer"))
+    if got is not None:
+        return got
+    # Some files carry no Metaspace pre-tokenizer and do the same job in the normalizer.
+    n = (tj or {}).get("normalizer") or {}
+    if n.get("type") == "Replace" and (n.get("pattern") or {}).get("String") == " ":
+        return {"mark": n.get("content") or "\u2581", "prepend": True}
+    return None
+
+
 def pretok_pattern(tj):
     """The pre-tokenization pattern a `tokenizer.json` asks for, or None when it says nothing.
 
@@ -129,7 +168,7 @@ class BPETokenizer:
                    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 
     def __init__(self, vocab, merges, eos_ids=None, chat_format=None,
-                 chat_template=None, control=None, pattern=None):
+                 chat_template=None, control=None, pattern=None, style=None):
         self.enc = vocab
         self._callfmt = _UNSET          # see `tool_call_format`; derived once, on demand
         self._toolshape = _UNSET        # see `tools_shape`
@@ -171,6 +210,13 @@ class BPETokenizer:
                    if (pattern or self.PRETOK_GPT4) == self.PRETOK_GPT2 else
                    r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]+|\s+")
         self.re = _re; self.pat = _re.compile(pat)
+        # `style` is the Metaspace description from `pretok_style`, or None for byte-level.
+        # It is read from the model's own file, never assumed: the two families produce
+        # different token sequences for the same text and nothing about the vocabulary says
+        # which one it was trained with.
+        self.style = style or None
+        self.mark = (style or {}).get("mark", "\u2581")
+        self.prepend = bool((style or {}).get("prepend", True))
         for t, i in self.SPECIALS.items():
             self.dec[i] = t
 
@@ -184,7 +230,36 @@ class BPETokenizer:
             i = pairs[best]; word = word[:i] + [best[0] + best[1]] + word[i + 2:]
         return word
 
+    def _encode_metaspace(self, text):
+        """Space becomes the marker, the marker starts every piece, merges run over
+        characters, and anything the vocabulary does not have falls back to its bytes."""
+        t = str(text).replace(" ", self.mark)
+        if self.prepend and not t.startswith(self.mark):
+            t = self.mark + t
+        pieces, cur = [], ""
+        for ch in t:
+            if ch == self.mark and cur:
+                pieces.append(cur); cur = ch
+            else:
+                cur += ch
+        if cur:
+            pieces.append(cur)
+        ids = []
+        for piece in pieces:
+            for sym in self._bpe(piece):
+                i = self.enc.get(sym)
+                if i is not None:
+                    ids.append(i)
+                    continue
+                for b in sym.encode("utf-8"):          # byte fallback, as the file spells it
+                    j = self.enc.get("<0x%02X>" % b)
+                    if j is not None:
+                        ids.append(j)
+        return ids
+
     def encode(self, text):
+        if self.style:
+            return self._encode_metaspace(text)
         ids = []
         for chunk in self.re.findall(self.pat, text):
             s = "".join(self.b2u[b] for b in chunk.encode("utf-8"))
@@ -1233,6 +1308,7 @@ class CausalLM:
             pass
         tj = await webio.read_json(self.base + "tokenizer.json")
         self._pretok = pretok_pattern(tj)
+        self._pretok_style = pretok_style(tj)
         mdl = tj.get("model") or {}
         vocab = dict(mdl.get("vocab") or {})
         added = []
@@ -1276,7 +1352,8 @@ class CausalLM:
         ctrl = ctrl or extra
         tok = BPETokenizer(vocab, merges, eos_ids=eos,
                            chat_template=tc.get("chat_template"), control=ctrl,
-                           pattern=getattr(self, "_pretok", None))
+                           pattern=getattr(self, "_pretok", None),
+                           style=getattr(self, "_pretok_style", None))
         await tok.prepare_template()
         await self._load_gen_defaults()
         return tok

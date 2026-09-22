@@ -127,6 +127,7 @@ class TextEncoder(wt.Module):
         self._ten = {}
         self.act = _ACT.get(cfg.act, gelu)
         self._rope = {}
+        self._emb_host = None
         missing = [n for n in (prefix + "embeddings.tok_embeddings.weight",
                                prefix + "final_norm.weight") if n not in self.have]
         if missing:
@@ -326,12 +327,33 @@ class TextEncoder(wt.Module):
         return self._lin(y, p + "down_proj" if self._has(p + "down_proj.weight") else p + "dense_out")
 
     # ---- the pass ------------------------------------------------------------------
+    # An embedding table big enough that putting it on the device is the wrong trade. The
+    # number is the staging buffer, not the device: uploading one goes through a host-side
+    # copy of the whole table, and a 256k x 768 vocabulary is 786 MB of f32, which failed to
+    # allocate outright. Below the line a table is uploaded once and every lookup happens on
+    # the device; above it, the table stays on the host and only the rows a sequence actually
+    # uses are sent -- a few hundred kilobytes against hundreds of megabytes, for a lookup
+    # that never needed the other quarter of a million rows.
+    _EMB_DEVICE_MAX = 64 << 20          # in elements: 64M floats, 256 MB
+
+    def _embed(self, ids):
+        name = self.p + "embeddings.tok_embeddings.weight"
+        if self._emb_host is None:
+            rows, dim = self.shape_of[name]
+            if rows * dim <= self._EMB_DEVICE_MAX:
+                return wt.embedding(self._t(name), ids)
+            src = self._src.pop(name, None)
+            if src is None:
+                return wt.embedding(self._t(name), ids)
+            self._emb_host = np.ascontiguousarray(src)       # left at the file's own width
+        return Tensor(_f32(self._emb_host[ids]))
+
     def encode(self, ids, valid=None):
         """Token ids in, one vector per position out. `valid` is 1 for a real token and 0 for
         padding; padded columns are unreadable by every position."""
         ids = np.asarray(ids, dtype=np.int64)
         T = int(ids.shape[0])
-        x = wt.embedding(self._t(self.p + "embeddings.tok_embeddings.weight"), ids)
+        x = self._embed(ids)
         x = self._norm(x, self.p + "embeddings.norm")
         masks = {k: self._mask(T, valid, k) for k in set(self.cfg.layer_types)}
         for i in range(self.cfg.layers):

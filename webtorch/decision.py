@@ -379,7 +379,7 @@ async def load_decision(src, **kw):
     loader, and "not a decision model" is the ordinary case, not a failure.
     """
     from . import webio
-    from .llm import BPETokenizer, pretok_pattern
+    from .llm import BPETokenizer, pretok_pattern, pretok_style
     from . import hfcompat
 
     src = str(src).rstrip("/")
@@ -425,7 +425,11 @@ async def load_decision(src, **kw):
         if isinstance(a, dict) and a.get("content") is not None and a.get("id") is not None:
             vocab[a["content"]] = int(a["id"]); control.append(a["content"])
     merges = [" ".join(m) if isinstance(m, (list, tuple)) else m for m in (mdl.get("merges") or [])]
-    tok = BPETokenizer(vocab, merges, control=control, pattern=pretok_pattern(tj))
+    # Which family of BPE this is comes from the file. A multilingual checkpoint trained
+    # with SentencePiece cuts text up by a marker character, not by a regex, and reading one
+    # as the other returns different tokens without failing.
+    tok = BPETokenizer(vocab, merges, control=control, pattern=pretok_pattern(tj),
+                       style=pretok_style(tj))
 
     # The marker token: whichever of the model's own added tokens marks a position to be
     # filled in. Read from the vocabulary rather than assumed, because the string differs
