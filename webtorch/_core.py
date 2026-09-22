@@ -612,6 +612,77 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 _geglu_k = {"added": False}
 
 
+_QKV_TAKE_WGSL = """@group(0) @binding(0) var<storage,read_write> o: array<f32>;
+@group(0) @binding(1) var<storage,read> s: array<f32>;
+@group(0) @binding(2) var<storage,read> cosb: array<f32>;
+@group(0) @binding(3) var<storage,read> sinb: array<f32>;
+struct QMeta { n: u32, T: u32, H: u32, HD: u32, which: u32, rope: u32, }
+@group(0) @binding(4) var<storage,read> qm: QMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x;
+  if (i >= qm.n) { return; }
+  // out is (H, T, HD); src is (T, 3*H*HD) with q, k, v laid end to end on each row.
+  let d = i % qm.HD;
+  let t = (i / qm.HD) % qm.T;
+  let head = i / (qm.HD * qm.T);
+  let D = qm.H * qm.HD;
+  let base = t * 3u * D + qm.which * D + head * qm.HD;
+  let x = s[base + d];
+  if (qm.rope == 0u) {
+    o[i] = x;
+    return;
+  }
+  let half = qm.HD / 2u;
+  var rot: f32;
+  if (d < half) {
+    rot = -s[base + d + half];
+  } else {
+    rot = s[base + d - half];
+  }
+  let ci = t * qm.HD + d;
+  o[i] = x * cosb[ci] + rot * sinb[ci];
+}
+"""
+_qkv_k = {"added": False}
+
+
+def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
+    """One of q, k or v, taken out of a fused projection and laid out for attention.
+
+    `qkv` is (T, 3*H*HD) as the projection produced it; the result is (H, T, HD) with rotary
+    applied when `cos`/`sin` are given. Written as expressions this is a slice, a transpose
+    and a rotation -- and the first two are strided COPIES of the whole tensor, because the
+    backend has no view of a slice of a row. Three of them per layer measured as costly as
+    every multiply in the pass put together.
+
+    Returns None without a fused backend, so the caller keeps its expression. No gradient.
+    """
+    if not _adam_backend_ready():
+        return None
+    xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
+    H, HD, T = int(H), int(HD), int(T)
+    if tuple(xd.shape) != (T, 3 * H * HD):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _qkv_k["added"]:
+        plat.addKernel("qkv_take", {"source": _QKV_TAKE_WGSL,
+                                    "bindingTypes": ["storage"] + ["read-only-storage"] * 4})
+        _qkv_k["added"] = True
+    use_rope = cos is not None and sin is not None
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos) if use_rope else xd
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin) if use_rope else xd
+    n = H * T * HD
+    out = _empty((n,))
+    meta = _adam_kernel["make_meta"]((n, T, H, HD, int(which), 1 if use_rope else 0),
+                                     "u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "qkv_take",
+                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id,
+                                cd.buffer.buffer_id, sd.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(out.reshape(H, T, HD))
+
+
 def geglu_split(x, half):
     """A gated MLP's activation, reading the two halves where they already are.
 

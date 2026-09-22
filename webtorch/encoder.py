@@ -203,11 +203,22 @@ class TextEncoder(wt.Module):
     def _attn(self, x, layer, kind, mask):
         h, hd, T = self.cfg.heads, self.cfg.head_dim, x.shape[0]
         p = "%slayers.%d.attn." % (self.p, layer)
+        cos, sin = self._rope_tables(T, kind)
         if self._has(p + "Wqkv.weight"):
             # One projection holding q, k and v back to back. The reference views it as
             # (T, 3, heads, head_dim) and unbinds axis 1, which in memory is exactly three
-            # consecutive slices of the flat row -- so slice the row and keep the shape.
+            # consecutive slices of the flat row.
             qkv = self._lin(x, p + "Wqkv")                     # (T, 3*h*hd)
+            # Taken, transposed and rotated in one pass each. Written out, this is a slice
+            # and a transpose before the rotation, and both are strided COPIES of the whole
+            # tensor -- the backend has no view of a slice of a row -- so three of them per
+            # layer cost more than every multiply in the pass put together.
+            qq = None if x.requires_grad else wt.qkv_take(qkv, 0, h, hd, T, cos, sin)
+            if qq is not None:
+                q = qq
+                k = wt.qkv_take(qkv, 1, h, hd, T, cos, sin)
+                v = wt.qkv_take(qkv, 2, h, hd, T)
+                return self._out(q, k, v, mask, p, T, h, hd)
             d = h * hd
             q = wt._slice_last(qkv, 0, d).reshape(T, h, hd)
             k = wt._slice_last(qkv, d, 2 * d).reshape(T, h, hd)
@@ -216,7 +227,6 @@ class TextEncoder(wt.Module):
             q = self._lin(x, p + "q_proj").reshape(T, h, hd)
             k = self._lin(x, p + "k_proj").reshape(T, h, hd)
             v = self._lin(x, p + "v_proj").reshape(T, h, hd)
-        cos, sin = self._rope_tables(T, kind)
         # rope wants (..., T, hd): put heads first so T is the second-to-last axis
         q, k = q.permute(1, 0, 2), k.permute(1, 0, 2)          # (h, T, hd)
         # One dispatch each where the backend has the fused form. Written out of primitives
@@ -229,6 +239,10 @@ class TextEncoder(wt.Module):
         else:
             q, k = wt.apply_rope(q, cos, sin), wt.apply_rope(k, cos, sin)
         v = v.permute(1, 0, 2)
+        return self._out(q, k, v, mask, p, T, h, hd)
+
+    def _out(self, q, k, v, mask, p, T, h, hd):
+        """Attention over q, k, v already laid out as (heads, T, head_dim)."""
         scores = bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))
         o = bmm(softmax(scores + mask), v)                     # (h, T, hd)
         o = o.permute(1, 0, 2).reshape(T, h * hd)
