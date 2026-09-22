@@ -4990,6 +4990,32 @@ _GGML_GEMM_TAIL = """
 # that `dec` runs per THREAD: every lane row decodes the same weight block again, so wider
 # lanes buy more rows and pay for them in repeated decode. Sharing the DECODED block through
 # workgroup memory is what would actually cut it, and that is a different kernel.
+#
+# What that kernel has to look like, with the constraints worked out, so whoever writes it
+# does not start from the beginning:
+#
+#   The reuse today is four: one thread owns one column and four rows, so a value it decodes
+#   feeds four outputs. The aim is to decode a weight tile ONCE per workgroup, into workgroup
+#   memory, and have every thread read it -- which turns the decode from per-thread into
+#   per-workgroup and lets the arithmetic per decoded value rise with the tile.
+#
+#   The budget is what shapes it. A whole block for the 64 columns a workgroup covers is
+#   64 * 256 * 4 = 64 KB of workgroup memory, and the limit is usually 16 KB, so the block has
+#   to be walked in K-chunks rather than staged whole. One arrangement that fits:
+#
+#       64 threads as 8x8, each owning 8 columns x 4 rows = 32 accumulators in registers
+#       workgroup covers 64 columns x 32 rows
+#       per K-chunk of 32 values:  weights 64*32*4 = 8 KB,  activations 32*32*4 = 4 KB
+#
+#   12 KB, inside the limit, and a decoded value then feeds 32 outputs instead of 4 -- eight
+#   times the arithmetic per decode, which is the ratio the two measurements above say is
+#   missing.
+#
+#   Two things to be careful of, both already documented in this file and both silent:
+#   `_ggml_src`'s substitutions have an order (a placeholder that arrives after its own
+#   substitution has run is left in the source and compiles to nothing), and a compile
+#   failure on these paths does not raise -- the dispatch produces zeros. The ggml self-check
+#   against the numpy reference, format by format, is what catches both.
 # Row groups (of 4 rows each) per workgroup on the batched path. A workgroup covers 4*KSG
 # activation rows, so the weights it reads serve that many -- which divides the weight
 # traffic by 4*KSG and looks like the obvious lever for prefill.
