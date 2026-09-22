@@ -319,10 +319,19 @@ class Tensor:
         return self._unary(xp.tanh(self.data), lambda g, o: (1.0 - o * o) * g, "tanh")
 
     def clamp(self, lo, hi):
-        """Bound the values, with the gradient stopped outside the bounds."""
+        """Bound the values, with the gradient stopped outside the bounds.
+
+        The mask that stops it is built inside the closure, not before it. Built before, it
+        costs two comparisons, two casts and a multiply on EVERY call -- and inference never
+        reads it. On a 28-layer encoder that was 180 dispatches spent on a gradient nobody
+        asked for.
+        """
         d = xp.minimum(xp.maximum(self.data, lo), hi)
-        inside = ((self.data > lo).astype(np.float32) * (self.data < hi).astype(np.float32))
-        return self._unary(d, lambda g, o: inside * g, "clamp")
+
+        def grad(g, o):
+            inside = ((self.data > lo).astype(np.float32) * (self.data < hi).astype(np.float32))
+            return inside * g
+        return self._unary(d, grad, "clamp")
 
     def sigmoid(self):
         return self._unary(1.0 / (1.0 + xp.exp(-self.data)), lambda g, o: o * (1.0 - o) * g, "sigmoid")
@@ -3490,17 +3499,33 @@ def _webgl_ln_bwd(xd, g, gd, eps):
     return dx, dgam, dbet
 
 
+# None = decide per call by row count (see `layernorm`); True/False force it, for measuring.
+_LN_FUSED = {"gpu": None}
+
+
 def layernorm(x, gamma, beta, eps=1e-5):
     """LayerNorm over the last axis. gamma/beta: (D,). Fused on both backends:
     WebGPU 1 fwd + 2 bwd dispatches; WebGL 1 fwd + 3 bwd draws (one output per
     draw). Fallback: plain xp ops."""
     xd = x.data
     D = xd.shape[-1]
-    # Fused LN is a WIN only on WebGL (draw-count-bound). On WebGPU, dispatches
-    # are batched into one submit (overhead ~0) and the fused per-row/per-column
-    # loop kernels have WORSE parallelism than the elementwise ops — measured
-    # 0.64ms -> 1.74ms/step, a pessimization. So: fuse on WebGL only.
-    fused_gpu = False
+    # Fusing on WebGPU is decided by HOW MANY ROWS there are, because that is the thing the
+    # two measurements disagree about.
+    #
+    # Fusing was rejected once at 0.64ms -> 1.74ms/step. That was a DECODE step: one row, so
+    # a row-parallel kernel has a single row of parallelism and loses. On a 250-row encoder
+    # pass the same switch measures the other way -- 791ms -> 609ms end to end, 2779 -> 1787
+    # dispatches, same answer to four decimals -- because 250 rows is not one row.
+    #
+    # So one row keeps exactly the path that was measured for one row, and everything else
+    # takes the path measured for many. The line is at 1 rather than at some round number
+    # because 1 is the case the earlier measurement actually covers; nothing is being assumed
+    # about the counts in between beyond that they are not the case that lost.
+    rows_ln = 1
+    for _d in xd.shape[:-1]:
+        rows_ln *= int(_d)
+    fused_gpu = (_LN_FUSED["gpu"] if _LN_FUSED["gpu"] is not None
+                 else rows_ln > 1) and _adam_backend_ready()
     fused_gl = (not _adam_backend_ready()) and _webgl_ready()
     if fused_gpu:
         od = _wgpu_ln_fwd(xd, gamma.data, beta.data, eps)

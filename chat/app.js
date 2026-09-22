@@ -364,6 +364,7 @@ worker.onmessage = (e) => {
     if (stageLog.length) console.log('load stages: ' + stageLog.join(' · '));
     probeTools();            // asked once per model, before any reply needs the answer
     modelLoaded = true; modelImage = !!m.image;
+    applySurface(m.surface || null);
     // Done is done: leaving the last mid-load fraction on screen reads as a load that
     // stalled just short of the end.
     if (lastLoadedBytes) $('#progressText').textContent = 'loaded ' + fmt(lastLoadedBytes);
@@ -565,6 +566,166 @@ function gpuBlocker(f) {
     + 'does not yet enable it by default.' };
   return { title: null, cause: 'WebGPU is present but the backend did not start.',
            runtimeLeads: true };
+}
+
+// ---- what the page shows, decided by what the model says it takes -------------------
+//
+// Not by its name, and not by a table kept here. A model that streams text gets the
+// transcript and the composer; a model that answers questions gets a state and a question
+// list. The page asks the SDK (`Model.surface()`) and follows the answer, so a kind of model
+// this page has never seen still gets an interface that fits -- and the old one-boolean
+// version of this ("does it take images?") is subsumed rather than extended.
+let modelSurface = null;
+
+function applySurface(sf) {
+  modelSurface = sf;
+  const decides = !!(sf && sf.kind === 'decision');
+  $('#messages').hidden = decides;
+  $('#composer').hidden = decides;
+  $('#attachments').hidden = decides;
+  $('#decision').hidden = !decides;
+  const hint = $('#hintbar');
+  if (hint) hint.hidden = decides;
+  if (decides) buildDecisionPanel(sf);
+}
+
+// The question types, and what each one needs from the reader, come from the surface.
+function qTypes() {
+  const t = (modelSurface && modelSurface.takes && modelSurface.takes.questions
+             && modelSurface.takes.questions.types) || {};
+  return Object.keys(t).map(k => Object.assign({ name: k }, t[k]));
+}
+
+function buildDecisionPanel(sf) {
+  const lim = sf.limits || {};
+  const maxq = (sf.takes.questions && sf.takes.questions.max) || null;
+  $('#dLimits').textContent =
+    [maxq ? 'up to ' + maxq : null,
+     lim.sequence_tokens ? lim.sequence_tokens + ' tokens per question' : null]
+    .filter(Boolean).join(' · ');
+  if (!$('#dqList').children.length) addQuestion();
+}
+
+function addQuestion(type) {
+  const types = qTypes();
+  if (!types.length) return;
+  const max = (modelSurface.takes.questions && modelSurface.takes.questions.max) || Infinity;
+  const list = $('#dqList');
+  if (list.children.length >= max) return note('This model takes at most ' + max + ' questions at once.');
+  const row = document.createElement('div'); row.className = 'dq';
+  const head = document.createElement('div'); head.className = 'dqhead';
+  const sel = document.createElement('select');
+  types.forEach(t => { const o = document.createElement('option');
+                       o.value = t.name; o.textContent = t.name; sel.appendChild(o); });
+  sel.value = type || types[0].name;
+  const ins = document.createElement('input');
+  ins.className = 'dqins'; ins.placeholder = 'What to decide…';
+  const del = document.createElement('button');
+  del.type = 'button'; del.className = 'dqdrop'; del.textContent = '×'; del.title = 'Remove';
+  del.onclick = () => { row.remove(); if (!list.children.length) addQuestion(); };
+  head.append(sel, ins, del);
+  const body = document.createElement('div');
+  row.append(head, body);
+  const paint = () => paintCriteria(body, types.find(t => t.name === sel.value));
+  sel.onchange = paint; paint();
+  list.appendChild(row);
+}
+
+// The editor for a type's answers is chosen by what that type SAYS it needs, so a type this
+// page has never heard of still gets the right one.
+function paintCriteria(body, spec) {
+  body.textContent = '';
+  if (!spec || !spec.needs) {
+    const p = document.createElement('div'); p.className = 'needs';
+    p.textContent = spec && spec.answer ? spec.answer : 'no options to give';
+    body.appendChild(p);
+    return;
+  }
+  const named = spec.options === 'named';
+  const wrap = document.createElement('div');
+  const add = document.createElement('button');
+  add.type = 'button'; add.textContent = named ? '+ option' : '+ level';
+  const one = (nm, ds) => {
+    const o = document.createElement('div'); o.className = 'opt';
+    if (named) {
+      const n = document.createElement('input'); n.placeholder = 'name'; n.value = nm || '';
+      o.appendChild(n);
+    }
+    const d = document.createElement('input');
+    d.placeholder = named ? 'what it means (optional)' : 'what this level means';
+    d.value = ds || '';
+    const x = document.createElement('button');
+    x.type = 'button'; x.className = 'dqdrop'; x.textContent = '×';
+    x.onclick = () => o.remove();
+    o.append(d, x); wrap.insertBefore(o, add);
+  };
+  add.onclick = () => one('', '');
+  wrap.appendChild(add);
+  const n = Math.max(2, spec.min || 2);
+  for (let i = 0; i < n; i++) one('', '');
+  body.appendChild(wrap);
+}
+
+// Read the panel back into the request shape the SDK takes.
+function readQuestions() {
+  const out = {};
+  [...$('#dqList').children].forEach((row, i) => {
+    const type = row.querySelector('select').value;
+    const ins = row.querySelector('.dqins').value.trim();
+    if (!ins) return;
+    const spec = qTypes().find(t => t.name === type) || {};
+    let criteria = null;
+    const opts = [...row.querySelectorAll('.opt')];
+    if (spec.needs && spec.options === 'named') {
+      criteria = {};
+      opts.forEach(o => {
+        const f = o.querySelectorAll('input');
+        const nm = f[0].value.trim();
+        if (nm) criteria[nm] = f[1].value.trim() || null;
+      });
+      if (Object.keys(criteria).length < (spec.min || 2)) return;
+    } else if (spec.needs) {
+      criteria = opts.map(o => o.querySelector('input').value.trim()).filter(Boolean);
+      if (criteria.length < (spec.min || 2)) return;
+    }
+    out['q' + (i + 1)] = { type, instructions: ins, criteria };
+  });
+  return out;
+}
+
+function renderAnswers(answers) {
+  const host = $('#dAnswers'); host.textContent = '';
+  Object.entries(answers || {}).forEach(([qid, a]) => {
+    const box = document.createElement('div'); box.className = 'dans';
+    const h = document.createElement('h4');
+    h.textContent = (a.instructions || qid) + '  ·  ' + a.type;
+    const v = document.createElement('div'); v.className = 'verdict';
+    v.textContent = a.choice !== undefined ? a.choice
+                  : a.score !== undefined ? a.score
+                  : (a.noul !== undefined ? (a.noul * 100).toFixed(1) + '%' : '');
+    box.append(h, v);
+    Object.entries(a.probabilities || {}).forEach(([k, p]) => {
+      // Scoped class names. The first version used `bar`, `nm`, `tr`, `fl` -- and `.bar`
+      // already belongs to the load progress bar, whose height and `overflow: hidden` won,
+      // flattening every probability row to five pixels.
+      const bar = document.createElement('div'); bar.className = 'dbar';
+      const nm = document.createElement('span'); nm.className = 'dname'; nm.textContent = k;
+      const tr = document.createElement('span'); tr.className = 'dtrack';
+      const fl = document.createElement('span'); fl.className = 'dfill';
+      fl.style.width = Math.round(p * 100) + '%';
+      tr.appendChild(fl);
+      const pc = document.createElement('span'); pc.className = 'dpct';
+      pc.textContent = (p * 100).toFixed(1) + '%';
+      bar.append(nm, tr, pc); box.appendChild(bar);
+    });
+    const meta = document.createElement('div'); meta.className = 'meta';
+    // Confidence is reported beside the answer because a probability on its own does not
+    // say whether the model was deciding or guessing.
+    meta.textContent = 'confidence ' + (a.confidence != null ? (a.confidence * 100).toFixed(0) + '%' : '—')
+                     + (a.act_probability != null ? '  ·  would answer ' + (a.act_probability * 100).toFixed(0) + '%' : '');
+    box.appendChild(meta);
+    host.appendChild(box);
+  });
 }
 
 function warnCpuFallback(name, sdkWhy) {
@@ -4232,6 +4393,36 @@ $('#exportBtn').onclick = async () => {
   a.download = 'webtorch-chat-' + Date.now() + '.zip';
   a.click(); URL.revokeObjectURL(a.href);
 };
+// ---- the decision panel's two actions ------------------------------------------------
+$('#dAdd').onclick = () => addQuestion();
+$('#dRun').onclick = async () => {
+  if (!modelLoaded) return note('Load a model first (left panel).');
+  const raw = $('#dState').value.trim();
+  if (!raw) return note('Give it a situation to judge.');
+  const questions = readQuestions();
+  if (!Object.keys(questions).length)
+    return note('Write at least one question, with enough options for it to choose between.');
+  // JSON if it parses as JSON, text otherwise. The model takes either, and a reader who
+  // pasted a record should have it read as a record rather than as prose about one.
+  let state = raw;
+  try { const p = JSON.parse(raw); if (p && typeof p === 'object') state = p; } catch (e) { /* text */ }
+  const btn = $('#dRun'); btn.disabled = true; $('#dTiming').textContent = 'thinking…';
+  const t0 = performance.now();
+  try {
+    const res = await call('decide', { state, questions });
+    // Label each answer with the question that produced it: the ids are this page's own.
+    Object.keys(res.answers || {}).forEach(k => {
+      if (questions[k]) res.answers[k].instructions = questions[k].instructions;
+    });
+    renderAnswers(res.answers);
+    $('#dTiming').textContent =
+      Math.round(performance.now() - t0) + ' ms · ' + (res.usage && res.usage.input_tokens) + ' tokens read';
+  } catch (e) {
+    $('#dTiming').textContent = '';
+    note('Error: ' + (e && e.message ? e.message : e));
+  } finally { btn.disabled = false; }
+};
+
 $('#importBtn').onclick = () => $('#importFile').click();
 $('#importFile').onchange = async (e) => {
   const f = e.target.files[0]; if (!f) return;

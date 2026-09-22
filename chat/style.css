@@ -497,3 +497,48 @@ iframe.jsview{width:100%;border:1px solid var(--line);border-radius:6px;
   .resnote{display:none}
   #resToggle{padding:8px 12px}
 }
+
+/* ---- decision models: a state, some typed questions, and their answers --------------
+   Laid out as a form rather than a transcript because there is no conversation: the same
+   questions are asked of a new state, over and over, and the previous answer is not
+   context for the next one. */
+#decision{flex:1;overflow:auto;padding:18px 22px;display:flex;flex-direction:column;gap:10px}
+#decision .dlabel{font-size:12px;font-weight:600;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+#decision textarea{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line);
+  border-radius:10px;background:var(--bg);color:inherit;font:inherit;resize:vertical}
+#decision .drow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#decision .drow .hint{margin-left:auto}
+.dq{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:0 0 8px;
+  display:flex;flex-direction:column;gap:8px}
+.dq .dqhead{display:flex;gap:8px;align-items:center}
+.dq select,.dq input{padding:6px 8px;border:1px solid var(--line);border-radius:8px;
+  background:var(--bg);color:inherit;font:inherit}
+.dq .dqins{flex:1}
+.dq .dqdrop{margin-left:auto;background:none;border:0;color:var(--mut);cursor:pointer;font-size:16px}
+.dq .opt{display:flex;gap:6px;align-items:center}
+.dq .opt input:first-child{width:150px}
+.dq .opt input:last-of-type{flex:1}
+.dq .needs{font-size:12px;color:var(--mut)}
+.dans{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0 0}
+.dans h4{margin:0 0 2px;font-size:13px}
+.dans .verdict{font-size:20px;font-weight:600;margin:2px 0 6px}
+.dans .dbar{display:flex;align-items:center;gap:8px;margin:3px 0;font-size:13px}
+.dans .dbar .dname{width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dans .dbar .dtrack{flex:1;height:8px;background:var(--code);border-radius:5px;overflow:hidden}
+/* A span is inline until told otherwise, and width does not apply to an inline box --
+   the fill measured zero pixels wide at every percentage. */
+.dans .dbar .dfill{display:block;height:100%;background:var(--accent,#2f9e75)}
+.dans .dbar .dpct{width:56px;text-align:right;color:var(--mut);font-variant-numeric:tabular-nums}
+.dans .meta{margin-top:6px;font-size:12px;color:var(--mut)}
+
+/* `hidden` is an attribute, not a layout rule: an element already given a `display` keeps
+   it and stays on screen. The panels that swap with each other say so explicitly. */
+#composer[hidden],#messages[hidden],#attachments[hidden],#decision[hidden],#hintbar[hidden]{display:none}
+/* The type picker takes what it needs and no more, so the question itself gets the room. */
+.dq select{flex:0 0 auto;width:120px}
+.dq .dqins{flex:1 1 auto;min-width:0}
+/* A flex column shrinks EVERY child to fit the height it has, which is not what any of
+   these want: the state box collapsed to one line despite `rows`, and the probability bars
+   stacked on top of each other. The panel scrolls, so nothing here should be shrinking. */
+#decision > *{flex:0 0 auto}
+#decision textarea{min-height:8.5em}

@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
-<link rel="stylesheet" href="style.css?v=5a742a60cd" />
+<link rel="stylesheet" href="style.css?v=ac3f0ff8a0" />
 
 <!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
      `crossorigin` is required, not cosmetic: this page is served with
@@ -73,6 +73,27 @@
         <span id="resCaret">▾</span> <span id="resSummary">resources</span>
       </button>
       <div id="resBody"></div>
+    </div>
+
+    <!-- The panel for a model that answers questions instead of writing. Hidden until a
+         loaded model says it takes questions, and built from what that model says it takes:
+         which question types exist, what each one needs from the reader, and how many may be
+         asked at once all come from the SDK, so a different decision model reshapes this
+         without a line changing here. -->
+    <div id="decision" hidden>
+      <label class="dlabel" for="dState">The situation</label>
+      <textarea id="dState" rows="7" placeholder="Paste the state to judge — plain text or JSON."></textarea>
+      <div class="drow">
+        <label class="dlabel">Questions</label>
+        <span id="dLimits" class="hint"></span>
+      </div>
+      <div id="dqList"></div>
+      <div class="drow">
+        <button type="button" id="dAdd">+ question</button>
+        <button type="button" id="dRun" class="primary">Answer</button>
+        <span id="dTiming" class="hint"></span>
+      </div>
+      <div id="dAnswers"></div>
     </div>
 
     <form id="composer">
@@ -308,6 +329,6 @@
 <script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
 <script src="../webtorch/js/webtorch-main.js?v=01f205aa85"></script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=31f581d44d"></script>
+<script src="app.js?v=c7d55040a4"></script>
 </body>
 </html>
