@@ -185,3 +185,48 @@ The line is drawn like this:
 Everything functional lives in `webtorch/`. Outside it there is UI and orchestration only —
 `chat/worker.js` marshals calls, `chat/app.js` renders. The chat app is a user of this SDK,
 and holds no capability of its own.
+
+## Making it faster: what this backend is actually bound by
+
+Five attempts to speed up one encoder pass, all measured end to end on the same machine.
+Four of them reduced something real and made no difference or made it worse. They are
+recorded because the reasoning behind each one was sound and still wrong, and the next
+person to have the idea should get the number rather than the afternoon.
+
+| attempt | what it reduced | result |
+|---|---|---|
+| fuse `gelu` into one dispatch | 1577 → 1187 dispatches | 280 → 271 ms |
+| pad K/V so attention's matmuls align | 896 dispatches onto a kernel 2× faster in isolation | first token 6.4 → 7.5 s, **worse** |
+| RGBA textures in the WebGL matmul | 32 → 5 texture fetches per 16 multiply-adds | 9.5 → 13.8 ms, **worse** |
+| int8 / int4 weights | 4–8× fewer bytes read | 0.42–0.71× as fast, **worse** |
+| **the `m % 32` gate on the tiled matmul** | **nothing** | **131 ms, 6× on the matmuls** |
+
+The one that worked did not reduce anything. There were already two matmul kernels, and the
+fast one required the row count to be a multiple of 32 — which is the token count, the one
+axis a caller does not choose. Every matmul in an encoder pass was falling to the naive
+kernel because of the shape of a check. Letting the tiled kernel take any row count is the
+whole of it.
+
+What the failures have in common is that each reduced the thing it assumed was the bound.
+At the sizes a decision model works at — 69 rows against a 1024-wide hidden state — this
+backend is short of **parallel work**, not of bandwidth:
+
+- The same kernel on the same weights measures 234 GFLOPS at 69 rows and 1573 at 800. It is
+  not the weights that are slow, it is having too few rows to fill the device.
+- Halving the bytes by holding weights at half precision is worth 1.33×, not the 2× the
+  arithmetic suggests — and nothing at all on the narrowest shape.
+- Quantising further makes it *slower*, because the dequantisation is arithmetic, and
+  arithmetic is what is already scarce. Half precision is the exception only because
+  `unpack2x16float` is one instruction where unpacking int4 is a shift, a mask, a multiply
+  and a subtract.
+- Fewer texture fetches was never less traffic: consecutive fragments reading consecutive
+  elements already share cache lines.
+- Dispatch count is not time. The note in `layernorm` saying so was right, and removing 390
+  dispatches to save 8 ms is what finally made that believable.
+
+Quantisation remains necessary for large models, but as a **capacity** decision and not a
+speed one: a 27B model does not fit otherwise. A 421M model fits either way, so nothing is
+buying the slowdown.
+
+One caveat on the last row: the quantised path has a dedicated GEMV kernel for a single row,
+which is the decode case. All of the above is measured at 69 rows, on the general path.
