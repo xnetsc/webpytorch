@@ -207,8 +207,33 @@ class DecisionModel(wt.Module):
         f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
         return x + f
 
+    # Where one pass over several questions beats one pass each.
+    #
+    # Measured, four matmuls per layer over 28 layers, separate against batched:
+    #
+    #     tokens each     x2      x3      x6
+    #        32          1.63    2.00    2.28
+    #        48          1.49    1.56    1.71
+    #        64          1.36    1.32    1.47
+    #        96          1.10    1.24    1.24
+    #       128          1.05    1.09    1.13
+    #       160+         1.04    1.04    1.04
+    #
+    # It is the same occupancy story as everywhere else here: a short sequence does not give
+    # the device enough rows to work on, and putting several together does. By 128 there are
+    # already enough and batching is noise, so the line is drawn where the gain stops being
+    # worth the padding -- sequences are padded to the longest, and a batch of uneven ones
+    # does arithmetic on padding that a separate pass would not.
+    _BATCH_MAX_TOKENS = 96
+
+    @classmethod
+    def batch_pays(cls, longest, count):
+        return count >= 2 and longest <= cls._BATCH_MAX_TOKENS
+
     def _run_one(self, ids, markers, qtype_idx):
-        h = self.enc.encode(ids)
+        return self._score(self.enc.encode(ids), markers, qtype_idx)
+
+    def _score(self, h, markers, qtype_idx):
         h = h + wt.embedding(self._t("type_emb.weight"),
                              np.full((h.shape[0],), qtype_idx, dtype=np.int64))
         for i in range(self.n_head_layers):
@@ -256,6 +281,9 @@ class DecisionModel(wt.Module):
         """
         out = {}
         total = 0
+        # Every sequence is built first, because whether to run them together depends on how
+        # long the longest one turned out to be.
+        built = []
         for qid, q in (questions or {}).items():
             qtype = q["type"]
             if qtype not in self.cfg.qtypes:
@@ -269,7 +297,20 @@ class DecisionModel(wt.Module):
                                  "them have no place in the sequence to be scored at"
                                  % (qid, self.cfg.head_max_len, len(labels) - len(markers)))
             total += len(ids)
-            logits, act = self._run_one(ids, markers, self.cfg.qtypes.index(qtype))
+            built.append((qid, q, qtype, ids, markers, labels))
+
+        hs = None
+        if built and self.batch_pays(max(len(b[3]) for b in built), len(built)):
+            try:
+                hs = self.enc.encode_many([b[3] for b in built])
+            except Exception:
+                hs = None            # a batched pass is an optimisation, not a step
+
+        for idx, (qid, q, qtype, ids, markers, labels) in enumerate(built):
+            if hs is not None:
+                logits, act = self._score(hs[idx], markers, self.cfg.qtypes.index(qtype))
+            else:
+                logits, act = self._run_one(ids, markers, self.cfg.qtypes.index(qtype))
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
             ans = {"type": qtype, "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},

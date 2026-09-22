@@ -617,6 +617,8 @@ _QKV_TAKE_WGSL = """@group(0) @binding(0) var<storage,read_write> o: array<f32>;
 @group(0) @binding(2) var<storage,read> cosb: array<f32>;
 @group(0) @binding(3) var<storage,read> sinb: array<f32>;
 struct QMeta { n: u32, T: u32, H: u32, HD: u32, which: u32, rope: u32, }
+// `n` counts the whole output, so the number of sequences is implied: out is (B*H, T, HD)
+// against a source of (B*T, 3*H*HD), and a sequence's rows sit together in it.
 @group(0) @binding(4) var<storage,read> qm: QMeta;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -625,9 +627,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   // out is (H, T, HD); src is (T, 3*H*HD) with q, k, v laid end to end on each row.
   let d = i % qm.HD;
   let t = (i / qm.HD) % qm.T;
-  let head = i / (qm.HD * qm.T);
+  let bh = i / (qm.HD * qm.T);          // which (sequence, head) pair this row belongs to
+  let b = bh / qm.H;
+  let head = bh % qm.H;
   let D = qm.H * qm.HD;
-  let base = t * 3u * D + qm.which * D + head * qm.HD;
+  let base = (b * qm.T + t) * 3u * D + qm.which * D + head * qm.HD;
   let x = s[base + d];
   if (qm.rope == 0u) {
     o[i] = x;
@@ -780,7 +784,7 @@ def matmul_f16w(x, wpacked, K, N):
     return Tensor(out.reshape(*(lead + (N,))))
 
 
-def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
+def qkv_take(qkv, which, H, HD, T, cos=None, sin=None, B=1):
     """One of q, k or v, taken out of a fused projection and laid out for attention.
 
     `qkv` is (T, 3*H*HD) as the projection produced it; the result is (H, T, HD) with rotary
@@ -794,8 +798,8 @@ def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
     if not _adam_backend_ready():
         return None
     xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
-    H, HD, T = int(H), int(HD), int(T)
-    if tuple(xd.shape) != (T, 3 * H * HD):
+    H, HD, T, B = int(H), int(HD), int(T), int(B)
+    if tuple(xd.shape) != (B * T, 3 * H * HD):
         return None
     plat = _adam_kernel["platform"]
     if not _qkv_k["added"]:
@@ -805,7 +809,7 @@ def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
     use_rope = cos is not None and sin is not None
     cd = _contig(cos.data if isinstance(cos, Tensor) else cos) if use_rope else xd
     sd = _contig(sin.data if isinstance(sin, Tensor) else sin) if use_rope else xd
-    n = H * T * HD
+    n = B * H * T * HD
     out = _empty((n,))
     meta = _adam_kernel["make_meta"]((n, T, H, HD, int(which), 1 if use_rope else 0),
                                      "u4,u4,u4,u4,u4,u4")
@@ -813,7 +817,7 @@ def qkv_take(qkv, which, H, HD, T, cos=None, sin=None):
                     "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id,
                                 cd.buffer.buffer_id, sd.buffer.buffer_id, meta.buffer_id],
                     "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
-    return Tensor(out.reshape(H, T, HD))
+    return Tensor(out.reshape(B * H, T, HD))
 
 
 def geglu_split(x, half):
