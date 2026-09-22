@@ -452,6 +452,25 @@ async def load_decision(src, **kw):
         webio.load_stage("weights", done, len(head))
 
     dec_cfg = DecisionConfig(dec_raw)
-    return DecisionModel(enc_cfg, dec_cfg, weights, tok,
-                         mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
-                         pad_id=enc_cfg.pad_id)
+    model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
+                          mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
+                          pad_id=enc_cfg.pad_id)
+    # Ask it something trivial before handing it over.
+    #
+    # Weights reach the device on first use, and shaders compile on first dispatch, so
+    # without this the FIRST question a reader asks pays for the whole model being uploaded
+    # -- measured at 3.5 s against 51 ms for the ones after it. It also makes the loaded
+    # model honest about itself: between loading and that first question the page reported
+    # nothing on the GPU, because nothing was.
+    try:
+        webio.load_stage("warm")
+        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
+                                         "instructions": "warm up",
+                                         "criteria": ["a", "b"]}})
+    except Exception as e:                    # a warm-up is an optimisation, not a step
+        try:
+            import js
+            js.console.warn("webtorch: decision warm-up skipped: " + str(e))
+        except Exception:
+            pass                              # no browser to tell; the model is still fine
+    return model
