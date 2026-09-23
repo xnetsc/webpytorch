@@ -127,7 +127,7 @@
   //
   // Resolves to what happened, rather than throwing: 'isolated' (nothing needed),
   // 'reloading' (a reload is on its way), 'registered' (worker is in place, isolation lands
-  // next load), or a reason it cannot work -- 'no-service-worker', 'not-served',
+  // next load), or a reason it cannot work -- 'not-secure', 'no-service-worker', 'not-served',
   // 'still-not-isolated', or 'failed: …'.
   const RELOAD_ONCE = 'webtorch.sw.reloaded';
 
@@ -181,6 +181,19 @@
       report('service-worker', 'opened from ' + location.protocol + ' rather than served, so '
              + 'the page cannot be cross-origin isolated and the model will run on the CPU');
       return 'not-served';
+    }
+    // Almost always this is the page not being a SECURE CONTEXT rather than the browser
+    // lacking the feature, and saying the wrong one sends whoever reads it looking in the
+    // wrong place. A service worker needs https, or localhost / 127.0.0.1, which browsers
+    // treat as trustworthy; a LAN address over plain http is not, and neither is file://.
+    // Cross-origin isolation needs the same thing, so on such an origin SharedArrayBuffer
+    // is gone even if the server does send the headers itself -- there is no workaround
+    // here, only a different URL.
+    if (!self.isSecureContext) {
+      report('service-worker', 'this page is not a secure context (' + location.origin
+             + '), so there is no service worker and no SharedArrayBuffer, and the model '
+             + 'will run on the CPU. Serve it over https, or from localhost.');
+      return 'not-secure';
     }
     if (!navigator.serviceWorker) {
       report('service-worker', 'this browser has no service worker, so a static host cannot '

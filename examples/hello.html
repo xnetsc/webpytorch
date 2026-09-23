@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<!--
+  webtorch — the whole of a page that runs a language model in a browser.
+
+  Serve this folder over HTTP and open it. Everything below is everything: there is no build
+  step, no bundler, and no worker file to write. `webtorch.start()` creates the worker, brings
+  up the GPU backend and Python inside it, and hands back functions.
+
+      cd .. && node serve-coi.mjs . 8119
+      open http://localhost:8119/examples/hello.html
+
+  Plain http is fine HERE because localhost is a secure context -- browsers count loopback as
+  trustworthy. Anywhere else it has to be https: a LAN address over http is not trustworthy,
+  and neither is file://. A service worker needs a secure context and so does
+  SharedArrayBuffer, which the GPU backend reaches the device over, so on such an origin
+  there is no isolation to be had even if the server sends the headers itself -- and the
+  model quietly runs on the CPU instead.
+
+  The one thing worth reading twice is what this page decides and the SDK does not: where
+  model files come from, whether they are kept, and whether anything about this GPU is
+  remembered between visits. The SDK offers a reader and a writer and installs neither.
+-->
+<meta charset="utf-8">
+<title>webtorch — hello</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; }
+  #out { white-space: pre-wrap; margin-top: 1rem; min-height: 6rem; }
+  #status { color: #666; } .err { color: #b00; }
+  button { font: inherit; padding: .4rem .9rem; }
+</style>
+
+<h1>webtorch</h1>
+<p id="status">starting…</p>
+<p>
+  <button id="load">Load Qwen3-0.6B</button>
+  <button id="ask" disabled>Ask something</button>
+  <button id="stop" disabled>Stop</button>
+</p>
+<div id="out"></div>
+
+<script src="../dist/wgpy-main.js"></script>
+<script src="../webtorch/js/webtorch-main.js"></script>
+<script>
+// The SDK needs the page cross-origin isolated, or SharedArrayBuffer is unavailable and the
+// model runs on the CPU. A server that can set COOP/COEP needs none of this; a static host
+// cannot, so the SDK registers a service worker that adds them. Called before anything else
+// because a first visit reloads once.
+webtorch.installServiceWorker({ baseURL: '../' });
+</script>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const say = (t) => { $('#status').textContent = t; };
+
+// Everything the SDK catches arrives here -- a call that threw, the runtime dying, the
+// backend falling back to the CPU. Registered first, because the SDK can fail while starting.
+webtorch.onError((e) => {
+  $('#status').className = 'err';
+  say(e.scope + ': ' + e.message);
+});
+
+let wt = null;
+
+const ready = webtorch.start({
+  baseURL: '../',
+  onStatus: say,                      // "starting Python…", "ready (webgpu)" — most of the wait
+}).then(async (w) => {
+  wt = w;
+  // THIS PAGE'S decisions, not the SDK's: where weights come from, and that they are kept so
+  // the second visit is instant. Leave the writer out and nothing is stored.
+  await w.run('import webtorch\n'
+            + 'webtorch.set_io_read(webtorch.modelscope_read())\n'
+            + 'webtorch.set_io_write(webtorch.default_io_write)\n');
+  say('ready — compute: ' + w.backend + (w.reason ? ' (' + w.reason + ')' : ''));
+  $('#load').disabled = false;
+  return w;
+});
+
+$('#load').onclick = async () => {
+  $('#load').disabled = true;
+  await ready;
+  await wt.load('unsloth/Qwen3-0.6B-GGUF', {
+    file: 'Qwen3-0.6B-Q4_K_M.gguf',
+    onProgress: (p) => say('downloading ' + (p.bytes / 1e6).toFixed(0) + ' MB'
+                         + (p.total ? ' of ' + (p.total / 1e6).toFixed(0) : '')),
+    onStage: (s) => say(s.stage + '…'),     // reading is done; this is the tail of the load
+  });
+  $('#ask').disabled = false;
+};
+
+$('#ask').onclick = async () => {
+  $('#out').textContent = '';
+  $('#ask').disabled = true; $('#stop').disabled = false;
+  try {
+    // Streaming: each piece arrives as it is decoded. `channel` separates a model's private
+    // reasoning from its answer, so the two are never shown as one.
+    const r = await wt.generate('Name three primary colours.', {
+      max_new: 200,
+      onToken: (t) => { if (t.channel === 'content') $('#out').textContent += t.text; },
+    });
+    say(r.n + ' tokens · ' + (r.tok_s || 0).toFixed(1) + ' tok/s');
+  } catch (e) {
+    // A stop is not a failure: it leaves the answer as far as it got.
+    say(webtorch.isCancelled(e) ? 'stopped' : 'failed: ' + e.message);
+  } finally {
+    $('#ask').disabled = false; $('#stop').disabled = true;
+  }
+};
+
+// Takes effect while the runtime is busy, which a message could not: it is a store into
+// shared memory, not something queued behind the work.
+$('#stop').onclick = () => wt.cancel();
+</script>

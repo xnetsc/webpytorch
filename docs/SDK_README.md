@@ -5,12 +5,104 @@ Transformers, and LLMs on **WebGPU/WebGL** (via Pyodide + WgPy), with a
 transformers-style model API and a streaming quantizer. Third parties use the
 public API only — no need to touch internals.
 
-> **Runtime:** this is **Python-in-the-browser**. All code below runs **inside Pyodide**
-> (CPython→WASM), typically in a Web Worker, via `pyodide.runPythonAsync(code)` on the WgPy
-> WebGPU/WebGL backend — hence top-level `await` works. webtorch is **not** `pip install`ed
-> into system Python; its files are loaded into Pyodide's virtual FS next to the backend
-> wheels (see [`webapp/worker.js`](../webapp/worker.js) and [BUILD.md](BUILD.md)). Host
-> CPython import is a numpy-fallback smoke test only; GPU paths need the browser.
+> **Runtime:** this is **Python-in-the-browser**. The Python below runs **inside Pyodide**
+> (CPython→WASM) on the WgPy WebGPU/WebGL backend — hence top-level `await` works. webtorch
+> is **not** `pip install`ed into system Python; its files are loaded into Pyodide's virtual
+> FS next to the backend wheels, which `webtorch.start()` does for you. Host CPython import
+> is a numpy-fallback smoke test only; GPU paths need the browser.
+
+---
+
+## 0. Getting started
+
+Two script tags and one call. There is no build step, no bundler, and **no worker file to
+write** — `webtorch.start()` creates the worker, brings up the GPU backend and Python inside
+it, and hands back functions.
+
+```html
+<script src="dist/wgpy-main.js"></script>
+<script src="webtorch/js/webtorch-main.js"></script>
+<script>
+  // Only needed on a host that cannot set response headers (see "It has to be https" below).
+  webtorch.installServiceWorker({ baseURL: './' });
+</script>
+<script>
+  const wt = await webtorch.start({ baseURL: './', onStatus: (t) => show(t) });
+
+  // Your decision, not the SDK's: where weights come from, and whether they are kept.
+  await wt.run(`import webtorch
+webtorch.set_io_read(webtorch.modelscope_read())
+webtorch.set_io_write(webtorch.default_io_write)`);
+
+  await wt.load('unsloth/Qwen3-0.6B-GGUF', { file: 'Qwen3-0.6B-Q4_K_M.gguf',
+                                             onProgress: (p) => show(p.bytes) });
+  const r = await wt.generate('Name three primary colours.',
+                              { max_new: 200, onToken: (t) => append(t.text) });
+</script>
+```
+
+A complete, runnable page is [`examples/hello.html`](../examples/hello.html) — load, stream,
+stop, and error handling, in about eighty lines:
+
+```sh
+node serve-coi.mjs . 8119
+open http://localhost:8119/examples/hello.html
+```
+
+### The page must be a secure context
+
+Which is **not** the same as "must be https". Browsers treat loopback as trustworthy, so
+local development over plain http is fine — it is what this project is developed on:
+
+| origin | works |
+|---|---|
+| `https://…` | yes |
+| `http://localhost:8119` | **yes** — loopback is a secure context |
+| `http://127.0.0.1:8119`, `http://[::1]:8119` | yes, same exemption |
+| `http://192.168.1.5:8119` | no — a LAN address over plain http is not trustworthy |
+| `file://…` | no |
+
+Why it matters: the GPU backend reaches the device from a worker over `SharedArrayBuffer`,
+which needs the page **cross-origin isolated**, which needs a secure context — and so does
+the service worker that provides that isolation on a static host. On an origin that is not
+one there is no isolation to be had *even if the server sends the headers itself*, and
+everything falls back to the CPU: seconds become minutes, with nothing said.
+
+So: serve it from `localhost` while you build, and over https when you deploy. Reaching a dev
+server from your phone on the same wi-fi is the case that bites — that is a LAN address, and
+it needs https (a tunnel, or a certificate) to be anything other than slow.
+
+If you control the server, send these two and you need no service worker at all:
+
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+
+If you do not (GitHub Pages and friends), `installServiceWorker()` registers a worker that
+adds them. It returns what happened rather than throwing — `'isolated'`, `'reloading'`,
+`'registered'`, or a reason: `'not-secure'`, `'not-served'`, `'no-service-worker'`,
+`'still-not-isolated'`, `'failed: …'`.
+
+### Hearing about it when something goes wrong
+
+```js
+webtorch.onError((e) => console.warn(e.scope, e.message));
+```
+
+Everything the SDK catches arrives there — a call that threw, the runtime dying (which also
+rejects every call in flight rather than leaving them hanging), the backend falling back to
+the CPU, the service worker's handler refusing to load. Register it before anything else:
+the SDK can fail while it is still starting.
+
+The full JavaScript surface — `generate`, `decide`, `cancel`, `resources`, `tools`, `cache`,
+and how to put your own service-worker code inside the SDK's worker — is in
+[API.md](API.md#one-call-no-worker--webtorchstart).
+
+---
+
+## Python, inside the runtime
+
+Everything below runs in Pyodide. From the page, `wt.run(code)` is the way in; from Python
+itself it is an ordinary import:
 
 ```python
 import webtorch          # inside Pyodide (browser / Web Worker)

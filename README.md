@@ -195,7 +195,8 @@ webtorch/            the SDK
   webio.py             the only IO layer: global callbacks, hub readers, cache management
   onnxrt.py            generic ONNX runtime
   torchshim.py         `import torch` compatibility
-chat/                the chat app (index.html, app.js, worker.js, pyworker.js)
+chat/                the chat app (index.html, app.js, cache-sw.js, pyworker.js)
+webtorch-sw.js       the SDK's service worker: cross-origin isolation for static hosts
 webapp/              example runner
 examples/            runnable examples
 docs/                API.md · SDK_README.md · ARCHITECTURE.md · BUILD.md · WGPY_BACKEND.md

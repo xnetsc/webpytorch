@@ -188,9 +188,25 @@ The line is drawn like this:
 - **Application-specific behaviour stays in the application.** Which tools exist, and what
   closing a tab means, are the chat app's; parsing and constraining them are the SDK's.
 
-Everything functional lives in `webtorch/`. Outside it there is UI and orchestration only —
-`chat/worker.js` marshals calls, `chat/app.js` renders. The chat app is a user of this SDK,
-and holds no capability of its own.
+Everything functional lives in `webtorch/`, and that now includes crossing into it. The SDK
+runs as Python in a worker, so every call used to cross a message boundary the host had to
+build: `chat/worker.js` was 690 lines of which about 400 were marshalling that no application
+should be writing — `toolScan` was `m.strip_tool_calls` plus `m.tool_calls`, `cacheList` was
+three documented calls and a dict comprehension. `webtorch.start()` creates the worker and
+returns functions, and that file is gone.
+
+What is left outside is what an application really owns. `chat/app.js` renders. `chat/cache-sw.js`
+says which files this page keeps and for how long — it rides inside the SDK's service worker,
+because a client has exactly one controller and on a static host that one has to be the SDK's:
+only a worker controlling the document can put the isolation headers on the document's own
+response, and without them the whole model runs on the CPU.
+
+The line between them is drawn by one question — **can the application build this itself?**
+It can build a service worker, a scope and a caching policy; it cannot work out that COEP has
+to be `require-corp` rather than `credentialless` (a measurement on WebKit, where the wrong
+one is ignored and every browser on an iPhone lands on the CPU with nothing said). So the
+worker is the SDK's and the caching is the page's. By the same test the SDK decides nothing
+about storage: caching models, and keeping what a GPU measured, are both off until asked for.
 
 ## Making it faster: what this backend is actually bound by
 

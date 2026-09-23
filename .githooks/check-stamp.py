@@ -13,8 +13,9 @@ impossible: for every stamped URL, it hashes the STAGED bytes of the file that U
 at and requires the URL to say the same thing.
 
 What it does NOT do: add stamps, or demand one for a URL that has none. A reference with no
-`?v=` is a deliberate choice in at least one place (`coi-serviceworker.js` registers itself
-and must keep a stable URL), and a hook cannot tell that apart from an oversight.
+`?v=` is a deliberate choice in at least one place (a service worker is identified by its
+URL, so stamping one re-registers it on every deploy), and a hook cannot tell that apart
+from an oversight.
 
 Fix a failure with:  sh scripts/stamp.sh
 This is a `pre-commit` check: it reads the STAGED tree, so it judges the commit being made.
