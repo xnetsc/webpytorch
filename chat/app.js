@@ -257,8 +257,8 @@ const PRESETS = [
   { gb: 11.5, label: 'gpt-oss-20B · MoE · Q3_K_M', repo: 'unsloth/gpt-oss-20b-GGUF', file: 'gpt-oss-20b-Q3_K_M.gguf' },
   { gb: 13.8, label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
   { gb: 13.8, label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
-  // Not a chat model: it writes nothing, and answers typed questions with calibrated
-  // probabilities instead. It is in the same list because the picker loads models, not
+  // Not a chat model: it writes nothing, and answers typed questions with probability
+  // scores instead. It is in the same list because the picker loads models, not
   // chats -- what the page then puts on screen comes from what the model says it takes.
   { gb: 0.8,  label: 'Laya · decision model · answers questions, writes nothing',
     repo: 'convaiinnovations/laya', file: '' },
@@ -638,6 +638,21 @@ function qTypes() {
 function buildDecisionPanel(sf) {
   const lim = sf.limits || {};
   const maxq = (sf.takes.questions && sf.takes.questions.max) || null;
+  const cal = sf.calibration || {};
+  const c = $('#dCalibration');
+  if (cal.domain_calibrated) {
+    c.className = 'dcal ok';
+    c.textContent = 'Probability scale fitted on held-out examples for: '
+      + ((cal.groups || []).join(', ') || 'this use');
+  } else {
+    c.className = 'dcal warn';
+    c.textContent = (cal.adjustments && cal.adjustments.length)
+      ? 'The checkpoint supplied unsafe calibration values. The SDK constrained them, so '
+        + 'these percentages are model scores, not measured success rates.'
+      : 'These percentages use checkpoint calibration, not your data. A displayed 90% is '
+        + 'not evidence that this will be right 90% of the time; fit on separate labelled '
+        + 'examples before automating on a threshold.';
+  }
   $('#dLimits').textContent =
     [maxq ? 'up to ' + maxq : null,
      lim.sequence_tokens ? lim.sequence_tokens + ' tokens per question' : null]
@@ -758,13 +773,6 @@ function readQuestions() {
 // SDK: the SDK reports the number and refuses to decide what counts as sure, which is right,
 // because the threshold depends on what the answer is for. The number is always printed
 // beside the word so nothing is hidden behind it.
-function sureness(p) {
-  if (p >= 0.85) return 'very sure';
-  if (p >= 0.6) return 'fairly sure';
-  if (p >= 0.4) return 'unsure';
-  return 'barely more than a guess';
-}
-
 // How SPREAD the odds are, which is a different question from how likely the winner is, and
 // has to be worded as one. Said as sureness it contradicts the headline: a statement given
 // an 84% chance came out as "barely more than a guess", because 84/16 across two answers is
@@ -789,6 +797,8 @@ function likelihood(p) {
 
 function renderAnswers(answers) {
   const host = $('#dAnswers'); host.textContent = '';
+  const calibratedGroups = ((modelSurface && modelSurface.calibration
+                              && modelSurface.calibration.groups) || []);
   Object.entries(answers || {}).forEach(([qid, a]) => {
     const box = document.createElement('div'); box.className = 'dans';
     const asked = document.createElement('p'); asked.className = 'asked';
@@ -797,11 +807,18 @@ function renderAnswers(answers) {
     const says = document.createElement('p'); says.className = 'says';
     const probs = Object.entries(a.probabilities || {});
     const top = probs.slice().sort((x, y) => y[1] - x[1])[0];
+    const n = probs.length;
+    const size = n <= 2 ? '2' : n <= 5 ? '3-5' : n <= 10 ? '6-10' : '11+';
+    const calibratedHere = calibratedGroups.includes(a.type)
+      || calibratedGroups.includes(a.type + ':' + size);
 
     if (a.choice !== undefined) {
       verdict.textContent = a.choice;
-      says.textContent = 'It picked this one, and is ' + sureness(top ? top[1] : 0)
-                       + ' (' + Math.round((top ? top[1] : 0) * 100) + '%).';
+      const pct = Math.round((top ? top[1] : 0) * 100);
+      says.textContent = calibratedHere
+        ? 'It picked this one at ' + pct + '% after calibration on held-out examples.'
+        : 'It assigned this option ' + pct + '%. That is a model score, not a measured '
+          + pct + '% success rate.';
     } else if (a.score !== undefined) {
       // The score is an expected level, so it usually sits BETWEEN two of the levels that
       // were written. Naming the nearest one answers the question; saying which way it
@@ -814,14 +831,20 @@ function renderAnswers(answers) {
       // "soon" while the balance came out at "normal". Shown side by side without a word
       // they read as a contradiction, so the sentence names both.
       const peak = top && (legend[top[0]] || top[0]);
-      says.textContent = (peak && peak !== verdict.textContent)
+      const summary = (peak && peak !== verdict.textContent)
         ? 'That is where the balance of the odds falls. The single most likely one is “'
           + peak + '” at ' + Math.round(top[1] * 100) + '%.'
         : 'That is both the most likely level and where the balance falls.';
+      says.textContent = summary + (calibratedHere
+        ? ' Its probability scale was fitted on held-out examples.'
+        : ' Percentages below are model scores, not measured success rates.');
     } else {
       const p = a.noul != null ? a.noul : 0;
-      verdict.textContent = likelihood(p);
-      says.textContent = 'It puts the chance at ' + (p * 100).toFixed(0) + '%.';
+      verdict.textContent = calibratedHere ? likelihood(p) : (p >= 0.5 ? 'Leaning yes' : 'Leaning no');
+      says.textContent = calibratedHere
+        ? 'It puts the calibrated chance at ' + (p * 100).toFixed(0) + '%.'
+        : 'The model assigned true ' + (p * 100).toFixed(0)
+          + '%. Validate that score on labelled examples before treating it as a probability.';
     }
     box.append(asked, verdict, says);
 

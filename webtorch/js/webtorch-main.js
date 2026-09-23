@@ -420,6 +420,12 @@
       },
       /** Score structured questions against a structured state, for a model that decides. */
       decide: function (state, questions) { return call('decide', { state: state, questions: questions }); },
+      /** Fit decision probabilities on separate labelled held-out examples. */
+      calibrate: function (examples, o) {
+        o = o || {};
+        return call('calibrate', { examples: examples, byOptions: o.byOptions,
+                                   minSamples: o.minSamples });
+      },
 
       /** What the model can be asked about its own output. */
       tools: {

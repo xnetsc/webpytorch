@@ -1,4 +1,4 @@
-"""Decision models: a state and some typed questions in, calibrated answers out.
+"""Decision models: a state and some typed questions in, probability-scaled answers out.
 
 A decision model does not write. It reads the situation once and returns, for each question,
 a probability over the answers the CALLER named -- which option, what level, how likely. There
@@ -20,12 +20,123 @@ gets the numbers to make it with.
 """
 import json
 import math
+import warnings
 
 import numpy as np
 
 from . import _core as wt
 from ._core import Tensor, bmm, gelu, layernorm, softmax, transpose_last2
 from .encoder import EncoderConfig, TextEncoder, _f32
+
+
+# A temperature is a divisor on logits. Zero is undefined; a tiny positive value turns an
+# ordinary lead into a displayed certainty. This is not peculiar to one checkpoint: any
+# classifier/decision model that publishes softmax values has this boundary. Keep the guard
+# here, where that class of model is recognised, rather than in a model-name adapter.
+TEMPERATURE_MIN = 0.5
+TEMPERATURE_MAX = 5.0
+
+
+def temperature_bucket(qtype, k):
+    size = "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else "11+"
+    return "%s:%s" % (qtype, size)
+
+
+def safe_temperature(value, low=TEMPERATURE_MIN, high=TEMPERATURE_MAX):
+    """A finite temperature inside a usable range; invalid values become the neutral 1.0.
+
+    The bounds are arguments so a caller fitting a specialised family can state a different
+    measured range instead of patching the implementation.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(value):
+        return 1.0
+    return min(float(high), max(float(low), value))
+
+
+def _probabilities(logits, temperature=1.0):
+    z = np.asarray(logits, dtype=np.float64).reshape(-1) / safe_temperature(temperature)
+    z -= z.max()
+    p = np.exp(z)
+    return p / p.sum()
+
+
+def calibration_error(probabilities, targets, bins=15):
+    """Expected calibration error for classification distributions.
+
+    A reported 0.9 is calibrated when predictions reported around 0.9 are right around 90%
+    of the time. ECE measures the gap, weighted across equally wide confidence bins.
+    """
+    rows = [np.asarray(p, dtype=np.float64).reshape(-1) for p in probabilities]
+    y = np.asarray(targets, dtype=np.int64).reshape(-1)
+    if not rows or len(rows) != len(y):
+        raise ValueError("probabilities and targets must contain the same non-zero number of rows")
+    conf = np.asarray([float(p.max()) for p in rows])
+    correct = np.asarray([int(p.argmax()) == int(t) for p, t in zip(rows, y)], dtype=np.float64)
+    out = 0.0
+    for i in range(int(bins)):
+        lo, hi = i / bins, (i + 1) / bins
+        take = (conf >= lo) & ((conf <= hi) if i == bins - 1 else (conf < hi))
+        if take.any():
+            out += float(take.mean()) * abs(float(conf[take].mean()) - float(correct[take].mean()))
+    return float(out)
+
+
+def fit_temperature(logits, targets, low=TEMPERATURE_MIN, high=TEMPERATURE_MAX,
+                    iterations=64):
+    """Fit one post-hoc temperature by held-out negative log likelihood.
+
+    `logits` may contain rows of different widths, which is needed when one option-count
+    bucket contains three-, four- and five-way questions. The class choice is unchanged by
+    a positive temperature; only the probability scale is repaired. The return value keeps
+    the before/after evidence beside the fitted number so callers can reject a fit that did
+    not improve their held-out data.
+    """
+    rows = [np.asarray(x, dtype=np.float64).reshape(-1) for x in logits]
+    y = np.asarray(targets, dtype=np.int64).reshape(-1)
+    if not rows or len(rows) != len(y):
+        raise ValueError("logits and targets must contain the same non-zero number of rows")
+    for i, (row, target) in enumerate(zip(rows, y)):
+        if row.size < 2 or not np.isfinite(row).all():
+            raise ValueError("logits row %d must contain at least two finite values" % i)
+        if target < 0 or target >= row.size:
+            raise ValueError("target %d is outside logits row %d (width %d)"
+                             % (target, i, row.size))
+    low, high = float(low), float(high)
+    if not (0 < low < high and math.isfinite(low) and math.isfinite(high)):
+        raise ValueError("temperature bounds must be finite and satisfy 0 < low < high")
+
+    def nll(t):
+        loss = 0.0
+        for row, target in zip(rows, y):
+            z = row / t
+            m = float(z.max())
+            loss += (m + math.log(float(np.exp(z - m).sum()))) - float(z[target])
+        return loss / len(rows)
+
+    # Temperature is positive, so search log(T). Golden-section search needs no scipy and
+    # gives a deterministic result in CPython and Pyodide.
+    a, b = math.log(low), math.log(high)
+    ratio = (math.sqrt(5.0) - 1.0) / 2.0
+    c, d = b - ratio * (b - a), a + ratio * (b - a)
+    fc, fd = nll(math.exp(c)), nll(math.exp(d))
+    for _ in range(int(iterations)):
+        if fc <= fd:
+            b, d, fd = d, c, fc
+            c = b - ratio * (b - a); fc = nll(math.exp(c))
+        else:
+            a, c, fc = c, d, fd
+            d = a + ratio * (b - a); fd = nll(math.exp(d))
+    fitted = safe_temperature(math.exp((a + b) * 0.5), low, high)
+    before = [_probabilities(row, 1.0) for row in rows]
+    after = [_probabilities(row, fitted) for row in rows]
+    return {"temperature": fitted, "samples": len(rows),
+            "nll_before": nll(1.0), "nll_after": nll(fitted),
+            "ece_before": calibration_error(before, y),
+            "ece_after": calibration_error(after, y)}
 
 
 def serialize_state(state):
@@ -67,21 +178,74 @@ class DecisionConfig(object):
         # Post-hoc calibration, fitted by whoever trained the model. Two levels: a
         # temperature per question type, and a finer one per type AND option count, because
         # a two-way question and a twenty-way one do not need the same scaling.
-        self.temperature = list(c.get("temperature", [1.0, 1.0, 1.0]))
-        self.temperature_by_options = dict(c.get("temperature_by_options", {}))
         self.qtypes = list(qtypes or ["choice", "score", "noul"])
+        raw_temperature = c.get("temperature", [1.0] * len(self.qtypes))
+        self.temperature_raw = (list(raw_temperature) if isinstance(raw_temperature, (list, tuple))
+                                else [raw_temperature] * len(self.qtypes))
+        raw_buckets = c.get("temperature_by_options", {})
+        self.temperature_by_options_raw = (dict(raw_buckets)
+                                           if isinstance(raw_buckets, dict) else {})
+        self.temperature = [safe_temperature(t) for t in self.temperature_raw]
+        self.temperature_by_options = {
+            k: safe_temperature(v) for k, v in self.temperature_by_options_raw.items()
+        }
+        self.temperature_adjustments = []
+        entries = [("temperature[%d]" % i, raw, applied)
+                   for i, (raw, applied) in enumerate(zip(self.temperature_raw, self.temperature))]
+        entries += [(k, raw, self.temperature_by_options[k])
+                    for k, raw in self.temperature_by_options_raw.items()]
+        for name, raw, applied in entries:
+            try:
+                unchanged = float(raw) == applied
+            except (TypeError, ValueError):
+                unchanged = False
+            if not unchanged:
+                self.temperature_adjustments.append(
+                    {"entry": name, "raw": repr(raw), "applied": applied})
+        self.checkpoint_calibration = bool("temperature" in c or "temperature_by_options" in c)
+        self.domain_calibrated = set()
+        if self.temperature_adjustments:
+            warnings.warn(
+                "decision checkpoint temperatures were invalid or outside [%g, %g]; "
+                "safe values were applied. Treat the affected probabilities as uncalibrated: %s"
+                % (TEMPERATURE_MIN, TEMPERATURE_MAX,
+                   ", ".join("%s=%s -> %g" % (x["entry"], x["raw"], x["applied"])
+                             for x in self.temperature_adjustments)),
+                RuntimeWarning, stacklevel=2)
 
     def temp_for(self, qtype, k):
-        size = "2" if k <= 2 else "3-5" if k <= 5 else "6-10" if k <= 10 else "11+"
         idx = self.qtypes.index(qtype)
         default = self.temperature[idx] if idx < len(self.temperature) else 1.0
-        return float(self.temperature_by_options.get("%s:%s" % (qtype, size), default))
+        return float(self.temperature_by_options.get(temperature_bucket(qtype, k), default))
+
+    def calibration(self):
+        if self.domain_calibrated:
+            status = "held-out"
+        elif self.temperature_adjustments:
+            status = "guarded"
+        elif self.checkpoint_calibration:
+            status = "checkpoint"
+        else:
+            status = "uncalibrated"
+        return {
+            "method": "temperature-scaling",
+            "status": status,
+            "domain_calibrated": bool(self.domain_calibrated),
+            "groups": sorted(self.domain_calibrated),
+            "safe_range": [TEMPERATURE_MIN, TEMPERATURE_MAX],
+            "adjustments": list(self.temperature_adjustments),
+            "note": ("A displayed 0.90 is a model probability, not evidence of 90% accuracy "
+                     "on this application's data. Fit on separate labelled held-out examples "
+                     "before using probability thresholds."),
+        }
 
 
 def confidence(p):
-    """How concentrated an answer is: 1 when it is certain, 0 when it is a coin toss over
-    however many options there were. Reported alongside every answer because a probability
-    on its own does not say whether the model was deciding or guessing."""
+    """How concentrated an answer is: 1 for a point mass, 0 for a uniform distribution.
+
+    This deliberately says nothing about correctness or calibration. It reports the shape
+    of this one distribution, not how often similarly shaped predictions prove correct.
+    """
     k = len(p)
     if k < 2:
         return 1.0
@@ -272,14 +436,7 @@ class DecisionModel(wt.Module):
         return logits, float(act[0])
 
     # ---- the API ---------------------------------------------------------------------
-    def decide(self, state, questions):
-        """Answer every question about this state.
-
-        `questions` is `{id: {"type", "instructions", "criteria"}}`, and the answers come back
-        under the same ids. Each carries its whole distribution, not only the winner, because
-        a caller that wants to act on "0.51 versus 0.49" has to be able to see it.
-        """
-        out = {}
+    def _prepare_questions(self, state, questions):
         total = 0
         # Every sequence is built first, because whether to run them together depends on how
         # long the longest one turned out to be.
@@ -298,7 +455,9 @@ class DecisionModel(wt.Module):
                                  % (qid, self.cfg.head_max_len, len(labels) - len(markers)))
             total += len(ids)
             built.append((qid, q, qtype, ids, markers, labels))
+        return built, total
 
+    def _raw_questions(self, built):
         hs = None
         if built and self.batch_pays(max(len(b[3]) for b in built), len(built)):
             try:
@@ -306,11 +465,25 @@ class DecisionModel(wt.Module):
             except Exception:
                 hs = None            # a batched pass is an optimisation, not a step
 
+        scored = []
         for idx, (qid, q, qtype, ids, markers, labels) in enumerate(built):
             if hs is not None:
                 logits, act = self._score(hs[idx], markers, self.cfg.qtypes.index(qtype))
             else:
                 logits, act = self._run_one(ids, markers, self.cfg.qtypes.index(qtype))
+            scored.append((qid, q, qtype, markers, labels, logits, act))
+        return scored
+
+    def decide(self, state, questions):
+        """Answer every question about this state.
+
+        `questions` is `{id: {"type", "instructions", "criteria"}}`, and the answers come back
+        under the same ids. Each carries its whole distribution, not only the winner, because
+        a caller that wants to act on "0.51 versus 0.49" has to be able to see it.
+        """
+        out = {}
+        built, total = self._prepare_questions(state, questions)
+        for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built):
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
             ans = {"type": qtype, "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
@@ -324,6 +497,89 @@ class DecisionModel(wt.Module):
                 ans["noul"] = round(float(p[1]), 4)
             out[qid] = ans
         return {"answers": out, "usage": {"input_tokens": total, "output_tokens": 0}}
+
+    @staticmethod
+    def _target_index(qtype, truth, labels):
+        if isinstance(truth, dict):
+            truth = truth.get(qtype, truth.get("target", truth.get("label")))
+        if qtype == "choice":
+            if truth in labels:
+                return labels.index(truth)
+        elif qtype == "noul":
+            if isinstance(truth, str):
+                v = truth.strip().lower()
+                if v in ("true", "yes", "1"): return 1
+                if v in ("false", "no", "0"): return 0
+            if isinstance(truth, (bool, int, np.integer)) and int(truth) in (0, 1):
+                return int(truth)
+        else:
+            if isinstance(truth, str) and truth in labels:
+                return labels.index(truth)
+            if isinstance(truth, (int, np.integer)) and 0 <= int(truth) < len(labels):
+                return int(truth)
+        raise ValueError("label %r is not one of the answers for this %s question (%s)"
+                         % (truth, qtype, ", ".join(labels)))
+
+    def calibrate(self, examples, by_options=True, min_samples=20):
+        """Fit probability temperatures on separate labelled held-out examples.
+
+        Each item is `{"state": ..., "questions": {...}, "answers": {id: truth}}`. Choice
+        truths are option names, score truths are level indices, and noul truths are booleans.
+        With `by_options=True` (the default), the same option-count buckets used at inference
+        are fitted independently; otherwise one value is fitted per question type.
+
+        The model's chosen class cannot change: positive temperature scaling only repairs
+        the numeric probability scale. Fitting on training examples is not calibration.
+        """
+        try:
+            min_samples = int(min_samples)
+        except (TypeError, ValueError):
+            raise ValueError("min_samples must be a positive integer")
+        if min_samples < 1:
+            raise ValueError("min_samples must be a positive integer")
+        groups = {}
+        for number, example in enumerate(examples or []):
+            if not isinstance(example, dict):
+                raise TypeError("calibration example %d must be a mapping" % number)
+            questions = example.get("questions") or {}
+            truths = example.get("answers", example.get("labels"))
+            if not isinstance(truths, dict):
+                raise ValueError("calibration example %d needs an answers mapping" % number)
+            built, _ = self._prepare_questions(example.get("state", ""), questions)
+            for qid, q, qtype, markers, labels, logits, _act in self._raw_questions(built):
+                if qid not in truths:
+                    raise ValueError("calibration example %d has no truth for question %r"
+                                     % (number, qid))
+                key = temperature_bucket(qtype, len(markers)) if by_options else qtype
+                row = groups.setdefault(key, {"logits": [], "targets": []})
+                row["logits"].append(np.asarray(logits, dtype=np.float64))
+                row["targets"].append(self._target_index(qtype, truths[qid], labels))
+        if not groups:
+            raise ValueError("calibrate() needs at least one labelled question")
+
+        report = {"method": "temperature-scaling", "group_by":
+                  "question-type-and-option-count" if by_options else "question-type",
+                  "groups": {}, "skipped": {}}
+        fitted = {}
+        for key, rows in groups.items():
+            if len(rows["targets"]) < min_samples:
+                report["skipped"][key] = {
+                    "samples": len(rows["targets"]), "minimum": min_samples}
+                continue
+            result = fit_temperature(rows["logits"], rows["targets"])
+            fitted[key] = result["temperature"]
+            report["groups"][key] = result
+        if not fitted:
+            raise ValueError("no calibration group reached min_samples=%d; counts: %s"
+                             % (min_samples, {k: len(v["targets"]) for k, v in groups.items()}))
+
+        for key, value in fitted.items():
+            if by_options:
+                self.cfg.temperature_by_options[key] = value
+            else:
+                self.cfg.temperature[self.cfg.qtypes.index(key)] = value
+            self.cfg.domain_calibrated.add(key)
+        return report
 
     __call__ = decide
 
@@ -372,6 +628,7 @@ class DecisionModel(wt.Module):
                       "questions": {"types": types,
                                     "max": self.cfg.max_questions or None}},
             "returns": {"per_question": ["probabilities", "confidence", "act_probability"]},
+            "calibration": self.cfg.calibration(),
             "limits": {"sequence_tokens": self.cfg.max_len,
                        "question_tokens": self.cfg.head_max_len,
                        "option_tokens": self.cfg.option_tokens},

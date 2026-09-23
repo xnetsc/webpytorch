@@ -508,6 +508,9 @@ iframe.jsview{width:100%;border:1px solid var(--line);border-radius:6px;
   border-radius:10px;background:var(--bg);color:inherit;font:inherit;resize:vertical}
 #decision .drow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 #decision .drow .hint{margin-left:auto}
+.dcal{border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:13px;line-height:1.45}
+.dcal.warn{border-color:#d99b3f;background:color-mix(in srgb,#d99b3f 10%,var(--bg));color:#9a5b00}
+.dcal.ok{border-color:#3a9b70;background:color-mix(in srgb,#3a9b70 10%,var(--bg));color:#25704f}
 .dq{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:0 0 8px;
   display:flex;flex-direction:column;gap:8px}
 .dq .dqhead{display:flex;gap:8px;align-items:center}

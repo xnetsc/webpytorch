@@ -360,8 +360,55 @@ Every answer carries its whole distribution, not only the winner, and the SDK ma
 decision with it: it does not pick a threshold, does not turn a probability into a yes, and
 does not choose what to ask.
 
+`confidence` on `choice`/`score` is distribution concentration (`1 - normalised entropy`),
+not a probability of correctness: `confidence == 0.90` never means “90% accurate”. Use the
+per-option probabilities for calibration and use `confidence` only to describe how spread
+or concentrated the returned distribution is.
+
 - `m.decide(state, questions)` / `m(state, questions)` — `{"answers": {...}, "usage": {...}}`
+- `m.calibrate(examples, by_options=True, min_samples=20)` — fit probability temperatures
+  on separate labelled held-out examples.
 - `m.surface()` — see below.
+
+### Probability calibration
+
+A softmax probability is a model score until it has been checked against labelled examples from
+the application that will use it. `0.90` means “right about 90% of the time” only when the
+model is calibrated on that distribution. This is a property of classifier/decision models,
+not of one checkpoint family.
+
+At load time the decision runtime validates every checkpoint temperature. Non-finite values
+fall back to the neutral `1.0`; numeric values are constrained to `[0.5, 5.0]`. This prevents
+an extreme value from turning an ordinary lead into a displayed certainty, but a safe
+fallback is **not** proof of calibration. `m.surface()["calibration"]` reports `checkpoint`,
+`guarded`, `uncalibrated`, or `held-out`, plus every value that was adjusted.
+
+Fit on a separate labelled held-out set from the real use case:
+
+```python
+examples = [
+  {"state": {"body": "charged twice"},
+   "questions": {
+     "route": {"type": "choice", "instructions": "Which team?",
+               "criteria": {"billing": "payments", "technical": "product faults"}},
+     "dupe": {"type": "noul", "instructions": "This is a duplicate charge."}},
+   "answers": {"route": "billing", "dupe": True}},
+  # ...independent labelled examples, not the examples used to train the model
+]
+
+report = m.calibrate(examples, by_options=True, min_samples=20)
+# One temperature per question type + option-count bucket. The report includes samples,
+# temperature, held-out NLL and ECE before/after. Positive temperature scaling cannot change
+# the winning answer; it changes only the probability scale.
+```
+
+For lower-level uses, `webtorch.fit_temperature(logits, targets)` and
+`webtorch.calibration_error(probabilities, targets)` expose the same generic mechanism.
+`webtorch.safe_temperature(value, low=0.5, high=5.0)` applies the load-time guard directly:
+invalid or non-finite input becomes the neutral `1.0`, and finite input is constrained to
+the stated range.
+Do not fit on training data and do not assume calibration transfers across languages,
+domains, option counts, or materially different question wording.
 
 ### What a model takes, from the model  (`Model.surface`)
 
@@ -383,6 +430,8 @@ which is a copy of knowledge the SDK already has and is wrong the day a new kind
 #            "questions": {"types": {"choice": {...}, "score": {...}, "noul": {...}},
 #                          "max": 6}},
 #  "returns": {"per_question": ["probabilities", "confidence", "act_probability"]},
+#  "calibration": {"method": "temperature-scaling", "status": "checkpoint",
+#                  "domain_calibrated": False, ...},
 #  "limits": {"sequence_tokens": 512, "question_tokens": 192, "option_tokens": 48}}
 ```
 
@@ -693,7 +742,8 @@ wt.resources();              // {gpuBytes, gpuPeak, gpuBuffers, wasmBytes, at} |
 await wt.run(code, vars);    // any Python, with page values bound as globals
 ```
 
-Also on it: `release()`, `stopLoading()`, `decide(state, questions)`, `splitReasoning(text)`,
+Also on it: `release()`, `stopLoading()`, `decide(state, questions)`,
+`calibrate(heldOutExamples, { byOptions, minSamples })`, `splitReasoning(text)`,
 `stats()`, `tools.{supported,calls,result,suggest,round,render}` and
 `cache.{list,delete,clear,export,import,migrate,watch}`.
 

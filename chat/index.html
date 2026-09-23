@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
-<link rel="stylesheet" href="style.css?v=bc379372a0" />
+<link rel="stylesheet" href="style.css?v=b3f9d6e5bd" />
 
 <!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
      `crossorigin` is required, not cosmetic: this page is served with
@@ -81,6 +81,7 @@
          asked at once all come from the SDK, so a different decision model reshapes this
          without a line changing here. -->
     <div id="decision" hidden>
+      <div id="dCalibration" class="dcal" role="status"></div>
       <div class="drow">
         <label class="dlabel" for="dState">1 · What happened</label>
         <button type="button" id="dExample" class="linky">Fill in an example</button>
@@ -337,7 +338,7 @@
 
 <script src="pyodide-version.js"></script>
 <script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
-<script src="../webtorch/js/webtorch-main.js?v=50ee17272c"></script>
+<script src="../webtorch/js/webtorch-main.js?v=27cd9896b1"></script>
 <!-- The SDK needs the document cross-origin isolated or the model runs on the CPU. On a
      static host that means a service worker, and a client has only one, so it is the SDK's.
      `cache-sw.js` is ours and rides inside it: what this page caches and how. Called here
@@ -354,6 +355,6 @@ webtorch.installServiceWorker({
 });
 </script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=f7b1bebc36"></script>
+<script src="app.js?v=8add3e938a"></script>
 </body>
 </html>

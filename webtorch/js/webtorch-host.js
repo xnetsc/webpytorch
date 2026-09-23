@@ -392,6 +392,24 @@ json.dumps(_m.decide(_req["state"], _req["questions"]))
 `);
     },
 
+    async calibrate(a) {
+      if (!ready) throw new Error('no runtime');
+      root.__calibrate_in = JSON.stringify({ examples: a.examples || [],
+                                             by_options: a.byOptions !== false,
+                                             min_samples: a.minSamples == null ? 20 : a.minSamples });
+      return await pyJSON(`
+import js, json
+_req = json.loads(js.self.__calibrate_in)
+_m = _MODEL["m"]
+if _m is None:
+    raise RuntimeError("load a model first")
+if not hasattr(_m, "calibrate"):
+    raise RuntimeError("this model does not publish classification probabilities")
+json.dumps(_m.calibrate(_req["examples"], by_options=_req["by_options"],
+                        min_samples=_req["min_samples"]))
+`);
+    },
+
     // ---- what the model can be asked about its own output ------------------------------
     async toolsSupported() {
       if (!ready) return { ok: false };

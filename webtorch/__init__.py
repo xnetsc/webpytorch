@@ -61,7 +61,8 @@ from . import lm_engine, quantize, webio, onnxrt   # generic building blocks (ad
 # Bidirectional encoders and the decision models built on them. Generic engines, the same
 # way `lm_engine` is for decoders: a config and a checkpoint go in, no model is named.
 from . import encoder, decision
-from .decision import DecisionModel, DecisionConfig
+from .decision import (DecisionModel, DecisionConfig, fit_temperature, calibration_error,
+                       safe_temperature)
 from .encoder import TextEncoder, EncoderConfig
 
 # ---- symmetric global async IO callbacks (REQUIRED) ---------------------------
@@ -113,8 +114,9 @@ __all__ = [
     "list_pipelines", "Quantizer", "OnnxModel",
     # generic decoder engine (CausalLM + MoE series)
     "TransformerLM", "build_lm", "SAMPLERS",
-    # bidirectional encoders + decision models (state + typed questions -> calibrated answers)
+    # bidirectional encoders + decision models (state + typed questions -> scored answers)
     "TextEncoder", "EncoderConfig", "DecisionModel", "DecisionConfig",
+    "fit_temperature", "calibration_error", "safe_temperature",
     # generic multimodal: pair ANY decoder with ANY registered media encoder
     "MultimodalLM", "register_encoder", "load_encoder", "list_encoders", "splice_embeddings",
     # symmetric global async IO callbacks (REQUIRED) — read: (name, offset, length) -> bytes ; write: (name, data, offset) -> None
