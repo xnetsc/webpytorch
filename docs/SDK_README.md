@@ -41,6 +41,39 @@ webtorch.set_io_write(webtorch.default_io_write)`);
 </script>
 ```
 
+### Where models come from
+
+The SDK has **no transport of its own and no default IO**. It reads nothing until you install
+a reader — not a hub id, not even a plain URL. (Checked: with `set_io_read(None)` a direct
+`http://…/model.gguf` fails exactly as a repo id does.) That is deliberate: where weights come
+from is a decision about your product, not about the library, so it fails fast rather than
+guessing.
+
+```python
+# A — your own files: a server, a CDN, local disk. NOT a hub -- names resolve against your
+#     page origin. Network reads are cached; pass cache=False for a plain fetch.
+webtorch.use_default_io()
+
+# B — a model hub, by repo id, cached and read ahead:
+webtorch.set_io_read(webtorch.modelscope_read())     # or hf_read()
+#     both take revision=, endpoint=, token= for a private repo or a mirror
+
+# C — your own storage (OPFS, IndexedDB, S3, a socket): two callbacks, that is the whole
+#     contract. `offset`/`length` are how ranged reads ask for one shard of a huge file.
+webtorch.set_io_read(my_read); webtorch.set_io_write(my_write)
+```
+
+Then `load()` takes whatever that reader understands: a repo id (`'org/repo'`, with `file:`
+naming one inside it), a URL or path to a `.gguf` or `.onnx`, or a model directory.
+
+**The writer is what makes the second visit instant.** `set_io_write(webtorch.default_io_write)`
+keeps downloaded weights in origin storage; leave it out and nothing is kept and every visit
+downloads again. Keeping several gigabytes in someone's browser is their business and yours,
+not the SDK's, which is why it is a line you write rather than a default. What is kept is
+managed from the page with `wt.cache.list() / delete() / clear() / export() / import()`.
+
+Full detail, including the exact callback shapes: [IO injection](#io-injection-required-not-optional).
+
 A complete, runnable page is [`examples/hello.html`](../examples/hello.html) — load, stream,
 stop, and error handling, in about eighty lines:
 

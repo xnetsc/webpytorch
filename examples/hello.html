@@ -66,8 +66,13 @@ const ready = webtorch.start({
   onStatus: say,                      // "starting Python…", "ready (webgpu)" — most of the wait
 }).then(async (w) => {
   wt = w;
-  // THIS PAGE'S decisions, not the SDK's: where weights come from, and that they are kept so
-  // the second visit is instant. Leave the writer out and nothing is stored.
+  // THIS PAGE'S decisions, not the SDK's. It ships no default IO and reads NOTHING until a
+  // reader is installed -- not a hub id, not even a plain URL -- because where weights come
+  // from is a decision about the product, not about the library.
+  //   modelscope_read() / hf_read()  a hub, by repo id
+  //   use_default_io()               your own server or CDN, names relative to the page
+  //   set_io_read(fn)                your own storage, two callbacks and that is the contract
+  // The writer is what makes the second visit instant; leave it out and nothing is kept.
   await w.run('import webtorch\n'
             + 'webtorch.set_io_read(webtorch.modelscope_read())\n'
             + 'webtorch.set_io_write(webtorch.default_io_write)\n');
