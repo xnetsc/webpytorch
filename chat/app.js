@@ -24,6 +24,34 @@ if (window.__coiFileMode) {
   throw new Error('webtorch chat: must be served over HTTP, not opened from ' + location.protocol);
 }
 
+// Everything the SDK catches, in one place, whatever part of it was running: a call that
+// threw, the runtime dying, the backend falling back to the CPU, the service worker's
+// handler refusing to load. Registered before anything else, because the SDK can fail before
+// it finishes starting.
+webtorch.onError(function (e) {
+  console.warn('[webtorch:' + e.scope + '] ' + e.message);
+  // Said out loud only where it changes what the person can do. The rest is a log line: a
+  // dialog for every best-effort thing that did not work is a page nobody reads.
+  if (e.scope === 'runtime') {
+    showStatus('the runtime stopped — reload the page');
+    note('The model runtime stopped: ' + e.message + ' — reload the page to start it again.');
+  } else if (e.scope === 'backend') {
+    showStatus(e.message);
+  } else if (e.scope === 'image') {
+    note(e.message);
+  }
+});
+
+function afterRelease() {
+  modelLoaded = false; modelImage = false;
+  setBar(0); syncButtons(); refreshCache();
+}
+
+function showStatus(t) {
+  $('#modelStatus').textContent = t;
+  $('#miniStatus').textContent = String(t).split('\n')[0].slice(0, 60);
+}
+
 // What our half of the service worker has to say. Two things it cannot deal with alone:
 // the browser refusing to keep any more (the page is the only thing here that can tell
 // anyone), and what it dropped on a new deploy (worth seeing in the log when a stale file
@@ -76,13 +104,15 @@ const sdk = webtorch.start({
   pyodideIndexURL: PYODIDE_URL,
   version: SDK_VERSION,            // this page's cache-busting, not the SDK's
   rememberTuning: true,            // keep what this GPU worked out, so reloads are quick
+  // Given here, not through `on()` afterwards: bringing up the GPU, Python and the backend
+  // is most of the wait, and a page that says nothing through it reads as a page that hung.
+  onStatus: showStatus,
+  onLog: (t) => console.log('[py]', t),
+  // A model arriving or going away changes what this page may offer, so the interface is
+  // rebuilt from the event rather than from the call that happened to ask.
+  onModel: (m) => { m.state === 'loaded' ? afterLoad(m) : afterRelease(); },
 }).then(async (w) => {
   wt = w;
-  w.on('status', (t) => {
-    $('#modelStatus').textContent = t;
-    $('#miniStatus').textContent = String(t).split('\n')[0].slice(0, 60);
-  });
-  w.on('log', (t) => console.log('[py]', t));
   // Where models come from, and that they are kept. Both are this page's policy: the SDK
   // offers a reader and a writer and installs neither.
   await w.run('import webtorch\n'
@@ -1421,8 +1451,8 @@ $('#loadBtn').onclick = async () => {
     loading = false; $('#loadBtn').textContent = 'Load'; $('#loadBtn').title = '';
     return;
   }
-  try { afterLoad(await (await sdk).load(repo, { file, maxContext: lmaxValue(),
-                                               onProgress: onLoadProgress, onStage: onLoadStage })); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
+  try { await (await sdk).load(repo, { file, maxContext: lmaxValue(),
+                                      onProgress: onLoadProgress, onStage: onLoadStage }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
   catch (e) {
     // The SDK raises one distinctive message for a stop the person asked for; that is a
     // normal ending, not a failure — say so, and put the meter back where it started.
@@ -1437,7 +1467,7 @@ $('#loadBtn').onclick = async () => {
   finally { loading = false; $('#loadBtn').textContent = 'Load model'; syncButtons(); }
 };
 $('#releaseBtn').onclick = async () => {
-  await (await sdk).release(); modelLoaded = false; modelImage = false; setBar(0);
+  await (await sdk).release(); setBar(0);
   $('#progressText').textContent = ''; syncButtons();
   note('Model released. Its files stay cached, so loading it again is fast.');
 };

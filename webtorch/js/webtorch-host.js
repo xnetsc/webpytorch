@@ -106,9 +106,17 @@
         }
         out.push({ w: bmp.width, h: bmp.height, rgb: rgb });
         bmp.close();
-      } catch (e) { emit(current, 'log', 'image decode failed: ' + e.message); }
+      } catch (e) {
+        // The person attached this and it is not going to the model. That is not a log line.
+        report('image', 'could not read an attached image, so it was not sent: ' + e.message);
+      }
     }
     return out;
+  }
+
+  /** Everything this file catches, to the page. Nothing here is allowed to just vanish. */
+  function report(scope, message) {
+    emit(0, 'error', { scope: scope, message: String((message && message.message) || message) });
   }
 
   async function py(code) { return await pyodide.runPythonAsync(code); }
@@ -123,6 +131,7 @@
         baseURL: BASE,
         version: VERSION,
         pyodideIndexURL: a && a.pyodideIndexURL,
+        onError: (e) => emit(0, 'error', e),
         stdout: (t) => emit(0, 'log', t),
         stderr: (t) => emit(0, 'log', t),
         onStatus: (t) => emit(0, 'status', t),
@@ -226,10 +235,17 @@ _json.dumps({"kind": getattr(_MODEL["m"], "kind", ""),
         try {
           await kpPut(kpk, JSON.parse(await py(
             'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
-        } catch (e) { /* an optimisation, not a step */ }
+        } catch (e) {
+          report('tuning', 'could not keep what this load measured, so the next load will '
+                 + 'measure it again: ' + ((e && e.message) || e));
+        }
       }
       emit(who, 'status', 'ready: ' + src);
       const info = JSON.parse(out);
+      // Said to everyone, not just to whoever awaited this call: a model arriving or going
+      // away changes what a whole interface may offer, and the part that has to react is
+      // rarely the part that asked.
+      emit(0, 'model', { state: 'loaded', id: src, kind: info.kind, surface: info.surface });
       // What the model says it takes and returns, so a caller builds itself from this
       // rather than keeping its own table of model kind -> interface.
       return { id: src, kind: info.kind, surface: info.surface };
@@ -243,6 +259,7 @@ if _MODEL["m"] is not None:
     webtorch.release(_MODEL["m"]); _MODEL["m"] = None; _MODEL["id"] = None
 `);
       emit(current, 'status', 'model released');
+      emit(0, 'model', { state: 'released' });
       return null;
     },
 
@@ -351,7 +368,12 @@ json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
         try {
           await py('import wgpy_backends.webgpu.webgpu_buffer as _b\n'
                  + 'if hasattr(_b, "reap_now"): _b.reap_now()');
-        } catch (e) { /* WebGL, or a runtime already gone: nothing to reap */ }
+        } catch (e) {
+          // This is where a reply's memory actually comes back. Failing here is the
+          // difference between a session that stays usable and one that climbs until the
+          // tab dies, so it does not get to be silent.
+          report('memory', 'could not release what this reply held: ' + ((e && e.message) || e));
+        }
       }
     },
 
@@ -596,7 +618,8 @@ await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
         const wt = pyodide.pyimport('webtorch');
         try { wt.cancel(); } finally { if (wt.destroy) wt.destroy(); }
       } catch (e) {
-        try { py('import webtorch; webtorch.cancel()'); } catch (e2) {}
+        try { py('import webtorch; webtorch.cancel()'); }
+        catch (e2) { report('cancel', 'the stop could not be delivered: ' + ((e2 && e2.message) || e2)); }
       }
       return null;
     },
@@ -618,7 +641,13 @@ await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
       if (!fn) throw new Error('webtorch: no such call "' + d.method + '"');
       reply(d.id, true, await fn(d.args || {}));
     } catch (err) {
-      reply(d.id, false, String((err && err.message) || err));
+      const message = String((err && err.message) || err);
+      reply(d.id, false, message);
+      // And as an event, because a caller that is awaiting this gets the rejection but a
+      // host that wants one place to notice everything going wrong has nowhere else to look.
+      // A host awaiting the call will see both; that is the caller's to sort out, and it is
+      // better than a failure with no general way to hear about it.
+      emit(0, 'error', { scope: d.method, message: message });
     } finally {
       current = prev;
       if (tasks) tasks.leave();

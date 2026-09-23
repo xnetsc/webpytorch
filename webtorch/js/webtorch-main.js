@@ -82,6 +82,27 @@
     return /webtorch: cancelled by request/.test(String((e && e.message) || e || ''));
   };
 
+  // ---- everything that goes wrong, in one place -------------------------------------------
+  //
+  // Not console.warn. A host cannot read a console, and a failure only the console knows
+  // about is a failure the person using the page finds out about by noticing that something
+  // is slow or missing. Everything the SDK catches ends up here instead: a call that threw,
+  // the runtime dying, the backend falling back to the CPU, the service worker's handler
+  // refusing to load. Each carries a `scope` so a host can decide what deserves saying out
+  // loud and what only deserves a log.
+  //
+  // Module level, and registered by its own call, because errors arrive before any of this
+  // is set up -- `installServiceWorker` runs before `start`, and both can fail.
+  const sinks = [];
+  /** Hear about everything that goes wrong, from any part of the SDK. */
+  wt.onError = function (fn) { if (fn) sinks.push(fn); return wt; };
+  function report(scope, message, extra) {
+    const e = Object.assign({ scope: scope, message: String(message) }, extra || {});
+    if (!sinks.length) console.warn('webtorch [' + scope + ']: ' + e.message);
+    for (const fn of sinks) { try { fn(e); } catch (err) { /* a sink that throws is its own */ } }
+  }
+  wt._report = report;                 // for the other half of this package, not for hosts
+
   // ---- the service worker the SDK needs ---------------------------------------------------
   //
   // Call this as early on the page as you can, before anything that wants the GPU:
@@ -129,6 +150,16 @@
 
   wt.installServiceWorker = async function (opts) {
     opts = opts || {};
+    wt.onError(opts.onError);
+    // The worker's own problems -- a handler that would not load, a handler that threw --
+    // reach the page over its own envelope, separate from the one the host's two halves use.
+    if (navigator.serviceWorker && !wt._swListening) {
+      wt._swListening = true;
+      navigator.serviceWorker.addEventListener('message', function (e) {
+        const d = e.data;
+        if (d && d.__wtsw === 2) report('service-worker', d.message, { detail: d.detail });
+      });
+    }
     // The page's end of that channel, declared here and not later, so both halves of a
     // host's service-worker code are fixed at the moment the worker is created.
     if (opts.onMessage && navigator.serviceWorker) {
@@ -146,8 +177,16 @@
     // service worker to add them with, so SharedArrayBuffer cannot exist -- and the module
     // fetches would be blocked by the origin anyway. Said plainly, because the symptom
     // otherwise is a silent fall back to the CPU.
-    if (location.protocol === 'file:' || location.protocol === 'data:') return 'not-served';
-    if (!navigator.serviceWorker) return 'no-service-worker';
+    if (location.protocol === 'file:' || location.protocol === 'data:') {
+      report('service-worker', 'opened from ' + location.protocol + ' rather than served, so '
+             + 'the page cannot be cross-origin isolated and the model will run on the CPU');
+      return 'not-served';
+    }
+    if (!navigator.serviceWorker) {
+      report('service-worker', 'this browser has no service worker, so a static host cannot '
+             + 'be cross-origin isolated and the model will run on the CPU');
+      return 'no-service-worker';
+    }
 
     if (self.crossOriginIsolated) {
       // Already isolated, by this worker on an earlier load or by the server's own headers.
@@ -168,7 +207,10 @@
     const hadController = !!navigator.serviceWorker.controller;
     let reg;
     try { reg = await navigator.serviceWorker.register(url); }
-    catch (err) { return 'failed: ' + String((err && err.message) || err); }
+    catch (err) {
+      report('service-worker', 'could not register: ' + String((err && err.message) || err));
+      return 'failed: ' + String((err && err.message) || err);
+    }
     if (hadController) return 'registered';   // this load was already served by a worker
 
     // A reload helps at most once. If it did not produce isolation, reloading again never
@@ -176,12 +218,23 @@
     let reloaded = false;
     try { reloaded = !!sessionStorage.getItem(RELOAD_ONCE); } catch (e) { /* private mode */ }
     if (self.crossOriginIsolated) return 'isolated';        // meanwhile, nothing left to do
-    if (reloaded) return 'still-not-isolated';
+    if (reloaded) {
+      report('service-worker', 'the worker is active but the page is still not isolated '
+             + 'after a reload, so the model will run on the CPU');
+      return 'still-not-isolated';
+    }
     try { sessionStorage.setItem(RELOAD_ONCE, '1'); } catch (e) { /* private mode */ }
     if (reg.active) { location.reload(); return 'reloading'; }
     const sw = reg.installing || reg.waiting;
     if (sw) sw.addEventListener('statechange', function (e) {
       if (e.target.state === 'activated') location.reload();
+      // Redundant without activating means the install threw -- a syntax error in the
+      // worker, or an importScripts that 404ed. Nothing reloads, and without this nothing
+      // says why.
+      if (e.target.state === 'redundant') {
+        report('service-worker', 'the worker failed to install, so the page will not be '
+               + 'cross-origin isolated and the model will run on the CPU');
+      }
     });
     return 'reloading';
   };
@@ -196,7 +249,10 @@
   //
   // Options, all optional: `baseURL`, `backendOrder`/`requireGpu` (as `initMain`),
   // `pyodideIndexURL`, `version` (passed through to the files this package serves, for a
-  // host whose caching is a URL that changes with the bytes), and `rememberTuning` -- which
+  // host whose caching is a URL that changes with the bytes), `onStatus`, `onLog`,
+  // `onModel` and `onError` -- which must be given here rather than through `on()` if a host
+  // wants to see the boot, since all of it happens before this returns -- and
+  // `rememberTuning`, which
   // lets the SDK keep what it measured about this GPU so the next load does not measure it
   // again. That last one is off by default: leaving something behind in a browser's storage
   // is the host's call, not the SDK's, and so is caching a model (install a writer with
@@ -227,11 +283,46 @@
     const pending = new Map();          // call id -> {resolve, reject, on}
     const listeners = {};               // name -> [fn], for events not tied to a call
 
+    // Registered HERE, before the boot call, because the most useful status a host can show
+    // is the boot's own -- connecting to the GPU, starting Python, installing the backend --
+    // and all of it happens before this function returns. Left to `api.on` afterwards, those
+    // messages are emitted into an empty list and lost, and a host has no way to catch them
+    // because the object carrying `on` does not exist yet. (It shipped that way once: the
+    // page sat on "no model loaded" through the whole boot and only came alive at the first
+    // load.)
+    function listen(name, fn) { if (fn) (listeners[name] || (listeners[name] = [])).push(fn); }
+    listen('status', opts.onStatus);
+    listen('log', opts.onLog);
+    // A model arriving or going away: {state:'loaded'|'released', id, kind, surface}.
+    listen('model', opts.onModel);
+    // Errors do not go through `listeners` -- they go to the one sink, so that what the
+    // service worker reports and what the runtime reports arrive at the same place.
+    wt.onError(opts.onError);
+
+    // The runtime dying, which until now was silent in the worst possible way: every call in
+    // flight simply never settled, so a page that had asked for anything waited for ever
+    // with nothing to show and no way to find out. A 27B that will not fit is exactly this
+    // -- the worker goes down on an allocation and takes the conversation's turn with it.
+    worker.addEventListener('error', function (e) {
+      const message = 'the runtime stopped: ' + ((e && e.message) || 'worker error');
+      report('runtime', message);
+      for (const [, p] of pending) { try { p.reject(new Error(message)); } catch (err) {} }
+      pending.clear();
+    });
+    worker.addEventListener('messageerror', function () {
+      report('runtime', 'a message could not be delivered to the runtime');
+    });
+
     worker.addEventListener('message', function (e) {
       const d = e.data;
       if (!d || (d.__wt !== 'reply' && d.__wt !== 'event')) return;
       const p = pending.get(d.id);
       if (d.__wt === 'event') {
+        // Errors never belong to a call: one sink, whatever they were doing at the time.
+        if (d.name === 'error') {
+          report((d.data && d.data.scope) || 'runtime', (d.data && d.data.message) || d.data);
+          return;
+        }
         // A call's own callback first; otherwise whoever is listening for that name. An
         // event with id 0 belongs to no call -- status and log during boot.
         const own = p && p.on && p.on[d.name];

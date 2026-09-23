@@ -25,6 +25,19 @@ const BASE = new URL('.', self.location.href).href;
 importScripts(BASE + 'webtorch/js/webtorch-coi.js');
 const isolate = self.webtorch.isolate;
 
+// What goes wrong in here, to every page that can hear it. A service worker's console is a
+// different console from the page's, opened from a different place, and nobody looks at it;
+// a handler that will not load or that throws on every request would otherwise be invisible
+// while the page just quietly stopped caching. `__wtsw: 2` is this, separate from the `1`
+// the host's two halves talk over.
+async function report(message, detail) {
+  try {
+    const cs = await self.clients.matchAll({ includeUncontrolled: true, type: 'window' });
+    for (const c of cs) { try { c.postMessage({ __wtsw: 2, message: message, detail: detail }); } catch (e) {} }
+  } catch (e) { /* no clients yet; the console line below is all there is */ }
+  console.warn('webtorch service worker: ' + message, detail || '');
+}
+
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 
@@ -71,8 +84,11 @@ async function serve(event, req) {
       if (res) return isolate(res);
     } catch (err) {
       // A handler that throws is a handler that is having a bad day, not a reason to fail
-      // the request: the network still works, and isolation still has to happen.
-      console.warn('webtorch: the host fetch handler threw, going to the network:', err);
+      // the request: the network still works, and isolation still has to happen. It is said
+      // out loud, though -- a handler that throws on everything is a page with no caching
+      // at all, and that is worth knowing before someone wonders why loads got slower.
+      report('the page fetch handler threw, going to the network',
+             String((err && err.message) || err));
     }
   }
   return isolate(await fetch(req));
@@ -107,7 +123,7 @@ self.addEventListener('message', (event) => {
       if (event.source) { try { event.source.postMessage({ __wtsw: 1, data: answer }); } catch (e) {} }
     });
   } catch (err) {
-    console.warn('webtorch: the host message handler threw:', err);
+    report('the page message handler threw', String((err && err.message) || err));
   }
 });
 
@@ -141,7 +157,8 @@ if (HANDLER) {
   try { importScripts(new URL(HANDLER, self.location.href).href); }
   catch (err) {
     // The host's handler is the host's business; isolation is not, and it must survive a
-    // handler that will not load. Requests then go straight to the network, isolated.
-    console.warn('webtorch: could not load the host fetch handler ' + HANDLER + ':', err);
+    // handler that will not load. Requests then go straight to the network, isolated -- and
+    // the page is told, because otherwise its caching is simply gone with nothing said.
+    report('could not load the page handler ' + HANDLER, String((err && err.message) || err));
   }
 }

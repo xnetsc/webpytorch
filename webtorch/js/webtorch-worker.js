@@ -246,7 +246,11 @@
       // arrives the interpreter is free -- so the SDK's own flag has to be set in Python.
       if (!STOP && root.pyodide) {
         try { root.pyodide.runPythonAsync('import webtorch; webtorch.cancel()'); }
-        catch (e) { /* nothing better to try */ }
+        catch (e) {
+          // The stop did not happen, and saying nothing means a Stop button that lies.
+          if (wt._oops) wt._oops({ scope: 'cancel',
+            message: 'the stop could not be delivered: ' + ((e && e.message) || e) });
+        }
       }
     },
   };
@@ -273,6 +277,14 @@
     // wants to carry. Point `pyodideIndexURL` at a local copy to run without a network.
     const idx = opts.pyodideIndexURL || wt.PYODIDE_URL;
     const say = opts.onStatus || function () {};
+    // Not console.warn. Every one of these used to be a line in a console nobody reads, and
+    // each of them decides whether the model runs on the GPU at all -- the page then showed
+    // "cpu" with no way to find out why.
+    const oops = opts.onError || function (e) { console.warn('webtorch: ' + e.message); };
+    wt._oops = oops;                     // for the parts of this file that run outside boot
+    const warn = function (scope, e) {
+      oops({ scope: scope, message: String((e && e.message) || e) });
+    };
 
     // Wait for the main thread's choice; it has the device, this context does not.
     const wanted = await announcedBackend;
@@ -280,7 +292,8 @@
     if (wanted !== 'cpu' && typeof root.wgpy !== 'undefined') {
       say('connecting to the GPU…');
       try { await root.wgpy.initWorker(); }
-      catch (e) { console.warn('webtorch: wgpy.initWorker failed, running on CPU:', e); }
+      catch (e) { warn('backend', 'the GPU backend would not start, so this runs on the '
+                        + 'CPU: ' + ((e && e.message) || e)); }
     }
 
     say('starting Python…');
@@ -297,7 +310,8 @@
       try {
         const mp = pyodide.pyimport('micropip');
         await mp.install(base + 'dist/wgpy_' + wanted + '-1.0.0-py3-none-any.whl');
-      } catch (e) { console.warn('webtorch: backend wheel install failed:', e); }
+      } catch (e) { warn('backend', 'the ' + wanted + ' backend could not be installed, so '
+                          + 'this runs on the CPU: ' + ((e && e.message) || e)); }
     }
 
     say('loading webtorch…');
@@ -334,7 +348,9 @@
     }
     if (INTR) {
       // An older Pyodide has no interrupt buffer; the cooperative flag is then all there is.
-      try { pyodide.setInterruptBuffer(INTR); } catch (e) { /* cooperative only */ }
+      try { pyodide.setInterruptBuffer(INTR); }
+      catch (e) { warn('cancel', 'this runtime has no interrupt buffer, so a stop only lands '
+                       + 'at the next checkpoint'); }
     }
     // Hand the page half what it reads and writes. One message, once, before anything the
     // host sends -- a cancel that arrives before this has nothing to store into.
@@ -344,7 +360,8 @@
     let backend = 'cpu';
     try {
       backend = await pyodide.runPythonAsync('import webtorch; webtorch.backend()');
-    } catch (e) { console.warn('webtorch: backend probe failed:', e); }
+    } catch (e) { warn('backend', 'could not ask which backend came up: '
+                        + ((e && e.message) || e)); }
     say('ready (' + backend + ')');
     return { pyodide: pyodide, backend: backend, tasks: tasks };
   };
