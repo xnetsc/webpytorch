@@ -2188,8 +2188,29 @@ async def clear_cache(cache_dir=None, host=None):
 
 
 # ---- model-hub readers: ready-made read callbacks over the HTTP transport ----
+def hub_read(to_url, token=None, cache=True, cache_dir=None, max_parallel=16,
+             prefetch=True, chunk_mb=16, persist=True):
+    """An `io_read`-shaped callback for ANY host that serves files over HTTP.
+
+    `hf_read` and `modelscope_read` are two lines each on top of this -- a lambda that builds
+    a URL -- and everything that makes them worth using is here: the cache, the read-ahead,
+    the concurrency that adapts to what a host will actually take, the rate-limit backoff,
+    and the chunked persistence that lets a half-finished download resume. It is public so
+    that "write your own reader" is a real option rather than an invitation to reimplement
+    all of that; a source that is not HTTP at all still goes through `set_io_read` directly.
+
+        webtorch.set_io_read(webtorch.hub_read(
+            lambda repo, path: "https://mirror.example/%s/raw/%s" % (repo, path)))
+
+    `to_url(repo, path)` is the only thing a host-specific reader has to know. The rest of
+    the arguments are `hf_read`'s, and mean the same things.
+    """
+    return _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb,
+                       persist)
+
+
 def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
-    """The read callback behind `hf_read` / `modelscope_read`.
+    """The read callback behind `hub_read`, and so behind `hf_read` / `modelscope_read`.
 
     It asks the cache first, and when the cache says it does not have the bytes, it deals
     with that itself -- which is the whole arrangement. `read_cache` answers one question,

@@ -63,8 +63,25 @@ webtorch.set_io_read(webtorch.modelscope_read())     # or hf_read()
 webtorch.set_io_read(my_read); webtorch.set_io_write(my_write)
 ```
 
-Then `load()` takes whatever that reader understands: a repo id (`'org/repo'`, with `file:`
-naming one inside it), a URL or path to a `.gguf` or `.onnx`, or a model directory.
+**`hf_read` and `modelscope_read` are tools the SDK happens to carry, not where models come
+from.** Nothing is installed until you install it, and neither one is privileged: they are
+two lines each — a function that turns `(repo, path)` into a URL — on top of `hub_read`,
+which is public for exactly this reason. A third host is the same two lines:
+
+```python
+webtorch.set_io_read(webtorch.hub_read(
+    lambda repo, path: "https://mirror.example/%s/raw/%s" % (repo, path), token=MY_TOKEN))
+```
+
+That gets you what the two named ones get: cache, read-ahead, concurrency that adapts to
+what the host will actually take, rate-limit backoff, and chunked persistence so a
+half-finished download resumes instead of restarting. If your source is not HTTP at all,
+skip `hub_read` and hand `set_io_read` your own function — `hub_read` is a convenience for
+one common shape, not a layer you have to go through.
+
+Then `load()` takes whatever the reader you installed understands: a repo id (`'org/repo'`,
+with `file:` naming one inside it), a URL or path to a `.gguf` or `.onnx`, or a model
+directory.
 
 **The writer is what makes the second visit instant.** `set_io_write(webtorch.default_io_write)`
 keeps downloaded weights in origin storage; leave it out and nothing is kept and every visit

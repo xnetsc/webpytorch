@@ -865,6 +865,7 @@ bytes come from*. Pick the one matching where your files live:
 | `use_default_io()` | **your own server / local disk** | `name` used **verbatim** as a path/URL (browser: relative to the page origin) | **network reads cached** (browser fetches + http/https URLs); local host files read directly |
 | `set_io_read(hf_read())` | **Hugging Face Hub** | `"<org>/<repo>/<path>"` → the HF file URL | yes |
 | `set_io_read(modelscope_read())` | **ModelScope (魔搭)** | `"<org>/<repo>/<path>"` → the ModelScope file URL | yes |
+| `set_io_read(hub_read(to_url))` | **any HTTP host** — the generic one the two above are built from | `"<org>/<repo>/<path>"` → whatever `to_url(repo, path)` returns | yes |
 
 > **`use_default_io()` is *not* a hub.** It does no repo-id→URL mapping — it just `fetch`es /
 > `open`s the `name` string as-is. So with `use_default_io()`,
@@ -908,12 +909,24 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
   webtorch.set_io_read(webtorch.modelscope_read())
   lm = await webtorch.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
   ```
+- `webtorch.hub_read(to_url, token=None, cache=True, cache_dir=None, max_parallel=16,
+  prefetch=True, chunk_mb=16, persist=True)` — **the generic one, and the two above are its
+  clients.** Neither hub is privileged: each is a function turning `(repo, path)` into a URL,
+  and everything worth having — the cache, the read-ahead, the concurrency that adapts to
+  what a host will actually take, the rate-limit backoff, the chunked persistence that
+  resumes a half-finished download — is here. Any other HTTP host is the same two lines:
+  ```python
+  webtorch.set_io_read(webtorch.hub_read(
+      lambda repo, path: "https://mirror.example/%s/raw/%s" % (repo, path), token=MY_TOKEN))
+  lm = await webtorch.load("org/repo", file="model.gguf")
+  ```
+  `name` arrives as `"<org>/<repo>/<path>"`; `to_url` is given the first two segments as
+  `repo` and the rest as `path`.
 
-**Build your own cached reader (generic tool).** The caching, background read-ahead, adaptive
-concurrency (see `max_parallel` below), and browser persistence are **not** hub-specific — they
-live inside the ready-made readers `hf_read`/`modelscope_read`. Writing a callback for your
-own source (S3, a signed CDN, your own server) means composing the same pieces yourself: read
-from the cache, and on a miss read from wherever the bytes live and put them in the cache.
+**A source that is not HTTP.** `hub_read` is a convenience for one common shape, not a layer
+you have to go through — hand `set_io_read` your own function and it will be used as-is. You
+then decide what caching, if any, is worth it; the pieces are public, so the usual shape is
+to ask the cache and deal with a miss yourself:
 
 ```python
 async def my_read(name, offset=0, length=None):

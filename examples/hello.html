@@ -69,9 +69,11 @@ const ready = webtorch.start({
   // THIS PAGE'S decisions, not the SDK's. It ships no default IO and reads NOTHING until a
   // reader is installed -- not a hub id, not even a plain URL -- because where weights come
   // from is a decision about the product, not about the library.
-  //   modelscope_read() / hf_read()  a hub, by repo id
+  //   modelscope_read() / hf_read()  tools the SDK carries, not a default -- two lines each
+  //                                  over hub_read(), and neither is privileged
+  //   hub_read(to_url)               any other HTTP host, same cache/prefetch/resume
   //   use_default_io()               your own server or CDN, names relative to the page
-  //   set_io_read(fn)                your own storage, two callbacks and that is the contract
+  //   set_io_read(fn)                anything else: two callbacks, that is the contract
   // The writer is what makes the second visit instant; leave it out and nothing is kept.
   await w.run('import webtorch\n'
             + 'webtorch.set_io_read(webtorch.modelscope_read())\n'

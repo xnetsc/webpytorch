@@ -84,7 +84,8 @@ from .webio import (use_directory, get_directory, migrate_cache, set_storage_ful
                     set_download_progress, get_download_progress,
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     cancel, Cancelled,
-                    use_default_io, default_io_read, default_io_write, hf_read, modelscope_read,
+                    use_default_io, default_io_read, default_io_write, hub_read,
+                    hf_read, modelscope_read,
                     throttle_reads, prefetch_whole_file, await_inflight, http_get, http_size, HttpError,
                     default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
                     write_cache, delete_cache, clear_cache)
@@ -121,9 +122,12 @@ __all__ = [
     # cooperative stop for an in-flight load (raises Cancelled at the next IO checkpoint)
     "cancel", "Cancelled",
     # built-in / hub read callbacks you install via set_io_read (NOT auto-installed)
-    "use_default_io", "default_io_read", "default_io_write", "hf_read", "modelscope_read",
-    # generic cached-reader tool (cache + read-ahead + adaptive concurrency + persistence) for
-    # building your own read callback; hf_read/modelscope_read are clients of it
+    "use_default_io", "default_io_read", "default_io_write",
+    # the generic one, and the two ready-made clients of it. `hub_read` is what makes writing
+    # a reader for a third host two lines rather than a reimplementation of the cache,
+    # read-ahead, adaptive concurrency, rate-limit backoff and resumable chunking.
+    "hub_read", "hf_read", "modelscope_read",
+    # raw HTTP, for a reader that wants none of the above
     "http_get", "http_size", "HttpError",
     # persistent-cache management (list/read/write/delete, separated by host/domain)
     "default_cache_dir", "list_cache", "cache_hosts", "cache_size", "read_cache",
