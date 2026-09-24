@@ -44,6 +44,13 @@ webtorch.onError(function (e) {
 
 function afterRelease() {
   modelLoaded = false; modelImage = false;
+  modelSurface = null;
+  const imageRow = $('#dImageRow');
+  if (imageRow) imageRow.hidden = true;
+  const imageInput = $('#dImage');
+  if (imageInput) imageInput.value = '';
+  const imageName = $('#dImageName');
+  if (imageName) imageName.textContent = '';
   setBar(0); syncButtons(); refreshCache();
 }
 
@@ -153,6 +160,8 @@ let convs = [];
 let curId = null;
 let attachments = [];
 let modelLoaded = false;
+let visionDecision = null;
+let visionLoadAbort = null;
 // Does the loaded model see images? Decides whether camera / image attachments are offered —
 // a text-only model can do nothing with pixels, so the controls say so instead of failing.
 let modelImage = false;
@@ -262,6 +271,12 @@ const PRESETS = [
   // chats -- what the page then puts on screen comes from what the model says it takes.
   { gb: 0.8,  label: 'Laya · decision model · answers questions, writes nothing',
     repo: 'convaiinnovations/laya', file: '' },
+  { gb: 0.5, label: 'Laya Vision · image + text decisions · FP16 WebGPU',
+    repo: 'thaitea/laya-vision-web', file: '', kind: 'vision-decision',
+    baseUrls: [
+      'https://modelscope.cn/models/thaitea/laya-vision-web/resolve/master/',
+      'https://huggingface.co/thaitea/laya-vision-web/resolve/main/',
+    ] },
   { gb: 0,    label: '— custom (type a repo/file below) —', repo: '', file: '' },
 ];
 
@@ -402,7 +417,9 @@ function onLoadStage(m) {
 }
 
 function afterLoad(m) {
-  const imageOK = !!(m.surface && m.surface.takes && m.surface.takes.images);
+  const stateKinds = (((m.surface || {}).takes || {}).state || {}).kinds || [];
+  const imageOK = !!(m.surface && m.surface.takes &&
+    (m.surface.takes.images || stateKinds.includes('image')));
     setBarBusy(false);
     if (stageLog.length) console.log('load stages: ' + stageLog.join(' · '));
     probeTools();            // asked once per model, before any reply needs the answer
@@ -626,6 +643,8 @@ function applySurface(sf) {
   const hint = $('#hintbar');
   if (hint) hint.hidden = decides;
   if (decides) buildDecisionPanel(sf);
+  const stateKinds = (((sf || {}).takes || {}).state || {}).kinds || [];
+  $('#dImageRow').hidden = !(decides && stateKinds.includes('image'));
 }
 
 // The question types, and what each one needs from the reader, come from the surface.
@@ -1442,6 +1461,48 @@ function fillPresets() {
 // While a load is in flight the same button is the stop control — the only way out of a
 // multi-GB download — and everything reverts to the initial state once it stops.
 let loading = false;
+const chosenDecisionSources = new Map();
+
+async function probeDecisionSource(baseUrl) {
+  const started = performance.now();
+  const manifestResponse = await fetch(baseUrl + 'laya_web.json', {
+    cache: 'no-cache', signal: AbortSignal.timeout(15000),
+  });
+  if (!manifestResponse.ok) throw new Error('HTTP ' + manifestResponse.status);
+  const manifest = await manifestResponse.json();
+  if (manifest.format_version !== 1 || manifest.source !== 'thaitea/laya-vision'
+      || !manifest.files?.['text_fp16.onnx']) throw new Error('unexpected export');
+  const latency = performance.now() - started;
+  let rate = 0;
+  const sampleStarted = performance.now();
+  try {
+    const sample = await fetch(baseUrl + 'text_fp16.onnx', {
+      headers: { Range: 'bytes=0-1048575' }, signal: AbortSignal.timeout(12000),
+    });
+    if (!sample.ok) throw new Error('sample HTTP ' + sample.status);
+    const reader = sample.body.getReader();
+    let bytes = 0;
+    while (bytes < 1048576) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+    }
+    await reader.cancel();
+    rate = bytes / Math.max(0.001, (performance.now() - sampleStarted) / 1000);
+  } catch { /* valid export; speed sample is advisory */ }
+  return { baseUrl, latency, rate };
+}
+
+async function decisionSource(preset) {
+  if (chosenDecisionSources.has(preset.repo)) return chosenDecisionSources.get(preset.repo);
+  const attempts = await Promise.allSettled((preset.baseUrls || []).map(probeDecisionSource));
+  const available = attempts.filter(item => item.status === 'fulfilled').map(item => item.value)
+    .sort((a, b) => b.rate - a.rate || a.latency - b.latency);
+  if (!available.length) throw new Error('No published Laya Vision source is reachable.');
+  chosenDecisionSources.set(preset.repo, available[0].baseUrl);
+  return available[0].baseUrl;
+}
+
 $('#loadBtn').onclick = async () => {
   if (loading) {
     // Say so at once. The flag is set immediately now, but the load still has to reach its
@@ -1450,6 +1511,7 @@ $('#loadBtn').onclick = async () => {
     $('#loadBtn').disabled = true;
     askStop();                                  // shared memory, so a busy worker still sees it
     wt && wt.stopLoading();
+    if (visionLoadAbort) visionLoadAbort.abort();
     return;
   }
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
@@ -1474,8 +1536,28 @@ $('#loadBtn').onclick = async () => {
     loading = false; $('#loadBtn').textContent = 'Load'; $('#loadBtn').title = '';
     return;
   }
-  try { await (await sdk).load(repo, { file, maxContext: lmaxValue(),
-                                      onProgress: onLoadProgress, onStage: onLoadStage }); note('Model ready. Large models take a while on first load; afterwards they come from the cache.'); }
+  try {
+    if (chosen && chosen.kind === 'vision-decision') {
+      visionLoadAbort = new AbortController();
+      showStatus('checking published model sources…');
+      const baseUrl = await decisionSource(chosen);
+      visionDecision = await webtorch.loadVisionDecision({
+        baseUrl, variant: 'auto', backend: 'auto',
+        signal: visionLoadAbort.signal,
+        onProgress: (progress) => onLoadProgress({
+          bytes: Number(progress.loaded || 0), total: Number(progress.total || 0),
+        }),
+        onError: (error) => console.warn('[vision decision]', error),
+      });
+      const surface = visionDecision.surface();
+      afterLoad({ id: chosen.repo, kind: 'decision', surface });
+      showStatus('ready: ' + visionDecision.model + ' on ' + visionDecision.backend);
+    } else {
+      await (await sdk).load(repo, { file, maxContext: lmaxValue(),
+                                    onProgress: onLoadProgress, onStage: onLoadStage });
+    }
+    note('Model ready. Large models take a while on first load; afterwards they come from the cache.');
+  }
   catch (e) {
     // The SDK raises one distinctive message for a stop the person asked for; that is a
     // normal ending, not a failure — say so, and put the meter back where it started.
@@ -1487,10 +1569,18 @@ $('#loadBtn').onclick = async () => {
       $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message);
     }
   }
-  finally { loading = false; $('#loadBtn').textContent = 'Load model'; syncButtons(); }
+  finally {
+    visionLoadAbort = null;
+    loading = false; $('#loadBtn').textContent = 'Load model'; syncButtons();
+  }
 };
 $('#releaseBtn').onclick = async () => {
-  await (await sdk).release(); setBar(0);
+  if (visionDecision) {
+    visionDecision.release(); visionDecision = null; afterRelease();
+  } else {
+    await (await sdk).release();
+  }
+  setBar(0);
   $('#progressText').textContent = ''; syncButtons();
   note('Model released. Its files stay cached, so loading it again is fast.');
 };
@@ -4648,6 +4738,24 @@ $('#dExample').onclick = () => {
 };
 
 $('#dAdd').onclick = () => addQuestion();
+$('#dImage').onchange = () => {
+  const file = $('#dImage').files && $('#dImage').files[0];
+  $('#dImageName').textContent = file ? file.name + ' · ' + fmt(file.size) : '';
+};
+$('#dImageClear').onclick = () => {
+  $('#dImage').value = '';
+  $('#dImageName').textContent = '';
+};
+
+function fileDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error || new Error('could not read image'));
+    reader.readAsDataURL(file);
+  });
+}
+
 $('#dRun').onclick = async () => {
   if (!modelLoaded) return note('Load a model first (left panel).');
   const raw = $('#dState').value.trim();
@@ -4659,17 +4767,27 @@ $('#dRun').onclick = async () => {
   // pasted a record should have it read as a record rather than as prose about one.
   let state = raw;
   try { const p = JSON.parse(raw); if (p && typeof p === 'object') state = p; } catch (e) { /* text */ }
+  const image = $('#dImage').files && $('#dImage').files[0];
+  if (image) {
+    state = { type: 'multimodal', text: state, images: [{
+      type: 'image', media_type: image.type || 'image/png', data: await fileDataUrl(image),
+    }] };
+  }
   const btn = $('#dRun'); btn.disabled = true; $('#dTiming').textContent = 'thinking…';
   const t0 = performance.now();
   try {
-    const res = await (await sdk).decide(state, questions);
+    const res = visionDecision
+      ? await visionDecision.decide(state, questions)
+      : await (await sdk).decide(state, questions);
     // Label each answer with the question that produced it: the ids are this page's own.
     Object.keys(res.answers || {}).forEach(k => {
       if (questions[k]) res.answers[k].instructions = questions[k].instructions;
     });
     renderAnswers(res.answers);
-    $('#dTiming').textContent =
-      Math.round(performance.now() - t0) + ' ms · ' + (res.usage && res.usage.input_tokens) + ' tokens read';
+    const usage = res.usage || {};
+    const cache = usage.vision_cache_hits ? ' · image features reused' : '';
+    $('#dTiming').textContent = Math.round(performance.now() - t0) + ' ms · '
+      + (usage.input_tokens || 0) + ' tokens read' + cache;
   } catch (e) {
     $('#dTiming').textContent = '';
     note('Error: ' + (e && e.message ? e.message : e));

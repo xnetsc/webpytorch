@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>webtorch chat</title>
-<link rel="stylesheet" href="style.css?v=b3f9d6e5bd" />
+<link rel="stylesheet" href="style.css?v=06ddd7682c" />
 
 <!-- Reply rendering: Markdown (GFM), LaTeX and syntax highlighting, from a CDN.
      `crossorigin` is required, not cosmetic: this page is served with
@@ -91,6 +91,13 @@
         make of this?”. Plain writing is fine.</p>
       <textarea id="dState" rows="7"
         placeholder="e.g. A customer writes: we were billed twice for the same invoice…"></textarea>
+
+      <div id="dImageRow" class="dimage" hidden>
+        <label class="dlabel" for="dImage">Image (optional)</label>
+        <input id="dImage" type="file" accept="image/*">
+        <button type="button" id="dImageClear" class="linky">Clear image</button>
+        <span id="dImageName" class="hint"></span>
+      </div>
 
       <div class="drow">
         <label class="dlabel">2 · What you want to know</label>
@@ -339,6 +346,7 @@
 <script src="pyodide-version.js"></script>
 <script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
 <script src="../webtorch/js/webtorch-main.js?v=27cd9896b1"></script>
+<script src="../webtorch/js/decision-vision.js"></script>
 <!-- The SDK needs the document cross-origin isolated or the model runs on the CPU. On a
      static host that means a service worker, and a client has only one, so it is the SDK's.
      `cache-sw.js` is ours and rides inside it: what this page caches and how. Called here
@@ -355,6 +363,6 @@ webtorch.installServiceWorker({
 });
 </script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=8add3e938a"></script>
+<script src="app.js?v=a33086ad58"></script>
 </body>
 </html>

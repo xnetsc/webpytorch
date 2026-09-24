@@ -420,6 +420,44 @@ the stated range.
 Do not fit on training data and do not assume calibration transfers across languages,
 domains, option counts, or materially different question wording.
 
+### Image + text decision export in the browser
+
+The optional browser adapter loads a three-graph ONNX decision export without changing the
+typed `decide(state, questions)` call. The application chooses the model URL; the SDK does not
+select or silently change a model host.
+
+```html
+<script src="/webtorch/js/decision-vision.js"></script>
+<script>
+const model = await webtorch.loadVisionDecision({
+  baseUrl: '/models/laya-vision/', // directory containing laya_web.json
+  backend: 'webgpu',
+  variant: 'auto',                // fp16 when WebGPU exposes shader-f16
+});
+
+const result = await model.decide({
+  type: 'multimodal',
+  text: 'Read the supplied chart.',
+  images: [{type: 'image', media_type: 'image/png', data: imageBase64}],
+}, questions);
+</script>
+```
+
+`webtorch.normalizeDecisionState(state)` accepts the same plain text/JSON states as before and
+adds explicit `image` and `multimodal` states. Images must be base64 or a base64 data URL; remote
+image URLs are deliberately not fetched. Each decoded image is limited to 16 MB.
+
+The worker hashes image bytes and keeps an in-memory LRU of vision features (32 images by
+default, configurable with `imageCacheEntries`). Reusing the same image skips the vision graph;
+`usage.vision_cache_hits` and `timing.vision_ms` expose the result. The official export still runs
+the text graph once per question, so this adapter does not claim multi-question text batching or
+prefix reuse. `model.surface()` reports the supported state kinds and calibration status, allowing
+an application to show an image input only when the loaded model declares it.
+
+The adapter code is Apache-2.0-derived as recorded in `NOTICE`. Model weights are separate: check
+the selected checkpoint's license before distributing or using them. In particular,
+`thaitea/laya-vision` weights are CC BY-NC-SA 4.0 and are not bundled with this SDK.
+
 ### What a model takes, from the model  (`Model.surface`)
 
 - `surface()` — what this model takes and returns, in the terms a caller works in.

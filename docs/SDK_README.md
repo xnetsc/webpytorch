@@ -328,6 +328,17 @@ print(gen("Hello", max_new=64))
 > Concrete implementations are reachable for advanced use as `webtorch.models.cosyvoice`
 > etc. (like `transformers.models.*`) but are **not** part of the public API.
 
+### Browser image + text decisions
+
+Load `webtorch/js/decision-vision.js` when an application needs the optional three-graph ONNX
+decision format. `webtorch.loadVisionDecision({baseUrl, backend, variant})` returns the same
+`decide(state, questions)` shape as the text decision model. Use a typed state such as
+`{type:"multimodal", text, images:[{type:"image", media_type, data:base64}]}`. The application
+supplies `baseUrl`; source selection is not an SDK policy. Image features are cached by SHA-256,
+and `surface().takes.state.kinds` lets the UI expose its image control dynamically. See
+[API.md](API.md#image--text-decision-export-in-the-browser) for limits, performance behavior and
+checkpoint licensing.
+
 ## IO injection (required, not optional)
 
 The library core never touches the filesystem — and it ships with **no default IO**, so you

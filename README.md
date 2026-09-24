@@ -150,6 +150,9 @@ everything below is a page you can use rather than a screenshot of one.
 
 - **Any model that fits.** Load a GGUF or an HF folder from the device, or any repo id from a
   hub. The list is examples, not a whitelist; the only real limit is GPU memory.
+- **Typed image decisions.** The optional Laya Vision preset exposes an image picker only after
+  its model surface declares image input, then keeps the same `decide(state, questions)` protocol
+  as text decisions and reuses cached features for an unchanged image.
 - **Replies that render.** Markdown, syntax-highlighted code, LaTeX typeset with KaTeX,
   tables. Sanitised before it reaches the DOM.
 - **The model can press it too.** Python and JavaScript are offered to the model as tools;

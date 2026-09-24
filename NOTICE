@@ -17,3 +17,8 @@ Modifications to WgPy in this repository (under src/, webgl/, webgpu/):
 
 The webtorch SDK (the top-level `webtorch/` package, plus examples/, webapp/,
 tools/, docs/) is original work in this repository and is also MIT-licensed.
+
+`webtorch/js/decision-vision-runtime.js` and `decision-vision-worker.js` derive
+from the laya-vision browser demo:
+  https://github.com/r33drichards/laya-vision
+Copyright its contributors, licensed under the Apache License 2.0.
