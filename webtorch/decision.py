@@ -385,10 +385,11 @@ class DecisionModel(wt.Module):
     #
     # It is the same occupancy story as everywhere else here: a short sequence does not give
     # the device enough rows to work on, and putting several together does. By 128 there are
-    # already enough and batching is noise, so the line is drawn where the gain stops being
-    # worth the padding -- sequences are padded to the longest, and a batch of uneven ones
-    # does arithmetic on padding that a separate pass would not.
-    _BATCH_MAX_TOKENS = 96
+    # already enough and batching is noise when the encoder output crosses the host boundary.
+    # Decision heads now consume the padded result on-device; measured at 115--138 tokens,
+    # four questions fell from 370.2 ms to 347.5 ms without changing an answer. Keep the
+    # boundary at 160: above it padding and the larger attention squares erase that gain.
+    _BATCH_MAX_TOKENS = 160
 
     @classmethod
     def batch_pays(cls, longest, count):
@@ -459,18 +460,32 @@ class DecisionModel(wt.Module):
 
     def _raw_questions(self, built, execution=None):
         hs = None
+        device_batch = None
         if built and self.batch_pays(max(len(b[3]) for b in built), len(built)):
             try:
-                hs = self.enc.encode_many([b[3] for b in built])
+                device_batch = self.enc._encode_many_device([b[3] for b in built])
             except Exception:
-                hs = None            # a batched pass is an optimisation, not a step
+                try:
+                    hs = self.enc.encode_many([b[3] for b in built])
+                except Exception:
+                    hs = None        # a batched pass is an optimisation, not a step
 
         encoded = {}
         encoder_tokens = 0
         encoder_passes = 0
         scored = []
         for idx, (qid, q, qtype, ids, markers, labels) in enumerate(built):
-            if hs is not None:
+            if device_batch is not None:
+                batch_h, lengths, padded = device_batch
+                # Select this sequence's valid rows while they are still on the device.
+                # A tiny one-hot matmul is cheaper than reading B*L*D values to the host and
+                # uploading each question again for its decision head.
+                selector = np.zeros((lengths[idx], len(lengths) * padded), dtype=np.float32)
+                rows = idx * padded + np.arange(lengths[idx])
+                selector[np.arange(lengths[idx]), rows] = 1.0
+                h = Tensor(selector).matmul(batch_h)
+                logits, act = self._score(h, markers, self.cfg.qtypes.index(qtype))
+            elif hs is not None:
                 logits, act = self._score(hs[idx], markers, self.cfg.qtypes.index(qtype))
             else:
                 # Questions can collapse to the exact same encoder input (for example two
@@ -483,13 +498,13 @@ class DecisionModel(wt.Module):
                     encoder_passes += 1
                 logits, act = self._score(encoded[key], markers, self.cfg.qtypes.index(qtype))
             scored.append((qid, q, qtype, markers, labels, logits, act))
-        if hs is not None:
+        if device_batch is not None or hs is not None:
             encoder_passes = 1 if built else 0
             encoder_tokens = len(built) * max(len(b[3]) for b in built) if built else 0
         if execution is not None:
             execution.update({"encoder_tokens": encoder_tokens,
                               "encoder_passes": encoder_passes,
-                              "batched": hs is not None})
+                              "batched": device_batch is not None or hs is not None})
         return scored
 
     def decide(self, state, questions):

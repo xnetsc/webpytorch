@@ -378,6 +378,28 @@ class TextEncoder(wt.Module):
         return self._run(np.asarray(ids, dtype=np.int64), int(np.size(ids)), 1,
                          [valid] if valid is not None else None)
 
+    def _encode_many_device(self, seqs):
+        """Several padded sequences in one pass, leaving the result on the backend device.
+
+        The returned tensor is still flattened as ``(B * L, hidden)``. Callers that can
+        consume it there avoid reading every hidden row to the host merely to upload the
+        same rows again for a downstream head.
+        """
+        if not seqs:
+            raise ValueError("encode_many needs at least one sequence")
+        L = max(len(s) for s in seqs)
+        B = len(seqs)
+        ids = np.zeros((B, L), dtype=np.int64)
+        valid = np.zeros((B, L), dtype=np.int64)
+        pad = self.cfg.pad_id or 0
+        ids[:] = pad
+        lengths = []
+        for b, s in enumerate(seqs):
+            lengths.append(len(s))
+            ids[b, :len(s)] = np.asarray(s, dtype=np.int64)
+            valid[b, :len(s)] = 1
+        return self._run(ids.reshape(-1), L, B, valid), lengths, L
+
     def encode_many(self, seqs):
         """Several sequences in one pass, each trimmed back to its own length on the way out.
 
@@ -389,18 +411,11 @@ class TextEncoder(wt.Module):
         Whether this is worth doing depends on how long the sequences are, and the caller
         decides that -- see `batch_pays`.
         """
-        L = max(len(s) for s in seqs)
-        B = len(seqs)
-        ids = np.zeros((B, L), dtype=np.int64)
-        valid = np.zeros((B, L), dtype=np.int64)
-        pad = self.cfg.pad_id or 0
-        ids[:] = pad
-        for b, s in enumerate(seqs):
-            ids[b, :len(s)] = np.asarray(s, dtype=np.int64)
-            valid[b, :len(s)] = 1
-        out = self._run(ids.reshape(-1), L, B, valid)
+        out, lengths, L = self._encode_many_device(seqs)
+        B = len(lengths)
         flat = out.numpy().reshape(B, L, -1)
-        return [Tensor(np.ascontiguousarray(flat[b, :len(s)])) for b, s in enumerate(seqs)]
+        return [Tensor(np.ascontiguousarray(flat[b, :length]))
+                for b, length in enumerate(lengths)]
 
     def _run(self, ids, T, B, valid):
         x = self._embed(ids)
