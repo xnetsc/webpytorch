@@ -348,6 +348,8 @@ out["answers"]["route"]["probabilities"]   # {"billing": 0.9086, "technical": 0.
 out["answers"]["route"]["confidence"]      # 0.664  — 1 minus the normalised entropy
 out["answers"]["dupe"]["noul"]             # 0.9466 — how likely the statement holds
 out["answers"]["urgent"]["score"]          # the expected level on the scale given
+out["usage"]["sequence_tokens"]             # encoded length of each question-conditioned input
+out["usage"]["encoder_passes"]              # actual encoder invocations for this call
 ```
 
 Three question types, which are the MODEL's vocabulary, read from its files rather than
@@ -369,6 +371,12 @@ or concentrated the returned distribution is.
 - `m.calibrate(examples, by_options=True, min_samples=20)` — fit probability temperatures
   on separate labelled held-out examples.
 - `m.surface()` — see below.
+
+The encoder input is built once per question: each sequence contains that question, its
+options, and the shared state. Consequently `usage.input_tokens` is the sum of all
+question-conditioned sequences, not the token count of the state alone. `sequence_tokens`
+shows each length; `encoder_tokens`, `encoder_passes`, and `batched` describe the work that
+actually ran. Exact duplicate sequences inside one call reuse their encoder result.
 
 ### Probability calibration
 

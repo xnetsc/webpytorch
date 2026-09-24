@@ -457,7 +457,7 @@ class DecisionModel(wt.Module):
             built.append((qid, q, qtype, ids, markers, labels))
         return built, total
 
-    def _raw_questions(self, built):
+    def _raw_questions(self, built, execution=None):
         hs = None
         if built and self.batch_pays(max(len(b[3]) for b in built), len(built)):
             try:
@@ -465,13 +465,31 @@ class DecisionModel(wt.Module):
             except Exception:
                 hs = None            # a batched pass is an optimisation, not a step
 
+        encoded = {}
+        encoder_tokens = 0
+        encoder_passes = 0
         scored = []
         for idx, (qid, q, qtype, ids, markers, labels) in enumerate(built):
             if hs is not None:
                 logits, act = self._score(hs[idx], markers, self.cfg.qtypes.index(qtype))
             else:
-                logits, act = self._run_one(ids, markers, self.cfg.qtypes.index(qtype))
+                # Questions can collapse to the exact same encoder input (for example two
+                # identical boolean statements under different caller ids). Encoding that
+                # sequence twice cannot change the answer, so share it within this call.
+                key = tuple(ids)
+                if key not in encoded:
+                    encoded[key] = self.enc.encode(ids)
+                    encoder_tokens += len(ids)
+                    encoder_passes += 1
+                logits, act = self._score(encoded[key], markers, self.cfg.qtypes.index(qtype))
             scored.append((qid, q, qtype, markers, labels, logits, act))
+        if hs is not None:
+            encoder_passes = 1 if built else 0
+            encoder_tokens = len(built) * max(len(b[3]) for b in built) if built else 0
+        if execution is not None:
+            execution.update({"encoder_tokens": encoder_tokens,
+                              "encoder_passes": encoder_passes,
+                              "batched": hs is not None})
         return scored
 
     def decide(self, state, questions):
@@ -483,7 +501,8 @@ class DecisionModel(wt.Module):
         """
         out = {}
         built, total = self._prepare_questions(state, questions)
-        for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built):
+        execution = {}
+        for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built, execution):
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
             ans = {"type": qtype, "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
@@ -496,7 +515,11 @@ class DecisionModel(wt.Module):
             else:
                 ans["noul"] = round(float(p[1]), 4)
             out[qid] = ans
-        return {"answers": out, "usage": {"input_tokens": total, "output_tokens": 0}}
+        usage = {"input_tokens": total, "output_tokens": 0,
+                 "questions": len(built),
+                 "sequence_tokens": {str(b[0]): len(b[3]) for b in built}}
+        usage.update(execution)
+        return {"answers": out, "usage": usage}
 
     @staticmethod
     def _target_index(qtype, truth, labels):

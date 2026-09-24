@@ -250,5 +250,11 @@ Quantisation remains necessary for large models, but as a **capacity** decision 
 speed one: a 27B model does not fit otherwise. A 421M model fits either way, so nothing is
 buying the slowdown.
 
+A multi-question decision request is also not one encoder sequence. Each question and its
+options are placed beside the state before bidirectional attention, so the state cannot be
+encoded once and appended to unrelated questions afterward. The runtime reports the resulting
+per-question lengths and encoder pass count in `usage`; exact duplicate sequences reuse one
+pass, while short compatible sequences may be batched.
+
 One caveat on the last row: the quantised path has a dedicated GEMV kernel for a single row,
 which is the decode case. All of the above is measured at 69 rows, on the general path.
