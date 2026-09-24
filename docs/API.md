@@ -376,7 +376,9 @@ The encoder input is built once per question: each sequence contains that questi
 options, and the shared state. Consequently `usage.input_tokens` is the sum of all
 question-conditioned sequences, not the token count of the state alone. `sequence_tokens`
 shows each length; `encoder_tokens`, `encoder_passes`, and `batched` describe the work that
-actually ran. Exact duplicate sequences inside one call reuse their encoder result.
+actually ran. Exact duplicate sequences inside one call reuse their encoder result. Short
+compatible sequences may share one padded encoder pass; the intermediate hidden rows remain
+on the GPU until their decision heads have consumed them.
 
 ### Probability calibration
 
