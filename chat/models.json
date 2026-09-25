@@ -86,9 +86,8 @@
       "file": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf"
     },
     {
-      "name": "Laya · decision model · answers questions, writes nothing",
-      "size": 846195574,
-      "repo": "convaiinnovations/laya",
+      "name": "Laya Multilingual · decision model · answers questions, writes nothing",
+      "repo": "convaiinnovations/laya-multilingual",
       "probe": "rl_agent_config.json"
     },
     {
