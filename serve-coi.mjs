@@ -5,6 +5,7 @@
 import { createServer } from 'node:http';
 import { stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 import { extname, normalize, join } from 'node:path';
 
 const ROOT = process.argv[2] || process.cwd();
@@ -32,7 +33,16 @@ function setCommon(res, ctype) {
 // requires) can only read a remote file if that host sends CORS headers. Model hosts
 // generally do not, so the page fetches `/ms/<path>` from us and we relay it — passing the
 // Range header through in both directions so tensors can still be streamed.
-const PROXY = { '/ms/': 'https://modelscope.cn/', '/hf/': 'https://huggingface.co/' };
+const PROXY = {
+  '/ms/': 'https://modelscope.cn/',
+  '/hf/': 'https://huggingface.co/',
+  // Development equivalent of the path produced by the Pages deployment. The browser uses
+  // the same repository-first URL locally and in production; only this server's backing
+  // changes from a Release relay to files embedded in the Pages artifact.
+  '/chat/models/thaitea/laya-vision-web/resolve/main/':
+    'https://github.com/xnetsc/webpytorch/releases/download/laya-vision-web-201m-v1/',
+  '/gh-release/': 'https://github.com/xnetsc/webpytorch/releases/download/',
+};
 
 async function proxy(req, res, prefix, origin) {
   const rest = req.url.slice(prefix.length);
@@ -49,8 +59,9 @@ async function proxy(req, res, prefix, origin) {
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'HEAD' || !r.body) { res.end(); return; }
-  const buf = Buffer.from(await r.arrayBuffer());
-  res.end(buf);
+  // Do not collect a multi-hundred-megabyte model file in Node's heap. Backpressure from
+  // the browser is carried through to the remote response while it downloads.
+  Readable.fromWeb(r.body).pipe(res);
 }
 
 createServer(async (req, res) => {

@@ -1,0 +1,81 @@
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: ["Publish Laya Vision browser bundle"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Assemble site and repository model publications
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          site="$RUNNER_TEMP/site"
+          mkdir -p "$site"
+          rsync -a --exclude '.git/' --exclude 'node_modules/' ./ "$site/"
+          touch "$site/.nojekyll"
+          while IFS= read -r publication; do
+            release=$(jq -r '.release' <<<"$publication")
+            path=$(jq -r '.path' <<<"$publication")
+            case "$path" in /*|*..*) echo "unsafe publication path: $path" >&2; exit 1;; esac
+            target="$site/$path"
+            mkdir -p "$target"
+            patterns=()
+            while IFS= read -r file; do patterns+=(--pattern "$file"); done \
+              < <(jq -r '.files[]' <<<"$publication")
+            gh release download "$release" --repo "$GITHUB_REPOSITORY" \
+              --dir "$target" "${patterns[@]}"
+          done < <(jq -c '.models[] | select(.publication) | .publication' chat/models.json)
+          python - "$site/chat/models" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          for manifest_path in root.rglob("laya_web.json"):
+              manifest = json.loads(manifest_path.read_text())
+              directory = manifest_path.parent
+              required = ["vision_fp16.onnx", "text_fp16.onnx", "head_fp16.onnx"]
+              for name in required:
+                  path = directory / name
+                  record = manifest["files"][name]
+                  assert path.stat().st_size == record["bytes"], name
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"], name
+              for name in manifest["tokenizer"]:
+                  assert (directory / name).is_file(), name
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

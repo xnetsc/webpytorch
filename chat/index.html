@@ -146,8 +146,9 @@
       <div id="customBox" hidden>
         <input id="modelId" placeholder="org/repo/file.gguf — or org/repo for a HF-format dir" />
       </div>
-      <p class="note">“custom” loads any other ModelScope model. “on this device” reads a
-        file or folder from disk — nothing is copied or cached.</p>
+      <p class="note">The list comes from this repository's <code>models.json</code>.
+        “custom” accepts another hub repository. “on this device” reads a file or folder
+        from disk — nothing is copied or cached.</p>
       <div class="row btns">
         <button id="loadBtn" class="primary">Load model</button>
         <button id="releaseBtn">Release</button>
@@ -283,8 +284,8 @@
       <button id="refreshCache">Refresh</button>
       <button id="clearCache" class="danger">Clear all</button>
     </div>
-    <p class="hint">Models downloaded from ModelScope are kept here. Models loaded from
-      this device are read where they lie — they never enter the cache.</p>
+    <p class="hint">Models downloaded from a listed URL or model hub are kept here. Models
+      loaded from this device are read where they lie — they never enter the cache.</p>
     <div id="cacheList" class="cache"></div>
     <div id="storeStatus" class="pyresult" hidden></div>
 
@@ -363,6 +364,6 @@ webtorch.installServiceWorker({
 });
 </script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=99c1954d0a"></script>
+<script src="app.js?v=a02e2e71bf"></script>
 </body>
 </html>

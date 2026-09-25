@@ -457,9 +457,15 @@ an application to show an image input only when the loaded model declares it.
 The adapter code is Apache-2.0-derived as recorded in `NOTICE`. Model weights are separate: check
 the selected checkpoint's license before distributing or using them. In particular,
 `thaitea/laya-vision` weights are CC BY-NC-SA 4.0 and are not bundled with this SDK.
-The demo probes a SHA-256-described, pinned GitHub release plus Hugging Face, `hf-mirror.com`,
-and ModelScope candidates and uses the fastest reachable copy. A mirror only helps connectivity:
-an absent or restricted repository is rejected rather than treated as a network failure.
+The demo's application-owned `chat/models.json` supplies the picker. A model may declare an
+optional complete HTTP URL and/or a hub repository. The page verifies the complete URL first as
+a fallback, measures it against Hugging Face, ModelScope and `hf-mirror.com`, and uses the fastest
+reachable source for the whole load. With no complete URL, failure of all three hubs is final.
+This source policy is not part of the SDK; the page installs the existing reader it selected.
+
+The Vision entry's complete URL is a Pages path. The Pages deployment copies the intact assets
+from this repository's pinned Release into the site artifact, because Release downloads do not
+provide the CORS headers the browser needs. The model files are neither committed nor split.
 
 ### What a model takes, from the model  (`Model.surface`)
 

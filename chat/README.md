@@ -2,10 +2,19 @@
 
 A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodide + WebGPU).
 
-- **Any model, not a fixed list.** The dropdown is only a set of examples — type any
-  ModelScope `org/repo` and file to load it. General repo presets use ModelScope; the optional
-  Laya Vision browser export probes the pinned GitHub release, Hugging Face, its China mirror,
-  and ModelScope, then uses the reachable faster source automatically without a source selector.
+- **Repository-owned model list, not a hard-coded picker.** The page reads
+  [`models.json`](models.json) and creates the dropdown from it. Each entry has a display name,
+  an optional byte size, an optional complete HTTP URL, and/or a hub repository plus file.
+  A custom `org/repo/file` still works without a list entry.
+- **Automatic application-side source choice.** When an entry has a complete URL, the page
+  checks it first so it is available as a fallback, then measures Hugging Face, ModelScope and
+  `hf-mirror.com`. The fastest reachable source wins; if all hubs are absent, the complete URL
+  still works. Without a complete URL, no reachable hub means the model cannot be downloaded.
+  This is page policy: it installs one of the SDK's existing readers and does not alter SDK
+  download behavior. One selected source is pinned for the whole load.
+- **Optional metadata stays optional.** An omitted size is not shown. Selecting that entry
+  probes its source; when a file server reports a total byte count, the option is updated with
+  the measured size. `hash` may be supplied for an immutable publication but is not required.
 - **Image decisions when declared.** A decision preset whose `surface()` includes image input
   reveals an image picker. The page sends a typed base64 multimodal state through the same
   `decide(state, questions)` call and reports when the image feature cache was reused.
@@ -60,6 +69,26 @@ cross-origin isolation and open `/chat/`:
 node serve-coi.mjs . 8119     # COOP/COEP + HTTP Range
 # http://localhost:8119/chat/
 ```
+
+## Model list
+
+The minimum useful entry is a `name` plus either `repo` or `url`. `file` identifies a
+single-file hub model; without it the page probes `probe` (default `config.json`). A complete
+`url` points to that same file or probe document, not merely to a website:
+
+```json
+{
+  "name": "Example Q4",
+  "repo": "group/example-GGUF",
+  "file": "example-Q4_K_M.gguf",
+  "url": "https://downloads.example.net/example-Q4_K_M.gguf",
+  "size": 123456789
+}
+```
+
+`size` and `url` are optional. The current Vision entry points to a same-origin Pages path.
+The Pages deployment obtains the intact ONNX files from this repository's Release and places
+them at that path; the weights are not committed to Git and are not split.
 
 ## What actually fits in a browser
 The presets run from 0.4 GB to 13.8 GB — a 0.6B for a quick first run, up to full-size 27B

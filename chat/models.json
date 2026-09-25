@@ -1,0 +1,114 @@
+{
+  "format_version": 1,
+  "models": [
+    {
+      "name": "Qwen3-0.6B · Q4_K_M · quickest start",
+      "size": 396705472,
+      "repo": "unsloth/Qwen3-0.6B-GGUF",
+      "file": "Qwen3-0.6B-Q4_K_M.gguf"
+    },
+    {
+      "name": "Qwen3-1.7B · Q4_K_M",
+      "size": 1107409472,
+      "repo": "unsloth/Qwen3-1.7B-GGUF",
+      "file": "Qwen3-1.7B-Q4_K_M.gguf"
+    },
+    {
+      "name": "Qwen3-4B-Instruct · Q4_K_M",
+      "size": 2497281120,
+      "repo": "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+      "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+    },
+    {
+      "name": "Qwen3-8B · Q4_K_M",
+      "size": 5027784512,
+      "repo": "unsloth/Qwen3-8B-GGUF",
+      "file": "Qwen3-8B-Q4_K_M.gguf"
+    },
+    {
+      "name": "Qwen3-14B · Q4_K_M",
+      "size": 9001753984,
+      "repo": "unsloth/Qwen3-14B-GGUF",
+      "file": "Qwen3-14B-Q4_K_M.gguf"
+    },
+    {
+      "name": "Qwen3.8-27B · 3-bit UD-Q3_K_XL · hybrid SSM + MTP",
+      "size": 13146393504,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    },
+    {
+      "name": "Qwen3.8-27B · UD-IQ3_XXS",
+      "size": 10934860704,
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-IQ3_XXS.gguf"
+    },
+    {
+      "name": "Qwen3-32B · dense · UD-IQ3_XXS",
+      "size": 12967551648,
+      "repo": "unsloth/Qwen3-32B-GGUF",
+      "file": "Qwen3-32B-UD-IQ3_XXS.gguf"
+    },
+    {
+      "name": "Gemma-3-27B-it · dense · UD-IQ3_XXS",
+      "size": 10810020960,
+      "repo": "unsloth/gemma-3-27b-it-GGUF",
+      "file": "gemma-3-27b-it-UD-IQ3_XXS.gguf"
+    },
+    {
+      "name": "Mistral-Small-3.2-24B · dense · UD-Q3_K_XL",
+      "size": 11850886688,
+      "repo": "unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+      "file": "Mistral-Small-3.2-24B-Instruct-2506-UD-Q3_K_XL.gguf"
+    },
+    {
+      "name": "Mistral-Small-3.2-24B · dense · UD-IQ3_XXS",
+      "size": 9409220128,
+      "repo": "unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+      "file": "Mistral-Small-3.2-24B-Instruct-2506-UD-IQ3_XXS.gguf"
+    },
+    {
+      "name": "gpt-oss-20B · MoE · Q3_K_M",
+      "size": 11506103488,
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "file": "gpt-oss-20b-Q3_K_M.gguf"
+    },
+    {
+      "name": "Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL",
+      "size": 13833048480,
+      "repo": "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+      "file": "Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf"
+    },
+    {
+      "name": "Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL",
+      "size": 13806312608,
+      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "file": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf"
+    },
+    {
+      "name": "Laya · decision model · answers questions, writes nothing",
+      "size": 846195574,
+      "repo": "convaiinnovations/laya",
+      "probe": "rl_agent_config.json"
+    },
+    {
+      "name": "Laya Vision · image + text decisions · FP16 WebGPU",
+      "kind": "vision-decision",
+      "repo": "thaitea/laya-vision-web",
+      "probe": "laya_web.json",
+      "url": "https://xnetsc.github.io/webpytorch/chat/models/thaitea/laya-vision-web/resolve/main/laya_web.json",
+      "publication": {
+        "release": "laya-vision-web-201m-v1",
+        "path": "chat/models/thaitea/laya-vision-web/resolve/main",
+        "files": [
+          "laya_web.json",
+          "tokenizer.json",
+          "tokenizer_config.json",
+          "vision_fp16.onnx",
+          "text_fp16.onnx",
+          "head_fp16.onnx"
+        ]
+      }
+    }
+  ]
+}

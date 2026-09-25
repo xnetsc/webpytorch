@@ -1,4 +1,4 @@
-/* Chat UI: model selection (any ModelScope model), load/release with status, cache
+/* Chat UI: registry-backed model selection, load/release with status, cache
    management, camera/file/URL tools, and zip export/import of the conversation. */
 const $ = (s) => document.querySelector(s);
 
@@ -120,10 +120,9 @@ const sdk = webtorch.start({
   onModel: (m) => { m.state === 'loaded' ? afterLoad(m) : afterRelease(); },
 }).then(async (w) => {
   wt = w;
-  // Where models come from, and that they are kept. Both are this page's policy: the SDK
-  // offers a reader and a writer and installs neither.
+  // Where models come from is selected immediately before each load. Keeping downloaded
+  // bytes is also this page's policy; the SDK installs neither callback by itself.
   await w.run('import webtorch\n'
-            + 'webtorch.set_io_read(webtorch.modelscope_read())\n'
             + 'webtorch.set_io_write(webtorch.default_io_write)\n');
   showBackend(w.backend, w.reason);
   return w;
@@ -245,42 +244,38 @@ function saveConvs() {
 function current() { return convs.find(c => c.id === curId) || null; }
 
 
-// Presets are EXAMPLES ONLY — any ModelScope repo/file works via the two inputs.
-// Examples only — any ModelScope repo/file works through the two inputs below.
+// Presets are examples only. The application resolves every remote model through the same
+// source policy; the SDK remains unaware of mirrors and repository preference.
 // Full-size models at 3-bit-ish quantization, across several families and both dense and MoE,
-// so the picker is not tied to one vendor or one architecture. `gb` drives the environment fit.
-const PRESETS = [
-  // Small first: a visitor on a modest machine should be able to reach a conversation in
-  // under a minute rather than after a 13 GB download. Sizes are the real file sizes.
-  { gb: 0.4,  label: 'Qwen3-0.6B · Q4_K_M · quickest start', repo: 'unsloth/Qwen3-0.6B-GGUF', file: 'Qwen3-0.6B-Q4_K_M.gguf' },
-  { gb: 1.0,  label: 'Qwen3-1.7B · Q4_K_M', repo: 'unsloth/Qwen3-1.7B-GGUF', file: 'Qwen3-1.7B-Q4_K_M.gguf' },
-  { gb: 2.3,  label: 'Qwen3-4B-Instruct · Q4_K_M', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF', file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf' },
-  { gb: 4.7,  label: 'Qwen3-8B · Q4_K_M', repo: 'unsloth/Qwen3-8B-GGUF', file: 'Qwen3-8B-Q4_K_M.gguf' },
-  { gb: 8.4,  label: 'Qwen3-14B · Q4_K_M', repo: 'unsloth/Qwen3-14B-GGUF', file: 'Qwen3-14B-Q4_K_M.gguf' },
-  { gb: 13.2, label: 'Qwen3.8-27B · 3-bit UD-Q3_K_XL · hybrid SSM + MTP', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-Q3_K_XL.gguf' },
-  { gb: 10.9, label: 'Qwen3.8-27B · UD-IQ3_XXS', repo: 'unsloth/Qwen3.8-27B-GGUF', file: 'Qwen3.8-27B-UD-IQ3_XXS.gguf' },
-  { gb: 13.0, label: 'Qwen3-32B · dense · UD-IQ3_XXS', repo: 'unsloth/Qwen3-32B-GGUF', file: 'Qwen3-32B-UD-IQ3_XXS.gguf' },
-  { gb: 10.8, label: 'Gemma-3-27B-it · dense · UD-IQ3_XXS', repo: 'unsloth/gemma-3-27b-it-GGUF', file: 'gemma-3-27b-it-UD-IQ3_XXS.gguf' },
-  { gb: 11.9, label: 'Mistral-Small-3.2-24B · dense · UD-Q3_K_XL', repo: 'unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF', file: 'Mistral-Small-3.2-24B-Instruct-2506-UD-Q3_K_XL.gguf' },
-  { gb: 9.4,  label: 'Mistral-Small-3.2-24B · dense · UD-IQ3_XXS', repo: 'unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF', file: 'Mistral-Small-3.2-24B-Instruct-2506-UD-IQ3_XXS.gguf' },
-  { gb: 11.5, label: 'gpt-oss-20B · MoE · Q3_K_M', repo: 'unsloth/gpt-oss-20b-GGUF', file: 'gpt-oss-20b-Q3_K_M.gguf' },
-  { gb: 13.8, label: 'Qwen3-30B-A3B-Instruct · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF', file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf' },
-  { gb: 13.8, label: 'Qwen3-Coder-30B-A3B · MoE · UD-Q3_K_XL', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF', file: 'Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf' },
-  // Not a chat model: it writes nothing, and answers typed questions with probability
-  // scores instead. It is in the same list because the picker loads models, not
-  // chats -- what the page then puts on screen comes from what the model says it takes.
-  { gb: 0.8,  label: 'Laya · decision model · answers questions, writes nothing',
-    repo: 'convaiinnovations/laya', file: '' },
-  { gb: 0.5, label: 'Laya Vision · image + text decisions · FP16 WebGPU',
-    repo: 'thaitea/laya-vision-web', file: '', kind: 'vision-decision',
-    baseUrls: [
-      'https://github.com/xnetsc/webpytorch/releases/download/laya-vision-web-201m-v1/',
-      'https://hf-mirror.com/thaitea/laya-vision-web/resolve/main/',
-      'https://huggingface.co/thaitea/laya-vision-web/resolve/main/',
-      'https://modelscope.cn/models/thaitea/laya-vision-web/resolve/master/',
-    ] },
-  { gb: 0,    label: '— custom (type a repo/file below) —', repo: '', file: '' },
-];
+// so the picker is not tied to one vendor or one architecture. The repository-owned list is
+// loaded at startup; adding a model never requires editing this script.
+let PRESETS = [];
+async function loadModelList() {
+  const response = await fetch('models.json', { cache: 'no-cache' });
+  if (!response.ok) throw new Error('model list HTTP ' + response.status);
+  const list = await response.json();
+  if (list.format_version !== 1 || !Array.isArray(list.models)) {
+    throw new Error('unsupported model list');
+  }
+  PRESETS = list.models.map((model, index) => {
+    if (!model || typeof model.name !== 'string' || !model.name.trim()) {
+      throw new Error('model list item ' + index + ' has no name');
+    }
+    if (model.size != null && (!Number.isFinite(model.size) || model.size <= 0)) {
+      throw new Error('model list item ' + index + ' has an invalid size');
+    }
+    if (!model.repo && !model.url) {
+      throw new Error('model list item ' + index + ' needs repo or url');
+    }
+    if (model.url && !/^https?:\/\//.test(model.url)) {
+      throw new Error('model list item ' + index + ' has an invalid url');
+    }
+    return { ...model, label: model.name, gb: model.size ? model.size / 1e9 : 0,
+      file: model.file || '' };
+  });
+  PRESETS.push({ gb: 0, label: '— custom (type a repo/file below) —', repo: '', file: '' });
+  return PRESETS;
+}
 
 // What this machine can actually take: RAM, how much the browser will let us cache, and
 // whether the GPU backend is available. Used to order the picker, never to hide anything.
@@ -1405,19 +1400,33 @@ function wireGpuMem() {
 function fillPresets() {
   const sel = $('#preset'); sel.innerHTML = '';
   const custom = PRESETS[PRESETS.length - 1];
-  const DEFAULT = PRESETS[0];                       // Qwen3.8-27B 3-bit
+  const DEFAULT = PRESETS[0];                       // first registry entry is the default
   const models = PRESETS.slice(0, -1);
 
   // The "from this device" entries are actions, not selectable models: choosing one opens
   // a picker, and cancelling restores whatever was selected before.
   let lastGood = null;
-  sel.onchange = () => {
+  sel.onchange = async () => {
     const p = PRESETS[sel.value];
     if (!p) { localPick(sel.value, () => { sel.value = lastGood; }); return; }
     lastGood = sel.value;
     // one box, shown only for a model that is not in the list
-    $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : '';
-    $('#customBox').hidden = !!p.repo;
+    $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : (p.url || '');
+    $('#customBox').hidden = !!(p.repo || p.url);
+    if (!p.size && (p.repo || p.url)) {
+      const value = sel.value;
+      try {
+        const spec = remoteModelSpec(p.repo || p.url, p);
+        const source = p.kind === 'vision-decision'
+          ? (await decisionSource(p), chosenModelSources.get(`${spec.repo || ''}@${spec.probe}@${spec.url || ''}`))
+          : await applicationModelSource(spec);
+        if (source && source.total && (p.file || p.kind === 'vision-decision')) {
+          p.size = source.total; p.gb = source.total / 1e9;
+          const option = [...sel.options].find(item => item.value === value);
+          if (option) option.textContent = p.label + ' (' + p.gb.toFixed(1) + ' GB)';
+        }
+      } catch { /* source availability is reported if the person actually loads it */ }
+    }
   };
 
   // Hide only what this device genuinely cannot run: weights that exceed usable memory.
@@ -1463,46 +1472,134 @@ function fillPresets() {
 // While a load is in flight the same button is the stop control — the only way out of a
 // multi-GB download — and everything reverts to the initial state once it stops.
 let loading = false;
-const chosenDecisionSources = new Map();
+const chosenModelSources = new Map();
+const APPLICATION_MODEL_SOURCES = [
+  { id: 'modelscope', label: 'ModelScope', kind: 'modelscope', endpoint: 'https://modelscope.cn',
+    revision: 'master' },
+  { id: 'huggingface', label: 'Hugging Face', kind: 'hf', endpoint: 'https://huggingface.co',
+    revision: 'main' },
+  { id: 'hf-mirror', label: 'Hugging Face mirror', kind: 'hf', endpoint: 'https://hf-mirror.com',
+    revision: 'main' },
+];
 
-async function probeDecisionSource(baseUrl) {
+function sourceBase(source, repo) {
+  if (source.kind === 'direct') return source.baseUrl;
+  const root = source.endpoint.replace(/\/$/, '');
+  const model = repo.split('/').map(encodeURIComponent).join('/');
+  return source.kind === 'modelscope'
+    ? `${root}/models/${model}/resolve/${encodeURIComponent(source.revision)}/`
+    : `${root}/${model}/resolve/${encodeURIComponent(source.revision)}/`;
+}
+
+async function sampleSource(source, repo, probePath, validate) {
+  const baseUrl = sourceBase(source, repo);
   const started = performance.now();
-  const manifestResponse = await fetch(baseUrl + 'laya_web.json', {
-    cache: 'no-cache', signal: AbortSignal.timeout(15000),
+  const probeUrl = source.kind === 'direct' ? source.url
+    : new URL(probePath.split('/').map(encodeURIComponent).join('/'), baseUrl).href;
+  const response = await fetch(probeUrl, {
+    cache: 'no-cache', headers: { Range: 'bytes=0-1048575' },
+    signal: AbortSignal.timeout(15000),
   });
-  if (!manifestResponse.ok) throw new Error('HTTP ' + manifestResponse.status);
-  const manifest = await manifestResponse.json();
-  if (manifest.format_version !== 1 || manifest.source !== 'thaitea/laya-vision'
-      || !manifest.files?.['text_fp16.onnx']) throw new Error('unexpected export');
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+  const contentRange = response.headers.get('content-range') || '';
+  const rangeTotal = /\/(\d+)$/.exec(contentRange);
+  const total = rangeTotal ? Number(rangeTotal[1])
+    : response.status === 200 ? Number(response.headers.get('content-length')) || 0 : 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (received < 1048576) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const keep = value.subarray(0, Math.min(value.length, 1048576 - received));
+    chunks.push(keep); received += keep.length;
+  }
+  try { await reader.cancel(); } catch { /* response already ended */ }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+  const metadata = validate ? (await validate(bytes, baseUrl) || {}) : {};
   const latency = performance.now() - started;
-  let rate = 0;
-  const sampleStarted = performance.now();
-  try {
-    const sample = await fetch(baseUrl + 'text_fp16.onnx', {
-      headers: { Range: 'bytes=0-1048575' }, signal: AbortSignal.timeout(12000),
-    });
-    if (!sample.ok) throw new Error('sample HTTP ' + sample.status);
-    const reader = sample.body.getReader();
-    let bytes = 0;
-    while (bytes < 1048576) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.length;
-    }
-    await reader.cancel();
-    rate = bytes / Math.max(0.001, (performance.now() - sampleStarted) / 1000);
-  } catch { /* valid export; speed sample is advisory */ }
-  return { baseUrl, latency, rate };
+  return { ...source, baseUrl, latency, total: metadata.size || total,
+    rate: bytes.length / Math.max(0.001, latency / 1000) };
+}
+
+function directSource(url, probePath) {
+  if (!url) return null;
+  const target = new URL(url, location.href);
+  const encoded = probePath.split('/').map(encodeURIComponent).join('/');
+  const suffix = '/' + encoded;
+  const baseUrl = target.pathname.endsWith(suffix)
+    ? target.href.slice(0, target.href.length - encoded.length)
+    : new URL('.', target).href;
+  return { id: 'url', label: 'listed URL', kind: 'direct', url: target.href, baseUrl,
+    revision: null };
+}
+
+async function applicationModelSource(spec, validate) {
+  const { repo, probe: probePath, url } = spec;
+  const key = `${repo || ''}@${probePath}@${url || ''}`;
+  if (chosenModelSources.has(key)) return chosenModelSources.get(key);
+  // The explicit URL is checked first so it is known-good as a fallback. It does not win by
+  // declaration: all matching hubs are then sampled and the fastest successful source wins.
+  const available = [];
+  const direct = directSource(url, probePath);
+  if (direct) {
+    try { available.push(await sampleSource(direct, repo, probePath, validate)); }
+    catch { /* the hubs may still carry it */ }
+  }
+  const attempts = repo ? await Promise.allSettled(APPLICATION_MODEL_SOURCES
+    .map(source => sampleSource(source, repo, probePath, validate))) : [];
+  available.push(...attempts.filter(item => item.status === 'fulfilled').map(item => item.value));
+  available.sort((a, b) => b.rate - a.rate || a.latency - b.latency);
+  if (!available.length) throw new Error('No model source is reachable.');
+  chosenModelSources.set(key, available[0]);
+  return available[0];
+}
+
+function remoteModelSpec(id, preset) {
+  if (preset && (preset.repo || preset.url)) return { repo: preset.repo || '',
+    file: preset.file || '', probe: preset.probe || preset.file || 'config.json',
+    url: preset.url || '', preset };
+  const parts = id.replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length < 2) throw new Error('Use org/repo or org/repo/path-to-file.');
+  return { repo: parts.slice(0, 2).join('/'), file: parts.slice(2).join('/'),
+    probe: parts.slice(2).join('/') || 'config.json', url: '', preset: null };
+}
+
+async function installApplicationReader(w, spec) {
+  const source = await applicationModelSource(spec);
+  if (source.total && spec.file && spec.preset && !spec.preset.size) {
+    spec.preset.size = source.total;
+    spec.preset.gb = source.total / 1e9;
+  }
+  if (source.kind === 'direct') {
+    const base = JSON.stringify(source.baseUrl);
+    const exact = JSON.stringify(source.url);
+    const probe = JSON.stringify(spec.probe);
+    await w.run('import webtorch\nwebtorch.set_io_read(webtorch.hub_read('
+      + 'lambda repo, path: ' + exact + ' if path == ' + probe + ' else ' + base + ' + path))\n');
+  } else {
+    const endpoint = JSON.stringify(source.endpoint);
+    const revision = JSON.stringify(source.revision);
+    const factory = source.kind === 'modelscope' ? 'modelscope_read' : 'hf_read';
+    await w.run('import webtorch\nwebtorch.set_io_read(webtorch.' + factory
+      + '(revision=' + revision + ', endpoint=' + endpoint + '))\n');
+  }
+  return source;
 }
 
 async function decisionSource(preset) {
-  if (chosenDecisionSources.has(preset.repo)) return chosenDecisionSources.get(preset.repo);
-  const attempts = await Promise.allSettled((preset.baseUrls || []).map(probeDecisionSource));
-  const available = attempts.filter(item => item.status === 'fulfilled').map(item => item.value)
-    .sort((a, b) => b.rate - a.rate || a.latency - b.latency);
-  if (!available.length) throw new Error('No published Laya Vision source is reachable.');
-  chosenDecisionSources.set(preset.repo, available[0].baseUrl);
-  return available[0].baseUrl;
+  const spec = remoteModelSpec(preset.repo || preset.url, preset);
+  const selected = await applicationModelSource(spec,
+    async (bytes) => {
+      const manifest = JSON.parse(new TextDecoder().decode(bytes));
+      if (manifest.format_version !== 1 || manifest.source !== 'thaitea/laya-vision'
+          || !manifest.files?.['text_fp16.onnx']) throw new Error('unexpected export');
+      return { size: ['vision_fp16.onnx', 'text_fp16.onnx', 'head_fp16.onnx']
+        .reduce((sum, name) => sum + Number(manifest.files[name]?.bytes || 0), 0) };
+    });
+  return selected.baseUrl;
 }
 
 $('#loadBtn').onclick = async () => {
@@ -1555,7 +1652,14 @@ $('#loadBtn').onclick = async () => {
       afterLoad({ id: chosen.repo, kind: 'decision', surface });
       showStatus('ready: ' + visionDecision.model + ' on ' + visionDecision.backend);
     } else {
-      await (await sdk).load(repo, { file, maxContext: lmaxValue(),
+      const runner = await sdk;
+      const spec = remoteModelSpec(id, chosen);
+      const source = await installApplicationReader(runner, spec);
+      showStatus('loading from ' + source.label + '…');
+      const loadTarget = spec.repo
+        ? (spec.file ? spec.repo + '/' + spec.file : spec.repo)
+        : 'registry/direct-' + PRESETS.indexOf(chosen) + '/' + spec.probe;
+      await runner.load(loadTarget, { file: '', maxContext: lmaxValue(),
                                     onProgress: onLoadProgress, onStage: onLoadStage });
     }
     note('Model ready. Large models take a while on first load; afterwards they come from the cache.');
@@ -4824,7 +4928,11 @@ loadConvs().then(() => {
   if (!convs.length) newConv(); else curId = convs[0].id;
   renderConvs(); render();
 });
-detectEnv().then(() => { fillPresets(); wireGpuMem(); });
+Promise.all([detectEnv(), loadModelList()]).then(() => {
+  fillPresets(); wireGpuMem();
+}).catch(error => {
+  $('#modelStatus').textContent = 'model list failed: ' + error.message;
+});
 // Ask the SDK to tell us when origin storage runs out, so the page can offer a folder.
 sdk.then(w => w.cache.watch((m) => offerDirectory(m.key))).catch(() => {});
 wirePython();
@@ -4835,7 +4943,7 @@ setTimeout(dbgStart, 2500);
 // After the first paint: booting a second Python is a few seconds of CPU, and the model
 // runtime starting up is what the person is actually waiting for.
 setTimeout(pyStart, 1200);
-note('Pick a model and press Load. Downloads come from ModelScope and are cached, so the next load is instant.');
+note('Pick a model and press Load. The listed URL and available model hubs are measured automatically; downloads are cached.');
 sdk.then(refreshCache).catch(e => {
   $('#modelStatus').textContent = 'runtime failed: ' + e.message;
   $('#openSettings').disabled = false;        // a dead runtime must not lock the UI shut
