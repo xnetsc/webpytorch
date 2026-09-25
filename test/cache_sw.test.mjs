@@ -63,3 +63,17 @@ test('an unexpected partial response is not handed to CacheStorage', async () =>
   assert.equal(runtime.cacheOpens(), 0);
   assert.deepEqual(runtime.notes, []);
 });
+
+test('browser-extension resources bypass CacheStorage', async () => {
+  const runtime = worker(new Response('asset'));
+  const waits = [];
+  const response = await runtime.handler({
+    url: 'chrome-extension://example/font.woff2',
+    headers: new Headers(),
+  }, { keepUntil(promise) { waits.push(promise); } });
+  await Promise.all(waits);
+  assert.equal(await response.text(), 'asset');
+  assert.equal(runtime.fetches(), 1);
+  assert.equal(runtime.cacheOpens(), 0);
+  assert.deepEqual(runtime.notes, []);
+});

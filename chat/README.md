@@ -7,11 +7,12 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   an optional byte size, an optional complete HTTP URL, and/or a hub repository plus file.
   A custom `org/repo/file` still works without a list entry.
 - **Automatic application-side source choice.** When an entry has a complete URL, the page
-  checks it first so it is available as a fallback, then measures Hugging Face, ModelScope and
-  `hf-mirror.com`. The fastest reachable source wins; if all hubs are absent, the complete URL
+  checks it first so it is available as a fallback, then measures Hugging Face and ModelScope.
+  The fastest reachable source wins; if all hubs are absent, the complete URL
   still works. Without a complete URL, no reachable hub means the model cannot be downloaded.
   This is page policy: it installs one of the SDK's existing readers and does not alter SDK
-  download behavior. One selected source is pinned for the whole load.
+  download behavior. One selected source is pinned for the whole load. Sources that do not
+  permit browser CORS, such as `hf-mirror.com`, cannot participate in a Pages download.
 - **Optional metadata stays optional.** An omitted size is not shown. Selecting that entry
   probes its source; when a file server reports a total byte count, the option is updated with
   the measured size. `hash` may be supplied for an immutable publication but is not required.

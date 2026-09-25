@@ -193,6 +193,12 @@ async function fromNetwork(req, ctx) {
 }
 
 webtorch.handleFetch(function (req, ctx) {
+  // CacheStorage only accepts HTTP(S), while browser extensions may inject chrome-extension
+  // font/script requests into the page. Passing those through avoids noisy, harmless cache
+  // errors without making the page responsible for extension assets.
+  var protocol;
+  try { protocol = new URL(req.url).protocol; } catch (e) { return fetch(req); }
+  if (protocol !== 'http:' && protocol !== 'https:') return fetch(req);
   // Model weights are range-streamed and cached by webtorch's read/write callbacks. Let the
   // request pass through untouched: CacheStorage cannot store 206 responses, and attempting
   // it used to report a TypeError after every completed model chunk.

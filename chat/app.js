@@ -1478,8 +1478,6 @@ const APPLICATION_MODEL_SOURCES = [
     revision: 'master' },
   { id: 'huggingface', label: 'Hugging Face', kind: 'hf', endpoint: 'https://huggingface.co',
     revision: 'main' },
-  { id: 'hf-mirror', label: 'Hugging Face mirror', kind: 'hf', endpoint: 'https://hf-mirror.com',
-    revision: 'main' },
 ];
 
 function sourceBase(source, repo) {

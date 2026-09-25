@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const list = JSON.parse(await readFile(new URL('../chat/models.json', import.meta.url), 'utf8'));
+const appSource = await readFile(new URL('../chat/app.js', import.meta.url), 'utf8');
 
 test('chat model list has valid optional metadata and a usable source', () => {
   assert.equal(list.format_version, 1);
@@ -26,4 +27,8 @@ test('Vision has a complete browser-readable fallback publication', () => {
   assert.equal(model.probe, 'laya_web.json');
   assert.match(model.url, /^https:\/\/xnetsc\.github\.io\/webpytorch\/chat\/models\//);
   assert.equal(model.size, undefined, 'omitted size exercises selected-entry probing');
+});
+
+test('browser source selection excludes endpoints without CORS support', () => {
+  assert.doesNotMatch(appSource, /endpoint:\s*['"]https:\/\/hf-mirror\.com/);
 });
