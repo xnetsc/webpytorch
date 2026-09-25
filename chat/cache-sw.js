@@ -144,7 +144,10 @@ async function sweepDeleted(c) {
 // stayed empty while everything looked fine. `keepUntil` keeps the worker alive until the
 // write lands; without it a worker that goes idle takes the pending put with it.
 function keep(ctx, cacheName, url, res) {
-  if (!res || !res.ok || res.type === 'opaque') return res;   // opaque: unreadable, poison
+  // CacheStorage rejects partial responses. Model readers deliberately use HTTP ranges and
+  // keep those chunks in the application's IndexedDB cache, so cloning a 206 here both adds
+  // no persistence and can disturb the response stream the loader is still consuming.
+  if (!res || !res.ok || res.type === 'opaque' || res.status === 206) return res;
   var copy = res.clone();
   ctx.keepUntil(caches.open(cacheName).then(async function (c) {
     try {
@@ -190,6 +193,10 @@ async function fromNetwork(req, ctx) {
 }
 
 webtorch.handleFetch(function (req, ctx) {
+  // Model weights are range-streamed and cached by webtorch's read/write callbacks. Let the
+  // request pass through untouched: CacheStorage cannot store 206 responses, and attempting
+  // it used to report a TypeError after every completed model chunk.
+  if (req.headers && req.headers.has('range')) return fetch(req);
   return isFixed(req.url) ? fromCache(req, ctx) : fromNetwork(req, ctx);
 });
 
