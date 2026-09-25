@@ -4,8 +4,8 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
 
 - **Any model, not a fixed list.** The dropdown is only a set of examples — type any
   ModelScope `org/repo` and file to load it. General repo presets use ModelScope; the optional
-  Laya Vision browser export probes its published ModelScope and Hugging Face locations, then
-  uses the reachable faster source automatically without a source selector.
+  Laya Vision browser export probes the pinned GitHub release, Hugging Face, its China mirror,
+  and ModelScope, then uses the reachable faster source automatically without a source selector.
 - **Image decisions when declared.** A decision preset whose `surface()` includes image input
   reveals an image picker. The page sends a typed base64 multimodal state through the same
   `decide(state, questions)` call and reports when the image feature cache was reused.

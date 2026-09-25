@@ -274,8 +274,10 @@ const PRESETS = [
   { gb: 0.5, label: 'Laya Vision · image + text decisions · FP16 WebGPU',
     repo: 'thaitea/laya-vision-web', file: '', kind: 'vision-decision',
     baseUrls: [
-      'https://modelscope.cn/models/thaitea/laya-vision-web/resolve/master/',
+      'https://github.com/xnetsc/webpytorch/releases/download/laya-vision-web-201m-v1/',
+      'https://hf-mirror.com/thaitea/laya-vision-web/resolve/main/',
       'https://huggingface.co/thaitea/laya-vision-web/resolve/main/',
+      'https://modelscope.cn/models/thaitea/laya-vision-web/resolve/master/',
     ] },
   { gb: 0,    label: '— custom (type a repo/file below) —', repo: '', file: '' },
 ];

@@ -457,6 +457,9 @@ an application to show an image input only when the loaded model declares it.
 The adapter code is Apache-2.0-derived as recorded in `NOTICE`. Model weights are separate: check
 the selected checkpoint's license before distributing or using them. In particular,
 `thaitea/laya-vision` weights are CC BY-NC-SA 4.0 and are not bundled with this SDK.
+The demo probes a SHA-256-described, pinned GitHub release plus Hugging Face, `hf-mirror.com`,
+and ModelScope candidates and uses the fastest reachable copy. A mirror only helps connectivity:
+an absent or restricted repository is rejected rather than treated as a network failure.
 
 ### What a model takes, from the model  (`Model.surface`)
 
