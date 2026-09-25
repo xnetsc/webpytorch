@@ -472,6 +472,13 @@ This source policy is not part of the SDK; the page installs the existing reader
 The Vision entry's complete URL is a Pages path. The Pages deployment copies the intact assets
 from this repository's pinned Release into the site artifact, because Release downloads do not
 provide the CORS headers the browser needs. The model files are neither committed nor split.
+The catalog's `thaitea/laya-vision-web` value is only the logical path of that publication, not a
+separate upstream checkpoint: its manifest pins the recommended
+`thaitea/laya-vision@8b318c99d7ad3ce19c24369263463882eada9d1e` weights and the author's exporter
+validates the FP16 ONNX graphs. It does not use the withdrawn quality-reduced web checkpoint.
+Export parity is not a substitute for rerunning the checkpoint's full quality suite. The base
+model declares English as its language, and no Chinese evaluation is published; Chinese text may
+tokenize and run, but must not be presented as validated language support.
 
 ### What a model takes, from the model  (`Model.surface`)
 

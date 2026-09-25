@@ -153,6 +153,9 @@ everything below is a page you can use rather than a screenshot of one.
 - **Typed image decisions.** The optional Laya Vision preset exposes an image picker only after
   its model surface declares image input, then keeps the same `decide(state, questions)` protocol
   as text decisions and reuses cached features for an unchanged image.
+  The browser publication is an FP16 ONNX export of the pinned official 201M checkpoint, not the
+  withdrawn quality-reduced web checkpoint. Its base model declares English; Chinese input is not
+  a published or validated capability.
 - **Replies that render.** Markdown, syntax-highlighted code, LaTeX typeset with KaTeX,
   tables. Sanitised before it reaches the DOM.
 - **The model can press it too.** Python and JavaScript are offered to the model as tools;

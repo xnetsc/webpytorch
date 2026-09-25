@@ -92,9 +92,10 @@
       "probe": "rl_agent_config.json"
     },
     {
-      "name": "Laya Vision · image + text decisions · FP16 WebGPU",
+      "name": "Laya Vision 201M · official checkpoint FP16 ONNX · English",
       "kind": "vision-decision",
       "repo": "thaitea/laya-vision-web",
+      "checkpoint": "thaitea/laya-vision@8b318c99d7ad3ce19c24369263463882eada9d1e",
       "probe": "laya_web.json",
       "url": "https://xnetsc.github.io/webpytorch/chat/models/thaitea/laya-vision-web/resolve/main/laya_web.json",
       "publication": {
