@@ -3,8 +3,8 @@
  */
 // Inference worker: loads the exported ONNX graphs with onnxruntime-web (WebGPU, else WASM) and answers
 // {type: "run"} messages with the same answer schema as VLMAgent.predict. All model work happens here so the
-// page stays responsive. Nothing leaves the browser: the only network requests are the pinned runtime files from
-// jsDelivr and the model files from the URL the page gives us.
+// page stays responsive. Model bytes are requested from the page and therefore go through the same installed
+// SDK io_read callback as every other model. This worker owns no source selection, transport or persistent cache.
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
 import { Tokenizer } from "https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.2.0/dist/tokenizers.min.mjs";
 import * as laya from "./decision-vision-runtime.js";
@@ -12,8 +12,9 @@ import * as laya from "./decision-vision-runtime.js";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 
-const CACHE = "laya-vision-models-v1";
 let state = null; // {cfg, tok, sessions, backend, variant, featureCache, maxFeatureCache}
+let nextReadId = 1;
+const pendingReads = new Map();
 
 function cachedFeature(key) {
   if (!key || !state.featureCache.has(key)) return null;
@@ -34,44 +35,46 @@ function rememberFeature(key, value) {
 
 const send = (type, data = {}) => self.postMessage({ type, ...data });
 
-async function cached(key) {
-  try {
-    const cache = await caches.open(CACHE);
-    return { cache, hit: await cache.match(key) };
-  } catch {
-    return { cache: null, hit: null };
-  }
+function requestBytes(name, offset = 0, length = null) {
+  const id = nextReadId++;
+  return new Promise((resolve, reject) => {
+    pendingReads.set(id, { resolve, reject });
+    send("read", { id, name, offset, length });
+  });
 }
 
-/** GET ``url`` as an ArrayBuffer with progress messages, through the Cache Storage API when it is available. The
- * cache key carries the file's SHA-256 from laya_web.json, so a re-export under the same URL is fetched again instead
- * of served stale (the first fp16 export was broken on real GPUs and replaced in place). */
-async function fetchBytes(url, label, sha256) {
-  const key = sha256 ? `${url}?sha256=${sha256}` : url;
-  const { cache, hit } = await cached(key);
-  let res = hit;
-  if (!res) {
-    res = await fetch(url);
-    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+/** Read a known-size model file in the cache's native 16 MiB units. Each request goes to
+ * webtorch.io_read on the Python worker; interrupted downloads therefore retain every chunk
+ * that hf_read/modelscope_read/hub_read already persisted. */
+async function readFile(model, path, label, size, sha256) {
+  const name = `${model}/${path}${sha256 ? `?sha256=${encodeURIComponent(sha256)}` : ""}`;
+  if (!size) return new Uint8Array(await requestBytes(name, 0, null));
+  const chunk = 16 * 1024 * 1024;
+  const parallel = 4;
+  const out = new Uint8Array(size);
+  let loaded = 0;
+  for (let base = 0; base < size; base += chunk * parallel) {
+    const requests = [];
+    for (let offset = base; offset < Math.min(size, base + chunk * parallel); offset += chunk) {
+      const length = Math.min(chunk, size - offset);
+      requests.push(requestBytes(name, offset, length).then((value) => {
+        const bytes = new Uint8Array(value);
+        if (bytes.length !== length) {
+          throw new Error(`${path}: short read at ${offset} (${bytes.length}/${length})`);
+        }
+        out.set(bytes, offset);
+        loaded += bytes.length;
+        send("progress", { phase: "load", label, loaded, total: size });
+      }));
+    }
+    await Promise.all(requests);
   }
-  const total = Number(res.headers.get("content-length")) || 0;
-  const reader = res.clone().body.getReader();
-  const parts = [];
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    got += value.length;
-    send("progress", { phase: "load", label, loaded: got, total, cached: !!hit });
-  }
-  const buf = new Uint8Array(got);
-  let o = 0;
-  for (const p of parts) { buf.set(p, o); o += p.length; }
-  if (cache && !hit) {
-    try { await cache.put(key, res); } catch { /* quota: fine, the HTTP cache may still help */ }
-  }
-  return buf;
+  return out;
+}
+
+async function readJSON(model, path) {
+  const bytes = await readFile(model, path, path, 0, null);
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 /** ``{ep, f16, adapter}``: WebGPU when asked for (or "auto") and an adapter exists, else WASM. ``f16`` says whether
@@ -89,13 +92,12 @@ async function pickBackend(requested) {
   return { ep: "webgpu", f16: adapter.features.has("shader-f16"), adapter: name + (adapter.isFallbackAdapter ? " (fallback)" : "") };
 }
 
-async function load({ baseUrl, variant, backend, imageCacheEntries = 32 }) {
+async function load({ model, variant, backend, imageCacheEntries = 32 }) {
   const t0 = performance.now();
-  const base = new URL(baseUrl, self.location.href);
-  if (!base.pathname.endsWith("/")) base.pathname += "/";
-  const cfg = await (await fetch(new URL("laya_web.json", base), { cache: "no-cache" })).json();
+  const cfg = await readJSON(model, "laya_web.json");
   if (cfg.format_version !== 1 || cfg.readout !== "terminator") throw new Error("unsupported laya_web.json (format or readout)");
-  const [tj, tc] = await Promise.all(cfg.tokenizer.map((p) => fetch(new URL(p, base)).then((r) => r.json())));
+  const [tj, tc] = await Promise.all(cfg.tokenizer.map((p) => readJSON(model, p)));
+  if (!tj?.model) throw new Error(`invalid tokenizer.json (keys: ${Object.keys(tj || {}).join(", ")})`);
   const tok = new Tokenizer(tj, tc);
   const { ep, f16, adapter } = await pickBackend(backend);
   if (variant === "auto") variant = ep === "webgpu" && f16 ? "fp16" : "q8";
@@ -107,7 +109,7 @@ async function load({ baseUrl, variant, backend, imageCacheEntries = 32 }) {
     const file = `${name}${suffix}.onnx`;
     if (!cfg.files[file]) throw new Error(`${file} is not in laya_web.json; export it with --quantize ${variant}`);
     const t = performance.now();
-    const bytes = await fetchBytes(new URL(file, base).href, file, cfg.files[file].sha256);
+    const bytes = await readFile(model, file, file, Number(cfg.files[file].bytes || 0), cfg.files[file].sha256);
     timings[`download ${file}`] = performance.now() - t;
     const t2 = performance.now();
     // the tiny head graph runs on WASM: a WebGPU dispatch per op costs more than the arithmetic
@@ -192,6 +194,14 @@ async function run({ images, stateObj, questions, nPermutations }) {
 }
 
 self.onmessage = async ({ data }) => {
+  if (data.type === "read-result" || data.type === "read-error") {
+    const pending = pendingReads.get(data.id);
+    if (!pending) return;
+    pendingReads.delete(data.id);
+    if (data.type === "read-result") pending.resolve(data.bytes);
+    else pending.reject(new Error(data.message || "model read failed"));
+    return;
+  }
   try {
     if (data.type === "load") await load(data);
     else if (data.type === "run") await run(data);

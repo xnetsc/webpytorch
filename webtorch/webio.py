@@ -460,15 +460,19 @@ async def _read_streaming(r, url):
     # model, which is the worst outcome available here.
     want = None
     try:
-        cr = r.js_response.headers.get("content-range")
-        if cr and "/" in cr and "-" in cr:
-            span = cr.split(" ")[-1].split("/")[0]
-            a, b = span.split("-")
-            want = int(b) - int(a) + 1
-        else:
-            cl = r.js_response.headers.get("content-length")
-            if cl:
-                want = int(cl)
+        headers = r.js_response.headers
+        # Fetch exposes the DECODED response body, while Content-Length describes the
+        # compressed wire representation. Content-Encoding is not necessarily CORS-exposed,
+        # so a 200 response cannot safely be checked against Content-Length at all. A 206's
+        # Content-Range is the requested representation and is the exact check needed for
+        # the large model chunks this transport issues.
+        status = int(getattr(r, "status", 200) or 200)
+        if status == 206:
+            cr = headers.get("content-range")
+            if cr and "/" in cr and "-" in cr:
+                span = cr.split(" ")[-1].split("/")[0]
+                a, b = span.split("-")
+                want = int(b) - int(a) + 1
     except Exception:
         want = None
     parts, total = [], 0
@@ -540,7 +544,8 @@ async def _fetch_range(url, offset=0, length=None, headers=None, retries=4):
     — the shared transport under `default_io_read`, `hf_read`, and `modelscope_read`. Network
     reads are retried with exponential backoff so a streamed load (hundreds of ranged reads)
     survives a transient drop / reset."""
-    rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
+    rng = (("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None
+           else (("bytes=%d-" % offset) if offset else None))
     if not url.startswith(("http://", "https://")):         # local file (host)
         try:
             from pyodide.http import pyfetch                 # in browser, a bare path is a URL
@@ -653,7 +658,7 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
         data = await get(name, offset + got, want)
         # See the same inference in the hub reader below: a short answer ends the file, and
         # so does a read that asked for no length -- what came back is the rest of it.
-        if total is None and (want is None or len(data) < want):
+        if want is None or (total is None and len(data) < want):
             total = offset + got + len(data)
             known[name] = total
         await write_cache(name, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
@@ -1768,7 +1773,8 @@ def http_rate_limited(exc):
 async def http_get(url, offset=0, length=None, headers=None):
     """The built-in HTTP range transport (browser `fetch` / host `urllib`). Raises `HttpError`
     on a non-2xx status. A ready-made `fetch` building block for a read callback."""
-    rng = ("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None else None
+    rng = (("bytes=%d-%d" % (offset, offset + length - 1)) if length is not None
+           else (("bytes=%d-" % offset) if offset else None))
     data = await _fetch_once(url, rng, headers)
     # No `_note_download` here: the streaming reader already reported these bytes as they
     # arrived, and counting them again would double the rate it shows.
@@ -1902,9 +1908,14 @@ def prefetch_whole_file(fetch, size=None, cache_dir=None, chunk_mb=16, key=None)
             pass                                     # read-ahead is an optimisation, never a failure
 
     async def ahead(k, offset, length):
-        t = bg.get(k)
-        if t is None or t.done():
-            bg[k] = asyncio.ensure_future(fill(k))
+        # A whole-file read is already doing exactly what read-ahead would do. Starting a
+        # second fetch races two writers and, for compressed small files, can use the wire
+        # Content-Length as if it were the decoded file length. Read-ahead is only useful
+        # when the foreground asked for a bounded range.
+        if length is not None:
+            t = bg.get(k)
+            if t is None or t.done():
+                bg[k] = asyncio.ensure_future(fill(k))
         return await fetch(k, offset, length)
 
     return ahead
@@ -2293,7 +2304,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         # second case a whole-file read leaves the entry with no known size, and an entry
         # with no size can never be marked complete -- which is why small configs fetched in
         # one go sat in the cache reading "incomplete" forever while being entirely present.
-        if total is None and (want is None or len(data) < want):
+        if want is None or (total is None and len(data) < want):
             total = offset + got + len(data)
             known[url] = total
         await write_cache(url, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)

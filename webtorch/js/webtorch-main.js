@@ -393,6 +393,22 @@
       run: function (code, vars) { return call('run', { code: code, vars: vars || {} }); },
 
       /**
+       * The page-side end of the SAME global byte callbacks used by every Python loader.
+       * This is deliberately only a bridge: source selection, URL mapping and persistence
+       * all remain properties of whichever callbacks the application installed.
+       */
+      io: {
+        start: function () { return call('ioStart'); },
+        read: function (name, offset, length) {
+          return call('ioRead', { name: name, offset: offset || 0,
+                                  length: length == null ? null : length });
+        },
+        write: function (name, data, offset) {
+          return call('ioWrite', { name: name, data: data, offset: offset || 0 });
+        },
+      },
+
+      /**
        * Load a model. `source` is whatever the installed reader takes; `file` names one
        * inside a repo. Returns {id, kind, surface} -- `surface` is the model's own account
        * of what it takes and returns, so a caller builds itself from that rather than from

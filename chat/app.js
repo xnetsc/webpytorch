@@ -1567,8 +1567,8 @@ function remoteModelSpec(id, preset) {
     probe: parts.slice(2).join('/') || 'config.json', url: '', preset: null };
 }
 
-async function installApplicationReader(w, spec) {
-  const source = await applicationModelSource(spec);
+async function installApplicationReader(w, spec, selected) {
+  const source = selected || await applicationModelSource(spec);
   if (source.total && spec.file && spec.preset && !spec.preset.size) {
     spec.preset.size = source.total;
     spec.preset.gb = source.total / 1e9;
@@ -1599,7 +1599,7 @@ async function decisionSource(preset) {
       return { size: ['vision_fp16.onnx', 'text_fp16.onnx', 'head_fp16.onnx']
         .reduce((sum, name) => sum + Number(manifest.files[name]?.bytes || 0), 0) };
     });
-  return selected.baseUrl;
+  return { spec, selected };
 }
 
 $('#loadBtn').onclick = async () => {
@@ -1639,9 +1639,15 @@ $('#loadBtn').onclick = async () => {
     if (chosen && chosen.kind === 'vision-decision') {
       visionLoadAbort = new AbortController();
       showStatus('checking published model sources…');
-      const baseUrl = await decisionSource(chosen);
+      const { spec, selected } = await decisionSource(chosen);
+      const runner = await sdk;
+      const source = await installApplicationReader(runner, spec, selected);
+      showStatus('loading from ' + source.label + '…');
+      await runner.io.start();
       visionDecision = await webtorch.loadVisionDecision({
-        baseUrl, variant: 'auto', backend: 'auto',
+        model: spec.repo || ('registry/direct-' + PRESETS.indexOf(chosen)),
+        read: runner.io.read,
+        variant: 'auto', backend: 'auto',
         signal: visionLoadAbort.signal,
         onProgress: (progress) => onLoadProgress({
           bytes: Number(progress.loaded || 0), total: Number(progress.total || 0),

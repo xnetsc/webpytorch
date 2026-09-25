@@ -25,7 +25,22 @@
   importScripts(BASE + 'dist/wgpy-worker.js');
   importScripts(BASE + 'webtorch/js/webtorch-worker.js');
 
-  let pyodide = null, tasks = null, ready = false;
+  let pyodide = null, tasks = null, ready = false, ioSequence = 0;
+
+  // A runPythonAsync may yield in pyfetch and let another raw-IO call enter. Give each call
+  // its own globals so the installed reader keeps its bounded concurrency without one
+  // request overwriting another request's name/offset.
+  function ioNames() {
+    const base = '_wt_io_' + (++ioSequence);
+    return { name: base + '_name', offset: base + '_offset',
+             length: base + '_length', data: base + '_data', bytes: base + '_bytes' };
+  }
+
+  function clearGlobals(names) {
+    for (const name of Object.values(names)) {
+      try { pyodide.globals.delete(name); } catch (e) { /* not every call binds every name */ }
+    }
+  }
 
   // ---- the wire ------------------------------------------------------------------------
   //
@@ -156,6 +171,48 @@
       for (const k of Object.keys((a && a.vars) || {})) pyodide.globals.set(k, a.vars[k]);
       const out = await py(a.code);
       return (out && out.toJs) ? out.toJs() : out;
+    },
+
+    /** Route JavaScript consumers through the installed SDK callbacks too. */
+    async ioStart() {
+      await METHODS.start({});
+      if (tasks) await tasks.begin().until(Promise.resolve());
+      await py('import webtorch\nwebtorch.cancel(False)');
+      return null;
+    },
+
+    async ioRead(a) {
+      await METHODS.start({});
+      const n = ioNames();
+      pyodide.globals.set(n.name, String(a.name));
+      pyodide.globals.set(n.offset, Number(a.offset) || 0);
+      pyodide.globals.set(n.length, a.length == null ? null : Number(a.length));
+      let out;
+      try {
+        out = await py('import webtorch\nawait webtorch.io_read('
+          + n.name + ', ' + n.offset + ', ' + n.length + ')');
+        return (out && out.toJs) ? out.toJs() : out;
+      } finally {
+        if (out && out.destroy) out.destroy();
+        clearGlobals(n);
+      }
+    },
+
+    async ioWrite(a) {
+      await METHODS.start({});
+      const n = ioNames();
+      pyodide.globals.set(n.name, String(a.name));
+      pyodide.globals.set(n.data, a.data);
+      pyodide.globals.set(n.offset, Number(a.offset) || 0);
+      try {
+        await py('import webtorch\n'
+          + n.bytes + ' = bytes(' + n.data + '.to_py()) if hasattr(' + n.data
+          + ', "to_py") else bytes(' + n.data + ')\n'
+          + 'await webtorch.io_write(' + n.name + ', ' + n.bytes + ', ' + n.offset + ')');
+        return null;
+      } finally {
+        clearGlobals(n);
+      }
     },
 
     async load(a) {

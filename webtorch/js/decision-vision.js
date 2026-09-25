@@ -1,8 +1,8 @@
 /* Browser-side typed decisions over image + text.
  *
  * This is a small adapter around the exported three-graph decision format used by
- * laya-vision. It deliberately does not choose a model host: the application passes a
- * base URL, just as it chooses which reader to install for the Python SDK.
+ * laya-vision. It deliberately does not choose or fetch from a model host: the application
+ * passes the same read callback it installed for the rest of the SDK.
  */
 (function (root) {
   const wt = root.webtorch || (root.webtorch = {});
@@ -81,7 +81,8 @@
 
   wt.loadVisionDecision = async function (options) {
     options = options || {};
-    if (!options.baseUrl) throw new TypeError('loadVisionDecision needs baseUrl');
+    if (typeof options.read !== 'function') throw new TypeError('loadVisionDecision needs read(name, offset, length)');
+    if (!options.model) throw new TypeError('loadVisionDecision needs model');
     const workerURL = options.workerURL || defaultWorker;
     if (!workerURL) throw new TypeError('loadVisionDecision needs workerURL outside a document');
     const worker = new Worker(workerURL, { type: 'module' });
@@ -91,8 +92,20 @@
     let runTail = Promise.resolve();
     const loadPromise = new Promise((resolve, reject) => { loadResolve = resolve; loadReject = reject; });
 
-    worker.addEventListener('message', ({ data }) => {
-      if (data.type === 'progress') {
+    worker.addEventListener('message', async ({ data }) => {
+      if (data.type === 'read') {
+        try {
+          const value = await options.read(data.name, data.offset, data.length);
+          const view = value instanceof Uint8Array ? value : new Uint8Array(value);
+          // Never transfer a buffer owned by the callback: transfer detaches it, and a host
+          // callback is allowed to retain or reuse what it returned.
+          const bytes = view.slice();
+          worker.postMessage({ type: 'read-result', id: data.id, bytes }, [bytes.buffer]);
+        } catch (error) {
+          worker.postMessage({ type: 'read-error', id: data.id,
+            message: String(error?.message || error) });
+        }
+      } else if (data.type === 'progress') {
         if (options.onProgress) options.onProgress(data);
       } else if (data.type === 'loaded') {
         loaded = data; loadResolve(data);
@@ -111,7 +124,7 @@
       if (!loaded) loadReject(error); else if (runReject) runReject(error);
       if (options.onError) options.onError(error);
     });
-    worker.postMessage({ type: 'load', baseUrl: options.baseUrl,
+    worker.postMessage({ type: 'load', model: String(options.model).replace(/\/$/, ''),
       variant: options.variant || 'auto', backend: options.backend || 'auto',
       imageCacheEntries: options.imageCacheEntries || 32 });
     const abortLoad = () => {

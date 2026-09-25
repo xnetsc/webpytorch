@@ -423,14 +423,20 @@ domains, option counts, or materially different question wording.
 ### Image + text decision export in the browser
 
 The optional browser adapter loads a three-graph ONNX decision export without changing the
-typed `decide(state, questions)` call. The application chooses the model URL; the SDK does not
-select or silently change a model host.
+typed `decide(state, questions)` call. The application chooses and installs the model reader;
+the SDK does not select or silently change a model host.
 
 ```html
 <script src="/webtorch/js/decision-vision.js"></script>
 <script>
+const wt = await webtorch.start({ baseURL: '/' });
+await wt.run(`import webtorch
+webtorch.set_io_read(webtorch.hf_read())`); // the application may choose another reader
+await wt.io.start();                        // clears an earlier stop before raw IO
+
 const model = await webtorch.loadVisionDecision({
-  baseUrl: '/models/laya-vision/', // directory containing laya_web.json
+  model: 'thaitea/laya-vision-web',
+  read: wt.io.read,              // the existing io_read callback, including its cache
   backend: 'webgpu',
   variant: 'auto',                // fp16 when WebGPU exposes shader-f16
 });
@@ -797,6 +803,9 @@ const r = await wt.generate('hello', { max_new: 200, onToken: (t) => show(t.text
 wt.cancel();                 // stops work that is already running, now
 wt.resources();              // {gpuBytes, gpuPeak, gpuBuffers, wasmBytes, at} | null
 await wt.run(code, vars);    // any Python, with page values bound as globals
+await wt.io.start();                         // begin raw IO; clears an earlier stop
+await wt.io.read(name, offset, length);       // calls the installed webtorch.io_read
+await wt.io.write(name, bytes, offset);       // calls the installed webtorch.io_write
 ```
 
 Also on it: `release()`, `stopLoading()`, `decide(state, questions)`,
@@ -813,7 +822,8 @@ with you, and is off unless you ask:
 | | how to say yes |
 |---|---|
 | where model files come from | `wt.run('webtorch.set_io_read(webtorch.modelscope_read())')` |
-| whether they are cached at all | `wt.run('webtorch.set_io_write(webtorch.default_io_write)')` |
+| whether model reads are cached | choose the installed reader's `cache=` option, for example `wt.run('webtorch.set_io_read(webtorch.hf_read(cache=True))')` |
+| where generated files are written | `wt.run('webtorch.set_io_write(webtorch.default_io_write)')` |
 | keeping what this GPU measured | `start({ rememberTuning: true })` |
 | how your files are cached | `start({ version })` — appended to the package's own file URLs, for a host whose cache policy is a URL that changes with the bytes. Leave it out and they are fetched plainly, so your server's headers decide. |
 
@@ -1001,7 +1011,7 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
 - `webtorch.default_io_read` / `webtorch.default_io_write` — the raw (uncached) built-in
   transports underneath: `default_io_read` reads via browser `fetch`+Range or host `urllib`/`open`;
   `default_io_write` writes via host/Pyodide `open`+seek. Install directly if you want the
-  transport without caching (equivalent to `use_default_io(cache=True)`).
+  transport without caching (equivalent to `use_default_io(cache=False)`).
 - `webtorch.hf_read(revision="main", endpoint=…, token=None, cache=True, cache_dir=None,
   max_parallel=16, prefetch=True, chunk_mb=16, persist=True)` — returns a callback that
   fetches straight from the **Hugging Face Hub**, so you load by repo id, no pre-download:

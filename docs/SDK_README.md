@@ -331,13 +331,20 @@ print(gen("Hello", max_new=64))
 ### Browser image + text decisions
 
 Load `webtorch/js/decision-vision.js` when an application needs the optional three-graph ONNX
-decision format. `webtorch.loadVisionDecision({baseUrl, backend, variant})` returns the same
+decision format. `webtorch.loadVisionDecision({model, read, backend, variant})` returns the same
 `decide(state, questions)` shape as the text decision model. Use a typed state such as
 `{type:"multimodal", text, images:[{type:"image", media_type, data:base64}]}`. The application
-supplies `baseUrl`; source selection is not an SDK policy. Image features are cached by SHA-256,
-and `surface().takes.state.kinds` lets the UI expose its image control dynamically. See
+installs its chosen `io_read` callback and supplies `read: wt.io.read`; source selection is not an
+SDK policy. ONNX files then use the same ranged, resumable cache as every other model instead of
+creating a second cache in the Vision worker. Image features are cached in memory by SHA-256, and
+`surface().takes.state.kinds` lets the UI expose its image control dynamically. See
 [API.md](API.md#image--text-decision-export-in-the-browser) for limits, performance behavior and
 checkpoint licensing.
+
+Call `await wt.io.start()` before loading after a prior `stopLoading()` / cancellation, then pass
+`read: wt.io.read`. `wt.io.read(name, offset, length)` and `wt.io.write(name, data, offset)` are
+only a browser bridge to the callbacks installed with `set_io_read` / `set_io_write`; they do not
+select a source or add another cache.
 
 ## IO injection (required, not optional)
 
