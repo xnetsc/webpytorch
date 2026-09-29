@@ -300,6 +300,17 @@ export function confidenceFromProbs(p, k) {
   return Math.min(1, Math.max(0, 1 - ent / Math.log(k)));
 }
 
+export function answerConfidenceFromProbs(p, k) {
+  if (k < 1) return 1;
+  return Math.min(1, Math.max(0, Math.max(...p.slice(0, k))));
+}
+
+export function safeTemperature(value, low = 0.5, high = 5.0) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  return Math.min(high, Math.max(low, number));
+}
+
 /** ``rows``: ``[{order, logits, actProb}]`` for one question. Returns the ``predict`` answer dict. */
 export function answer(cfg, q, rows) {
   const k = renderOptions(q).length;
@@ -310,21 +321,23 @@ export function answer(cfg, q, rows) {
     actSum += r.actProb;
   }
   const qt = QTYPES[q.t];
-  const tScale = cfg.temperature_by_options[tempBucket(qt, k)] ?? cfg.temperature[qt];
-  const p = softmax(zSum.map((z) => z / rows.length / Math.max(1e-3, tScale)));
+  const tScale = safeTemperature(cfg.temperature_by_options[tempBucket(qt, k)] ?? cfg.temperature[qt]);
+  const p = softmax(zSum.map((z) => z / rows.length / tScale));
   const conf = round4(confidenceFromProbs(p, k));
+  const answerConf = round4(answerConfidenceFromProbs(p, k));
   const ext = { act_probability: round4(actSum / rows.length) };
   if (q.t === "choice") {
     const keys = Object.keys(q.crit);
     const best = p.indexOf(Math.max(...p));
     return { type: "choice", choice: keys[best], probabilities: Object.fromEntries(keys.map((kk, i) => [kk, round4(p[i])])),
-             confidence: conf, action: ext };
+             confidence: conf, answer_confidence: answerConf, action: ext };
   }
   if (q.t === "score") {
     return { type: "score", score: round4(p.reduce((a, v, i) => a + i * v, 0)),
              legend: Object.fromEntries(q.crit.map((c, i) => [String(i), c])),
-             probabilities: Object.fromEntries(p.map((v, i) => [String(i), round4(v)])), confidence: conf, action: ext };
+             probabilities: Object.fromEntries(p.map((v, i) => [String(i), round4(v)])),
+             confidence: conf, answer_confidence: answerConf, action: ext };
   }
-  return { type: "noul", noul: round4(p[1]), confidence: round4(Math.max(p[1], 1 - p[1])), action: ext };
+  return { type: "noul", noul: round4(p[1]), confidence: answerConf,
+           answer_confidence: answerConf, action: ext };
 }
-

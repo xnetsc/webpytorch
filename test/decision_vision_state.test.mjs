@@ -4,6 +4,18 @@ import test from 'node:test';
 
 await import('../webtorch/js/decision-vision.js');
 const { normalizeDecisionState } = globalThis.webtorch;
+const { answer, safeTemperature } = await import('../webtorch/js/decision-vision-runtime.js');
+
+test('vision answers expose calibrated answer confidence and guard unsafe temperatures once', () => {
+  const q = { t: 'choice', crit: { a: 'A', b: 'B' } };
+  const cfg = { temperature: [2, 1, 1], temperature_by_options: {} };
+  const out = answer(cfg, q, [{ order: [0, 1], logits: [4, 0], actProb: 0.8 }]);
+  const expected = 1 / (1 + Math.exp(-2));
+  assert.equal(out.answer_confidence, Number(expected.toFixed(4)));
+  assert.notEqual(out.answer_confidence, Number((1 / (1 + Math.exp(-1))).toFixed(4)));
+  assert.equal(safeTemperature(0.1006), 0.5);
+  assert.equal(safeTemperature(Number.NaN), 1);
+});
 
 test('plain text and JSON states retain their existing shape', () => {
   assert.deepEqual(normalizeDecisionState('market is open'), {

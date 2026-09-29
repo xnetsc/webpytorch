@@ -253,6 +253,19 @@ def confidence(p):
     return float(1.0 - ent / math.log(k))
 
 
+def answer_confidence(p):
+    """Probability mass on the reported answer: ``max(p)``.
+
+    Temperature fitting and ECE operate on this quantity.  Keep it separate from
+    ``confidence()``, which is distribution concentration and is not a calibrated
+    probability of correctness.
+    """
+    p = np.asarray(p, dtype=np.float64).reshape(-1)
+    if not len(p):
+        return 1.0
+    return float(np.clip(p.max(), 0.0, 1.0))
+
+
 class DecisionModel(wt.Module):
     """An encoder, a small transformer head, and a scorer that reads one position per option.
 
@@ -520,8 +533,11 @@ class DecisionModel(wt.Module):
         for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built, execution):
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
+            legacy_confidence = answer_confidence(p) if qtype == "noul" else confidence(p)
             ans = {"type": qtype, "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
-                   "confidence": round(confidence(p), 4), "act_probability": round(act, 4)}
+                   "confidence": round(legacy_confidence, 4),
+                   "answer_confidence": round(answer_confidence(p), 4),
+                   "act_probability": round(act, 4)}
             if qtype == "choice":
                 ans["choice"] = labels[int(p.argmax())]
             elif qtype == "score":
@@ -567,7 +583,9 @@ class DecisionModel(wt.Module):
         are fitted independently; otherwise one value is fitted per question type.
 
         The model's chosen class cannot change: positive temperature scaling only repairs
-        the numeric probability scale. Fitting on training examples is not calibration.
+        the numeric probability scale. The fit always starts from raw logits and replaces the
+        matching checkpoint temperature; it is never composed with, or fitted on, probabilities
+        that have already been temperature-scaled. Fitting on training examples is not calibration.
         """
         try:
             min_samples = int(min_samples)
@@ -665,7 +683,8 @@ class DecisionModel(wt.Module):
             "takes": {"state": {"kinds": ["text", "json"]},
                       "questions": {"types": types,
                                     "max": self.cfg.max_questions or None}},
-            "returns": {"per_question": ["probabilities", "confidence", "act_probability"]},
+            "returns": {"per_question": ["probabilities", "answer_confidence", "confidence",
+                                           "act_probability"]},
             "calibration": self.cfg.calibration(),
             "limits": {"sequence_tokens": self.cfg.max_len,
                        "question_tokens": self.cfg.head_max_len,

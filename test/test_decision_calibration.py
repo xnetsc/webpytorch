@@ -6,6 +6,7 @@ import numpy as np
 from webtorch.decision import (
     DecisionConfig,
     DecisionModel,
+    answer_confidence,
     calibration_error,
     fit_temperature,
     safe_temperature,
@@ -38,6 +39,11 @@ def test_ece_means_ninety_percent_is_right_nine_times_out_of_ten():
     assert calibration_error(probabilities, targets) < 1e-12
 
 
+def test_answer_confidence_is_the_probability_used_by_calibration():
+    probabilities = np.array([0.1, 0.7, 0.2])
+    assert answer_confidence(probabilities) == 0.7
+
+
 def test_temperature_fit_repairs_overconfidence_without_changing_winners():
     # Eight right and four wrong predictions, all with the same much-too-sharp margin.
     rows = [np.array([4.0, 0.0])] * 8 + [np.array([0.0, 4.0])] * 4
@@ -67,7 +73,7 @@ def test_model_calibration_updates_only_the_matching_generic_bucket():
         _target_index = staticmethod(DecisionModel._target_index)
 
         def __init__(self):
-            self.cfg = DecisionConfig({"temperature": [1.0, 1.0, 1.0]})
+            self.cfg = DecisionConfig({"temperature": [2.0, 1.0, 1.0]})
 
         def _prepare_questions(self, state, questions):
             q = questions["route"]
@@ -90,5 +96,6 @@ def test_model_calibration_updates_only_the_matching_generic_bucket():
     report = model.calibrate(examples, min_samples=3)
     assert report["groups"]["choice:2"]["temperature"] > 1.0
     assert model.cfg.temp_for("choice", 2) == report["groups"]["choice:2"]["temperature"]
+    assert model.cfg.temp_for("choice", 2) != 2.0 * report["groups"]["choice:2"]["temperature"]
     assert model.cfg.calibration()["status"] == "held-out"
     assert model.cfg.calibration()["groups"] == ["choice:2"]

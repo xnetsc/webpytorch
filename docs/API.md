@@ -346,6 +346,7 @@ out = m.decide(
 out["answers"]["route"]["choice"]          # "billing"
 out["answers"]["route"]["probabilities"]   # {"billing": 0.9086, "technical": 0.0474, …}
 out["answers"]["route"]["confidence"]      # 0.664  — 1 minus the normalised entropy
+out["answers"]["route"]["answer_confidence"] # 0.9086 — calibrated mass on the returned answer
 out["answers"]["dupe"]["noul"]             # 0.9466 — how likely the statement holds
 out["answers"]["urgent"]["score"]          # the expected level on the scale given
 out["usage"]["sequence_tokens"]             # encoded length of each question-conditioned input
@@ -365,7 +366,9 @@ does not choose what to ask.
 `confidence` on `choice`/`score` is distribution concentration (`1 - normalised entropy`),
 not a probability of correctness: `confidence == 0.90` never means “90% accurate”. Use the
 per-option probabilities for calibration and use `confidence` only to describe how spread
-or concentrated the returned distribution is.
+or concentrated the returned distribution is. `answer_confidence` is `max(probabilities)`
+for every question type; it is the quantity fitted by temperature scaling and the only one
+that may be compared with an accuracy-calibrated threshold.
 
 - `m.decide(state, questions)` / `m(state, questions)` — `{"answers": {...}, "usage": {...}}`
 - `m.calibrate(examples, by_options=True, min_samples=20)` — fit probability temperatures
@@ -409,7 +412,9 @@ examples = [
 report = m.calibrate(examples, by_options=True, min_samples=20)
 # One temperature per question type + option-count bucket. The report includes samples,
 # temperature, held-out NLL and ECE before/after. Positive temperature scaling cannot change
-# the winning answer; it changes only the probability scale.
+# the winning answer; it changes only the probability scale. The fit uses raw logits and
+# replaces the matching checkpoint temperature, so it never temperature-scales an already
+# calibrated probability distribution a second time.
 ```
 
 For lower-level uses, `webtorch.fit_temperature(logits, targets)` and

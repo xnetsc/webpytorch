@@ -153,7 +153,7 @@
         } },
         questions: { types: questionTypes(loaded.qtypes), max: null },
       },
-      returns: { per_question: ['probabilities', 'confidence', 'act_probability'] },
+      returns: { per_question: ['probabilities', 'answer_confidence', 'confidence', 'act_probability'] },
       calibration: { method: 'temperature-scaling', status: 'checkpoint',
         domain_calibrated: false, groups: [], adjustments: [],
         note: 'Checkpoint calibration is not evidence of accuracy on this application data.' },
