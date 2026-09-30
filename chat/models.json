@@ -88,7 +88,12 @@
     {
       "name": "Laya Multilingual · decision model · answers questions, writes nothing",
       "repo": "convaiinnovations/laya-multilingual",
-      "probe": "rl_agent_config.json"
+      "probe": "model.safetensors"
+    },
+    {
+      "name": "Julia-1 · decision model · multilingual routing",
+      "repo": "SupersonicLabs/Julia-1",
+      "probe": "model.safetensors"
     },
     {
       "name": "Laya Vision 201M · official checkpoint FP16 ONNX · English",

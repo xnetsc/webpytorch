@@ -696,9 +696,50 @@ class DecisionModel(wt.Module):
 # Config file names a decision model may carry. There is no way to list a served directory
 # over HTTP, so the alternatives are probed. Which one a model uses says nothing about the
 # model -- it is a naming habit -- so several are accepted rather than one being required.
-_DECISION_CONFIGS = ("decision_config.json", "rl_agent_config.json")
+#
+# A list of naming habits grows, though: it was one name, then two, and the third checkpoint
+# to come along called its file something else again. So `_index` is tried first. Some
+# checkpoints ship a `config.json` that is not a config at all but a statement of where
+# everything is, and a model that says where its own files are does not need to be guessed
+# at. The probes stay for the ones that say nothing.
+_DECISION_CONFIGS = ("decision_config.json", "rl_agent_config.json", "julia_config.json")
 _ENCODER_DIRS = ("encoder/", "")
 _TOKENIZER_DIRS = ("tokenizer/", "")
+
+
+def _named_first(named, fallbacks):
+    """What the checkpoint named, then the conventional places, without repeats."""
+    out = []
+    for x in ([named] if isinstance(named, str) else list(named or [])) + list(fallbacks):
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+async def _index(src, read_json):
+    """What a checkpoint says about its own layout, or {} if it says nothing.
+
+    An index is a `config.json` whose values are paths. It is NOT the encoder config, which
+    also lives at that name in some layouts -- told apart by what it contains: an encoder
+    config describes an architecture (`hidden_size`, `architectures`), an index describes
+    files. Anything ambiguous is treated as not an index, because guessing wrong here means
+    reading an architecture as a set of filenames.
+    """
+    try:
+        c = await read_json(src + "/config.json")
+    except Exception:
+        return {}
+    if not isinstance(c, dict) or "hidden_size" in c or "architectures" in c:
+        return {}
+    out = {}
+    for key, value in c.items():
+        if not isinstance(value, str) or not value:
+            continue
+        if key.endswith("_directory"):
+            out.setdefault("dirs", {})[key[:-len("_directory")]] = value.rstrip("/") + "/"
+        elif key.endswith("_file"):
+            out.setdefault("files", {})[key[:-len("_file")]] = value
+    return out
 
 
 async def _rng(path, start, end):
@@ -738,7 +779,10 @@ async def load_decision(src, **kw):
     from . import hfcompat
 
     src = str(src).rstrip("/")
-    path = src + "/model.safetensors"
+    said = await _index(src, webio.read_json)
+    files, dirs = said.get("files", {}), said.get("dirs", {})
+
+    path = src + "/" + files.get("weights", "model.safetensors")
     try:
         head, base = await _safetensors_header(path)
     except Exception:
@@ -746,26 +790,31 @@ async def load_decision(src, **kw):
     if not looks_like_decision(head):
         return None
 
+    # Where the checkpoint says its encoder config is, then the usual places.
     enc_cfg = None
-    for d in _ENCODER_DIRS:
+    for cand in _named_first(files.get("encoder_config"), ["%sconfig.json" % d for d in _ENCODER_DIRS]):
         try:
-            enc_cfg = EncoderConfig(await webio.read_json("%s/%sconfig.json" % (src, d)))
+            enc_cfg = EncoderConfig(await webio.read_json("%s/%s" % (src, cand)))
             break
         except Exception:
             continue
     if enc_cfg is None:
         return None
 
+    # The decision config is whatever `_config_file` the checkpoint named that is not the
+    # encoder's; failing that, the naming habits.
+    named = [v for k, v in files.items() if k.endswith("config") and k != "encoder_config"]
     dec_raw = {}
-    for name in _DECISION_CONFIGS:
+    for cand in _named_first(named, _DECISION_CONFIGS):
         try:
-            dec_raw = await webio.read_json("%s/%s" % (src, name))
+            dec_raw = await webio.read_json("%s/%s" % (src, cand))
             break
         except Exception:
             continue
 
+    tok_dirs = _named_first(dirs.get("tokenizer"), _TOKENIZER_DIRS)
     tj = None
-    for d in _TOKENIZER_DIRS:
+    for d in tok_dirs:
         try:
             tj = await webio.read_json("%s/%stokenizer.json" % (src, d))
             break
@@ -805,6 +854,16 @@ async def load_decision(src, **kw):
         weights[name] = hfcompat._decode(bytes(raw), info["dtype"], info["shape"])
         done += 1
         webio.load_stage("weights", done, len(head))
+
+    # Calibration a checkpoint ships in its WEIGHTS rather than its config. Both are ordinary
+    # places to keep it -- it is fitted after training, so it lands wherever that script put
+    # it -- and a temperature that is not read is not an error anyone sees: the ranking is
+    # unchanged and only the confidence beside it is wrong, which is the worst way for a
+    # number to be wrong. The config still wins where it says something.
+    if "temperature" not in dec_raw and "temperature" in weights:
+        dec_raw = dict(dec_raw or {})
+        dec_raw["temperature"] = [float(x) for x in
+                                  np.asarray(weights["temperature"]).reshape(-1)]
 
     dec_cfg = DecisionConfig(dec_raw)
     model = DecisionModel(enc_cfg, dec_cfg, weights, tok,

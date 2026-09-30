@@ -1489,6 +1489,11 @@ function sourceBase(source, repo) {
     : `${root}/${model}/resolve/${encodeURIComponent(source.revision)}/`;
 }
 
+// Bytes a sample has to move before its rate is worth comparing. Below this the number is
+// dominated by the round trip, which is a different property of a host than how fast it can
+// stream gigabytes -- and it is the second one that decides whether a model arrives.
+const SAMPLE_MEANINGFUL = 262144;
+
 async function sampleSource(source, repo, probePath, validate) {
   const baseUrl = sourceBase(source, repo);
   const started = performance.now();
@@ -1518,7 +1523,14 @@ async function sampleSource(source, repo, probePath, validate) {
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
   const metadata = validate ? (await validate(bytes, baseUrl) || {}) : {};
   const latency = performance.now() - started;
+  // A rate is only a rate if enough bytes moved to make one. Probing a 150-byte config and
+  // dividing by the round trip measures LATENCY and calls it throughput -- and the two do
+  // not agree: one hub answered a small file in 3.1 s and a 64 KB block in 3.1 s, while the
+  // other answered the same block in 0.43 s, so the small-file race picked the slower hub
+  // for a 577 MB download and then could not deliver it at all. `measured` says whether
+  // this number means anything; see how `applicationModelSource` sorts on it.
   return { ...source, baseUrl, latency, total: metadata.size || total,
+    sampled: bytes.length, measured: bytes.length >= SAMPLE_MEANINGFUL,
     rate: bytes.length / Math.max(0.001, latency / 1000) };
 }
 
@@ -1549,7 +1561,11 @@ async function applicationModelSource(spec, validate) {
   const attempts = repo ? await Promise.allSettled(APPLICATION_MODEL_SOURCES
     .map(source => sampleSource(source, repo, probePath, validate))) : [];
   available.push(...attempts.filter(item => item.status === 'fulfilled').map(item => item.value));
-  available.sort((a, b) => b.rate - a.rate || a.latency - b.latency);
+  // A source that actually streamed beats one we only pinged, whatever the ping said. Among
+  // sources of the same kind, the faster one; and when nothing streamed -- the probe really
+  // is a small file -- this is the old ordering, by round trip.
+  available.sort((a, b) => Number(b.measured) - Number(a.measured)
+                        || b.rate - a.rate || a.latency - b.latency);
   if (!available.length) throw new Error('No model source is reachable.');
   chosenModelSources.set(key, available[0]);
   return available[0];
