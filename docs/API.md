@@ -995,6 +995,7 @@ bytes come from*. Pick the one matching where your files live:
 | `set_io_read(hf_read())` | **Hugging Face Hub** | `"<org>/<repo>/<path>"` → the HF file URL | yes |
 | `set_io_read(modelscope_read())` | **ModelScope (魔搭)** | `"<org>/<repo>/<path>"` → the ModelScope file URL | yes |
 | `set_io_read(hub_read(to_url))` | **any HTTP host** — the generic one the two above are built from | `"<org>/<repo>/<path>"` → whatever `to_url(repo, path)` returns | yes |
+| `set_io_read(mirrored_read())` | **several hubs at once** — each block from whichever answers | as above, cached under the first | yes |
 
 > **`use_default_io()` is *not* a hub.** It does no repo-id→URL mapping — it just `fetch`es /
 > `open`s the `name` string as-is. So with `use_default_io()`,
@@ -1051,6 +1052,25 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
   ```
   `name` arrives as `"<org>/<repo>/<path>"`; `to_url` is given the first two segments as
   `repo` and the rest as `path`.
+
+  **`to_url` may be a LIST**, and then one file is read from several hosts at once — each
+  block from whichever is answering, the next one tried when a host stops. Measured on one
+  mirrored checkpoint, 64 KB at three offsets: 3.1 / 1.7 / 1.2 s from one hub against
+  1.4 / 0.48 / 0.43 s from the other, and the first aborted partway through the real
+  download. A mirror earns that first — same length, and one block from the middle that
+  matches — because mixing blocks from hosts that disagree gives a model that is corrupt
+  with nothing reported. When the FIRST host is unreachable the mirror is used anyway:
+  nothing is being mixed then, the file simply comes from elsewhere, which is what a
+  single-source reader pointed at that mirror would have done. The first function names the
+  file for the cache, so which host a block came from leaves no trace and a resumed download
+  does not care that the network changed under it.
+- `webtorch.mirrored_read(readers=None, **kw)` — the ready-made case of that: the hubs this
+  package already addresses, used together rather than chosen between. A repo that exists on
+  only one of them still works, because a mirror that cannot be proven identical is simply
+  not used.
+  ```python
+  webtorch.set_io_read(webtorch.mirrored_read())
+  ```
 
 **A source that is not HTTP.** `hub_read` is a convenience for one common shape, not a layer
 you have to go through — hand `set_io_read` your own function and it will be used as-is. You

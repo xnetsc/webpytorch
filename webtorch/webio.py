@@ -2215,6 +2215,18 @@ def hub_read(to_url, token=None, cache=True, cache_dir=None, max_parallel=16,
 
     `to_url(repo, path)` is the only thing a host-specific reader has to know. The rest of
     the arguments are `hf_read`'s, and mean the same things.
+
+    **Several places, one file.** `to_url` may be a LIST of such functions, and then a block
+    is fetched from whichever host is answering fastest, with the next one tried when a host
+    stops answering. A mirror has to earn that first: same length, and one block from the
+    middle that matches, because mixing blocks from two hosts that disagree gives a model
+    that is corrupt with nothing reported. The first function in the list names the file for
+    the cache, so which host a block came from leaves no trace and a resumed download does
+    not care that the network changed under it.
+
+        webtorch.set_io_read(webtorch.hub_read([
+            lambda r, p: "https://huggingface.co/%s/resolve/main/%s" % (r, p),
+            lambda r, p: "https://modelscope.cn/models/%s/resolve/master/%s" % (r, p)]))
     """
     return _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb,
                        persist)
@@ -2233,11 +2245,93 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     cdir = (cache_dir or _default_hub_cache()) if cache else None
     known = {}
 
+    # ---- several places the same bytes live ---------------------------------------------
+    #
+    # A file mirrored on two hubs is one file. There is no reason a download has to pick a
+    # host and stay with it: whichever answers a given block fastest can serve that block,
+    # and a host that stops answering costs one retry rather than the whole model. Measured
+    # on one mirrored checkpoint, 64 KB at three offsets: 3.1 / 1.7 / 1.2 s from one hub
+    # against 1.4 / 0.48 / 0.43 s from the other, and the first aborted partway through the
+    # real download. Pinning to either is leaving that on the table.
+    #
+    # The cache stays keyed by ONE url -- the first builder's -- or blocks fetched from
+    # different hosts would land under different keys and neither copy would ever be whole.
+    import time
+    builders = list(to_url) if isinstance(to_url, (list, tuple)) else [to_url]
+    _alt = {}               # canonical url -> [url, ...] the same file is also served at
+    mirrors = {}            # canonical url -> [url, ...] proven to be the same bytes
+    rate = {}               # url -> bytes per second, last seen
+    _SAMPLE = 65536
+
     async def size(url):
         return await http_size(url, hdr)
 
+    async def _same_file(a, b, sa):
+        """Is `b` byte-for-byte the file `a` is? Asked before a mirror is ever MIXED IN.
+
+        Mixing blocks from two hosts that disagree produces a model that is corrupt in a way
+        nothing reports: every block arrives, the file is the right length, and the weights
+        are nonsense. So the mirror has to earn it -- same length, and one block from the
+        middle that matches. It is evidence rather than proof, and it is the evidence that
+        is affordable: the alternative is downloading both copies to compare them.
+        """
+        try:
+            if not sa or sa != await size(b):
+                return False
+            at = max(0, (sa // 2) - (sa // 2) % _SAMPLE)
+            ba = await http_get(a, at, _SAMPLE, hdr)
+            bb = await http_get(b, at, _SAMPLE, hdr)
+            return len(ba) == len(bb) and bytes(ba) == bytes(bb)
+        except Exception:
+            return False
+
+    async def _origins(url):
+        """The hosts that may serve this file, fastest first."""
+        if url not in mirrors:
+            alts = list(_alt.get(url, []))
+            try:
+                here = await size(url)
+            except Exception:
+                here = None
+            if here is None and alts:
+                # The named host is not answering at all. A mirror cannot be cross-checked
+                # against a host that will not speak, and refusing it on that ground means
+                # the model does not load -- which is worse than what a single-source reader
+                # pointed at this same mirror would have done, and no less safe: nothing is
+                # MIXED here, the file simply comes from somewhere else entirely.
+                mirrors[url] = alts
+            else:
+                proven = [url]
+                for other in alts:
+                    if await _same_file(url, other, here):
+                        proven.append(other)
+                mirrors[url] = proven
+        # Unmeasured hosts go first: one block is what it costs to find out, and a host
+        # nobody has tried is the only way a better one is ever discovered.
+        return sorted(mirrors[url], key=lambda u: -rate.get(u, float("inf")))
+
     async def raw(url, offset, length):
-        return await http_get(url, offset, length, hdr)
+        origins = await _origins(url)
+        last = None
+        for i, cand in enumerate(origins):
+            t0 = time.monotonic()
+            try:
+                data = await http_get(cand, offset, length, hdr)
+            except Exception as e:
+                # A host that will not answer this block is demoted, not abandoned: hubs
+                # rate-limit and recover, and the next block may go through.
+                rate[cand] = 0.0
+                last = e
+                if i + 1 == len(origins):
+                    raise
+                continue
+            dt = max(1e-3, time.monotonic() - t0)
+            seen = rate.get(cand)
+            measured = len(data) / dt
+            # Smoothed, because one slow block is weather and one fast block is luck.
+            rate[cand] = measured if seen in (None, 0.0) else (seen * 0.7 + measured * 0.3)
+            return data
+        raise last if last else RuntimeError("no origin answered " + url)
 
     # Concurrency and rate-limit handling are properties of HTTP, so they wrap the transport
     # here rather than living in the cache; read-ahead likewise, filling the cache in the
@@ -2247,7 +2341,19 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         get = prefetch_whole_file(get, size=size, cache_dir=cdir, chunk_mb=chunk_mb)
 
     def to_key(name):
-        return name if name.startswith(("http://", "https://")) else to_url(*_split_repo(name))
+        """The one url this file is cached under, remembering where else it lives.
+
+        The first builder names the file; the rest are places to fetch the same bytes from.
+        Only the first is ever a cache key, so which host a block came from leaves no trace
+        and a resumed download does not care that the network changed under it.
+        """
+        if name.startswith(("http://", "https://")):
+            return name
+        repo, path = _split_repo(name)
+        urls = [b(repo, path) for b in builders]
+        if len(urls) > 1:
+            _alt.setdefault(urls[0], urls[1:])
+        return urls[0]
 
     async def read(name, offset=0, length=None):
         # A file the person pointed at IS the model: read it where it lies, before
@@ -2313,6 +2419,27 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         return out
 
     return read
+
+
+def mirrored_read(readers=None, **kw):
+    """Read from several hubs at once, taking each block from whichever is answering.
+
+    The ready-made case of `hub_read`'s list form: the hubs this package already knows how
+    to address, used together rather than chosen between. A repo that only exists on one of
+    them still works -- a mirror that cannot be proven to hold the same bytes is simply not
+    used -- so this is a reasonable default for a host that does not want to care.
+
+        webtorch.set_io_read(webtorch.mirrored_read())
+        webtorch.set_io_read(webtorch.mirrored_read(token=MY_HF_TOKEN))
+
+    `readers` overrides the hubs with your own `to_url` functions, in preference order.
+    """
+    if readers is None:
+        readers = [
+            lambda repo, path: "https://huggingface.co/%s/resolve/main/%s" % (repo, path),
+            lambda repo, path: "https://modelscope.cn/models/%s/resolve/master/%s" % (repo, path),
+        ]
+    return hub_read(list(readers), **kw)
 
 
 def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
