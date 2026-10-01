@@ -1494,6 +1494,42 @@ function sourceBase(source, repo) {
 // stream gigabytes -- and it is the second one that decides whether a model arrives.
 const SAMPLE_MEANINGFUL = 262144;
 
+async function probeSource(source, repo, probePath, validate) {
+  const baseUrl = sourceBase(source, repo);
+  const started = performance.now();
+  const probeUrl = source.kind === 'direct' ? source.url
+    : new URL(probePath.split('/').map(encodeURIComponent).join('/'), baseUrl).href;
+  // Existence and throughput are different questions. One byte is enough to establish that
+  // a generic model artifact exists on this host. A structured manifest validator needs the
+  // small document itself, but still does not turn that read into a speed comparison.
+  const limit = validate ? 1048576 : 1;
+  const response = await fetch(probeUrl, {
+    cache: 'no-cache', headers: { Range: `bytes=0-${limit - 1}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+  const contentRange = response.headers.get('content-range') || '';
+  const rangeTotal = /\/(\d+)$/.exec(contentRange);
+  const total = rangeTotal ? Number(rangeTotal[1])
+    : response.status === 200 ? Number(response.headers.get('content-length')) || 0 : 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (received < limit) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const keep = value.subarray(0, Math.min(value.length, limit - received));
+    chunks.push(keep); received += keep.length;
+  }
+  try { await reader.cancel(); } catch { /* response already ended */ }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+  const metadata = validate ? (await validate(bytes, baseUrl) || {}) : {};
+  return { ...source, baseUrl, latency: performance.now() - started,
+    total: metadata.size || total, sampled: bytes.length, measured: false, rate: 0 };
+}
+
 async function sampleSource(source, repo, probePath, validate) {
   const baseUrl = sourceBase(source, repo);
   const started = performance.now();
@@ -1550,29 +1586,39 @@ async function applicationModelSource(spec, validate) {
   const { repo, probe: probePath, url } = spec;
   const key = `${repo || ''}@${probePath}@${url || ''}`;
   if (chosenModelSources.has(key)) return chosenModelSources.get(key);
-  // The explicit URL is checked first so it is known-good as a fallback. It does not win by
-  // declaration: all matching hubs are then sampled and the fastest successful source wins.
-  const available = [];
+  // First establish where the artifact exists with the smallest useful request. Throughput
+  // only resolves a choice: when exactly one host has it, there is nothing to race and the
+  // model starts loading immediately.
+  const candidates = [];
   const direct = directSource(url, probePath);
-  if (direct) {
-    try { available.push(await sampleSource(direct, repo, probePath, validate)); }
-    catch { /* the hubs may still carry it */ }
+  if (direct) candidates.push(direct);
+  if (repo) candidates.push(...APPLICATION_MODEL_SOURCES);
+  const checks = await Promise.allSettled(candidates
+    .map(source => probeSource(source, repo, probePath, validate)));
+  const available = checks.filter(item => item.status === 'fulfilled').map(item => item.value);
+  if (!available.length) throw new Error('No model source is reachable.');
+
+  let ranked = available;
+  if (available.length > 1) {
+    const samples = await Promise.allSettled(available
+      .map(source => sampleSource(source, repo, probePath, validate)));
+    const raced = samples.filter(item => item.status === 'fulfilled').map(item => item.value);
+    const racedIds = new Set(raced.map(source => source.id));
+    // A host that passed existence but failed the speed sample remains a last-resort
+    // alternate; one transient benchmark failure must not erase a known source.
+    ranked = raced.concat(available.filter(source => !racedIds.has(source.id)));
   }
-  const attempts = repo ? await Promise.allSettled(APPLICATION_MODEL_SOURCES
-    .map(source => sampleSource(source, repo, probePath, validate))) : [];
-  available.push(...attempts.filter(item => item.status === 'fulfilled').map(item => item.value));
   // A source that actually streamed beats one we only pinged, whatever the ping said. Among
   // sources of the same kind, the faster one; and when nothing streamed -- the probe really
   // is a small file -- this is the old ordering, by round trip.
-  available.sort((a, b) => Number(b.measured) - Number(a.measured)
-                        || b.rate - a.rate || a.latency - b.latency);
-  if (!available.length) throw new Error('No model source is reachable.');
+  ranked.sort((a, b) => Number(b.measured) - Number(a.measured)
+                     || b.rate - a.rate || a.latency - b.latency);
   // The winner is still the winner -- it is what the reader is keyed by, so a model already
   // cached stays cached. The ones behind it are kept because they are reachable, and a file
   // that exists on more than one host has no reason to come from only one of them.
-  available[0].alternates = available.slice(1);
-  chosenModelSources.set(key, available[0]);
-  return available[0];
+  ranked[0].alternates = ranked.slice(1);
+  chosenModelSources.set(key, ranked[0]);
+  return ranked[0];
 }
 
 function remoteModelSpec(id, preset) {

@@ -323,9 +323,12 @@ probability over the answers the CALLER named. There is no token stream, no samp
 stopping rule, so nothing in the decoder engine applies; what runs is one encoder pass and a
 scorer.
 
-`webtorch.load` recognises one from the checkpoint rather than the name — a file carrying an
-encoder and a scorer is a decision model, which costs one ranged read of the safetensors
-index — and `Model.kind` is then `"decision"`.
+`webtorch.load` recognises one from the checkpoint rather than the name — a safetensors
+directory or self-contained GGUF carrying an encoder and a scorer is a decision model, and
+`Model.kind` is then `"decision"`. GGUF architecture strings and filenames are not an
+allow-list: the tensor structure selects the task, while the architecture value selects the
+file's own embedded config/tokenizer namespace. Any GGUF tensor encoding supported by the
+generic GGUF decoder is accepted; the decision loader is not restricted to one quantization.
 
 ```python
 m = await webtorch.load("convaiinnovations/laya")     # kind == "decision"

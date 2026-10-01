@@ -771,6 +771,171 @@ def looks_like_decision(names):
     return has_encoder and bool(scorers)
 
 
+async def _gguf_header(path):
+    """Read a GGUF header without knowing how large its embedded metadata is.
+
+    A complete model may carry its tokenizer in metadata, so a fixed small header read is
+    not sufficient.  Grow only until the parser says it has the complete header; ordinary
+    LLM GGUFs stop on the first read, while self-contained artifacts may need more.
+    """
+    from . import ggufload as G
+
+    size = 12 << 20
+    while True:
+        buf = await _rng(path, 0, size - 1)
+        try:
+            return G.parse_header(buf)
+        except EOFError:
+            size <<= 1
+            if size > (128 << 20):
+                raise ValueError("GGUF metadata exceeds the 128 MiB SDK header limit")
+
+
+def _gguf_meta_json(meta, key):
+    """JSON metadata in the namespace declared by the file's own architecture.
+
+    The namespace is data, not a model allow-list: a previously unseen architecture name
+    works when it publishes the same decision checkpoint contract.
+    """
+    arch = meta.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None
+    raw = meta.get(arch + "." + key)
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except Exception as e:
+        raise ValueError("GGUF %s.%s is not valid JSON: %s" % (arch, key, e))
+    return value
+
+
+async def _gguf_tensor(path, data_start, info):
+    """Decode one GGUF tensor, bounded by a small conversion workspace.
+
+    F16/F32 tensors keep their stored width. Quantized tensors are expanded to fp16 in
+    block-aligned bands, so the 256k-token embedding never also exists as one giant fp32
+    temporary. Decision execution already packs or uploads each weight lazily and drops this
+    host copy after first use.
+    """
+    from . import ggufload as G
+
+    shape = tuple(int(d) for d in reversed(info["dims"]))
+    count = int(np.prod(shape, dtype=np.int64))
+    ttype = info["type"]
+    kind = G.GGML_NAMES.get(ttype)
+    if not G.is_supported(ttype):
+        raise NotImplementedError("decision GGUF tensor %s uses unsupported type %s"
+                                  % (info["name"], kind or ttype))
+    offset = data_start + int(info["offset"])
+    nbytes = G.tensor_nbytes(ttype, count)
+    if kind in ("F16", "F32"):
+        raw = bytes(await _rng(path, offset, offset + nbytes - 1))
+        dtype = np.float16 if kind == "F16" else np.float32
+        return np.frombuffer(raw, dtype=dtype, count=count).reshape(shape)
+
+    block, block_bytes = G.tensor_block(ttype)
+    if count % block:
+        raise ValueError("decision GGUF tensor %s has %d elements, not a whole %s block"
+                         % (info["name"], count, kind))
+    out = np.empty((count,), dtype=np.float16)
+    # At most 8 MiB of expanded fp16 plus the smaller encoded range and fp32 decode scratch.
+    band = max(block, ((4 << 20) // block) * block)
+    for first in range(0, count, band):
+        last = min(count, first + band)
+        byte_first = (first // block) * block_bytes
+        byte_last = (last // block) * block_bytes
+        raw = await _rng(path, offset + byte_first, offset + byte_last - 1)
+        out[first:last] = G.dequant(ttype, raw, last - first).astype(np.float16)
+    return out.reshape(shape)
+
+
+def _tokenizer_from_json(tj):
+    from .llm import BPETokenizer, pretok_pattern, pretok_style
+
+    mdl = tj.get("model") or {}
+    vocab = dict(mdl.get("vocab") or {})
+    control = []
+    for a in (tj.get("added_tokens") or []):
+        if isinstance(a, dict) and a.get("content") is not None and a.get("id") is not None:
+            vocab[a["content"]] = int(a["id"]); control.append(a["content"])
+    merges = [" ".join(m) if isinstance(m, (list, tuple)) else m
+              for m in (mdl.get("merges") or [])]
+    tok = BPETokenizer(vocab, merges, control=control, pattern=pretok_pattern(tj),
+                       style=pretok_style(tj))
+    return tok, vocab
+
+
+def _warm_decision(model, dec_cfg, webio):
+    try:
+        webio.load_stage("warm")
+        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
+                                           "instructions": "warm up",
+                                           "criteria": ["a", "b"]}})
+    except Exception as e:                    # a warm-up is an optimisation, not a step
+        try:
+            import js
+            js.console.warn("webtorch: decision warm-up skipped: " + str(e))
+        except Exception:
+            pass                              # no browser to tell; the model is still fine
+
+
+async def load_decision_gguf(src, **kw):
+    """Build a decision model from a self-contained GGUF, or return None for another task.
+
+    Recognition is structural, using the tensor names already used for safetensors
+    detection. Repository names, filenames, and architecture strings are never allow-listed.
+    The file's architecture value only selects its own metadata namespace.
+    """
+    from . import ggufload as G
+    from . import webio
+
+    src = str(src).rstrip("/")
+    _version, meta, infos, data_start = await _gguf_header(src)
+    by_name = {item["name"]: item for item in infos}
+    if not looks_like_decision(by_name):
+        return None
+
+    enc_raw = _gguf_meta_json(meta, "encoder_config")
+    dec_raw = _gguf_meta_json(meta, "agent_config")
+    tj = _gguf_meta_json(meta, "tokenizer_json")
+    missing = [name for name, value in (("encoder_config", enc_raw),
+                                        ("agent_config", dec_raw),
+                                        ("tokenizer_json", tj)) if not isinstance(value, dict)]
+    if missing:
+        arch = meta.get("general.architecture", "<missing>")
+        raise ValueError("decision GGUF architecture %r is missing embedded metadata: %s"
+                         % (arch, ", ".join(missing)))
+
+    unsupported = sorted({G.GGML_NAMES.get(item["type"], str(item["type"]))
+                          for item in infos if not G.is_supported(item["type"])})
+    if unsupported:
+        raise NotImplementedError("decision GGUF uses unsupported tensor type(s): %s"
+                                  % ", ".join(unsupported))
+
+    weights = {}
+    for done, name in enumerate(sorted(by_name), 1):
+        weights[name] = await _gguf_tensor(src, data_start, by_name[name])
+        webio.load_stage("weights", done, len(by_name))
+
+    enc_cfg = EncoderConfig(enc_raw)
+    tok, vocab = _tokenizer_from_json(tj)
+    mask_id = next((vocab[t] for t in ("[MASK]", "<mask>", "<MASK>", "[mask]")
+                    if t in vocab), None)
+    if mask_id is None:
+        raise ValueError("%s: no marker token in the embedded GGUF tokenizer" % src)
+    if "temperature" not in dec_raw and "temperature" in weights:
+        dec_raw = dict(dec_raw)
+        dec_raw["temperature"] = [float(x) for x in
+                                  np.asarray(weights["temperature"]).reshape(-1)]
+    dec_cfg = DecisionConfig(dec_raw)
+    model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
+                          mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
+                          pad_id=enc_cfg.pad_id)
+    _warm_decision(model, dec_cfg, webio)
+    return model
+
+
 async def load_decision(src, **kw):
     """Build a decision model from a served directory, or return None if it is not one.
 
@@ -778,7 +943,6 @@ async def load_decision(src, **kw):
     loader, and "not a decision model" is the ordinary case, not a failure.
     """
     from . import webio
-    from .llm import BPETokenizer, pretok_pattern, pretok_style
     from . import hfcompat
 
     src = str(src).rstrip("/")
@@ -825,18 +989,10 @@ async def load_decision(src, **kw):
             continue
     if tj is None:
         raise ValueError("%s has a decision checkpoint but no tokenizer.json beside it" % src)
-    mdl = tj.get("model") or {}
-    vocab = dict(mdl.get("vocab") or {})
-    control = []
-    for a in (tj.get("added_tokens") or []):
-        if isinstance(a, dict) and a.get("content") is not None and a.get("id") is not None:
-            vocab[a["content"]] = int(a["id"]); control.append(a["content"])
-    merges = [" ".join(m) if isinstance(m, (list, tuple)) else m for m in (mdl.get("merges") or [])]
     # Which family of BPE this is comes from the file. A multilingual checkpoint trained
     # with SentencePiece cuts text up by a marker character, not by a regex, and reading one
     # as the other returns different tokens without failing.
-    tok = BPETokenizer(vocab, merges, control=control, pattern=pretok_pattern(tj),
-                       style=pretok_style(tj))
+    tok, vocab = _tokenizer_from_json(tj)
 
     # The marker token: whichever of the model's own added tokens marks a position to be
     # filled in. Read from the vocabulary rather than assumed, because the string differs
@@ -879,15 +1035,5 @@ async def load_decision(src, **kw):
     # -- measured at 3.5 s against 51 ms for the ones after it. It also makes the loaded
     # model honest about itself: between loading and that first question the page reported
     # nothing on the GPU, because nothing was.
-    try:
-        webio.load_stage("warm")
-        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
-                                         "instructions": "warm up",
-                                         "criteria": ["a", "b"]}})
-    except Exception as e:                    # a warm-up is an optimisation, not a step
-        try:
-            import js
-            js.console.warn("webtorch: decision warm-up skipped: " + str(e))
-        except Exception:
-            pass                              # no browser to tell; the model is still fine
+    _warm_decision(model, dec_cfg, webio)
     return model

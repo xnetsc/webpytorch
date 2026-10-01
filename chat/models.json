@@ -86,10 +86,10 @@
       "file": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf"
     },
     {
-      "name": "xDecision · 322M decision model · multilingual",
+      "name": "xDecision · 322M · Q8_0 GGUF · multilingual decision model",
+      "size": 402546752,
       "repo": "mccoysc/xDecision",
-      "file": "models/checkpoint",
-      "probe": "models/checkpoint/model.safetensors"
+      "file": "models/gguf/xDecision-Q8_0.gguf"
     },
     {
       "name": "Laya Multilingual · decision model · answers questions, writes nothing",

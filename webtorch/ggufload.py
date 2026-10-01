@@ -557,3 +557,8 @@ def tensor_nbytes(ttype, n):
     name = GGML_NAMES.get(ttype, str(ttype))
     bs, by = _BLOCK[name]
     return (n // bs) * by if bs > 1 else n * by
+
+
+def tensor_block(ttype):
+    """Return ``(elements, bytes)`` for one encoded block of a supported tensor type."""
+    return _BLOCK[GGML_NAMES.get(ttype, str(ttype))]

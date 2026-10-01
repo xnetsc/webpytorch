@@ -404,11 +404,11 @@ async def _load_uncached(source, task, dtype, encoder, kw):
     # loader because the two are told apart by what the checkpoint CONTAINS -- an encoder
     # and a scorer -- and that costs one ranged read of the file's index; guessing from the
     # directory's name would get a model nobody has published yet wrong.
-    if not src.endswith(".gguf"):
-        from . import decision as _decision
-        dm = await _decision.load_decision(src, **kw)
-        if dm is not None:
-            return Model(dm, "decision")
+    from . import decision as _decision
+    dm = (await _decision.load_decision_gguf(src, **kw) if src.endswith(".gguf")
+          else await _decision.load_decision(src, **kw))
+    if dm is not None:
+        return Model(dm, "decision")
     lm = await AutoModelForCausalLM.from_pretrained(
         src, dtype=dtype, **{k: kw[k] for k in _LLM_OPTS if k in kw and k != "dtype"})
     lm = _apply_gen_defaults(lm, kw)
