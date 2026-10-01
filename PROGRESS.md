@@ -1,5 +1,28 @@
 # Progress
 
+## 2026-10-02 ▸ Phase-one exact Q4 vector kernels
+
+**Constraint:** Optimise within the source format first. No weight re-encoding, activation
+requantisation, or materialised alternate-width comparison may decide this phase.
+
+- Added register-local packed-nibble vector decoders for Q4_0, Q4_1, and Q4_K. Four source
+  bytes are read together, split into their original low/high Q4 values, scaled with the
+  format's exact block parameters, and accumulated against unchanged FP32 activations.
+- Added an interleaved same-width scalar/vector benchmark. It labels itself phase one and
+  cannot be used as evidence for cross-width routing.
+- Rejected the first tiny-shape timing set: its 0.06–0.38 ms kernels were dominated by
+  dispatch/reclamation noise and repeated runs contradicted one another.
+- At realistic K=4096, N=3072 shapes, two independent interleaved runs showed Q4_0
+  1.03–1.12× / 1.06–1.10×, Q4_1 1.02–1.09× / 1.03–1.10×, and Q4_K
+  1.01–1.14× / 1.07–1.14× across M=1/32/128. Relative numerical differences stayed near
+  1e-6 and came only from equivalent FP32 accumulation order.
+
+### Evidence
+
+- Final Chrome WebGPU matrix: 28 formats × 5 operator cases = 140/140, no failures; the
+  decision-feature reduction also matched its CPU reference.
+- Python suite: 47 passed. JavaScript suite: 19 passed.
+
 ## 2026-10-01 ▸ Native-width performance methodology correction
 
 **Correction:** The earlier stored-versus-materialized timings were taken before the stored

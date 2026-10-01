@@ -5438,6 +5438,20 @@ fn k4sc(so: u32, j: u32) -> vec2<f32> {
 }
 """
 
+_Q4V_FN = """
+// Four packed bytes contain four consecutive low-nibble values and four consecutive
+// high-nibble values. Keep the source nibbles packed until this register-local expansion;
+// no alternate-width weight buffer is produced.
+fn Q4LO(p: u32) -> vec4<f32> {
+  return vec4<f32>(f32(p & 15u), f32((p >> 8u) & 15u),
+                   f32((p >> 16u) & 15u), f32((p >> 24u) & 15u));
+}
+fn Q4HI(p: u32) -> vec4<f32> {
+  return vec4<f32>(f32((p >> 4u) & 15u), f32((p >> 12u) & 15u),
+                   f32((p >> 20u) & 15u), f32((p >> 28u) & 15u));
+}
+"""
+
 # Q8_0: 32 values / 34 bytes -- f16 d + int8[32].
 _Q8_0_DEC = """
     let o = base + b * 34u;
@@ -5516,10 +5530,13 @@ _Q4K_DEC = """
       let s1 = k4sc(so, i0); let s2 = k4sc(so, i0 + 1u);
       let d1 = d * s1.x; let m1 = dmin * s1.y;
       let d2 = d * s2.x; let m2 = dmin * s2.y;
-      for (var l: u32 = 0u; l < 32u; l = l + 1u) {
-        let q = B(qo + g * 32u + l);
-        ACC(kb + i0 * 32u + l, d1 * f32(q & 15u) - m1);
-        ACC(kb + (i0 + 1u) * 32u + l, d2 * f32(q >> 4u) - m2);
+      for (var lw: u32 = 0u; lw < 8u; lw = lw + 1u) {
+        let l = lw * 4u;
+        let q = B4(qo + g * 32u + l);
+        ACC4(kb + i0 * 32u + l,
+             Q4LO(q) * d1 - vec4<f32>(m1, m1, m1, m1));
+        ACC4(kb + (i0 + 1u) * 32u + l,
+             Q4HI(q) * d2 - vec4<f32>(m2, m2, m2, m2));
       }
     }
 """
@@ -5969,7 +5986,36 @@ _IQ1M_DEC = """
     }
 """
 
-# Q4_0: 32 values / 18 bytes -- f16 d + 16 nibble pairs, quants centred on 8.
+# Q4_0 vector candidate. Kept beside the production scalar decoder so the same-width
+# benchmark can compare them without changing or materialising the stored representation.
+_Q4_0_VEC_DEC = """
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u;
+      let q = B4(o + 2u + j);
+      ACC4(kb + j, d * (Q4LO(q) - vec4<f32>(8.0, 8.0, 8.0, 8.0)));
+      ACC4(kb + 16u + j, d * (Q4HI(q) - vec4<f32>(8.0, 8.0, 8.0, 8.0)));
+    }
+"""
+
+_Q4_1_VEC_DEC = """
+    let o = base + b * 20u;
+    let d = F16(o); let mn = F16(o + 2u);
+    let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u;
+      let q = B4(o + 4u + j);
+      ACC4(kb + j, d * Q4LO(q) + vec4<f32>(mn, mn, mn, mn));
+      ACC4(kb + 16u + j, d * Q4HI(q) + vec4<f32>(mn, mn, mn, mn));
+    }
+"""
+
+# Scalar Q4_0/Q4_1 candidates retained for the same-width benchmark. Production uses the
+# vector candidates above: at realistic 4096x3072 Linear shapes they won across M=1/32/128
+# in two full interleaved runs. The earlier sub-millisecond synthetic result was dominated
+# by dispatch/reclamation noise and is intentionally not used for routing.
 _Q4_0_DEC = """
     let o = base + b * 18u;
     let d = F16(o);
@@ -5981,7 +6027,6 @@ _Q4_0_DEC = """
     }
 """
 
-# Q4_1: 32 values / 20 bytes -- f16 d, f16 min, 16 nibble pairs.
 _Q4_1_DEC = """
     let o = base + b * 20u;
     let d = F16(o); let mn = F16(o + 2u);
@@ -6170,14 +6215,14 @@ _GGML_TYPES = {
     "NVFP4":   (_NVFP4_DEC,   _FP4_FN,             64,  36, None),
     "Q1_0":    (_Q1_0_DEC,    "",                 128,  18, None),
     "Q2_0":    (_Q2_0_DEC,    "",                  64,  18, None),
-    "Q4_0":    (_Q4_0_DEC,    "",                  32,  18, None),
-    "Q4_1":    (_Q4_1_DEC,    "",                  32,  20, None),
+    "Q4_0":    (_Q4_0_VEC_DEC, _Q4V_FN,            32,  18, None),
+    "Q4_1":    (_Q4_1_VEC_DEC, _Q4V_FN,            32,  20, None),
     "Q5_0":    (_Q5_0_DEC,    "",                  32,  22, None),
     "Q5_1":    (_Q5_1_DEC,    "",                  32,  24, None),
     "Q8_0":    (_Q8_0_DEC,    "",                  32,  34, None),
     "IQ4_NL":  (_IQ4NL_DEC,   _KV_FN,              32,  18, None),
     "IQ4_XS":  (_IQ4XS_DEC,   _KV_FN,             256, 136, None),
-    "Q4_K":    (_Q4K_DEC,     _K4SC_FN,           256, 144, None),
+    "Q4_K":    (_Q4K_DEC,     _K4SC_FN + _Q4V_FN, 256, 144, None),
     "Q5_K":    (_Q5K_DEC,     _K4SC_FN,           256, 176, None),
     "Q6_K":    (_Q6K_DEC,     "",                 256, 210, None),
     "Q3_K":    (_Q3K_DEC,     _Q3K_HELP,          256, 110, None),

@@ -19,6 +19,21 @@ def test_q8_native_path_vectorizes_the_original_block_without_requantizing_activ
     assert "dot4I8Packed" not in src
 
 
+def test_q4_native_vector_candidates_never_create_an_alternate_weight_buffer():
+    assert "fn Q4LO(p: u32)" in wt._Q4V_FN
+    assert "fn Q4HI(p: u32)" in wt._Q4V_FN
+    for src in (wt._Q4_0_VEC_DEC, wt._Q4_1_VEC_DEC, wt._Q4K_DEC):
+        assert "B4(" in src
+        assert "ACC4(" in src
+        assert "round(" not in src
+
+
+def test_measured_positive_q4_vector_paths_are_enabled_without_cross_width_routing():
+    for name in ("Q4_0", "Q4_1", "Q4_K"):
+        assert "ACC4(" in wt._GGML_TYPES[name][0]
+        assert "round(" not in wt._GGML_TYPES[name][0]
+
+
 def test_stored_weight_materializes_only_when_an_operator_requests_an_array():
     values = np.arange(-16, 16, dtype=np.int8)
     raw = np.asarray([0.5], dtype=np.float16).tobytes() + values.tobytes()
