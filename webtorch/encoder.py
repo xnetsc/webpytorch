@@ -128,6 +128,10 @@ class TextEncoder(wt.Module):
         self.act = _ACT.get(cfg.act, gelu)
         self._rope = {}
         self._emb_host = None
+        # One recorded command list per sequence-length bucket, and a latch for a backend
+        # that cannot record at all.
+        self._cap = {}
+        self._cap_off = False
         missing = [n for n in (prefix + "embeddings.tok_embeddings.weight",
                                prefix + "final_norm.weight") if n not in self.have]
         if missing:
@@ -417,10 +421,98 @@ class TextEncoder(wt.Module):
         return [Tensor(np.ascontiguousarray(flat[b, :length]))
                 for b, length in enumerate(lengths)]
 
-    def _run(self, ids, T, B, valid):
-        x = self._embed(ids)
+    # Sequence lengths are rounded up to a multiple of this before a pass is captured.
+    # A capture is only reusable for the exact shape it recorded, and questions are never
+    # the same length twice; rounding turns "every length is new" into a handful of buckets,
+    # and the positions that rounding adds are padding, which the mask already makes
+    # unreadable. 64 because the attention kernels already want their extents in 64s.
+    _BUCKET = 64
+
+    def _replayed(self, ids, T, B, valid):
+        """One encoder pass through a recorded command list, or None if that is not on.
+
+        Measured on this backend, one 82-token pass of a 22-layer 768-wide encoder: 36.2 ms
+        of it is the HOST issuing 550 dispatches and 0.7 ms is waiting for the GPU, which is
+        idle almost the whole time. The arithmetic is not the cost; reaching the device 550
+        times from Python inside wasm is. A captured pass issues one command instead.
+
+        Only where the shape can be held still: a single sequence, no autograd, and a backend
+        that records (WebGL does not). Everything else takes the ordinary path.
+        """
+        if B != 1 or not self._capture_ok():
+            return None
+        Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
+        if self.cfg.max_len and Tb > self.cfg.max_len:
+            return None
+        slot = self._cap.get(Tb)
+        if slot is None:
+            slot = self._cap_make(Tb)
+            if slot is None:
+                return None
+        self._cap_write(slot, ids, T, valid)
+        plat = wt._adam_kernel["platform"]
+        if slot["recorded"]:
+            plat.replay(slot["name"])
+        else:
+            plat.beginCapture(slot["name"])
+            out = self._layers(slot["x"], slot["masks"], 1)
+            out.numpy()                      # the capture has to include the read it replays
+            plat.endCapture()
+            slot["out"] = out
+            slot["recorded"] = True
+        return slot["out"]
+
+    def _capture_ok(self):
+        if self._cap_off:
+            return False
+        try:
+            plat = wt._adam_kernel["platform"]
+            self._cap_off = not (hasattr(plat, "beginCapture") and hasattr(plat, "replay"))
+        except Exception:
+            self._cap_off = True
+        return not self._cap_off
+
+    def _cap_make(self, Tb):
+        """Buffers this length's recorded pass reads from. Written before every replay, never
+        reallocated -- a capture binds the buffer it saw, so a fresh one would be invisible
+        to it and the pass would answer with whatever the first call happened to contain."""
+        try:
+            x = Tensor(np.zeros((Tb, self.cfg.hidden), np.float32))
+            masks = {k: Tensor(np.zeros((Tb, Tb), np.float32))
+                     for k in set(self.cfg.layer_types)}
+        except Exception:
+            self._cap_off = True
+            return None
+        slot = {"x": x, "masks": masks, "out": None, "recorded": False,
+                "name": "enc%d_%d" % (id(self) & 0xffff, Tb), "T": Tb}
+        self._cap[Tb] = slot
+        return slot
+
+    def _cap_write(self, slot, ids, T, valid):
+        Tb = slot["T"]
+        pad = self.cfg.pad_id or 0
+        full = np.full(Tb, pad, dtype=np.int64)
+        full[:T] = np.asarray(ids, dtype=np.int64)[:T]
+        live = np.zeros(Tb, dtype=np.int64)
+        live[:T] = 1 if valid is None else np.asarray(
+            valid[0] if np.ndim(valid) == 2 else valid, dtype=np.int64)[:T]
+        emb = self._embed_rows(full)
+        slot["x"].data.buffer.set_data(np.ascontiguousarray(emb, dtype=np.float32).reshape(-1))
+        for kind, m in slot["masks"].items():
+            built = self._mask(Tb, [live], kind, 1)
+            m.data.buffer.set_data(
+                np.ascontiguousarray(np.asarray(built.numpy()), np.float32).reshape(-1))
+
+    def _embed_rows(self, ids):
+        """The embedding rows for `ids`, as a host array."""
+        t = self._embed(ids)
+        return np.asarray(t.numpy()) if hasattr(t, "numpy") else np.asarray(t.data)
+
+    def _layers(self, x, masks, B):
+        """The stack, from embeddings to the final norm. Separate from `_run` because this
+        part is the same dispatches every time for a given length -- which is what makes it
+        capturable."""
         x = self._norm(x, self.p + "embeddings.norm")
-        masks = {k: self._mask(T, valid, k, B) for k in set(self.cfg.layer_types)}
         for i in range(self.cfg.layers):
             kind = self.cfg.layer_types[i]
             an = "%slayers.%d.attn_norm" % (self.p, i)
@@ -428,5 +520,12 @@ class TextEncoder(wt.Module):
             x = x + self._attn(xa, i, kind, masks[kind], B)
             x = x + self._mlp(self._norm(x, "%slayers.%d.mlp_norm" % (self.p, i)), i)
         return self._norm(x, self.p + "final_norm")
+
+    def _run(self, ids, T, B, valid):
+        got = self._replayed(ids, T, B, valid)
+        if got is not None:
+            return got
+        masks = {k: self._mask(T, valid, k, B) for k in set(self.cfg.layer_types)}
+        return self._layers(self._embed(ids), masks, B)
 
     forward = encode
