@@ -2415,6 +2415,46 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
 
     _settled = {}           # canonical url -> the key this file is actually cached under
 
+    async def _same_copy(a, b):
+        """Are two CACHED entries the same file? Asked before one of them is deleted.
+
+        The hosts' own hashes settle it when both will give one. They do not always: this
+        hub serves one checkpoint straight from its own domain with no object URL to read a
+        hash out of, and its API does not answer cross-origin, so from a page there is no
+        hash to be had for it at all -- and the duplicate sat there because of it.
+
+        Both copies are already on this machine, so they can simply be compared. Nothing is
+        downloaded; this reads what is already stored, in windows, and stops at the first
+        difference. Slower than comparing two hashes and it is proof rather than evidence,
+        which is the right trade when the alternative is deleting 678 MB on a guess.
+        """
+        da, db = await _published(a), await _published(b)
+        if da and db:
+            return da == db
+        try:
+            sa, sb = await _cached_extent(a), await _cached_extent(b)
+        except Exception:
+            return False
+        if not sa or sa != sb:
+            return False
+        WIN = 8 << 20
+        off = 0
+        while off < sa:
+            n = min(WIN, sa - off)
+            x = await read_cache(a, off, n, cdir)
+            y = await read_cache(b, off, n, cdir)
+            if x is None or y is None or len(x) != n or len(y) != n or bytes(x) != bytes(y):
+                return False
+            off += n
+        return True
+
+    async def _cached_extent(key):
+        """How much of this entry is actually held, or None if it is not complete."""
+        for e in await list_cache(cdir):
+            if e["key"] == key or key.split("://", 1)[-1] == e["key"]:
+                return e["total"] if e["complete"] else None
+        return None
+
     async def _cache_key(url):
         """The one key this file is held under, whichever host it came from.
 
@@ -2452,8 +2492,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         # hash and the hashes agree, the extra copy goes now rather than waiting for someone
         # to run a cleanup they do not know exists.
         for other in held[1:]:
-            a, b = await _published(keep), await _published(other)
-            if a and b and a == b:
+            if await _same_copy(keep, other):
                 try:
                     await delete_cache(other, cdir)
                 except Exception:
