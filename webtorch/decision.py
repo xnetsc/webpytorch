@@ -172,6 +172,21 @@ GENERAL_SHAPE = "named"
 _CONVENTIONAL = (("choice", "named"), ("score", "ordered"), ("noul", "fixed"))
 
 
+def type_rows(weights):
+    """How many question types the WEIGHTS have: one row of the type embedding each.
+
+    The authoritative count, which is why it is preferred over the config's temperature
+    list. A temperature list usually agrees, but it is calibration metadata -- it can be
+    short, absent, or a single scalar -- while the embedding IS the model: a checkpoint
+    cannot answer a type it has no row for, and must be able to answer every type it has.
+    """
+    try:
+        n = int(np.shape((weights or {}).get("type_emb.weight"))[0])
+    except Exception:
+        return None
+    return n or None
+
+
 def render_options(shape, criteria):
     """The answer texts, in label order, for a question of this SHAPE.
 
@@ -194,8 +209,9 @@ class DecisionConfig(object):
     """The decision half of the model's own config: how long a sequence may be, how the
     answer distribution is scaled, and which question types exist."""
 
-    def __init__(self, cfg, qtypes=None):
+    def __init__(self, cfg, qtypes=None, type_count=None):
         c = dict(cfg or {})
+        self.type_count = type_count
         self.raw = c
         self.max_len = int(c.get("max_len", 512))
         self.head_max_len = int(c.get("head_max_len", 192))
@@ -205,7 +221,7 @@ class DecisionConfig(object):
         # Post-hoc calibration, fitted by whoever trained the model. Two levels: a
         # temperature per question type, and a finer one per type AND option count, because
         # a two-way question and a twenty-way one do not need the same scaling.
-        self.qtypes, self.shapes = self._read_types(c, qtypes)
+        self.qtypes, self.shapes = self._read_types(c, qtypes, type_count)
         raw_temperature = c.get("temperature", [1.0] * len(self.qtypes))
         self.temperature_raw = (list(raw_temperature) if isinstance(raw_temperature, (list, tuple))
                                 else [raw_temperature] * len(self.qtypes))
@@ -241,7 +257,7 @@ class DecisionConfig(object):
                 RuntimeWarning, stacklevel=2)
 
     @staticmethod
-    def _read_types(c, qtypes=None):
+    def _read_types(c, qtypes=None, type_count=None):
         """The question types this checkpoint has, in the order its type embedding is in.
 
         Declared, if it says so: `question_types` as a list -- order is meaningful, it is
@@ -249,8 +265,9 @@ class DecisionConfig(object):
         `{"name", "shape"}`. That is how a model says what it answers, and a model that
         says it needs nothing added here to be supported.
 
-        Otherwise the count is still knowable, from however many temperatures the file
-        carries, and only the names and shapes are the convention above. Anything past the
+        Otherwise the count is still knowable -- from the type embedding's rows, which is
+        the model itself, and failing that from however many temperatures the file carries --
+        and only the names and shapes are the convention above. Anything past the
         conventional ones is named positionally and takes the general shape rather than
         being quietly given the last one's.
         """
@@ -268,7 +285,9 @@ class DecisionConfig(object):
                 shapes[name] = shape if shape in SHAPES else GENERAL_SHAPE
             return names, shapes
         t = c.get("temperature")
-        count = len(t) if isinstance(t, (list, tuple)) and t else len(_CONVENTIONAL)
+        count = (type_count
+                 or (len(t) if isinstance(t, (list, tuple)) and t else 0)
+                 or len(_CONVENTIONAL))
         for i in range(count):
             name, shape = (_CONVENTIONAL[i] if i < len(_CONVENTIONAL)
                            else ("type%d" % i, GENERAL_SHAPE))
@@ -1026,7 +1045,7 @@ async def _from_gguf(src, **kw):
         dec_raw = dict(dec_raw)
         dec_raw["temperature"] = [float(x) for x in
                                   np.asarray(weights["temperature"]).reshape(-1)]
-    dec_cfg = DecisionConfig(dec_raw)
+    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights))
     model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
                           mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
                           pad_id=enc_cfg.pad_id)
@@ -1153,7 +1172,7 @@ async def _from_directory(src, **kw):
         dec_raw["temperature"] = [float(x) for x in
                                   np.asarray(weights["temperature"]).reshape(-1)]
 
-    dec_cfg = DecisionConfig(dec_raw)
+    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights))
     model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
                           mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
                           pad_id=enc_cfg.pad_id)

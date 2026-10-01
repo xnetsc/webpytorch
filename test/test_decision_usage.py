@@ -371,3 +371,42 @@ def test_a_truth_is_read_by_the_shape_of_the_question():
     assert D._target_index("fixed", False, ["false", "true"]) == 0
     # A dict of truths may be keyed by the type's own name, whatever that is.
     assert D._target_index("named", {"route": "c"}, ["a", "b", "c"], "route") == 2
+
+
+def test_the_type_count_comes_from_the_model_not_from_its_calibration_metadata():
+    """Downstream callers ask for `noul` by name. A checkpoint whose temperature list is
+    short or missing must not lose a type it actually has -- the type embedding says how
+    many there are, and that is the model rather than metadata beside it."""
+    from webtorch.decision import DecisionConfig, type_rows
+
+    w = {"type_emb.weight": np.zeros((3, 8), np.float32)}
+    assert type_rows(w) == 3
+    assert type_rows({}) is None
+
+    for cfg in ({"temperature": [1.0, 1.0]},        # short
+                {"temperature": 1.0},               # a scalar
+                {}):                                # absent
+        c = DecisionConfig(cfg, type_count=type_rows(w))
+        assert c.qtypes == ["choice", "score", "noul"], cfg
+        assert c.shape_of("noul") == "fixed"
+
+
+def test_the_answer_keys_downstream_reads_are_unchanged():
+    """`laya-service` and the browser-use skill read `answer.choice`, `answer.score` and
+    `answer.noul` off the wire. The shapes decide those keys now; for a checkpoint that
+    declares no types -- which is every one published so far -- they must come out the
+    same."""
+    from webtorch.decision import DecisionConfig, render_options
+
+    cfg = DecisionConfig({"temperature": [1.0, 1.0, 1.0]})
+    keyed = {"named": "choice", "ordered": "score", "fixed": "noul"}
+    assert {t: keyed[cfg.shape_of(t)] for t in cfg.qtypes} == {
+        "choice": "choice", "score": "score", "noul": "noul"}
+
+    # And the sequences built for them are byte-for-byte what they were.
+    assert render_options(cfg.shape_of("choice"), ["a", "b"]) == (["a", "b"], ["a", "b"])
+    assert render_options(cfg.shape_of("score"), ["lo", "hi"]) == (
+        ["0", "1"], ["level 0: lo", "level 1: hi"])
+    assert render_options(cfg.shape_of("noul"), None) == (
+        ["false", "true"], ["false: no, the statement does not hold",
+                            "true: yes, the statement holds"])
