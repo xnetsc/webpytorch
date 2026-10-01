@@ -422,11 +422,44 @@ class TextEncoder(wt.Module):
         return [Tensor(np.ascontiguousarray(flat[b, :length]))
                 for b, length in enumerate(lengths)]
 
-    # A padded pass is mathematically equivalent but not numerically identical on WebGPU:
-    # changing the reduction width moved this checkpoint's logits by up to 0.04 after 22
-    # layers. Capture only the exact shape, and only after a length repeats. Each graph pins
-    # its intermediate buffers, so keep a small hard bound and let one-off lengths use the
-    # ordinary path.
+    # Sequence lengths are rounded up to a multiple of this before a pass is captured.
+    #
+    # A capture is only reusable for the shape it recorded, and decision sequences are never
+    # the same length twice: measured over 24 real ones, 14 distinct lengths between 105 and
+    # 185 tokens. Keyed by the exact length, four slots fill with lengths that occur once and
+    # the other ten are never captured at all -- which is WORSE than not capturing, because
+    # every one of them pays to record a pass that is then never replayed. Median of three
+    # runs over those 24 calls, total and the warm second half:
+    #
+    #     bucket      total     warm      captures
+    #     exact       1451 ms   692 ms    4   -- slots wasted on lengths seen once
+    #     none        1131 ms   553 ms    0
+    #     16          1345 ms   481 ms    4   -- too many buckets, slots run out
+    #     32          1024 ms   440 ms    3
+    #     48          1000 ms   453 ms    2
+    #     64          1121 ms   471 ms    2   -- 20% of the positions are padding
+    #
+    # So the size is a trade between how often a bucket is hit and how much padding is then
+    # carried through a quadratic attention. 32 rather than 48 because the padding share is
+    # what grows with length, and these were short sequences.
+    _BUCKET = 32
+
+    # Rounding is this method's own, so `_replayed` trims the answer back to the length it was
+    # asked about. It has to: padding changes NOTHING on the real positions -- measured on
+    # this checkpoint at 105 to 225 tokens, padding to a multiple of 64 and trimming back
+    # leaves the hidden states bit-identical, max absolute difference 0.0 at every length
+    # against values of magnitude 42 -- but handing the padded ROWS on is a different thing
+    # entirely. A decision head's attention has no mask, so it reads them, which moved its
+    # logits by up to 0.012. That is what once got the rounding here removed, as if padding
+    # were numerically unsound; it is the missing trim. `encode_many` never had the bug, for
+    # the same reason: it cuts every sequence back to its own length on the way out.
+
+    # Each retained graph pins its own intermediate buffers, so their number is bounded rather
+    # than left to grow with however many lengths a session happens to see. Once full it stays
+    # full: the backend can drop ALL captures (`resetCaptures`, which release() sends) but not
+    # one of them, so there is no way to retire a cold slot in favour of a warm one. A session
+    # whose lengths drift far from its first few therefore stops benefiting -- visible as
+    # decisions settling back to the uncaptured time, not as anything going wrong.
     _CAP_MAX = 4
 
     def _replayed(self, ids, T, B, valid):
@@ -442,7 +475,7 @@ class TextEncoder(wt.Module):
         """
         if B != 1 or not self._capture_ok():
             return None
-        Tb = T
+        Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
         if self.cfg.max_positions and Tb > self.cfg.max_positions:
             return None
         slot = self._cap.get(Tb)
@@ -466,7 +499,13 @@ class TextEncoder(wt.Module):
             plat.endCapture()
             slot["out"] = out
             slot["recorded"] = True
-        return slot["out"]
+        # `encode` answers for the ids it was given: undo the rounding. Free, near enough --
+        # the read is already part of the recorded pass, so the rows are on the host anyway
+        # and this is a slice. See the note on _BUCKET for what skipping it costs.
+        if Tb == T:
+            return slot["out"]
+        rows = np.asarray(slot["out"].numpy()).reshape(Tb, -1)[:T]
+        return Tensor(np.ascontiguousarray(rows))
 
     def _capture_ok(self):
         if self._cap_off:

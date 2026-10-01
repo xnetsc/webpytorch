@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from webtorch._core import Tensor
 from webtorch.decision import DecisionModel, _named_first
+from webtorch import _core as wt
 from webtorch.encoder import TextEncoder
 
 
@@ -10,32 +11,116 @@ def test_named_layout_fallback_keeps_the_model_root():
     assert _named_first(None, ("tokenizer/", "")) == ["tokenizer/", ""]
 
 
-def test_encoder_capture_waits_for_an_exact_length_repeat_and_stays_bounded():
-    class Encoder:
-        _CAP_MAX = TextEncoder._CAP_MAX
-        _replayed = TextEncoder._replayed
+class _FakePlatform(object):
+    """A backend that records and replays, without a device behind it."""
 
-        def __init__(self):
-            self.cfg = SimpleNamespace(max_positions=1024)
-            self._cap = {}
-            self._cap_seen = set()
+    def __init__(self):
+        self.replayed = []
+        self.captured = []
 
-        @staticmethod
-        def _capture_ok():
-            return True
+    def replay(self, name):
+        self.replayed.append(name)
 
-        @staticmethod
-        def _cap_make(_length):
-            raise AssertionError("a first-seen or over-limit length must not be captured")
+    def beginCapture(self, name):
+        self.captured.append(name)
 
-    enc = Encoder()
+    def endCapture(self):
+        pass
+
+
+def _bucket_of(length):
+    """The slot a length lands in -- the same rounding `_replayed` does."""
+    b = TextEncoder._BUCKET
+    return int(((length + b - 1) // b) * b)
+
+
+def _with_platform(plat):
+    """`_replayed` reaches the backend through the module-level kernel table; swap it for the
+    duration of a test and put back whatever was there."""
+    before = wt._adam_kernel.get("platform")
+    wt._adam_kernel["platform"] = plat
+    return before
+
+
+class _FakeEncoder(object):
+    """Enough of a TextEncoder for `_replayed` to run with no backend under it."""
+
+    _BUCKET = TextEncoder._BUCKET
+    _CAP_MAX = TextEncoder._CAP_MAX
+    _replayed = TextEncoder._replayed
+
+    def __init__(self, hidden=4):
+        self.cfg = SimpleNamespace(max_positions=1024)
+        self.hidden = hidden
+        self._cap = {}
+        self._cap_seen = set()
+        self.made = []
+        self.written = []
+
+    @staticmethod
+    def _capture_ok():
+        return True
+
+    def _cap_make(self, length):
+        self.made.append(length)
+        rows = np.arange(length * self.hidden, dtype=np.float32).reshape(length, self.hidden)
+        slot = {"T": length, "recorded": True, "out": SimpleNamespace(numpy=lambda: rows),
+                "name": "fake%d" % length, "x": None, "masks": {}}
+        self._cap[length] = slot
+        return slot
+
+    def _cap_write(self, slot, ids, T, valid):
+        self.written.append((slot["T"], T))
+
+    def _layers(self, x, masks, B):
+        raise AssertionError("a recorded slot must replay, not run the stack again")
+
+
+def test_encoder_capture_rounds_the_length_up_to_a_bucket():
+    enc = _FakeEncoder()
+    before = _with_platform(_FakePlatform())
+    # First sight of a bucket records nothing: it is the repeat that pays for the capture.
     assert enc._replayed(np.arange(37), 37, 1, None) is None
-    assert enc._cap_seen == {37}
+    assert enc._cap_seen == {_bucket_of(37)}
+    assert enc.made == []
+    # A DIFFERENT length in the same bucket is that repeat -- which is the whole point of
+    # bucketing, since two decision sequences are never the same length twice.
+    assert _bucket_of(51) == _bucket_of(37), "pick two lengths that share a bucket"
+    try:
+        enc._replayed(np.arange(51), 51, 1, None)
+    finally:
+        wt._adam_kernel["platform"] = before
+    assert enc.made == [_bucket_of(37)]
 
+
+def test_encoder_capture_stays_bounded():
+    enc = _FakeEncoder()
     enc._cap = {n: object() for n in range(enc._CAP_MAX)}
-    enc._cap_seen.add(53)
+    enc._cap_seen.add(_bucket_of(53))
     assert enc._replayed(np.arange(53), 53, 1, None) is None
-    assert 53 in enc._cap_seen
+    assert enc.made == []
+
+
+def test_encoder_replay_answers_for_the_ids_it_was_given():
+    """A padded pass is bit-identical on the real positions, but it has MORE rows, and the
+    decision head's attention has no mask -- so handing the padding on moves its logits."""
+    enc = _FakeEncoder(hidden=3)
+    T = 37
+    Tb = _bucket_of(T)
+    enc._cap_seen.add(Tb)                    # pretend the bucket has been seen once
+    plat = _FakePlatform()
+    before = _with_platform(plat)
+    try:
+        got = enc._replayed(np.arange(T), T, 1, None)
+    finally:
+        wt._adam_kernel["platform"] = before
+    assert plat.replayed == ["fake%d" % Tb]
+    assert enc.made == [Tb]
+    assert enc.written == [(Tb, T)]
+    rows = np.asarray(got.numpy()) if hasattr(got, "numpy") else np.asarray(got.data)
+    assert rows.shape == (T, 3)
+    whole = np.arange(Tb * 3, dtype=np.float32).reshape(Tb, 3)
+    assert np.array_equal(rows, whole[:T])
 
 
 def test_decide_reuses_identical_encoder_inputs_and_reports_actual_work():

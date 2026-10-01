@@ -210,8 +210,9 @@ about storage: caching models, and keeping what a GPU measured, are both off unt
 
 ## Making it faster: what this backend is actually bound by
 
-Five attempts to speed up one encoder pass, all measured end to end on the same machine.
-Four of them reduced something real and made no difference or made it worse. They are
+Six attempts to speed up one encoder pass, all measured end to end on the same machine. The
+first five are below; the sixth has a section of its own. Four of them reduced something real
+and made no difference or made it worse. They are
 recorded because the reasoning behind each one was sound and still wrong, and the next
 person to have the idea should get the number rather than the afternoon.
 
@@ -258,6 +259,42 @@ pass, while short compatible sequences may be batched. A decision batch stays on
 through sequence extraction and head scoring. Reading its full `(batch × padded length ×
 hidden)` result back to the host and uploading each question again erased most of the batch
 gain; only the final logits cross that boundary now.
+
+### The sixth attempt: stop issuing the pass at all
+
+The same reasoning one step further. If the device is short of work and not of bandwidth, then
+the cost is the host: measured on one 82-token pass of a 22-layer 768-wide encoder, **36.2 ms
+of it is Python issuing 550 dispatches and 0.7 ms is waiting for the GPU.** So the pass is
+recorded once as a command graph and re-issued with one call afterwards, with the inputs
+written into the buffers the recording bound. Dispatches per pass: 485 → 0.
+
+What makes that hard is that a recording is only valid for the shape it saw, and decision
+sequences are never the same length twice — 24 real ones gave 14 distinct lengths. Keyed by
+the exact length it is not merely useless, it is **negative**: the handful of retained slots
+fill up with lengths that occur once, each having paid to record a pass that is never
+replayed. Lengths are therefore rounded up to a multiple of 32 and the answer trimmed back.
+Median of three runs over those 24 calls:
+
+| keyed by | total | warm half | slots used |
+|---|---|---|---|
+| the exact length | 1451 ms | 692 ms | 4, all cold |
+| nothing (no capture) | 1131 ms | 553 ms | — |
+| a 32 bucket | **1024 ms** | **440 ms** | 3 |
+| a 64 bucket | 1121 ms | 471 ms | 2 |
+
+A 64 bucket is worth about nothing, because a fifth of the positions it computes are padding
+and attention is quadratic in them. 32 is also the multiple the tiled matmul wanted in the
+row above, which is not a coincidence — it is the same axis.
+
+Two things are worth being plain about. **Padding does not change the result**: measured at
+105 to 225 tokens, padding to a bucket and trimming back leaves the hidden states
+bit-identical, difference 0.0 at every length against values of magnitude 42. What does change
+it is handing the padded *rows* onward, because a decision head's attention has no mask and
+reads them — 0.012 on its logits, and the reason the rounding was once removed as if padding
+were unsound. And **1.26× is the whole of it**, not the 1.44× one captured length suggests:
+that figure was measured where the sequence already fitted its bucket. The host cost is real
+and this removes most of it; what is left is arithmetic, and 4× the length still costs 3.94×
+the time.
 
 One caveat on the last row: the quantised path has a dedicated GEMV kernel for a single row,
 which is the decode case. All of the above is measured at 69 rows, on the general path.
