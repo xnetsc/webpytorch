@@ -11,6 +11,14 @@ def test_every_decodable_gguf_type_has_a_native_compute_kernel():
     assert set(ggufload.SUPPORTED_NAMES) == set(wt._GGML_TYPES)
 
 
+def test_q8_native_path_vectorizes_the_original_block_without_requantizing_activations():
+    src = wt._Q8_0_DEC
+    assert "let p = B4(o + 2u + j * 4u)" in src
+    assert "ACC4(kb + j * 4u, d * q)" in src
+    assert "round(" not in src
+    assert "dot4I8Packed" not in src
+
+
 def test_stored_weight_materializes_only_when_an_operator_requests_an_array():
     values = np.arange(-16, 16, dtype=np.int8)
     raw = np.asarray([0.5], dtype=np.float16).tobytes() + values.tobytes()
@@ -33,7 +41,7 @@ def test_non_gguf_quantized_module_uses_the_same_stored_linear_interface():
 
     assert wt.stored_linear(module) is module
     assert module.storage_format == "GPTQ_INT8"
-    assert module.execution == "auto"
+    assert module.execution == "stored"
 
 
 def test_stored_execution_is_the_default_and_policy_is_forwarded_generically():
@@ -44,10 +52,10 @@ def test_stored_execution_is_the_default_and_policy_is_forwarded_generically():
             return {"bias": bias, "execution": execution}
 
     assert wt.stored_linear(EncodedWeight(), bias="b") == {
-        "bias": "b", "execution": "auto",
+        "bias": "b", "execution": "stored",
     }
-    assert wt.stored_linear(EncodedWeight(), execution="stored") == {
-        "bias": None, "execution": "stored",
+    assert wt.stored_linear(EncodedWeight(), execution="auto") == {
+        "bias": None, "execution": "auto",
     }
 
 

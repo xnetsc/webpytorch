@@ -5443,7 +5443,19 @@ _Q8_0_DEC = """
     let o = base + b * 34u;
     let d = F16(o);
     let kb = b * 32u;
-    for (var l: u32 = 0u; l < 32u; l = l + 1u) { ACC(kb + l, d * I8(o + 2u + l)); }
+    // Keep the GGUF Q8_0 block exactly as stored. B4 fetches four original signed bytes in
+    // one/two coalesced word reads; sign extension and the block scale happen in registers.
+    // This is mathematically the same Q8_0 x f32 operation as the scalar loop, with no
+    // activation requantisation and no materialised alternate-width weight.
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let p = B4(o + 2u + j * 4u);
+      let q = vec4<f32>(
+          f32(i32((p & 255u) << 24u) >> 24u),
+          f32(i32(((p >> 8u) & 255u) << 24u) >> 24u),
+          f32(i32(((p >> 16u) & 255u) << 24u) >> 24u),
+          f32(i32(((p >> 24u) & 255u) << 24u) >> 24u));
+      ACC4(kb + j * 4u, d * q);
+    }
 """
 
 # IQ4_NL: 32 values / 18 bytes -- f16 d + 16 bytes of paired codebook indices.
@@ -8992,7 +9004,7 @@ class GGMLWeight(object):
             dtype = np.float32 if self.type_name == "F32" else np.float16
         return out.astype(dtype)
 
-    def as_linear(self, bias=None, execution="auto"):
+    def as_linear(self, bias=None, execution="stored"):
         if len(self.shape) != 2:
             raise ValueError("stored Linear weight must be two-dimensional")
         if not ggml_native_supported(self.type_name):
@@ -9014,7 +9026,7 @@ def materialize_weight(weight, dtype=None):
     return np.asarray(value, dtype=dtype) if dtype is not None else np.asarray(value)
 
 
-def stored_linear(weight, bias=None, execution="auto"):
+def stored_linear(weight, bias=None, execution="stored"):
     """Return a ready native Linear for an encoded weight/module, or None for a dense array.
 
     GGMLWeight and future storage encodings implement ``as_linear``.  AutoGPTQ already
@@ -9034,7 +9046,7 @@ class GGMLLinear(Module):
     are and `ggml_matmul` unpacks each block while it multiplies. That removes the whole
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
-    def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
+    def __init__(self, raw, type_name, K, N, bias=None, execution="stored"):
         if execution not in ("stored", "materialized", "auto"):
             raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         b = np.frombuffer(raw, np.uint8)
@@ -9133,7 +9145,7 @@ class GGMLMoELinear(Module):
 class QuantizedLinear(Module):
     """Inference-only GPTQ-format weight-quantized Linear (group-wise int4/int8)."""
     def __init__(self, qweight, qzeros, scales, bias, Kt, Nt, Kp, Np, gs, bits,
-                 zero_offset=0.0, execution="auto"):
+                 zero_offset=0.0, execution="stored"):
         if execution not in ("stored", "materialized", "auto"):
             raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         self.qweight = xp.asarray(qweight)     # int32 GPU

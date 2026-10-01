@@ -1,5 +1,29 @@
 # Progress
 
+## 2026-10-01 ▸ Native-width performance methodology correction
+
+**Correction:** The earlier stored-versus-materialized timings were taken before the stored
+formats had all received their applicable native integer-dot implementations. They are useful
+diagnostics, but cannot decide production routing yet.
+
+- Restored stored/original-format execution as the public default for GGML and GPTQ modules.
+- Kept `auto` available only as an explicit diagnostic opt-in; it is not the default policy.
+- Marked the existing benchmark output as provisional and without routing authority.
+- Completion order is now explicit: implement and verify each original-format kernel first;
+  then benchmark; only then consider an alternate representation for a measured shape/device.
+- "Original format" also constrains the computation candidate: activation requantisation to
+  satisfy a packed integer-dot instruction is a cross-width algorithm and therefore belongs
+  to phase two. The phase-one Q8_0 change instead vectorises exact reads from each stored
+  signed-byte block and preserves the existing FP32 activation path.
+
+### Evidence
+
+- Chrome WebGPU: 28 stored GGML formats × GEMV/GEMV2/GEMM/MoE-GEMV/MoE-GEMM = 140/140;
+  the decision-feature GPU reduction also matched its independent CPU reference.
+- Real cached xDecision Q8 inference retained the corrected distributions (billing 89.7%,
+  duplicate true 97.9%, urgency 15.7/26.6/27.3/30.4) and completed in 304 ms for 486 tokens.
+- Python suite: 45 passed. JavaScript suite: 19 passed.
+
 ## 2026-10-01 ▸ Decision-output correctness correction
 
 **Trigger:** The real xDecision page showed uniform 50/50 and 25/25/25/25 distributions,

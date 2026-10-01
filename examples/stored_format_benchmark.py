@@ -1,7 +1,9 @@
-"""Interleaved browser benchmark of encoded weights against explicit alternatives.
+"""Provisional diagnostic for encoded weights against explicit alternatives.
 
-The benchmark starts with the complete correctness gate.  It therefore cannot publish a
-speed verdict for a stored kernel that has not first matched the independent decoder.
+This is deliberately not allowed to drive runtime routing yet.  Matching the independent
+decoder proves correctness, but it does not prove that the original-width kernel has received
+all applicable hardware optimisations.  The comparison becomes routing evidence only after
+that native-path completion gate is satisfied for the format under test.
 """
 import json
 import statistics
@@ -144,6 +146,8 @@ def main():
     correctness_gate()
     print("CORRECTNESS_GATE passed")
     result = {"backend": cp.get_backend_name(), "correctness_gate": True,
+              "routing_authority": False,
+              "status": "provisional_until_native_width_paths_are_optimized",
               "shape": {"K": K, "N": N, "M": list(M_VALUES)},
               "rounds": ROUNDS, "repeats_per_round": REPEATS,
               "ggml": ggml_results(), "non_gguf": gptq_results()}
