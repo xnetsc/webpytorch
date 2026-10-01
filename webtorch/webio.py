@@ -364,6 +364,28 @@ async def io_read(name, offset=0, length=None, io=None):
     return bytes(await fn(name, offset, length))
 
 
+# The container formats a source can be served in, by the extension each one is published
+# under. Everything that is published is published under these names.
+_CONTAINERS = (".gguf", ".onnx", ".safetensors")
+
+
+def container_of(name):
+    """Which container `name` is — `"gguf"`, `"onnx"`, `"safetensors"`, or `""` for a
+    directory, a repo id, or a single file in some other shape.
+
+    A *format* is a file naming convention and reading it off the name is honest. What this
+    is NOT for is deciding what **model** is inside: a GGUF may hold a decoder, a decision
+    model or something nobody has published yet, and only its contents say which. So this
+    answers "how are these bytes packed" and nothing else, and it lives in one place so that
+    the answer cannot drift between the loaders that need it.
+    """
+    low = str(name).rstrip("/").lower()
+    for ext in _CONTAINERS:
+        if low.endswith(ext):
+            return ext[1:]
+    return ""
+
+
 def set_io_write(callback):
     """Install the GLOBAL async WRITE callback used for EVERY file the SDK writes:
         async def callback(name, data, offset=0) -> None

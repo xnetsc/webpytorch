@@ -50,3 +50,54 @@ def test_decision_gguf_decodes_f16_and_q8_without_model_specific_names():
 
     np.testing.assert_array_equal(got_f16, f16)
     np.testing.assert_array_equal(got_q8, q8_values.astype(np.float16) * np.float16(0.5))
+
+
+def test_container_is_read_off_the_name_and_nothing_else_is():
+    from webtorch.webio import container_of
+
+    assert container_of("org/repo/weights-Q8_0.gguf") == "gguf"
+    assert container_of("org/repo/model.safetensors") == "safetensors"
+    assert container_of("a/b/graph.ONNX") == "onnx"
+    # A repo or a served directory is not a container, and neither is some other file.
+    assert container_of("org/repo") == ""
+    assert container_of("org/repo/") == ""
+    assert container_of("org/weights.bin") == ""
+    # A name that merely SOUNDS like a decision model is not one; only the tensors say.
+    assert decision.looks_like_decision(["decision.scorer.weight"]) is False
+    assert decision.looks_like_decision(["encoder.x.weight", "scorer.0.weight"]) is True
+
+
+def test_there_is_one_decision_loader_and_the_container_is_internal():
+    """A second, format-named entry point would make every caller carry a fact about file
+    layout in order to ask a question about models."""
+    assert not hasattr(decision, "load_decision_gguf")
+    assert callable(decision.load_decision)
+
+    seen = {}
+
+    async def fake_gguf(src, **kw):
+        seen["gguf"] = src
+        return "a decision model"
+
+    async def fake_dir(src, **kw):
+        seen["dir"] = src
+        return "a decision model"
+
+    before = decision._from_gguf, decision._from_directory
+    decision._from_gguf, decision._from_directory = fake_gguf, fake_dir
+    try:
+        assert asyncio.run(decision.load_decision("org/repo/x.gguf")) == "a decision model"
+        assert seen == {"gguf": "org/repo/x.gguf"}
+        seen.clear()
+        assert asyncio.run(decision.load_decision("org/repo")) == "a decision model"
+        assert seen == {"dir": "org/repo"}
+        seen.clear()
+        # A caller that already knows the container is believed rather than second-guessed.
+        assert asyncio.run(decision.load_decision("org/repo/odd-name", container="gguf"))
+        assert seen == {"gguf": "org/repo/odd-name"}
+        seen.clear()
+        # A lone weights file in a container that cannot carry a config is not one.
+        assert asyncio.run(decision.load_decision("org/repo/m.safetensors")) is None
+        assert seen == {}
+    finally:
+        decision._from_gguf, decision._from_directory = before

@@ -25,7 +25,13 @@ One entry point for every model type; the specialised APIs below remain availabl
     `.gguf`, or a `.onnx`. Omit it and pass `task=` to build a registered pipeline.
   - `task`: force a task (`"text-to-speech"`, `"asr"`, …); `encoder=`: a registered media
     encoder, giving a multimodal model; `dtype`: `"auto"|"fp16"|"int4"|"int8"`.
-  - Detection is by content (extension, then the served `config.json`) — never by model name.
+  - **The format may be read off the name; the model never is.** `.gguf`/`.onnx`/
+    `.safetensors` say how the bytes are packed, which is all a file extension is a
+    convention for, and `webtorch.container_of` is the one place that reads it. WHICH model
+    is inside is then decided by what the checkpoint carries — its tensors, and the served
+    `config.json` — so a model nobody has published yet is recognised on the first try and
+    one with a familiar name is not. There is one loader per model kind and none per
+    container: no `load_decision_gguf` and nothing like it.
 - `Model.infer(...)` / `model(...)` — **the single inference call for every model type**. It
   dispatches to whatever the impl exposes (`__call__`, then `generate`/`run`/`synth`/`detect`/
   `transcribe`/`classify`/`encode`). `.stream(...)` streams where supported. `.kind` and
@@ -335,6 +341,12 @@ directory or self-contained GGUF carrying an encoder and a scorer is a decision 
 allow-list: the tensor structure selects the task, while the architecture value selects the
 file's own embedded config/tokenizer namespace. Any GGUF tensor encoding supported by the
 generic GGUF decoder is accepted; the decision loader is not restricted to one quantization.
+
+**One loader, whatever the container.** A directory and a self-contained file are the same
+request — "is there a decision model here" — so there is a single `load_decision`, and which
+container answers it is internal. A format-named second entry point would make every caller
+carry a fact about file layout in order to ask a question about models, and would need a
+third the next time something is published in a different wrapper.
 
 ```python
 m = await webtorch.load("convaiinnovations/laya")     # kind == "decision"

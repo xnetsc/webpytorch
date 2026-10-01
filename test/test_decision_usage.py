@@ -282,3 +282,35 @@ def test_a_decision_model_drops_its_encoder_and_its_tensors():
     assert enc.released
     assert m.__dict__["enc"] is None and m.__dict__["_ten"] == {}
     assert m.__dict__["_released"] is True
+
+
+def test_a_checkpoint_that_names_its_own_config_needs_no_entry_in_the_sdk():
+    """The fallback list is for checkpoints that say nothing. One that declares its layout
+    is read from the declaration, so its filename never has to be known here -- which is the
+    difference between supporting a model and allow-listing one."""
+    import asyncio
+    from webtorch.decision import _DECISION_CONFIGS, _index, _named_first
+
+    # A real published layout: the root config.json is an INDEX, not an architecture.
+    declared = {
+        "format_version": 1,
+        "architecture": "SomeDecisionModel",
+        "jellyfish_config_file": "jellyfish_config.json",
+        "encoder_config_file": "encoder/config.json",
+        "weights_file": "model.safetensors",
+        "tokenizer_directory": "tokenizer",
+    }
+
+    async def read_json(_name):
+        return declared
+
+    said = asyncio.run(_index("org/repo", read_json))
+    files, dirs = said["files"], said["dirs"]
+    assert files["weights"] == "model.safetensors"
+    assert dirs["tokenizer"] == "tokenizer/"
+
+    named = [v for k, v in files.items() if k.endswith("config") and k != "encoder_config"]
+    assert _named_first(named, _DECISION_CONFIGS)[0] == "jellyfish_config.json"
+    # And no published model's filename is carried in the SDK itself.
+    assert all("_config.json" == n[-len("_config.json"):] for n in _DECISION_CONFIGS)
+    assert set(_DECISION_CONFIGS) == {"decision_config.json", "rl_agent_config.json"}

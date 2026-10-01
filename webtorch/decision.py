@@ -711,7 +711,12 @@ class DecisionModel(wt.Module):
 # checkpoints ship a `config.json` that is not a config at all but a statement of where
 # everything is, and a model that says where its own files are does not need to be guessed
 # at. The probes stay for the ones that say nothing.
-_DECISION_CONFIGS = ("decision_config.json", "rl_agent_config.json", "julia_config.json")
+# Where a decision config sits when the checkpoint does not say. Only conventional names
+# belong here: a checkpoint that uses its own name declares it in its index (`*_config_file`),
+# which `_named_first` tries FIRST, so adding a published model's filename here buys nothing
+# and starts a list that grows by one entry per model. One was here and did exactly nothing --
+# the model it was added for declares the same name in its own `config.json`.
+_DECISION_CONFIGS = ("decision_config.json", "rl_agent_config.json")
 _ENCODER_DIRS = ("encoder/", "")
 _TOKENIZER_DIRS = ("tokenizer/", "")
 
@@ -889,8 +894,12 @@ def _warm_decision(model, dec_cfg, webio):
             pass                              # no browser to tell; the model is still fine
 
 
-async def load_decision_gguf(src, **kw):
-    """Build a decision model from a self-contained GGUF, or return None for another task.
+async def _from_gguf(src, **kw):
+    """Open a self-contained GGUF as a decision model, or return None for another task.
+
+    Not an entry point. `load_decision` picks it once it knows the container; what is a
+    decision model and what the bytes are packed in are separate questions, and a caller
+    should have to answer neither.
 
     Recognition is structural, using the tensor names already used for safetensors
     detection. Repository names, filenames, and architecture strings are never allow-listed.
@@ -945,12 +954,43 @@ async def load_decision_gguf(src, **kw):
     return model
 
 
-async def load_decision(src, **kw):
-    """Build a decision model from a served directory, or return None if it is not one.
+async def load_decision(src, container=None, **kw):
+    """**Build a decision model from `src`, or return None if it is not one.**
+
+    The one entry point, whatever the weights are packed in. A self-contained GGUF file and
+    a served directory of safetensors are the same request -- "is there a decision model
+    here, and if so give it to me" -- and which container answers it is this function's
+    business, not its caller's. There is deliberately no `load_decision_gguf`: a second,
+    format-named entry point would make every caller carry a fact about file layout in order
+    to ask a question about models, and would have to be matched by a third the next time
+    something is published in a different wrapper.
+
+    What a model IS is still never read off a name. The container is (a format is a naming
+    convention), but the answer to "decision model?" comes from the tensors the checkpoint
+    carries -- see `looks_like_decision` -- so one nobody has heard of is recognised on the
+    first try and one with a familiar name is not.
+
+    `container` is `webio.container_of(src)` when the caller already computed it, so a load
+    that has to know the format anyway does not work it out twice.
 
     Returning None rather than raising is deliberate: this sits in front of the general
     loader, and "not a decision model" is the ordinary case, not a failure.
     """
+    from . import webio
+
+    src = str(src).rstrip("/")
+    kind = webio.container_of(src) if container is None else container
+    if kind == "gguf":
+        return await _from_gguf(src, **kw)
+    if kind:
+        # A lone weights file in some other container: the config and tokenizer a decision
+        # model needs are not in it and there is nowhere to look for them.
+        return None
+    return await _from_directory(src, **kw)
+
+
+async def _from_directory(src, **kw):
+    """Open a served directory as a decision model, or return None for another task."""
     from . import webio
     from . import hfcompat
 
