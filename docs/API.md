@@ -374,6 +374,29 @@ in the engine branches on a type's name — a type past the conventional ones is
 positionally and asked the general (`named`) way, rather than silently taking the shape of
 whichever one happened to be last.
 
+### ModelScope answers on two origins
+
+`modelscope.cn` and `modelscope.ai` are **not copies of each other**, in both directions.
+Measured, three reads each:
+
+| repo | `.cn` | `.ai` |
+|---|---|---|
+| `mccoysc/xDecision` | 404 | 200 |
+| `convaiinnovations/laya-multilingual` | 200 | 404 |
+| `Qwen/Qwen2-0.5B-Instruct` | 200 | 200 |
+
+So `webtorch.modelscope_read()` is given both (`webtorch.MODELSCOPE_ORIGINS`) and falls over
+between them, through the same list machinery mirrors use: the first names the file for the
+cache, and a second origin has to prove it holds the same bytes — its own published digest,
+or a matching block — before any of them are mixed in. `endpoint="https://modelscope.ai"`
+pins one if you want that. A reader pinned to a single origin silently cannot see part of the
+hub, and which origin carries a repo is not something a caller can know in advance.
+
+This is not the SDK choosing where models come from. Which hubs to use at all is still the
+application's: a page that lists both origins as separate sources gets the behaviour for free
+from whatever it already does with several sources — the one without the file drops out, and
+when both have it the faster wins on a measurement.
+
 **One loader, whatever the container.** A directory and a self-contained file are the same
 request — "is there a decision model here" — so there is a single `load_decision`, and which
 container answers it is internal. A format-named second entry point would make every caller

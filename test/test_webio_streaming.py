@@ -137,3 +137,48 @@ def test_whole_file_read_fetches_past_a_cached_prefix():
         ("https://example.test/config.json", 0, 4),
         ("https://example.test/config.json", 4, None),
     ]
+
+
+def test_modelscope_reader_covers_both_origins_because_they_are_not_copies():
+    """Measured, three reads each: `mccoysc/xDecision` is on .ai and 404 on .cn, while
+    `convaiinnovations/laya-multilingual` is the other way round. A reader pinned to one
+    origin silently cannot see part of the hub, and which origin has a repo is not something
+    a caller can be expected to know."""
+    import inspect
+
+    assert webio.MODELSCOPE_ORIGINS == ("https://modelscope.cn", "https://modelscope.ai")
+
+    built = []
+    real = webio._hub_reader
+    webio._hub_reader = lambda to_url, *a, **kw: built.append((to_url, kw)) or "reader"
+    try:
+        assert webio.modelscope_read() == "reader"
+        to_url, kw = built.pop()
+        urls = [f("org/repo", "weights.bin") for f in to_url]
+        assert urls == [
+            "https://modelscope.cn/models/org/repo/resolve/master/weights.bin",
+            "https://modelscope.ai/models/org/repo/resolve/master/weights.bin",
+        ], urls
+        # One digest per origin, each asking the origin it belongs to -- a hash from the
+        # wrong host would wave through bytes it never saw.
+        assert len(kw["digest"]) == 2
+        for fn, origin in zip(kw["digest"], webio.MODELSCOPE_ORIGINS):
+            assert inspect.getclosurevars(fn).nonlocals["ep"] == origin
+
+        # Pinned to one origin when the caller names one, as before.
+        assert webio.modelscope_read(endpoint="https://modelscope.ai") == "reader"
+        to_url, kw = built.pop()
+        assert [f("org/repo", "w") for f in to_url] == [
+            "https://modelscope.ai/models/org/repo/resolve/master/w"]
+        assert kw.get("digest") is None
+    finally:
+        webio._hub_reader = real
+
+
+def test_one_origins_dead_api_does_not_silence_the_other():
+    """The latch that stops re-asking an API that will not answer is per origin. Shared, the
+    first origin's CORS failure would also stop the second from ever being asked."""
+    webio._API_DEAD.clear()
+    webio._API_DEAD["modelscope@https://modelscope.cn"] = True
+    assert not webio._API_DEAD.get("modelscope@https://modelscope.ai")
+    webio._API_DEAD.clear()

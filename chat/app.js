@@ -1473,9 +1473,17 @@ function fillPresets() {
 // multi-GB download — and everything reverts to the initial state once it stops.
 let loading = false;
 const chosenModelSources = new Map();
+// ModelScope answers on two origins and they are NOT copies of each other. Measured, three
+// reads each: `mccoysc/xDecision` is 200 on .ai and 404 on .cn, `convaiinnovations/laya-multilingual`
+// is 200 on .cn and 404 on .ai, `Qwen/Qwen2-0.5B-Instruct` is on both. So both are listed, as
+// separate sources, and everything below already does the right thing with that: a source that
+// does not have the file drops out of the race, and when both have it the faster one wins on a
+// measurement rather than on which was written first.
 const APPLICATION_MODEL_SOURCES = [
-  { id: 'modelscope', label: 'ModelScope', kind: 'modelscope', endpoint: 'https://modelscope.cn',
-    revision: 'master' },
+  { id: 'modelscope-cn', label: 'ModelScope (.cn)', kind: 'modelscope',
+    endpoint: 'https://modelscope.cn', revision: 'master' },
+  { id: 'modelscope-ai', label: 'ModelScope (.ai)', kind: 'modelscope',
+    endpoint: 'https://modelscope.ai', revision: 'master' },
   { id: 'huggingface', label: 'Hugging Face', kind: 'hf', endpoint: 'https://huggingface.co',
     revision: 'main' },
 ];

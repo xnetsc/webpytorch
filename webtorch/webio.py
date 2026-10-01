@@ -2703,6 +2703,18 @@ async def hf_digest(repo, path, endpoint="https://huggingface.co", revision="mai
     return None
 
 
+# ModelScope answers on two origins, and they are NOT copies of each other. Measured, three
+# reads each: `mccoysc/xDecision` is 200 on .ai and 404 on .cn, `convaiinnovations/laya-multilingual`
+# is 200 on .cn and 404 on .ai, and `Qwen/Qwen2-0.5B-Instruct` is on both. Neither is a superset,
+# and which origin carries a repo is not something a caller can be expected to know -- so the
+# reader this package ships is given both and falls over between them. That is not the SDK
+# choosing a hub: the caller chose ModelScope, and this is what reaching ModelScope takes.
+#
+# .cn first because it is the established one and the first entry names the file for the cache;
+# a second origin still has to prove it holds the same bytes before any of them are mixed in.
+MODELSCOPE_ORIGINS = ("https://modelscope.cn", "https://modelscope.ai")
+
+
 async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revision="master",
                             token=None):
     """The sha256 ModelScope publishes for one file, or None.
@@ -2720,7 +2732,7 @@ async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revisi
     # a browser, because it sends no CORS header -- it will not start, and asking again per
     # file is a failed request and a console line each time for nothing.
     try:
-        if _API_DEAD.get("modelscope"):
+        if _API_DEAD.get("modelscope@" + base):
             raise RuntimeError("asked before")
         body = await http_get("%s/api/v1/models/%s/repo/files?Revision=%s" % (base, repo, revision),
                               0, None, hdr)
@@ -2730,7 +2742,7 @@ async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revisi
                 if f.get("Sha256"):
                     return f["Sha256"]
     except Exception:
-        _API_DEAD["modelscope"] = True
+        _API_DEAD["modelscope@" + base] = True
     return await lfs_digest("%s/models/%s/resolve/%s/%s" % (base, repo, revision, path), token)
 
 
@@ -2750,9 +2762,11 @@ def mirrored_read(readers=None, **kw):
     if readers is None:
         readers = [
             lambda repo, path: "https://huggingface.co/%s/resolve/main/%s" % (repo, path),
-            lambda repo, path: "https://modelscope.cn/models/%s/resolve/master/%s" % (repo, path),
-        ]
-        kw.setdefault("digest", [hf_digest, modelscope_digest])
+        ] + [(lambda ep: lambda repo, path: "%s/models/%s/resolve/master/%s" % (ep, repo, path))(e)
+             for e in MODELSCOPE_ORIGINS]
+        kw.setdefault("digest", [hf_digest] + [
+            (lambda ep: lambda repo, path: modelscope_digest(repo, path, endpoint=ep))(e)
+            for e in MODELSCOPE_ORIGINS])
     return hub_read(list(readers), **kw)
 
 
@@ -2784,7 +2798,7 @@ def hf_read(revision="main", endpoint="https://huggingface.co", token=None,
     return _hub_reader(lambda repo, path: "%s/%s/resolve/%s/%s" % (ep, repo, revision, path),
                        token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)
 
-def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=None,
+def modelscope_read(revision="master", endpoint=None, token=None,
                     cache=True, cache_dir=None, max_parallel=16, prefetch=True, chunk_mb=16, persist=True):
     """Return an `io_read`-shaped async callback that fetches files directly from
     **ModelScope (魔搭)**, caching as it goes. Same shape and options as
@@ -2797,14 +2811,27 @@ def modelscope_read(revision="master", endpoint="https://modelscope.cn", token=N
     `{endpoint}/models/{org}/{repo}/resolve/{revision}/{path}`; `revision` defaults to
     ModelScope's `master`.
 
+    **Both of ModelScope's origins**, unless `endpoint` names one. They are not copies of each
+    other -- see `MODELSCOPE_ORIGINS` -- so a reader pinned to one silently cannot see part of
+    the hub. Pass `endpoint=` to pin it anyway.
+
     This `resolve` route is used rather than the `/api/v1/.../repo?FilePath=` one because it
     (and the CDN it redirects large files to) returns `Access-Control-Allow-Origin: *` and
     allows the `Range` header — so a browser page, which can only read a cross-origin file when
     the host opts in, can stream weights directly. Reads only."""
-    ep = endpoint.rstrip("/")
-    return _hub_reader(
-        lambda repo, path: "%s/models/%s/resolve/%s/%s" % (ep, repo, revision, path),
-        token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist)
+    eps = [endpoint.rstrip("/")] if endpoint else [e.rstrip("/") for e in MODELSCOPE_ORIGINS]
+    # Bound per origin rather than closing over the loop variable, which would give every
+    # builder the last one.
+    def to_url(ep):
+        return lambda repo, path: "%s/models/%s/resolve/%s/%s" % (ep, repo, revision, path)
+
+    def to_digest(ep):
+        return lambda repo, path: modelscope_digest(repo, path, endpoint=ep,
+                                                    revision=revision, token=token)
+
+    return _hub_reader([to_url(e) for e in eps], token, cache, cache_dir, max_parallel,
+                       prefetch, chunk_mb, persist,
+                       digest=[to_digest(e) for e in eps] if len(eps) > 1 else None)
 
 
 # ----------------------------- byte-source helpers (built on io_read) -----------------------------
