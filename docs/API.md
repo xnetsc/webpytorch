@@ -1066,11 +1066,15 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
   three requests in total and fetched no sample blocks at all. Where a host will not answer,
   the check falls back to equal length plus three blocks spread through the file, which is
   evidence and not proof, and the alternative is downloading both copies in full to compare.
-  Reachability is not uniform: measured from a browser, Hugging Face's repo API answers with
-  CORS and gives the sha256, while ModelScope's file API does not answer cross-origin — and
-  neither hub's hash survives on the file route itself, one losing the header to its CDN
-  redirect and the other exposing no headers at all. So from a page one hash is available and
-  from a host both are.
+  Reachability differs per hub, so each digest function takes the route that works rather
+  than one route for everyone. Measured from a browser: no hub's hash survives on the file
+  route's headers — one loses `X-Linked-ETag` to its CDN redirect and the CDN's own `ETag` is
+  a different hash entirely, the other exposes no headers cross-origin at all. Hugging Face
+  serves the git-LFS pointer at `/raw/`, about 130 bytes of text, and that reads fine.
+  ModelScope's APIs carry the number and none of them answer cross-origin — but it stores
+  LFS objects under their own hash, so the redirect LANDS on a path that spells the oid out,
+  and a final URL is readable where a header is not. Both hashes are obtainable from a page,
+  by different routes, and they agree.
 
   When the FIRST host is unreachable the mirror is used anyway:
   nothing is being mixed then, the file simply comes from elsewhere, which is what a
@@ -1078,7 +1082,13 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
   file for the cache, so which host a block came from leaves no trace and a resumed download
   does not care that the network changed under it.
 - `webtorch.hf_digest(repo, path, …)` / `webtorch.modelscope_digest(repo, path, …)` — the
-  sha256 each hub publishes for one file, or None where it will not say.
+  sha256 each hub publishes for one file, or None where it will not say. Each tries the
+  route that works from where it is called before falling back to the other.
+- `webtorch.lfs_digest(url, token=None)` — the sha256 a host's own object URL names, for any
+  host that stores git-LFS objects under their hash: the redirect of a request that was
+  going to happen anyway lands on `…/df/85/3bf7…95b72`, which is the oid split two-and-two.
+  Costs nothing extra and is readable cross-origin, which the headers and APIs carrying the
+  same number frequently are not.
 - `webtorch.mirrored_read(readers=None, **kw)` — the ready-made case of that: the hubs this
   package already addresses, used together rather than chosen between, with the two digest
   lookups above already wired in. A repo that exists on only one of them still works, because

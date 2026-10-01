@@ -2467,21 +2467,85 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     return read
 
 
-async def hf_digest(repo, path, endpoint="https://huggingface.co", token=None):
+async def _final_url(url, headers=None):
+    """Where a URL actually lands, after redirects. One byte is fetched to find out."""
+    try:
+        from pyodide.http import pyfetch                     # browser
+    except ImportError:
+        pyfetch = None
+    h = dict(headers or {}); h["Range"] = "bytes=0-0"
+    if pyfetch is not None:
+        r = await _pyfetch(url, headers=h)
+        return str(getattr(r, "url", "") or "")
+    import urllib.request
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.geturl()
+
+
+async def lfs_digest(url, token=None):
+    """The sha256 a host's own object URL names, or None.
+
+    Git-LFS stores an object under its hash, so a host that serves one from a CDN usually
+    says the hash in the path: `/lfs-objects/df/85/3bf7fe…95b72`, which is the oid split by
+    the usual two-and-two. That is the host's own statement about the file and it costs
+    nothing extra -- it comes back on the redirect of a request that was going to happen
+    anyway -- and it is readable from a browser, which the headers and APIs carrying the same
+    number frequently are not.
+
+    None whenever the path does not spell one out, which is not a failure: the caller falls
+    back to whatever else it knows.
+    """
+    import re
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    try:
+        final = await _final_url(url, hdr)
+    except Exception:
+        return None
+    for part in reversed(final.split("?")[0].split("/")):
+        if not re.fullmatch(r"[0-9a-f]+", part or ""):
+            continue
+        # Walk back up the path joining hex segments, which is how the two-and-two split
+        # reads: .../df/85/3bf7…  ->  df85 3bf7…
+        pieces, segs = [], final.split("?")[0].split("/")
+        i = segs.index(part)
+        j = i
+        while j > 0 and re.fullmatch(r"[0-9a-f]+", segs[j - 1] or ""):
+            j -= 1
+        joined = "".join(segs[j:i + 1])
+        if len(joined) == 64:
+            return joined
+    return None
+
+
+async def hf_digest(repo, path, endpoint="https://huggingface.co", revision="main", token=None):
     """The sha256 Hugging Face publishes for one file, or None.
 
-    From the repo API rather than the file's own headers: `X-Linked-ETag` carries it, but a
-    browser following the redirect to the CDN never sees that header, and the CDN's own
-    `ETag` is a different hash entirely. The API answers with CORS, so this works from a page.
+    From the LFS pointer, which this hub serves at `/raw/` as about 130 bytes of text and
+    which reads cross-origin. Not from the file's own headers: `X-Linked-ETag` carries the
+    number, but a browser following the redirect to the CDN never sees that header, and the
+    CDN's own `ETag` is a different hash entirely. The repo API carries it too and is the
+    fallback, being the larger request of the two.
     """
-    import json
-    url = "%s/api/models/%s?blobs=true" % (endpoint.rstrip("/"), repo)
+    import json, re
+    base = endpoint.rstrip("/")
     hdr = {"Authorization": "Bearer " + token} if token else None
-    body = await http_get(url, 0, None, hdr)
-    for f in (json.loads(bytes(body).decode("utf-8")) or {}).get("siblings") or []:
-        if f.get("rfilename") == path:
-            lfs = f.get("lfs") or {}
-            return lfs.get("sha256") or lfs.get("oid")
+    try:
+        ptr = bytes(await http_get("%s/%s/raw/%s/%s" % (base, repo, revision, path),
+                                   0, None, hdr)).decode("utf-8", "replace")
+        m = re.search(r"oid sha256:([0-9a-f]{64})", ptr)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        body = await http_get("%s/api/models/%s?blobs=true" % (base, repo), 0, None, hdr)
+        for f in (json.loads(bytes(body).decode("utf-8")) or {}).get("siblings") or []:
+            if f.get("rfilename") == path:
+                lfs = f.get("lfs") or {}
+                return lfs.get("sha256") or lfs.get("oid")
+    except Exception:
+        pass
     return None
 
 
@@ -2489,18 +2553,26 @@ async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revisi
                             token=None):
     """The sha256 ModelScope publishes for one file, or None.
 
-    Its file API carries it. Note that the API does not answer cross-origin, so from a
-    browser this returns None and the comparison falls back; from a host it works.
+    Two ways, because neither works everywhere. Its APIs carry the number and do not answer
+    cross-origin -- measured, both the file listing and the raw-pointer route fail from a
+    page -- so from a browser the answer comes from where the content redirect LANDS: this
+    hub serves LFS objects from a path that spells the oid out, and a final URL is readable
+    where a header is not.
     """
     import json
-    url = "%s/api/v1/models/%s/repo/files?Revision=%s" % (endpoint.rstrip("/"), repo, revision)
+    base = endpoint.rstrip("/")
     hdr = {"Authorization": "Bearer " + token} if token else None
-    body = await http_get(url, 0, None, hdr)
-    data = json.loads(bytes(body).decode("utf-8")) or {}
-    for f in (data.get("Data") or {}).get("Files") or []:
-        if f.get("Path") == path:
-            return f.get("Sha256")
-    return None
+    try:
+        body = await http_get("%s/api/v1/models/%s/repo/files?Revision=%s" % (base, repo, revision),
+                              0, None, hdr)
+        data = json.loads(bytes(body).decode("utf-8")) or {}
+        for f in (data.get("Data") or {}).get("Files") or []:
+            if f.get("Path") == path:
+                if f.get("Sha256"):
+                    return f["Sha256"]
+    except Exception:
+        pass
+    return await lfs_digest("%s/models/%s/resolve/%s/%s" % (base, repo, revision, path), token)
 
 
 def mirrored_read(readers=None, **kw):
