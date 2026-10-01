@@ -27,14 +27,8 @@ async function run() {
     if (document.getElementById(b).checked) backendOrder.push(b);
   }
 
-  log('init wgpy main interface');
-  let backend = 'cpu';
-  try {
-    const r = await wgpy.initMain(worker, { backendOrder });
-    backend = r.backend;
-  } catch (e) { log(`initMain failed: ${e.message}`); }
-  log(`main backend: ${backend}`);
-
+  // Attach before the WgPy handshake.  The worker begins reporting progress immediately;
+  // attaching afterwards loses the only diagnostics for a slow or failed Pyodide boot.
   worker.addEventListener('message', (e) => {
     if (e.data.namespace !== 'app') return;
     if (e.data.method === 'log') log(e.data.message);
@@ -47,10 +41,21 @@ async function run() {
       playAudio(e.data.samples, e.data.sr);
     }
   });
+  worker.addEventListener('error', (e) => log(`Worker startup error: ${e.message || e.type}`));
+  worker.addEventListener('messageerror', () => log('Worker message could not be decoded'));
+
+  log('init wgpy main interface');
+  let backend = 'cpu';
+  try {
+    const r = await wgpy.initMain(worker, { backendOrder });
+    backend = r.backend;
+  } catch (e) { log(`initMain failed: ${e.message}`); }
+  log(`main backend: ${backend}`);
 
   const sel = document.getElementById('script');
   const script = sel ? sel.value : 'run.py';
   worker.postMessage({ namespace: 'app', method: 'start', config: { script } });
+  log(`worker start sent: ${script}`);
 }
 
 window.addEventListener('load', () => {

@@ -2261,6 +2261,54 @@ _GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 _TUNED = {}
 
 
+def _weight_execution(family, storage_format, K, N, M, run):
+    """Choose stored blocks or an explicit materialized path from measurements.
+
+    The key contains only operator facts, never a model/repository name.  Nearby batch
+    sizes share a power-of-two bucket so a prompt does not pay for a new tune at every
+    length.  A materialized path must win by at least 5%; ties stay stored because that
+    representation uses less device memory and is the correctness baseline.
+    """
+    m = int(M)
+    if m <= 2:
+        return "stored"
+    bucket = 1 << (m - 1).bit_length()
+    key = ("weight_exec", str(family), str(storage_format), int(K), int(N), bucket)
+    if key in _TUNED:
+        return _TUNED[key]
+    import time as _t
+    import statistics as _s
+    candidates = ("stored", "materialized")
+    # Four dispatches amortize a readback without queueing many simultaneous expanded
+    # copies of a very large weight.  More repetitions improved tiny synthetic timings but
+    # multiplied peak transient memory on the models where this choice matters most.
+    repeat = 4
+
+    def batch(which):
+        out = None
+        t0 = _t.perf_counter()
+        for _ in range(repeat):
+            out = run(which)
+        out.get()
+        return (_t.perf_counter() - t0) / repeat
+
+    try:
+        for which in candidates:
+            batch(which)                         # compile/warm before timing
+        times = {which: [] for which in candidates}
+        for r in range(5):
+            order = candidates if not (r & 1) else tuple(reversed(candidates))
+            for which in order:
+                times[which].append(batch(which))
+        stored = _s.median(times["stored"])
+        materialized = _s.median(times["materialized"])
+        chosen = "materialized" if materialized < stored * 0.95 else "stored"
+    except Exception:
+        chosen = "stored"
+    _TUNED[key] = chosen
+    return chosen
+
+
 def tune(key, candidates, apply, bench, check=None, rounds=5, default=None):
     """The best of `candidates` on this device, remembered under `key`.
 
@@ -2510,6 +2558,10 @@ def use_kernel_profile(profile):
         parts = k.split("|")
         if len(parts) == 4 and parts[0] == "ggml_shape":
             _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]))] = v
+            n += 1
+        elif len(parts) == 6 and parts[0] == "weight_exec" and v in ("stored", "materialized"):
+            _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
+                    int(parts[5]))] = v
             n += 1
     for k, v in (profile.get("checked") or {}).items():
         parts = k.split("|")
@@ -3580,6 +3632,85 @@ def softmax(x):
                 x._accum(s * (g - dot))
     out._setback(_backward)
     return out
+
+
+# A decision head does not need the whole probability vector to decide whether it should
+# answer.  It needs four numbers: the largest probability, its margin over the runner-up,
+# normalized entropy, and the option count.  Reading the logits to Python to make those four
+# numbers forces the encoder/scorer queue to finish, then uploads them again for the action
+# head.  This one-workgroup reduction keeps that boundary on the device.
+_DECISION_FEATURES_WGSL = """@group(0) @binding(0)
+var<storage,read> logits: array<f32>;
+@group(0) @binding(1)
+var<storage,read_write> feats: array<f32>;
+struct DMeta { width: u32, norm_k: u32, }
+@group(0) @binding(2)
+var<storage,read> meta: DMeta;
+@compute @workgroup_size(1)
+fn main() {
+  var mx: f32 = logits[0];
+  var top1: f32 = logits[0];
+  var top2: f32 = -1e30;
+  for (var j: u32 = 1u; j < meta.width; j = j + 1u) {
+    let v = logits[j];
+    mx = max(mx, v);
+    if (v > top1) { top2 = top1; top1 = v; }
+    else if (v > top2) { top2 = v; }
+  }
+  var den: f32 = 0.0;
+  for (var j: u32 = 0u; j < meta.width; j = j + 1u) {
+    den = den + exp(logits[j] - mx);
+  }
+  let p1 = exp(top1 - mx) / den;
+  let p2 = select(0.0, exp(top2 - mx) / den, meta.width > 1u);
+  var ent: f32 = 0.0;
+  for (var j: u32 = 0u; j < meta.width; j = j + 1u) {
+    let p = exp(logits[j] - mx) / den;
+    ent = ent - p * log(clamp(p, 1e-9, 1.0));
+  }
+  feats[0] = p1;
+  feats[1] = p1 - p2;
+  feats[2] = ent / log(f32(meta.norm_k));
+  feats[3] = f32(meta.norm_k) / 255.0;
+}
+"""
+_decision_features_kernel = {"added": False}
+
+
+def decision_features(logits, option_count=None):
+    """Return the four action-head features for one row of decision logits.
+
+    WebGPU performs the reduction without crossing the device boundary.  CPU and WebGL keep
+    the same arithmetic as the original host implementation; WebGL has no command capture,
+    so a dedicated shader there would not remove the boundary this function exists for.
+    """
+    width = int(logits.data.size)
+    if width < 1:
+        raise ValueError("decision logits need at least one option")
+    norm_k = max(2, int(width if option_count is None else option_count))
+    if _adam_backend_ready():
+        plat = _adam_kernel["platform"]
+        if not _decision_features_kernel["added"]:
+            plat.addKernel("decision_features", {
+                "source": _DECISION_FEATURES_WGSL,
+                "bindingTypes": ["read-only-storage", "storage", "read-only-storage"],
+            })
+            _decision_features_kernel["added"] = True
+        out = _empty((1, 4))
+        meta = _adam_kernel["make_meta"]((width, norm_k), "u4,u4")
+        plat.runKernel({
+            "name": "decision_features",
+            "tensors": [_contig(logits.data).buffer.buffer_id, out.buffer.buffer_id,
+                        meta.buffer_id],
+            "workGroups": {"x": 1, "y": 1, "z": 1},
+        })
+        return Tensor(out)
+    z = np.asarray(logits.numpy(), dtype=np.float32).reshape(-1)
+    p = np.exp(z - z.max()); p = p / p.sum()
+    top = np.sort(p)[::-1][:2]
+    p1 = float(top[0]); p2 = float(top[1]) if len(top) > 1 else 0.0
+    ent = float(-(p * np.log(np.clip(p, 1e-9, 1.0))).sum() / np.log(norm_k))
+    return Tensor(np.asarray([[p1, p1 - p2, ent, norm_k / 255.0]], np.float32))
 
 
 # ---- fused layernorm --------------------------------------------------------
@@ -6520,49 +6651,11 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None):
                               type_name, N, K, err))
 
 
-# Rows above which unpacking the weights once and multiplying fast beats unpacking inside
-# the multiply. Measured on this machine, gate (K=1024 N=3072 Q4_K) and down (K=3072 N=1024
-# Q6_K), medians of interleaved replays, milliseconds:
-#
-#     M          1     2     4     8    16    32    64   256   512  1536
-#     quantised .75   .91  1.42  1.46  2.18  3.19  5.16  6.55 12.02 23.40
-#     dequant   1.54  1.62 1.54  2.26  2.98  1.44  1.81  1.69  2.52  4.83
-#
-# One and two rows belong to the quantised kernel and always will -- unpacking a whole weight
-# matrix to multiply one row is absurd, and the decode path is the hot one. From 32 rows the
-# other way wins and keeps winning, reaching 4.8x by the time a prefill is a real length.
-# Between 4 and 16 the two are inside each other's noise at one to three milliseconds, so the
-# threshold sits at the first size where the answer is not in doubt.
-#
-# Deliberately NOT tuned per device: the region where the choice is close is a couple of
-# milliseconds wide and a prefill is hundreds of rows, so measuring it on every load would
-# spend real time to move a boundary nothing lands on.
-#
-# Also measured on a 12.2 GB model, where the table's assumption does not hold -- one weight
-# unpacks to 283 MB there, written and then read on a machine the weights already fill. The
-# threshold was raised out of reach so every prefill kept the quantised kernel, and the same
-# prompt was timed both ways:
-#
-#     unpacking on    66 rows   2627 dispatches   5.3 s   80.3 ms a row
-#     unpacking off   67 rows   1792 dispatches   5.6 s   83.6 ms a row
-#
-# So it is a wash at this size, slightly in favour of unpacking, and 32 stays. What that
-# rules out is more useful than the 4%: the prompt's cost is NOT the unpacked copy. A
-# 67-row prefill reads every weight once, so it should cost what a decode step costs plus
-# arithmetic, and it costs thirty of them. The remaining candidate was the batched kernel
-# itself, and it was -- see `_GGML_MROW`, which took it from about 400 GFLOPS to about 780.
-#
-# 32 still stays, and the reason is now a measurement rather than an inheritance. Unpacking
-# still wins above it, by less than it did: at N=3072 K=1024, unpacking against the widened
-# quantised kernel is 1.112 vs 1.700 ms at M=32, 2.742 vs 4.325 at M=512 and 6.303 vs 12.407
-# at M=1536 -- 1.5x to 2.0x, where it used to be about 5x.
-#
-# Whether the threshold itself should MOVE was asked and not answered: across M = 4..64 the
-# two paths come within 20% of each other and the numbers stop being monotone in M (M = 64
-# measured faster than M = 32 on the same code), which means that region is bounded by host
-# enqueue in this harness and not by either kernel. A threshold is not worth moving on a
-# measurement that cannot see what it is measuring.
-_GGML_DEQ_M = 32
+# There is deliberately no global row threshold here.  The crossover between stored-block
+# compute and materialize-then-matmul changed with format, shape and device in the complete
+# matrix benchmark (and even reversed around the old threshold).  `_weight_execution`
+# measures the actual operator, keeps a 5% margin for the lower-memory stored path, and puts
+# the device-specific answer in the reusable kernel profile.
 
 # Rows the fp32 matmul wants its input to be a multiple of. Its tiled kernel only runs when
 # they are, and missing it costs seven times -- at K=1024 N=3072, 1850 GFLOPS at M=2816
@@ -6700,7 +6793,7 @@ def ggml_dequant_ok(type_name):
 
 
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
-                xper=False, bias=None):
+                xper=False, bias=None, execution="stored"):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
 
     `packed` must be in the transposed (word, row) layout that `ggml_transpose` produces --
@@ -6708,7 +6801,16 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
 
     With `eidx`, `packed` holds SEVERAL weights of that shape end to end and the shader picks
     one at run time: `eidx[eslot]` is its index and `estride` its size in words. That is how a
-    sparse-MoE projection runs without the choice of expert being baked into the command."""
+    sparse-MoE projection runs without the choice of expert being baked into the command.
+
+    ``execution="stored"`` is the correctness baseline: every multiply decodes the source
+    blocks inside the quantized kernel, so the execution path really is the file's original
+    representation.  ``"materialized"`` explicitly compares the alternative that first
+    expands a supported weight on the GPU.  ``"auto"`` is reserved for a measured routing
+    policy; callers must opt into it rather than silently changing representations.
+    """
+    if execution not in ("stored", "materialized", "auto"):
+        raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
     _gpu_stat_push()
@@ -6733,6 +6835,8 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     # kept because what they rule out has not changed: routing a batch through the two-row
     # decode kernel still loses on the copies the routing costs, whatever the batched
     # kernel is worth.
+    if execution == "materialized" and not _adam_backend_ready():
+        raise RuntimeError("materialized ggml comparison requires the WebGPU backend")
     if _webgl_ready() and not _adam_backend_ready():
         moe = eidx is not None
         moedec = moe and m <= 2
@@ -6744,10 +6848,24 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
-    if (mode == 0 and eidx is None and not xper and m >= _GGML_DEQ_M
-            and _adam_backend_ready() and ggml_dequant_ok(type_name)):
-        # Enough rows to pay for unpacking once -- see `_GGML_DEQ_M`. Bit-exact against the
-        # quantised kernel; the only difference is fp32 rounding in the accumulation order.
+    can_materialize = (eidx is None and not xper and _adam_backend_ready()
+                       and ggml_dequant_ok(type_name))
+    if execution == "materialized" and not can_materialize:
+        raise RuntimeError("%s has no verified materialized comparison path" % type_name)
+    if execution == "auto":
+        if can_materialize:
+            execution = _weight_execution(
+                "ggml", type_name, K, N, m,
+                lambda which: ggml_matmul(xf, packed, type_name, K, N, eidx=eidx,
+                                          eslot=eslot, estride=estride, xper=xper,
+                                          bias=bias, execution=which),
+            )
+        else:
+            execution = "stored"
+    if execution == "materialized":
+        # The measured policy above has found enough rows to pay for unpacking once.
+        # Bit-exact against the quantised kernel; the only difference is fp32 rounding in
+        # the accumulation order.
         #
         # The tiled fp32 kernel only runs on a row count that is a multiple of
         # `_MATMUL_ROW_ALIGN`, and missing it costs seven times. That alignment belongs to
@@ -8848,6 +8966,66 @@ def gpu_reap():
     _gpu_stat_push(force=True)
 
 
+class GGMLWeight(object):
+    """One tensor kept in the encoding its storage source supplied.
+
+    This is a weight protocol implementation, not a model type.  Any loader can hand one to
+    any model: a Linear consumer obtains the matching native module with ``as_linear``;
+    another operator explicitly materializes it.  The model never branches on GGUF, a
+    quantization name, or a repository name.
+    """
+
+    def __init__(self, raw, type_name, shape, type_id=None):
+        self.raw = bytes(raw)
+        self.type_name = str(type_name)
+        self.shape = tuple(int(x) for x in shape)
+        self.type_id = type_id
+
+    def materialize(self, dtype=None):
+        from . import ggufload as G
+        raw, self.raw = self.raw, None
+        ttype = self.type_id if self.type_id is not None else G.GGML_IDS[self.type_name]
+        count = int(np.prod(self.shape, dtype=np.int64))
+        out = G.dequant(ttype, raw, count).reshape(self.shape)
+        if dtype is None:
+            dtype = np.float32 if self.type_name == "F32" else np.float16
+        return out.astype(dtype)
+
+    def as_linear(self, bias=None, execution="auto"):
+        if len(self.shape) != 2:
+            raise ValueError("stored Linear weight must be two-dimensional")
+        if not ggml_native_supported(self.type_name):
+            raise RuntimeError("%s weight has no active native compute backend" % self.type_name)
+        raw, self.raw = self.raw, None
+        n_out, n_in = self.shape
+        return GGMLLinear(raw, self.type_name, n_in, n_out, bias, execution=execution)
+
+
+def weight_shape(weight):
+    """The logical tensor shape, independent of how its values are stored."""
+    return tuple(getattr(weight, "shape", np.shape(weight)))
+
+
+def materialize_weight(weight, dtype=None):
+    """Explicitly turn a stored weight into an array for a non-Linear operator."""
+    fn = getattr(weight, "materialize", None)
+    value = fn(dtype=dtype) if callable(fn) else weight
+    return np.asarray(value, dtype=dtype) if dtype is not None else np.asarray(value)
+
+
+def stored_linear(weight, bias=None, execution="auto"):
+    """Return a ready native Linear for an encoded weight/module, or None for a dense array.
+
+    GGMLWeight and future storage encodings implement ``as_linear``.  AutoGPTQ already
+    arrives as QuantizedLinear, so it passes through unchanged.  Model code only asks this
+    one question and contains no format-specific branch.
+    """
+    if isinstance(weight, Module):
+        return weight
+    fn = getattr(weight, "as_linear", None)
+    return fn(bias=bias, execution=execution) if callable(fn) else None
+
+
 class GGMLLinear(Module):
     """Inference-only Linear whose weight stays in the encoding the GGUF shipped it in.
 
@@ -8855,7 +9033,9 @@ class GGMLLinear(Module):
     are and `ggml_matmul` unpacks each block while it multiplies. That removes the whole
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
-    def __init__(self, raw, type_name, K, N, bias=None):
+    def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
+        if execution not in ("stored", "materialized", "auto"):
+            raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         b = np.frombuffer(raw, np.uint8)
         pad = (-b.size) % 4
         if pad:
@@ -8867,6 +9047,8 @@ class GGMLLinear(Module):
         self.packed = ggml_transpose(up, int(N), (int(K) // vals) * blk)
         del up
         self.type_name = type_name
+        self.storage_format = type_name
+        self.execution = execution
         self.Kt = int(K); self.Nt = int(N)
         self.bias = None if bias is None else xp.asarray(np.asarray(bias, np.float32))
 
@@ -8874,7 +9056,8 @@ class GGMLLinear(Module):
         xd = x.data
         lead = xd.shape[:-1]
         of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed,
-                         self.type_name, self.Kt, self.Nt, bias=self.bias)
+                         self.type_name, self.Kt, self.Nt, bias=self.bias,
+                         execution=self.execution)
         return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
 
 
@@ -8948,13 +9131,18 @@ class GGMLMoELinear(Module):
 
 class QuantizedLinear(Module):
     """Inference-only GPTQ-format weight-quantized Linear (group-wise int4/int8)."""
-    def __init__(self, qweight, qzeros, scales, bias, Kt, Nt, Kp, Np, gs, bits, zero_offset=0.0):
+    def __init__(self, qweight, qzeros, scales, bias, Kt, Nt, Kp, Np, gs, bits,
+                 zero_offset=0.0, execution="auto"):
+        if execution not in ("stored", "materialized", "auto"):
+            raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         self.qweight = xp.asarray(qweight)     # int32 GPU
         self.qzeros = xp.asarray(qzeros)       # int32 GPU
         self.scales = xp.asarray(scales)       # f32 GPU
         self.bias = xp.asarray(bias.astype(np.float32))
         self.Kt = Kt; self.Nt = Nt; self.Kp = Kp; self.Np = Np; self.gs = gs; self.bits = bits
         self.zero_offset = float(zero_offset)  # AutoGPTQ stores (zero-1) -> use 1.0
+        self.storage_format = "GPTQ_INT%d" % int(bits)
+        self.execution = execution
 
     @staticmethod
     def from_autogptq(qweight, qzeros, scales, bias, gs, bits):
@@ -8989,8 +9177,22 @@ class QuantizedLinear(Module):
         xf = _contig(xd.reshape(-1, self.Kt))
         if self.Kp != self.Kt:                      # pad activation to padded K
             xp_ = _zeros((int(xf.shape[0]), self.Kp)); xp_[:, :self.Kt] = xf; xf = xp_
-        of = _gptq_matmul(xf, self.qweight, self.qzeros, self.scales, self.Kp, self.Np,
-                          self.gs, self.bits, zoff=self.zero_offset)
+        def run(which):
+            if which == "stored":
+                return _gptq_matmul(xf, self.qweight, self.qzeros, self.scales,
+                                    self.Kp, self.Np, self.gs, self.bits,
+                                    zoff=self.zero_offset)
+            full = _dequant_full(self.qweight, self.qzeros, self.scales, self.Kp,
+                                 self.Np, self.gs, self.bits, self.zero_offset)
+            return xf @ full
+
+        execution = self.execution
+        if execution == "auto" and GPU:
+            execution = _weight_execution("gptq", self.storage_format, self.Kp, self.Np,
+                                          int(xf.shape[0]), run)
+        elif execution == "auto":
+            execution = "stored"
+        of = run(execution)
         if self.Np != self.Nt:
             of = _contig(of[:, :self.Nt])
         return Tensor((of + self.bias).reshape(*lead, self.Nt))   # inference-only
@@ -9212,7 +9414,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let qv = (qw >> ((k%PERu)*BITSu)) & MASKu;
   let qz = qzeros[g*Npp + n/PERu];
   let zv = (qz >> ((n%PERu)*BITSu)) & MASKu;
-  outp[i] = scales[g*c.Np + n] * (f32(qv) - f32(zv));
+  outp[i] = scales[g*c.Np + n] * (f32(qv) - (f32(zv) + ZOFFf));
 }
 """
 _GL_DQF = """#version 300 es
@@ -9227,20 +9429,22 @@ void main(){
   int k=i/Np; int n=i-k*Np; int g=k/gs; int Npp=Np/PER;
   int qw=ifetch(tex_qw,(k/PER)*Np+n); int qv=(qw>>((k%PER)*BITS))&MASK;
   int qz=ifetch(tex_qz,g*Npp+n/PER); int zv=(qz>>((n%PER)*BITS))&MASK;
-  fragColor = fetch(tex_s,g*Np+n)*(float(qv)-float(zv));
+  fragColor = fetch(tex_s,g*Np+n)*(float(qv)-(float(zv)+ZOFFf));
 }
 """.replace("FETCH", _GL_FETCH)
 _dqf_k = {"wgpu": set(), "gl": set()}
 
 
-def _dequant_full(qweight, qzeros, scales, Kp, Np, gs, bits):
-    name = f"dqf{bits}"
+def _dequant_full(qweight, qzeros, scales, Kp, Np, gs, bits, zoff=0.0):
+    zt = 1 if zoff else 0
+    key = (bits, zt)
+    name = f"dqf{bits}_z{zt}"
     if _adam_backend_ready():
         plat = _adam_kernel["platform"]
-        if bits not in _dqf_k["wgpu"]:
-            plat.addKernel(name, {"source": _gptq_src(_DQF_WGSL, bits),
+        if key not in _dqf_k["wgpu"]:
+            plat.addKernel(name, {"source": _gptq_src(_DQF_WGSL, bits, zoff=zoff),
                 "bindingTypes": ["read-only-storage", "read-only-storage", "read-only-storage", "storage", "read-only-storage"]})
-            _dqf_k["wgpu"].add(bits)
+            _dqf_k["wgpu"].add(key)
         of = _empty((Kp, Np))
         meta = _adam_kernel["make_meta"]((Kp, Np, gs), "u4,u4,u4")
         plat.runKernel({"name": name, "tensors": [qweight.buffer.buffer_id, qzeros.buffer.buffer_id, scales.buffer.buffer_id, of.buffer.buffer_id, meta.buffer_id],
@@ -9248,9 +9452,9 @@ def _dequant_full(qweight, qzeros, scales, Kp, Np, gs, bits):
         return of
     _webgl_ready()
     plat = _copy_kernel["plat"]
-    if bits not in _dqf_k["gl"]:
-        plat.addKernel(name, {"source": _gptq_src(_GL_DQF, bits)})
-        _dqf_k["gl"].add(bits)
+    if key not in _dqf_k["gl"]:
+        plat.addKernel(name, {"source": _gptq_src(_GL_DQF, bits, zoff=zoff)})
+        _dqf_k["gl"].add(key)
     of = _empty((Kp, Np))
     plat.runKernel({"name": name,
         "inputs": [{"name": "tex_s", "id": scales.buffer.buffer_id}, {"name": "tex_qw", "id": qweight.buffer.buffer_id}, {"name": "tex_qz", "id": qzeros.buffer.buffer_id}],
@@ -9263,7 +9467,8 @@ def _dequant_full(qweight, qzeros, scales, Kp, Np, gs, bits):
 def _qlin_dequant_weight(ql):
     """Dequantize a QuantizedLinear's frozen weight to a (Kt, Nt) fp32 Tensor
     (constant; gradient flows to the input, not the weight)."""
-    full = _dequant_full(ql.qweight, ql.qzeros, ql.scales, ql.Kp, ql.Np, ql.gs, ql.bits)
+    full = _dequant_full(ql.qweight, ql.qzeros, ql.scales, ql.Kp, ql.Np, ql.gs,
+                         ql.bits, ql.zero_offset)
     if ql.Kp != ql.Kt or ql.Np != ql.Nt:
         full = _contig(full[:ql.Kt, :ql.Nt])
     return Tensor(full)   # no grad

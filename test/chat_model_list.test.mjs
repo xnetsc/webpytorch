@@ -70,15 +70,15 @@ test('a single reachable model source is probed but never throughput-raced', asy
   const calls = [];
   const selectSource = modelSourceHarness(async (url, options) => {
     calls.push({ url, range: options.headers.Range });
-    if (url.startsWith('https://modelscope.cn/')) throw new Error('not published here');
+    if (url.startsWith('https://modelscope.')) throw new Error('not published here');
     return rangeResponse(1);
   });
   const source = await selectSource({
     repo: 'mccoysc/xDecision', probe: 'models/gguf/xDecision-Q8_0.gguf', url: '',
   });
   assert.equal(source.id, 'huggingface');
-  assert.equal(calls.length, 2, 'one existence probe per configured hub');
-  assert.deepEqual(calls.map(call => call.range), ['bytes=0-0', 'bytes=0-0']);
+  assert.equal(calls.length, 3, 'one existence probe per configured source');
+  assert.deepEqual(calls.map(call => call.range), ['bytes=0-0', 'bytes=0-0', 'bytes=0-0']);
 });
 
 test('multiple reachable model sources are throughput-raced after probing', async () => {
@@ -88,9 +88,10 @@ test('multiple reachable model sources are throughput-raced after probing', asyn
     return rangeResponse(options.headers.Range === 'bytes=0-0' ? 1 : 300000);
   });
   await selectSource({ repo: 'org/model', probe: 'model.gguf', url: '' });
-  assert.equal(calls.length, 4, 'two probes followed by two throughput samples');
+  assert.equal(calls.length, 6, 'three probes followed by three throughput samples');
   assert.deepEqual(calls.map(call => call.range), [
-    'bytes=0-0', 'bytes=0-0', 'bytes=0-1048575', 'bytes=0-1048575',
+    'bytes=0-0', 'bytes=0-0', 'bytes=0-0',
+    'bytes=0-1048575', 'bytes=0-1048575', 'bytes=0-1048575',
   ]);
 });
 

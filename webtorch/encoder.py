@@ -101,7 +101,7 @@ class EncoderConfig(object):
 
 def _f32(a):
     """Weights arrive as whatever the file stored (fp16 is usual); the maths is fp32."""
-    return np.ascontiguousarray(np.asarray(a, dtype=np.float32))
+    return np.ascontiguousarray(wt.materialize_weight(a, dtype=np.float32))
 
 
 class TextEncoder(wt.Module):
@@ -122,7 +122,7 @@ class TextEncoder(wt.Module):
         self.p = prefix
         # What EXISTS is the structure, and it is needed after the arrays are gone.
         self.have = set(weights)
-        self.shape_of = {k: tuple(np.shape(v)) for k, v in weights.items()}
+        self.shape_of = {k: wt.weight_shape(v) for k, v in weights.items()}
         self._src = dict(weights)          # emptied as tensors are built
         self._ten = {}
         self.act = _ACT.get(cfg.act, gelu)
@@ -222,8 +222,19 @@ class TextEncoder(wt.Module):
         """
         wn = name + ".weight"
         y = None
+        key = (wn, "stored-linear")
+        linear = self._ten.get(key)
+        if linear is None:
+            src = self._src.get(wn)
+            native = wt.stored_linear(src)
+            if native is not None:
+                linear = native
+                self._ten[key] = linear
+                self._src.pop(wn, None)
+        if linear is not None:
+            y = linear(x)
         if not x.requires_grad:
-            pk = self._packed(wn)
+            pk = None if y is not None else self._packed(wn)
             if pk is not None:
                 n_out, n_in = self.shape_of[wn]
                 y = wt.matmul_f16w(x, pk, n_in, n_out)
@@ -389,6 +400,7 @@ class TextEncoder(wt.Module):
             src = self._src.pop(name, None)
             if src is None:
                 return wt.embedding(self._t(name), ids)
+            src = wt.materialize_weight(src)
             self._emb_host = np.ascontiguousarray(src)       # left at the file's own width
         return Tensor(_f32(self._emb_host[ids]))
 

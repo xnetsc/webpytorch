@@ -139,6 +139,46 @@ def test_whole_file_read_fetches_past_a_cached_prefix():
     ]
 
 
+def test_read_progress_counts_unique_ranges_not_retries_or_overlap():
+    seen = []
+    webio.set_read_progress(seen.append)
+    try:
+        webio._report("model.gguf", 100, 200, 0)
+        webio._report("model.gguf", 100, 200, 0)     # exact retry
+        webio._report("model.gguf", 100, 200, 50)    # 50 new bytes
+        webio._report("model.gguf", 100, 200, 150)   # clamped at EOF
+    finally:
+        webio.set_read_progress(None)
+
+    assert [event["done"] for event in seen] == [100, 100, 150, 200]
+    assert all(event["done"] <= event["total"] for event in seen)
+
+
+def test_read_progress_merges_disjoint_ranges_when_the_gap_arrives():
+    seen = []
+    webio.set_read_progress(seen.append)
+    try:
+        webio._report("model.gguf", 25, 100, 0)
+        webio._report("model.gguf", 25, 100, 75)
+        webio._report("model.gguf", 50, 100, 25)
+    finally:
+        webio.set_read_progress(None)
+
+    assert [event["done"] for event in seen] == [25, 50, 100]
+
+
+def test_read_progress_reclamps_early_ranges_when_eof_becomes_known():
+    seen = []
+    webio.set_read_progress(seen.append)
+    try:
+        webio._report("model.gguf", 150, None, 0)
+        webio._report("model.gguf", 50, 100, 0)
+    finally:
+        webio.set_read_progress(None)
+
+    assert [event["done"] for event in seen] == [150, 100]
+
+
 def test_modelscope_reader_covers_both_origins_because_they_are_not_copies():
     """Measured, three reads each: `mccoysc/xDecision` is on .ai and 404 on .cn, while
     `convaiinnovations/laya-multilingual` is the other way round. A reader pinned to one

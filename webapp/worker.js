@@ -1,6 +1,10 @@
 // Pyodide worker: boots WgPy (WebGPU/WebGL backend), writes the webtorch library
 // modules into the Pyodide FS, then runs the selected script (run.py).
-importScripts('../lib/pyodide/pyodide.js');
+// Keep the runtime release in the same single source of truth as the production chat.
+// A local offline build may set self.PYODIDE_URL before this worker starts.
+importScripts('../chat/pyodide-version.js');
+const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
+importScripts(PYODIDE_URL + 'pyodide.js');
 importScripts('../dist/wgpy-worker.js');
 
 let pyodide;
@@ -17,9 +21,14 @@ async function fetchText(url) {
 // the `webtorch` SDK package, loaded into the Pyodide FS as a package dir so
 // `import webtorch` works (public API in __init__).
 const PKG = 'webtorch';
-const PKG_MODULES = ['__init__.py', '_core.py', '_sdk.py', 'torchshim.py', 'ggufload.py',
-  'hfcompat.py', 'webenv.py', 'llm.py', 'vl.py', 'detection.py', 'tts.py', 'webio.py',
-  'onnxrt.py', 'lm_engine.py', 'quantize.py', 'audiofe.py', 'cosyvoice.py'];
+
+async function packageModules() {
+  const r = await fetch('../webtorch/modules.json?cb=' + Date.now(), { cache: 'no-store' });
+  if (!r.ok) throw new Error(`webtorch/modules.json: ${r.status}`);
+  const modules = (await r.json()).modules;
+  if (!Array.isArray(modules) || !modules.length) throw new Error('empty webtorch module manifest');
+  return modules;
+}
 
 async function start(config) {
   log('init wgpy worker interface');
@@ -31,7 +40,7 @@ async function start(config) {
   }
 
   log('loading pyodide');
-  pyodide = await loadPyodide({ indexURL: '../lib/pyodide/', stdout, stderr: stdout });
+  pyodide = await loadPyodide({ indexURL: PYODIDE_URL, stdout, stderr: stdout });
   await pyodide.loadPackage('micropip');
   await pyodide.loadPackage('numpy');
   if (initWorkerResult) {
@@ -42,7 +51,7 @@ async function start(config) {
   }
 
   try { pyodide.FS.mkdir(PKG); } catch (e) { /* exists */ }
-  for (const m of PKG_MODULES) {
+  for (const m of await packageModules()) {
     pyodide.FS.writeFile(`${PKG}/${m}`, await fetchText(`../${PKG}/${m}`));
   }
 

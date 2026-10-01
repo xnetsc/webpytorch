@@ -240,6 +240,26 @@ def test_batched_decisions_keep_encoder_rows_on_device_until_scoring():
     assert execution == {"encoder_tokens": 6, "encoder_passes": 1, "batched": True}
 
 
+def test_decision_action_features_match_the_original_host_formula():
+    logits = np.asarray([1.25, -0.5, 0.75, 2.0], dtype=np.float32)
+    p = np.exp(logits - logits.max()); p = p / p.sum()
+    top2 = np.sort(p)[::-1][:2]
+    expected = np.asarray([
+        top2[0], top2[0] - top2[1],
+        -(p * np.log(np.clip(p, 1e-9, 1.0))).sum() / np.log(len(logits)),
+        len(logits) / 255.0,
+    ], dtype=np.float32)
+
+    got = wt.decision_features(Tensor(logits.reshape(1, -1)), len(logits)).numpy()[0]
+
+    assert np.allclose(got, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_decision_action_features_keep_the_two_option_entropy_denominator():
+    got = wt.decision_features(Tensor([[3.0]]), 1).numpy()[0]
+    assert np.allclose(got, [1.0, 1.0, 0.0, 2.0 / 255.0])
+
+
 def test_releasing_a_model_hands_memory_back_even_when_no_known_name_matched():
     """`_HEAVY` is a list of attribute names, and a decision model's weights hang off `enc`,
     which is not one of them. Taking "nothing recognised" for "nothing to give back" left

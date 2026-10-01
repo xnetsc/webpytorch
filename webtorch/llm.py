@@ -1287,7 +1287,7 @@ class CausalLM:
         nm = G.GGML_NAMES.get(ttype)
         if (getattr(self, "_weights", "native") == "native"
                 and wt.ggml_native_supported(nm) and H % wt._GGML_TYPES[nm][2] == 0):
-            return wt.GGMLLinear(chunk, nm, H, rows)
+            return wt.GGMLWeight(chunk, nm, (rows, H), type_id=ttype).as_linear()
         return self._gquant(G.dequant(ttype, chunk, rows * H).reshape(rows, H))
 
     async def _tok_files(self):
@@ -1442,7 +1442,8 @@ class CausalLM:
         for e in range(ne):
             chunk = raw[e * nb:(e + 1) * nb]
             if native:
-                yield wt.GGMLLinear(chunk, nm, in_d, out_d)
+                yield wt.GGMLWeight(chunk, nm, (out_d, in_d),
+                                    type_id=t["type"]).as_linear()
             else:
                 yield self._gquant(G.dequant(t["type"], chunk, per).reshape(out_d, in_d))
 
@@ -1467,7 +1468,9 @@ class CausalLM:
             return None
         row = G.tensor_nbytes(t["type"], K)
         off = self._gds + t["offset"]
-        return wt.GGMLLinear(await self._grng(off, off + N * row - 1), nm, K, N, bias)
+        stored = wt.GGMLWeight(await self._grng(off, off + N * row - 1), nm, (N, K),
+                               type_id=t["type"])
+        return stored.as_linear(bias)
 
     async def _gload_quant(self, name, bias=None):
         """Read a GGUF weight and quantize it without ever holding it whole.
@@ -3182,13 +3185,10 @@ class CausalLM:
             # one row reaches only the decode GEMV. Three is the first count that leaves it
             # for the batched kernel, which the reader's first prompt was compiling instead.
             #
-            # NOT at `_GGML_DEQ_M` rows, which is the other branch -- the one that unpacks the
-            # weights to fp32 and multiplies them plainly. Warming that would compile it here
-            # rather than in front of the reader, but it would also materialise an unpacked
-            # copy of one tensor per shape during the load, and on a machine the model already
-            # fills, making room for those is what pushes the weights back out. That is the
-            # same trade this file refuses on the prefill path itself; it is not worth taking
-            # at load time to save a compile. Left out until it is measured, not assumed.
+            # This load-time pass forces the stored path.  The stored-vs-materialized choice
+            # is measured later on the first real batch, whose row count is meaningful; doing
+            # it here with three synthetic rows would both answer the wrong shape and allocate
+            # an unpacked tensor while the uploaded model already fills the device.
             #
             # One shape per distinct (format, N, K), not one per layer, so this is a pass over
             # a few dozen tensors rather than over the model.
@@ -3199,7 +3199,14 @@ class CausalLM:
                                                    tname, nt, kt)
                         if lay is None:
                             continue
-                        held.append(lay(wt.Tensor(np.zeros((m, int(kt)), np.float32))))
+                        old_execution = getattr(lay, "execution", None)
+                        if old_execution is not None:
+                            lay.execution = "stored"
+                        try:
+                            held.append(lay(wt.Tensor(np.zeros((m, int(kt)), np.float32))))
+                        finally:
+                            if old_execution is not None:
+                                lay.execution = old_execution
                     if held:
                         held[-1].numpy()
                 except Exception:

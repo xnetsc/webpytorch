@@ -181,7 +181,7 @@ def type_rows(weights):
     cannot answer a type it has no row for, and must be able to answer every type it has.
     """
     try:
-        n = int(np.shape((weights or {}).get("type_emb.weight"))[0])
+        n = int(wt.weight_shape((weights or {}).get("type_emb.weight"))[0])
     except Exception:
         return None
     return n or None
@@ -411,7 +411,19 @@ class DecisionModel(wt.Module):
         """
         wn = n + ".weight" if (n + ".weight") in self.have else n + "_weight"
         bn = n + ".bias" if (n + ".bias") in self.have else n + "_bias"
-        y = x.matmul(self._t(wn, transposed=True))
+        key = (wn, "stored-linear")
+        linear = self._ten.get(key)
+        if linear is None:
+            src = self._src.get(wn)
+            native = wt.stored_linear(src)
+            if native is not None:
+                linear = native
+                self._ten[key] = linear
+                self._src.pop(wn, None)
+        if linear is not None:
+            y = linear(x)
+        else:
+            y = x.matmul(self._t(wn, transposed=True))
         return y + self._t(bn) if bn in self.have else y
 
     def _ln(self, x, n):
@@ -530,18 +542,16 @@ class DecisionModel(wt.Module):
         pooled_t = Tensor(pp).matmul(h)                      # (1, D)
         s = self._ln(m, "scorer.0")
         s = self._lin(gelu(self._lin(s, "scorer.1")), "scorer.3")
-        logits = s.numpy().reshape(-1)
-        # the action head: the model's own read on whether it should answer at all
-        p = np.exp(logits - logits.max()); p = p / p.sum()
-        k = max(2, len(markers))
-        ent = float(-(p * np.log(np.clip(p, 1e-9, 1))).sum() / math.log(k))
-        top2 = np.sort(p)[::-1][:2]
-        feats = np.array([top2[0], top2[0] - (top2[1] if len(top2) > 1 else 0.0),
-                          ent, k / 255.0], dtype=np.float32)
-        pooled = pooled_t.numpy().reshape(-1)
-        a = Tensor(np.concatenate([pooled, feats])[None, :])
+        # Keep the scorer/action boundary on the device.  Reading `s` and `pooled_t` here
+        # used to insert two queue synchronizations and a GPU -> CPU -> GPU round-trip for
+        # four scalar features.  The reduction and concatenate are capture-safe GPU kernels;
+        # logits and the final action are packed into the one readback the caller needs.
+        feats = wt.decision_features(s.reshape(1, -1), len(markers))
+        a = wt.cat([pooled_t, feats], axis=1)
         a = self._lin(gelu(self._lin(a, "act_head.0")), "act_head.2")
-        act = a.numpy().reshape(-1)
+        packed = wt.cat([s.reshape(-1), a.reshape(-1)], axis=0).numpy().reshape(-1)
+        logits = packed[:len(markers)]
+        act = packed[len(markers):]
         act = np.exp(act - act.max()); act = act / act.sum()
         return logits, float(act[0])
 
@@ -963,6 +973,22 @@ async def _gguf_tensor(path, data_start, info):
     return out.reshape(shape)
 
 
+async def _gguf_weight(path, data_start, info):
+    """Read one GGUF tensor, preserving a native quantized Linear where possible."""
+    from . import ggufload as G
+
+    shape = tuple(int(d) for d in reversed(info["dims"]))
+    kind = G.GGML_NAMES.get(info["type"])
+    if (len(shape) == 2 and wt.ggml_native_supported(kind)
+            and shape[1] % wt._GGML_TYPES[kind][2] == 0):
+        count = int(np.prod(shape, dtype=np.int64))
+        offset = data_start + int(info["offset"])
+        nbytes = G.tensor_nbytes(info["type"], count)
+        raw = await _rng(path, offset, offset + nbytes - 1)
+        return wt.GGMLWeight(raw, kind, shape, type_id=info["type"])
+    return await _gguf_tensor(path, data_start, info)
+
+
 def _tokenizer_from_json(tj):
     from .llm import BPETokenizer, pretok_pattern, pretok_style
 
@@ -1032,7 +1058,7 @@ async def _from_gguf(src, **kw):
 
     weights = {}
     for done, name in enumerate(sorted(by_name), 1):
-        weights[name] = await _gguf_tensor(src, data_start, by_name[name])
+        weights[name] = await _gguf_weight(src, data_start, by_name[name])
         webio.load_stage("weights", done, len(by_name))
 
     enc_cfg = EncoderConfig(enc_raw)

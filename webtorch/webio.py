@@ -658,18 +658,18 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
         h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:                                    # a file the person pointed at
             data = await _read_local_file(h, offset, length)
-            _report(name, len(data), None)
+            _report(name, len(data), None, offset)
             return data
         # Ask the cache; if it has not got them, that is this callback's problem to solve.
         hit = await read_cache(name, offset, length, cdir)
         if hit is not None and (length is None or len(hit) >= length):
-            _report(name, len(hit), known.get(name))
+            _report(name, len(hit), known.get(name), offset)
             return hit
         got = len(hit) if hit else 0
         if await await_inflight(name, offset + got, chunk_mb << 20):
             again = await read_cache(name, offset, length, cdir)
             if again is not None and (length is None or len(again) >= length):
-                _report(name, len(again), known.get(name))
+                _report(name, len(again), known.get(name), offset)
                 return again
             hit = again if again is not None else hit
             got = len(hit) if hit else 0
@@ -685,7 +685,7 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
             known[name] = total
         await write_cache(name, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
         out = (hit or b"") + data
-        _report(name, len(out), total)
+        _report(name, len(out), total, offset)
         return out
 
     set_io_read(read)
@@ -1185,9 +1185,10 @@ def _in_browser():
         return False
 
 
-# Progress is reported on bytes SERVED, not bytes fetched. A model already in the cache
-# does no network at all, and counting fetches leaves that load looking frozen -- which is
-# exactly what a cache is for. Counting reads covers both, with one number.
+# Progress is reported on UNIQUE FILE POSITIONS SERVED, not bytes fetched. A model already
+# in the cache does no network at all, and counting fetches leaves that load looking frozen.
+# Counting raw reads is also wrong: retries and overlapping tensor ranges can make one file
+# appear larger than it is. The covered-range union below measures actual load coverage.
 _progress = {"cb": None, "state": {}}
 
 
@@ -1197,7 +1198,7 @@ def set_read_progress(cb):
     `info` is a dict, so it can gain fields without breaking callers:
 
         key       the entry being read
-        done      cumulative bytes served for it since the hook was installed
+        done      unique byte positions served for it since the hook was installed
         total     its full length, or None when it is not known
         elapsed   seconds since the first read of this entry
         rate      bytes/second being served, smoothed over recent reads
@@ -1281,12 +1282,41 @@ def _prog_state(key):
         import time
         now = time.monotonic()
         st = _progress["state"][key] = {"t0": now, "t": now, "done": 0, "mark": 0,
-                                        "rate": 0.0}
+                                        "rate": 0.0, "ranges": []}
     return st
 
 
-def _report(key, delta, total):
-    """Add `delta` freshly-served bytes for `key` and report the running total.
+def _covered_bytes(st, offset, length, total):
+    """Merge one served range and return the exact union size.
+
+    A total learned after early reads also clamps the older ranges. That matters for servers
+    which reveal their length only after an open-ended request reaches EOF.
+    """
+    start = max(0, int(offset))
+    end = start + max(0, int(length))
+    if total is not None:
+        limit = max(0, int(total))
+        start, end = min(start, limit), min(end, limit)
+    ranges = list(st["ranges"])
+    if end > start:
+        ranges.append((start, end))
+    ranges.sort()
+    merged = []
+    for a, z in ranges:
+        if total is not None:
+            a, z = min(a, limit), min(z, limit)
+        if z <= a:
+            continue
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], z))
+        else:
+            merged.append((a, z))
+    st["ranges"] = merged
+    return sum(z - a for a, z in merged)
+
+
+def _report(key, delta, total, offset=None):
+    """Add one served range for `key` and report unique file coverage.
 
     The total lives HERE, not in the reader, because the reader is installed once and stays
     installed while any number of loads come and go -- so a counter it owned would keep
@@ -1299,13 +1329,21 @@ def _report(key, delta, total):
         return
     import time
     st = _prog_state(key)
-    st["done"] += delta
+    if offset is None:
+        # Compatibility for custom/internal callers that have no positional information.
+        st["done"] += delta
+        if total is not None:
+            st["done"] = min(st["done"], total)
+    else:
+        st["done"] = _covered_bytes(st, offset, delta, total)
     done = st["done"]
     now = time.monotonic()
     dt = now - st["t"]
     if dt >= 0.2:                             # smooth over a window, not per read
         a = 0.4                               # recent enough to feel live, steady enough to read
-        st["rate"] = a * ((done - st["mark"]) / dt) + (1 - a) * st["rate"]
+        # Learning the real EOF can clamp an earlier open-ended range. Coverage cannot have
+        # a negative rate merely because the estimate became more accurate.
+        st["rate"] = a * (max(0, done - st["mark"]) / dt) + (1 - a) * st["rate"]
         st["t"] = now; st["mark"] = done
     el = now - st["t0"]
     # Until the window has produced a figure, the average since the first read is the honest
@@ -2553,26 +2591,26 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         h = _local_files.get(n) or _local_files.get(n.rsplit("/", 1)[-1])
         if h is not None:
             data = await _read_local_file(h, offset, length)
-            _report(name, len(data), None)
+            _report(name, len(data), None, offset)
             return data
         # A same-origin path ("/models/…", "./x.gguf") is a location, not a repo id: fetch it
         # where it is served and do NOT copy it into the hub cache — it is already local, so
         # caching it would burn quota for nothing. Only repo ids and full URLs map to the hub.
         if str(name).startswith(("/", "./")):
             data = await http_get(name, offset, length)
-            _report(name, len(data), None)
+            _report(name, len(data), None, offset)
             return data
         url = await _cache_key(to_key(name))
         if cdir is None:                               # caching off: straight to HTTP
             data = await get(url, offset, length)
-            _report(url, len(data), None)
+            _report(url, len(data), None, offset)
             return data
 
         hit = await read_cache(url, offset, length, cdir)
         complete = (length is None and hit is not None
                     and await _cache_has_complete_tail(url, offset, cdir))
         if hit is not None and (complete or (length is not None and len(hit) >= length)):
-            _report(url, len(hit), known.get(url))   # cached bytes are loaded bytes too
+            _report(url, len(hit), known.get(url), offset)  # cache is load coverage too
             return hit
 
         # A miss, or a short answer that ran into a gap. If the read-ahead is already
@@ -2585,7 +2623,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             complete = (length is None and again is not None
                         and await _cache_has_complete_tail(url, offset, cdir))
             if again is not None and (complete or (length is not None and len(again) >= length)):
-                _report(url, len(again), known.get(url))
+                _report(url, len(again), known.get(url), offset)
                 return again
             hit = again if again is not None else hit
             got = len(hit) if hit else 0
@@ -2606,7 +2644,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             known[url] = total
         await write_cache(url, data, cdir, offset=offset + got, total=total, chunk_mb=chunk_mb)
         out = (hit or b"") + data
-        _report(url, len(out), total)
+        _report(url, len(out), total, offset)
         return out
 
     return read

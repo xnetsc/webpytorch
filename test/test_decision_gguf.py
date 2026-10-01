@@ -52,6 +52,60 @@ def test_decision_gguf_decodes_f16_and_q8_without_model_specific_names():
     np.testing.assert_array_equal(got_q8, q8_values.astype(np.float16) * np.float16(0.5))
 
 
+def test_decision_gguf_preserves_supported_quantized_linear_blocks():
+    q8_values = np.arange(-16, 16, dtype=np.int8)
+    block = np.asarray([0.5], dtype=np.float16).tobytes() + q8_values.tobytes()
+    payload = block + block
+    original_rng = decision._rng
+    original_supported = decision.wt.ggml_native_supported
+
+    async def fake_rng(_path, start, end):
+        return payload[start:end + 1]
+
+    decision._rng = fake_rng
+    decision.wt.ggml_native_supported = lambda kind: kind == "Q8_0"
+    try:
+        got = asyncio.run(decision._gguf_weight("model.gguf", 0, {
+            "name": "encoder.layers.0.attn.Wqkv.weight", "dims": [32, 2],
+            "type": GGML_IDS["Q8_0"], "offset": 0,
+        }))
+    finally:
+        decision._rng = original_rng
+        decision.wt.ggml_native_supported = original_supported
+
+    assert isinstance(got, decision.wt.GGMLWeight)
+    assert got.shape == (2, 32)
+    assert got.type_name == "Q8_0"
+    np.testing.assert_array_equal(
+        got.materialize(),
+        np.tile(q8_values.astype(np.float16) * np.float16(0.5), (2, 1)),
+    )
+
+
+def test_decision_gguf_does_not_preserve_a_non_linear_quantized_tensor():
+    q8_values = np.arange(-16, 16, dtype=np.int8)
+    payload = np.asarray([0.5], dtype=np.float16).tobytes() + q8_values.tobytes()
+    original_rng = decision._rng
+    original_supported = decision.wt.ggml_native_supported
+
+    async def fake_rng(_path, start, end):
+        return payload[start:end + 1]
+
+    decision._rng = fake_rng
+    decision.wt.ggml_native_supported = lambda _kind: True
+    try:
+        got = asyncio.run(decision._gguf_weight("model.gguf", 0, {
+            "name": "temperature", "dims": [32],
+            "type": GGML_IDS["Q8_0"], "offset": 0,
+        }))
+    finally:
+        decision._rng = original_rng
+        decision.wt.ggml_native_supported = original_supported
+
+    assert isinstance(got, np.ndarray)
+    np.testing.assert_array_equal(got, q8_values.astype(np.float16) * np.float16(0.5))
+
+
 def test_container_is_read_off_the_name_and_nothing_else_is():
     from webtorch.webio import container_of
 

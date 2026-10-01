@@ -382,7 +382,8 @@ function onExporting(m) {
 // own progress hooks, and this page says what to do with each. Same code, no protocol.
 
 function onLoadProgress(m) { if (m.total) { expected = m.total; expectedIsReal = true; }
-    if (m.bytes > 0) loadedGB = +(m.bytes / 1e9).toFixed(2);
+    const observed = m.total ? Math.min(m.bytes, m.total) : m.bytes;
+    if (observed > 0) loadedGB = +(observed / 1e9).toFixed(2);
     showProgress(m.bytes, m.rate, m.dlRate);
 }
 
@@ -1365,7 +1366,10 @@ function setBarBusy(on) {
 
 function showProgress(bytes, rate, dlRate) {
   setBarBusy(false);
-  lastLoadedBytes = bytes;
+  // The SDK reports unique byte coverage. Clamp here as a defensive UI invariant too: an
+  // external/custom reader must never render an impossible "loaded more than the file".
+  const shownBytes = expectedIsReal ? Math.min(bytes, expected) : bytes;
+  lastLoadedBytes = shownBytes;
   // "loaded", not "downloaded": the same meter covers a load served entirely from cache.
   // The download figure is shown only while bytes are actually coming over the wire --
   // it comes from the HTTP reader, and a cached load has none.
@@ -1375,11 +1379,11 @@ function showProgress(bytes, rate, dlRate) {
   // finished load reading "397.2 MB of 400.0 MB", which says something false about a file
   // that arrived whole. It seeds the bar so there is something to watch, and the moment a
   // real total arrives it is replaced.
-  const parts = ['loaded ' + fmt(bytes) + (expectedIsReal ? ' of ' + fmt(expected) : '')];
+  const parts = ['loaded ' + fmt(shownBytes) + (expectedIsReal ? ' of ' + fmt(expected) : '')];
   if (rate) parts.push(fmt(rate) + '/s');
   if (dlRate) parts.push('↓ ' + fmt(dlRate) + '/s');
   $('#progressText').textContent = parts.join(' · ');
-  if (expected) setBar(bytes / expected); else setBar(((bytes / 5e8) % 1));
+  if (expected) setBar(shownBytes / expected); else setBar(((shownBytes / 5e8) % 1));
 }
 
 // ---- model ----
