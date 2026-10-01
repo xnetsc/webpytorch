@@ -60,6 +60,12 @@ context managers (`with await webtorch.load(...) as m:`). Releasing also clears 
 cache entry, so a later `load()` rebuilds. Repeated load/release keeps memory flat: the freed
 weights are reused by the next load.
 
+**A model may define its own `release()`**, and `webtorch.release()` uses it in preference to
+guessing from attribute names. A model engine that holds its weights somewhere unusual should
+define one; the decision engine does. The device gets its pools and its captured graphs' pins
+back once the release has unwound, whatever the model looked like — not only when a name was
+recognised, which is how a decision model once came to leave 459 MB and 903 buffers behind.
+
 ## Generation parameters
 `generate(...)` / `stream(...)` take `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `do_sample`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`,
