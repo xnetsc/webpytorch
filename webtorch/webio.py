@@ -2413,6 +2413,37 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     if prefetch and cache:
         get = prefetch_whole_file(get, size=size, cache_dir=cdir, chunk_mb=chunk_mb)
 
+    _settled = {}           # canonical url -> the key this file is actually cached under
+
+    async def _cache_key(url):
+        """The one key this file is held under, whichever host it came from.
+
+        A cache keyed by URL treats the same bytes on two hubs as two files. That is not
+        hypothetical: switching this reader from one hub to the other put a second 678 MB
+        copy of the same checkpoint on disk, both complete, both identical -- the hashes had
+        already been checked equal, which is how blocks from either host were allowed to mix
+        in the first place.
+
+        So before fetching, the other hosts' urls are asked whether they are already holding
+        it, and the first that is becomes the key for reads AND writes. Nothing is
+        re-downloaded because a race picked a different winner this time, and nothing is
+        stored twice.
+        """
+        if cdir is None or url in _settled:
+            return _settled.get(url, url)
+        cands = [url] + list(_alt.get(url, []))
+        found = url
+        if len(cands) > 1:
+            for c in cands:
+                try:
+                    if await read_cache(c, 0, 1, cdir):
+                        found = c
+                        break
+                except Exception:
+                    continue
+        _settled[url] = found
+        return found
+
     def to_key(name):
         """The one url this file is cached under, remembering where else it lives.
 
@@ -2426,8 +2457,11 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         urls = [b(repo, path) for b in builders]
         for i, u in enumerate(urls):
             _digest_of[u] = (i, repo, path)
-        if len(urls) > 1:
-            _alt.setdefault(urls[0], urls[1:])
+            if len(urls) > 1:
+                # Each candidate lists the others, so the key may be ANY of them -- which is
+                # what lets a file already cached under one host go on being read from there
+                # while the rest stay available to fetch from.
+                _alt.setdefault(u, [v for v in urls if v != u])
         return urls[0]
 
     async def read(name, offset=0, length=None):
@@ -2450,7 +2484,7 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             data = await http_get(name, offset, length)
             _report(name, len(data), None)
             return data
-        url = to_key(name)
+        url = await _cache_key(to_key(name))
         if cdir is None:                               # caching off: straight to HTTP
             data = await get(url, offset, length)
             _report(url, len(data), None)
