@@ -442,7 +442,7 @@ class TextEncoder(wt.Module):
         if B != 1 or not self._capture_ok():
             return None
         Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
-        if self.cfg.max_len and Tb > self.cfg.max_len:
+        if self.cfg.max_positions and Tb > self.cfg.max_positions:
             return None
         slot = self._cap.get(Tb)
         if slot is None:
