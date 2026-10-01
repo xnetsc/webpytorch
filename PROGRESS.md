@@ -1,5 +1,32 @@
 # Progress
 
+## 2026-10-01 ▸ Decision-output correctness correction
+
+**Trigger:** The real xDecision page showed uniform 50/50 and 25/25/25/25 distributions,
+so its displayed conclusions were not credible even though all stored-weight format tests
+passed.
+
+### Root cause and changes
+
+- The scorer itself produced non-zero logits. A validation-sensitive WGSL spelling in the
+  subsequent decision-feature reduction made its dispatch invalid and discarded the whole
+  pending WebGPU command buffer, including the scorer work; the zero logits then became a
+  uniform softmax.
+- Replaced that reduction with the WGSL form verified on the target browser and added a
+  numerical browser gate for its four outputs. This tests dispatch and readback, not merely
+  pipeline creation.
+- Expanded the SDK version digest to include all Python modules, the module manifest, and
+  both worker bootstraps. A Python-kernel fix now changes the browser URLs on the first
+  reload instead of leaving a stale cached module behind.
+
+### Evidence
+
+- Browser correctness gate: 140/140 stored GGML operator comparisons plus decision-feature
+  reduction passed; GPU output matched the CPU reference component-by-component.
+- Real cached xDecision Q8 request completed in 595 ms: billing 89.7%, duplicate charge true
+  97.9%, urgency distribution 15.7% / 26.6% / 27.3% / 30.4%.
+- Python suite: 44 passed. JavaScript suite: 19 passed.
+
 ## 2026-10-01 ▸ Native stored-weight execution and truthful load progress
 
 **Trigger:** Quantized weights must compute from their stored representation without

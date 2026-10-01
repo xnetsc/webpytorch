@@ -17,9 +17,28 @@ set -e
 cd "$(dirname "$0")/.."
 h() { shasum -a 1 "$1" | cut -c1-10; }
 
+# The script tag is also the version token for the worker-side SDK package.  Hashing only
+# webtorch-main.js leaves a changed Python module at the old URL, so a normal reload can run
+# a stale kernel even though the checkout is current.  One digest covers every file loaded
+# by webtorch.start(): both worker bootstraps, the module manifest, and all Python modules.
+sdk_hash() {
+  {
+    for f in webtorch/js/webtorch-main.js webtorch/js/webtorch-host.js \
+             webtorch/js/webtorch-worker.js webtorch/modules.json; do
+      shasum -a 1 "$f"
+    done
+    find webtorch -maxdepth 1 -type f -name '*.py' -print | LC_ALL=C sort | while IFS= read -r f; do
+      shasum -a 1 "$f"
+    done
+  } | shasum -a 1 | cut -c1-10
+}
+
 stamp_html() {                     # file, path-as-written, real-path
   v=$(h "$3")
   perl -0pi -e "s{src=\"\Q$2\E(\?v=[0-9a-f]+)?\"}{src=\"$2?v=$v\"}g" "$1"
+}
+stamp_html_version() {             # file, path-as-written, already-computed-version
+  perl -0pi -e "s{src=\"\Q$2\E(\?v=[0-9a-f]+)?\"}{src=\"$2?v=$3\"}g" "$1"
 }
 stamp_worker() {                   # file, worker-file-name, real-path
   v=$(h "$3")
@@ -34,7 +53,7 @@ stamp_href() {                     # file, path-as-written, real-path
 
 stamp_href chat/index.html "style.css"                     chat/style.css
 stamp_html chat/index.html "../dist/wgpy-main.js"          dist/wgpy-main.js
-stamp_html chat/index.html "../webtorch/js/webtorch-main.js" webtorch/js/webtorch-main.js
+stamp_html_version chat/index.html "../webtorch/js/webtorch-main.js" "$(sdk_hash)"
 stamp_html chat/index.html "zip.js"                        chat/zip.js
 stamp_html chat/index.html "app.js"                        chat/app.js
 stamp_worker chat/app.js   "pyworker.js"                   chat/pyworker.js

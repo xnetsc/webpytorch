@@ -22,8 +22,9 @@
   // The host's own cache-busting token, if it has one, so the package files are fetched the
   // same way the host serves everything else. The SDK has no policy of its own here.
   const VERSION = Q.get('v') || null;
+  const VQ = VERSION ? ('?v=' + encodeURIComponent(VERSION)) : '';
   importScripts(BASE + 'dist/wgpy-worker.js');
-  importScripts(BASE + 'webtorch/js/webtorch-worker.js');
+  importScripts(BASE + 'webtorch/js/webtorch-worker.js' + VQ);
 
   let pyodide = null, tasks = null, ready = false, ioSequence = 0;
 

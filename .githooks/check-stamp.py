@@ -8,6 +8,10 @@ old file until a SECOND reload. The failure is silent -- the page works, it is j
 page that was committed -- and it costs an entire measurement to notice, because the code
 under test is not the code running.
 
+Most URLs hash that one file. The webtorch-main URL is also the version token passed to the
+SDK worker, so it hashes the whole browser package: main/host/worker JS, modules.json, and
+every top-level Python module. This check mirrors that rule against the staged tree.
+
 The stamp only helps if it is actually re-run. This check is what makes forgetting it
 impossible: for every stamped URL, it hashes the STAGED bytes of the file that URL points
 at and requires the URL to say the same thing.
@@ -45,6 +49,22 @@ def blob(path):
     return p.stdout if p.returncode == 0 else None
 
 
+def sdk_hash(length):
+    fixed = ['webtorch/js/webtorch-main.js', 'webtorch/js/webtorch-host.js',
+             'webtorch/js/webtorch-worker.js', 'webtorch/modules.json']
+    p = subprocess.run(['git', 'ls-files', '--cached', '--', 'webtorch'],
+                       stdout=subprocess.PIPE, check=True, text=True)
+    modules = sorted(path for path in p.stdout.splitlines()
+                     if posixpath.dirname(path) == 'webtorch' and path.endswith('.py'))
+    lines = bytearray()
+    for path in fixed + modules:
+        content = blob(path)
+        if content is None:
+            continue
+        lines.extend(('%s  %s\n' % (hashlib.sha1(content).hexdigest(), path)).encode())
+    return hashlib.sha1(lines).hexdigest()[:length]
+
+
 def main():
     bad = []
     for src, pattern in SOURCES:
@@ -59,7 +79,10 @@ def main():
             content = blob(target)
             if content is None:
                 continue                                  # not tracked; nothing to hash
-            want = hashlib.sha1(content).hexdigest()[:len(m.group('v'))]
+            if src == 'chat/index.html' and url == '../webtorch/js/webtorch-main.js':
+                want = sdk_hash(len(m.group('v')))
+            else:
+                want = hashlib.sha1(content).hexdigest()[:len(m.group('v'))]
             if want != m.group('v'):
                 bad.append((src, url, m.group('v'), want))
     if bad:

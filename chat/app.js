@@ -78,10 +78,10 @@ window.onSwNote = function (m) {
 
 // Which Pyodide, and this page's own cache-busting token.
 //
-// Both are the page's, not the SDK's. The version is the content hash `scripts/stamp.sh`
-// already wrote onto the SDK's own script tag -- reused rather than invented, so one run of
-// that script keeps the page and the SDK's Python files in step. A host that caches by
-// headers instead passes nothing and the SDK fetches them plainly.
+// Both are the page's, not the SDK's. The version is the package hash `scripts/stamp.sh`
+// already wrote onto the SDK script tag -- reused rather than invented, so one run keeps
+// the main script, both worker bootstraps, the manifest, and every Python module in step. A
+// host that caches by headers instead passes nothing and the SDK fetches them plainly.
 const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
 const SDK_VERSION = (() => {
   const el = document.querySelector('script[src*="webtorch-main.js"]');

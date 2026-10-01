@@ -3640,38 +3640,39 @@ def softmax(x):
 # numbers forces the encoder/scorer queue to finish, then uploads them again for the action
 # head.  This one-workgroup reduction keeps that boundary on the device.
 _DECISION_FEATURES_WGSL = """@group(0) @binding(0)
-var<storage,read> logits: array<f32>;
+var<storage,read> x: array<f32>;
 @group(0) @binding(1)
-var<storage,read_write> feats: array<f32>;
-struct DMeta { width: u32, norm_k: u32, }
+var<storage,read_write> y: array<f32>;
+struct M { width: u32, k: u32, }
 @group(0) @binding(2)
-var<storage,read> meta: DMeta;
+var<storage,read> m: M;
 @compute @workgroup_size(1)
 fn main() {
-  var mx: f32 = logits[0];
-  var top1: f32 = logits[0];
-  var top2: f32 = -1e30;
-  for (var j: u32 = 1u; j < meta.width; j = j + 1u) {
-    let v = logits[j];
+  var mx: f32 = x[0];
+  var t1: f32 = x[0];
+  var t2: f32 = -1e30;
+  for (var j: u32 = 1u; j < m.width; j = j + 1u) {
+    let v = x[j];
     mx = max(mx, v);
-    if (v > top1) { top2 = top1; top1 = v; }
-    else if (v > top2) { top2 = v; }
+    if (v > t1) { t2 = t1; t1 = v; }
+    else if (v > t2) { t2 = v; }
   }
   var den: f32 = 0.0;
-  for (var j: u32 = 0u; j < meta.width; j = j + 1u) {
-    den = den + exp(logits[j] - mx);
+  for (var j: u32 = 0u; j < m.width; j = j + 1u) {
+    den = den + exp(x[j] - mx);
   }
-  let p1 = exp(top1 - mx) / den;
-  let p2 = select(0.0, exp(top2 - mx) / den, meta.width > 1u);
+  let p1 = exp(t1 - mx) / den;
+  var p2: f32 = 0.0;
+  if (m.width > 1u) { p2 = exp(t2 - mx) / den; }
   var ent: f32 = 0.0;
-  for (var j: u32 = 0u; j < meta.width; j = j + 1u) {
-    let p = exp(logits[j] - mx) / den;
-    ent = ent - p * log(clamp(p, 1e-9, 1.0));
+  for (var j: u32 = 0u; j < m.width; j = j + 1u) {
+    let pp = exp(x[j] - mx) / den;
+    ent = ent - pp * log(max(pp, 1e-9));
   }
-  feats[0] = p1;
-  feats[1] = p1 - p2;
-  feats[2] = ent / log(f32(meta.norm_k));
-  feats[3] = f32(meta.norm_k) / 255.0;
+  y[0] = p1;
+  y[1] = p1 - p2;
+  y[2] = ent / log(f32(m.k));
+  y[3] = f32(m.k) / 255.0;
 }
 """
 _decision_features_kernel = {"added": False}
