@@ -29,6 +29,13 @@ test('Vision has a complete browser-readable fallback publication', () => {
   assert.equal(model.size, undefined, 'omitted size exercises selected-entry probing');
 });
 
+test('xDecision loads the published checkpoint directory from Hugging Face', () => {
+  const model = list.models.find(item => item.repo === 'mccoysc/xDecision');
+  assert.ok(model);
+  assert.equal(model.file, 'models/checkpoint');
+  assert.equal(model.probe, 'models/checkpoint/model.safetensors');
+});
+
 test('browser source selection excludes endpoints without CORS support', () => {
   assert.doesNotMatch(appSource, /endpoint:\s*['"]https:\/\/hf-mirror\.com/);
 });
