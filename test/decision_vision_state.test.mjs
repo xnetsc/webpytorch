@@ -4,17 +4,48 @@ import test from 'node:test';
 
 await import('../webtorch/js/decision-vision.js');
 const { normalizeDecisionState } = globalThis.webtorch;
-const { answer, safeTemperature } = await import('../webtorch/js/decision-vision-runtime.js');
+const { answer, safeTemperature, toInternal, questionTypes } =
+  await import('../webtorch/js/decision-vision-runtime.js');
 
 test('vision answers expose calibrated answer confidence and guard unsafe temperatures once', () => {
-  const q = { t: 'choice', crit: { a: 'A', b: 'B' } };
   const cfg = { temperature: [2, 1, 1], temperature_by_options: {} };
+  const q = toInternal(cfg, { type: 'choice', instructions: 'pick', criteria: { a: 'A', b: 'B' } });
   const out = answer(cfg, q, [{ order: [0, 1], logits: [4, 0], actProb: 0.8 }]);
   const expected = 1 / (1 + Math.exp(-2));
   assert.equal(out.answer_confidence, Number(expected.toFixed(4)));
   assert.notEqual(out.answer_confidence, Number((1 / (1 + Math.exp(-1))).toFixed(4)));
   assert.equal(safeTemperature(0.1006), 0.5);
   assert.equal(safeTemperature(Number.NaN), 1);
+});
+
+test('an export that names its own question types is read, not assumed', () => {
+  // What the exports in circulation say: how many types, never what they are.
+  assert.deepEqual(questionTypes({ temperature: [1, 1, 1] }).names, ['choice', 'score', 'noul']);
+  assert.deepEqual(questionTypes({ temperature: [1, 1] }).names, ['choice', 'score']);
+  // A fourth type is named positionally and takes the general shape rather than the last
+  // one's -- it is not a two-outcome question just because it is unrecognised.
+  assert.equal(questionTypes({ temperature: [1, 1, 1, 1] }).shapes.type3, 'named');
+
+  // And one that declares them needs nothing added to this runtime.
+  const cfg = { temperature: [1, 1, 1], temperature_by_options: {},
+                question_types: [{ name: 'route', shape: 'named' },
+                                 { name: 'severity', shape: 'ordered' },
+                                 { name: 'holds', shape: 'fixed' }] };
+  assert.deepEqual(questionTypes(cfg).names, ['route', 'severity', 'holds']);
+
+  const sev = toInternal(cfg, { type: 'severity', instructions: 'how bad', criteria: ['low', 'high'] });
+  assert.equal(sev.shape, 'ordered');
+  assert.equal(sev.index, 1);                       // the row of the type embedding it is
+  const scored = answer(cfg, sev, [{ order: [0, 1], logits: [0, 2], actProb: 0.5 }]);
+  assert.equal(scored.type, 'severity');            // answered under ITS name
+  assert.ok(scored.score !== undefined);            // and in its SHAPE
+
+  const holds = toInternal(cfg, { type: 'holds', instructions: 'is it so' });
+  assert.equal(holds.shape, 'fixed');
+  assert.ok(answer(cfg, holds, [{ order: [0, 1], logits: [0, 2], actProb: 0.5 }]).noul !== undefined);
+
+  assert.throws(() => toInternal(cfg, { type: 'choice', instructions: 'x', criteria: ['a', 'b'] }),
+                /must be one of route, severity, holds/);
 });
 
 test('plain text and JSON states retain their existing shape', () => {

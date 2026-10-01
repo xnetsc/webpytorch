@@ -134,6 +134,11 @@ def test_decide_reuses_identical_encoder_inputs_and_reports_actual_work():
 
     class Config:
         qtypes = ["choice", "score", "noul"]
+        shapes = {"choice": "named", "score": "ordered", "noul": "fixed"}
+
+        @classmethod
+        def shape_of(cls, qtype):
+            return cls.shapes.get(qtype, "named")
 
         @staticmethod
         def temp_for(_qtype, _count):
@@ -200,6 +205,10 @@ def test_batched_decisions_keep_encoder_rows_on_device_until_scoring():
 
     class Config:
         qtypes = ["noul"]
+
+        @staticmethod
+        def shape_of(_qtype):
+            return "fixed"
 
     class Model:
         _raw_questions = DecisionModel._raw_questions
@@ -314,3 +323,51 @@ def test_a_checkpoint_that_names_its_own_config_needs_no_entry_in_the_sdk():
     # And no published model's filename is carried in the SDK itself.
     assert all("_config.json" == n[-len("_config.json"):] for n in _DECISION_CONFIGS)
     assert set(_DECISION_CONFIGS) == {"decision_config.json", "rl_agent_config.json"}
+
+
+def test_question_types_come_from_the_checkpoint_and_shapes_drive_everything():
+    """A checkpoint that names its own question types needs no entry in this engine.
+
+    What used to happen: every type that was not literally "choice" or "score" was rendered
+    as a two-outcome statement and answered under a key named after one model family's
+    vocabulary. A model that called its types anything else got another model's answers.
+    """
+    from webtorch.decision import DecisionConfig, render_options
+
+    # The checkpoints in circulation say how many types they have and nothing else.
+    assert DecisionConfig({"temperature": [1.0, 1.0, 1.0]}).qtypes == ["choice", "score", "noul"]
+    assert DecisionConfig({"temperature": [1.0, 1.0]}).qtypes == ["choice", "score"]
+    # A fourth is named positionally and is asked the GENERAL way, not given the last
+    # one's shape -- it is not a two-outcome question merely for being unrecognised.
+    four = DecisionConfig({"temperature": [1.0] * 4})
+    assert four.qtypes[3] == "type3" and four.shape_of("type3") == "named"
+
+    # One that declares them is read, and nothing here had to change for it.
+    cfg = DecisionConfig({"temperature": [1.0, 1.0, 1.0],
+                          "question_types": [{"name": "route", "shape": "named"},
+                                             {"name": "severity", "shape": "ordered"},
+                                             {"name": "holds", "shape": "fixed"}]})
+    assert cfg.qtypes == ["route", "severity", "holds"]
+    assert [cfg.shape_of(t) for t in cfg.qtypes] == ["named", "ordered", "fixed"]
+    # The index into the type embedding is the position it was declared at.
+    assert cfg.qtypes.index("severity") == 1
+    # A type the checkpoint never declared is asked the general way rather than guessed at.
+    assert cfg.shape_of("not-a-type") == "named"
+
+    # Rendering follows the shape, so "severity" is levels and "holds" is two outcomes --
+    # neither of which could be known from the names.
+    assert render_options(cfg.shape_of("severity"), ["low", "high"]) == (
+        ["0", "1"], ["level 0: low", "level 1: high"])
+    assert render_options(cfg.shape_of("holds"), None)[0] == ["false", "true"]
+    assert render_options(cfg.shape_of("route"), ["a", "b"]) == (["a", "b"], ["a", "b"])
+
+
+def test_a_truth_is_read_by_the_shape_of_the_question():
+    from webtorch.decision import DecisionModel as D
+
+    assert D._target_index("named", "b", ["a", "b", "c"]) == 1
+    assert D._target_index("ordered", 2, ["0", "1", "2"]) == 2
+    assert D._target_index("fixed", "yes", ["false", "true"]) == 1
+    assert D._target_index("fixed", False, ["false", "true"]) == 0
+    # A dict of truths may be keyed by the type's own name, whatever that is.
+    assert D._target_index("named", {"route": "c"}, ["a", "b", "c"], "route") == 2

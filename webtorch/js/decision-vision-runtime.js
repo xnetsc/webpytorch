@@ -6,8 +6,50 @@
 // turning logits into answers. No DOM, no model runtime: the tokenizer is passed in, so the same module runs in
 // the worker and in Node for the parity test (web-demo/test_parity.mjs).
 
-export const QTYPES = { choice: 0, score: 1, noul: 2 };
-const QTYPE_NAMES = ["choice", "score", "noul"];
+// The SHAPES a question can have: what the caller supplies and what the answer means.
+// Mirrors webtorch/decision.py -- see the note there. A shape is what this runtime can act
+// on; the NAME of a type is whatever the exported model calls it, and nothing below may
+// branch on that, or a model that names its types anything else silently gets another
+// model's answer shape.
+//
+//   named    the caller names the options; the answer is one of them
+//   ordered  the caller names the levels in order; the answer is a place on that scale
+//   fixed    the caller supplies no options; two outcomes, and the second is the answer
+//
+// `named` is the general one, so it is what an undeclared or unrecognised type gets.
+export const GENERAL_SHAPE = "named";
+
+// An export in circulation says how many question types it has -- one temperature and one
+// type-embedding row each -- without saying what they are. For those, and only those, these
+// names and shapes are the convention this runtime supplies. An export that declares
+// `question_types` in its json is read instead and none of this applies to it.
+const CONVENTIONAL = [["choice", "named"], ["score", "ordered"], ["noul", "fixed"]];
+
+/** The question types this export has, in the order its type embedding is in: `{names, shapes}`. */
+export function questionTypes(cfg) {
+  const declared = (cfg && cfg.question_types) || null;
+  const names = [], shapes = {};
+  if (declared && declared.length) {
+    declared.forEach((item, i) => {
+      const name = typeof item === "object" && item ? String(item.name ?? item.type ?? i) : String(item);
+      const fromTable = Object.fromEntries(CONVENTIONAL)[name];
+      const raw = typeof item === "object" && item
+        ? String(item.shape ?? item.options ?? fromTable ?? GENERAL_SHAPE)
+        : (fromTable ?? GENERAL_SHAPE);
+      names.push(name);
+      shapes[name] = ["named", "ordered", "fixed"].includes(raw) ? raw : GENERAL_SHAPE;
+    });
+    return { names, shapes };
+  }
+  const temps = (cfg && cfg.temperature) || null;
+  const count = Array.isArray(temps) && temps.length ? temps.length : CONVENTIONAL.length;
+  for (let i = 0; i < count; i++) {
+    const [name, shape] = i < CONVENTIONAL.length ? CONVENTIONAL[i] : [`type${i}`, GENERAL_SHAPE];
+    names.push(name);
+    shapes[name] = shape;
+  }
+  return { names, shapes };
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // Python json.dumps, for instructions given as objects and for the state text
@@ -60,32 +102,36 @@ export function pyJsonDumps(value, ensureAscii = true) {
 // Questions (VLMAgent._to_internal, common.render_options)
 // ---------------------------------------------------------------------------------------------------------
 
-export function toInternal(qdef) {
+export function toInternal(cfg, qdef) {
+  const { names, shapes } = questionTypes(cfg);
   const t = qdef.type;
-  if (!(t in QTYPES)) throw new Error(`question type must be choice, score or noul, got ${JSON.stringify(t)}`);
+  if (!names.includes(t)) {
+    throw new Error(`question type must be one of ${names.join(", ")}, got ${JSON.stringify(t)}`);
+  }
+  const shape = shapes[t] || GENERAL_SHAPE;
   let crit = qdef.criteria ?? null;
-  if (t === "choice" && Array.isArray(crit)) crit = Object.fromEntries(crit.map((c) => [String(c), null]));
+  if (shape === "named" && Array.isArray(crit)) crit = Object.fromEntries(crit.map((c) => [String(c), null]));
   let ins = qdef.instructions;
   if (ins === undefined) throw new Error("every question needs instructions");
   if (typeof ins !== "string") ins = pyJsonDumps(ins, true);
-  return { t, ins, crit };
+  return { t, shape, index: names.indexOf(t), ins, crit };
 }
 
 export function renderOptions(q) {
-  const { t, crit } = q;
-  if (t === "choice") {
-    if (!crit || typeof crit !== "object") throw new Error("a choice question needs criteria");
-    return Object.entries(crit).map(([k, v]) => (v ? `${k}: ${v}` : k));
-  }
-  if (t === "score") {
-    if (!Array.isArray(crit)) throw new Error("a score question needs a list of criteria, one per level");
+  const { shape, crit } = q;
+  if (shape === "ordered") {
+    if (!Array.isArray(crit)) throw new Error("a question of this shape needs a list of criteria, one per level");
     return crit.map((c, i) => `level ${i}: ${c}`);
   }
-  const c = crit || {};
-  return [
-    "false: " + (c.false || "no, the statement does not hold"),
-    "true: " + (c.true || "yes, the statement holds"),
-  ];
+  if (shape === "fixed") {
+    const c = crit && typeof crit === "object" && !Array.isArray(crit) ? crit : {};
+    return [
+      "false: " + (c.false || "no, the statement does not hold"),
+      "true: " + (c.true || "yes, the statement holds"),
+    ];
+  }
+  if (!crit || typeof crit !== "object") throw new Error("a question of this shape needs criteria");
+  return Object.entries(crit).map(([k, v]) => (v ? `${k}: ${v}` : k));
 }
 
 /** Deterministic option orders. Only the first two of ``laya.vlm._permutations`` (identity, reversed) are
@@ -281,9 +327,11 @@ export function pixelValues(rgba, h, w, cfg) {
 
 const round4 = (x) => Math.round(x * 1e4) / 1e4;
 
-export function tempBucket(qt, k) {
+// Keyed by the type's own name, exactly as `temperature_bucket` in decision.py is: the
+// checkpoint wrote these keys, so they are in whatever it calls its types.
+export function tempBucket(qtype, k) {
   const size = k <= 2 ? "2" : k <= 5 ? "3-5" : k <= 10 ? "6-10" : "11+";
-  return `${QTYPE_NAMES[qt]}:${size}`;
+  return `${qtype}:${size}`;
 }
 
 export function softmax(z) {
@@ -320,24 +368,27 @@ export function answer(cfg, q, rows) {
     r.order.forEach((opt, j) => { zSum[opt] += r.logits[j]; });
     actSum += r.actProb;
   }
-  const qt = QTYPES[q.t];
-  const tScale = safeTemperature(cfg.temperature_by_options[tempBucket(qt, k)] ?? cfg.temperature[qt]);
+  const qt = q.index;
+  const tScale = safeTemperature(cfg.temperature_by_options[tempBucket(q.t, k)] ?? cfg.temperature[qt]);
   const p = softmax(zSum.map((z) => z / rows.length / tScale));
   const conf = round4(confidenceFromProbs(p, k));
   const answerConf = round4(answerConfidenceFromProbs(p, k));
   const ext = { act_probability: round4(actSum / rows.length) };
-  if (q.t === "choice") {
-    const keys = Object.keys(q.crit);
-    const best = p.indexOf(Math.max(...p));
-    return { type: "choice", choice: keys[best], probabilities: Object.fromEntries(keys.map((kk, i) => [kk, round4(p[i])])),
-             confidence: conf, answer_confidence: answerConf, action: ext };
-  }
-  if (q.t === "score") {
-    return { type: "score", score: round4(p.reduce((a, v, i) => a + i * v, 0)),
+  // Keyed by the shape, which is what decides what the number MEANS -- never by the name,
+  // which is only what this export happens to call the type.
+  if (q.shape === "ordered") {
+    return { type: q.t, shape: q.shape, score: round4(p.reduce((a, v, i) => a + i * v, 0)),
              legend: Object.fromEntries(q.crit.map((c, i) => [String(i), c])),
              probabilities: Object.fromEntries(p.map((v, i) => [String(i), round4(v)])),
              confidence: conf, answer_confidence: answerConf, action: ext };
   }
-  return { type: "noul", noul: round4(p[1]), confidence: answerConf,
-           answer_confidence: answerConf, action: ext };
+  if (q.shape === "fixed") {
+    return { type: q.t, shape: q.shape, noul: round4(p[1]), confidence: answerConf,
+             answer_confidence: answerConf, action: ext };
+  }
+  const keys = Object.keys(q.crit);
+  const best = p.indexOf(Math.max(...p));
+  return { type: q.t, shape: q.shape, choice: keys[best],
+           probabilities: Object.fromEntries(keys.map((kk, i) => [kk, round4(p[i])])),
+           confidence: conf, answer_confidence: answerConf, action: ext };
 }

@@ -145,22 +145,49 @@ def serialize_state(state):
     return state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
 
 
-def render_options(qtype, criteria):
-    """The answer texts, in label order.
+# The SHAPES a question can have: what the caller has to supply, and what the answer means.
+#
+# A shape is the thing the engine can act on. The NAME of a question type is whatever a
+# given checkpoint calls it, and nothing here may depend on that -- branching on the name
+# means a model that calls its types anything else silently gets another model's answer
+# shape, which is what used to happen: every type that was not "choice" or "score" was
+# rendered as a two-outcome statement and answered under a key named after one particular
+# model family's vocabulary.
+#
+#   named    the caller names the options; the answer is one of them
+#   ordered  the caller names the levels in order; the answer is a place on that scale
+#   fixed    the caller supplies no options; two outcomes, and the second is the answer
+#
+# `named` is the general one: any question type can be asked that way, so it is what an
+# undeclared or unrecognised type gets. The other two are narrowings a checkpoint has to
+# ask for, because only its training knows that its levels are ordered or its outcomes two.
+SHAPES = ("named", "ordered", "fixed")
+GENERAL_SHAPE = "named"
 
-    Each type has one shape, and the shapes are not interchangeable: `noul` is always
-    [false, true] in that order, which is what makes the second probability the answer.
+# Checkpoints in circulation say how many question types they have -- one temperature and
+# one type embedding each -- without saying what they are. For those, and only those, the
+# names and shapes below are the convention this engine supplies. A checkpoint that
+# declares `question_types` is read instead, and none of this applies to it; that is the
+# path a new model should take, and it needs no change here to be supported.
+_CONVENTIONAL = (("choice", "named"), ("score", "ordered"), ("noul", "fixed"))
+
+
+def render_options(shape, criteria):
+    """The answer texts, in label order, for a question of this SHAPE.
+
+    The shapes are not interchangeable: `fixed` is always two outcomes in that order, which
+    is what makes the second probability the answer.
     """
-    if qtype == "choice":
-        crit = {c: None for c in criteria} if isinstance(criteria, list) else dict(criteria or {})
-        return list(crit.keys()), [k if not v else "%s: %s" % (k, v) for k, v in crit.items()]
-    if qtype == "score":
+    if shape == "ordered":
         crit = list(criteria or [])
         return [str(i) for i in range(len(crit))], ["level %d: %s" % (i, c) for i, c in enumerate(crit)]
-    crit = criteria or {}
-    return ["false", "true"], [
-        "false: " + (crit.get("false") or "no, the statement does not hold"),
-        "true: " + (crit.get("true") or "yes, the statement holds")]
+    if shape == "fixed":
+        crit = criteria if isinstance(criteria, dict) else {}
+        return ["false", "true"], [
+            "false: " + (crit.get("false") or "no, the statement does not hold"),
+            "true: " + (crit.get("true") or "yes, the statement holds")]
+    crit = {c: None for c in criteria} if isinstance(criteria, list) else dict(criteria or {})
+    return list(crit.keys()), [k if not v else "%s: %s" % (k, v) for k, v in crit.items()]
 
 
 class DecisionConfig(object):
@@ -178,7 +205,7 @@ class DecisionConfig(object):
         # Post-hoc calibration, fitted by whoever trained the model. Two levels: a
         # temperature per question type, and a finer one per type AND option count, because
         # a two-way question and a twenty-way one do not need the same scaling.
-        self.qtypes = list(qtypes or ["choice", "score", "noul"])
+        self.qtypes, self.shapes = self._read_types(c, qtypes)
         raw_temperature = c.get("temperature", [1.0] * len(self.qtypes))
         self.temperature_raw = (list(raw_temperature) if isinstance(raw_temperature, (list, tuple))
                                 else [raw_temperature] * len(self.qtypes))
@@ -212,6 +239,47 @@ class DecisionConfig(object):
                    ", ".join("%s=%s -> %g" % (x["entry"], x["raw"], x["applied"])
                              for x in self.temperature_adjustments)),
                 RuntimeWarning, stacklevel=2)
+
+    @staticmethod
+    def _read_types(c, qtypes=None):
+        """The question types this checkpoint has, in the order its type embedding is in.
+
+        Declared, if it says so: `question_types` as a list -- order is meaningful, it is
+        the index into the type embedding and the temperatures -- of names, or of
+        `{"name", "shape"}`. That is how a model says what it answers, and a model that
+        says it needs nothing added here to be supported.
+
+        Otherwise the count is still knowable, from however many temperatures the file
+        carries, and only the names and shapes are the convention above. Anything past the
+        conventional ones is named positionally and takes the general shape rather than
+        being quietly given the last one's.
+        """
+        declared = qtypes if qtypes is not None else c.get("question_types")
+        names, shapes = [], {}
+        if declared:
+            for i, item in enumerate(declared):
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("type") or i)
+                    shape = str(item.get("shape") or item.get("options") or GENERAL_SHAPE)
+                else:
+                    name = str(item)
+                    shape = dict(_CONVENTIONAL).get(name, GENERAL_SHAPE)
+                names.append(name)
+                shapes[name] = shape if shape in SHAPES else GENERAL_SHAPE
+            return names, shapes
+        t = c.get("temperature")
+        count = len(t) if isinstance(t, (list, tuple)) and t else len(_CONVENTIONAL)
+        for i in range(count):
+            name, shape = (_CONVENTIONAL[i] if i < len(_CONVENTIONAL)
+                           else ("type%d" % i, GENERAL_SHAPE))
+            names.append(name)
+            shapes[name] = shape
+        return names, shapes
+
+    def shape_of(self, qtype):
+        """What a question of this type takes and what its answer means. A type this
+        checkpoint never declared is asked the general way rather than guessed at."""
+        return self.shapes.get(qtype, GENERAL_SHAPE)
 
     def temp_for(self, qtype, k):
         idx = self.qtypes.index(qtype)
@@ -350,7 +418,7 @@ class DecisionModel(wt.Module):
         def clean(s):
             return str(s).replace(mask_str, " ") if mask_str else str(s)
 
-        labels, opts = render_options(qtype, criteria)
+        labels, opts = render_options(self.cfg.shape_of(qtype), criteria)
         head_ids = self.tok.encode("%s question: %s" % (qtype, clean(instructions)))
         opt_ids = [[self.mask_id] + self.tok.encode(" " + clean(o))[:self.cfg.option_tokens]
                    for o in opts]
@@ -542,18 +610,24 @@ class DecisionModel(wt.Module):
         for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built, execution):
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
-            legacy_confidence = answer_confidence(p) if qtype == "noul" else confidence(p)
-            ans = {"type": qtype, "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
+            shape = self.cfg.shape_of(qtype)
+            legacy_confidence = answer_confidence(p) if shape == "fixed" else confidence(p)
+            ans = {"type": qtype, "shape": shape,
+                   "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
                    "confidence": round(legacy_confidence, 4),
                    "answer_confidence": round(answer_confidence(p), 4),
                    "act_probability": round(act, 4)}
-            if qtype == "choice":
-                ans["choice"] = labels[int(p.argmax())]
-            elif qtype == "score":
+            # Keyed by the shape, which is the thing that decides what the number MEANS. A
+            # type this checkpoint never declared lands on the general shape and is answered
+            # like any other named question, rather than being reported under a key borrowed
+            # from one model family's two-outcome type.
+            if shape == "ordered":
                 ans["score"] = round(float((np.arange(len(p)) * p).sum()), 4)
                 ans["legend"] = {str(i): c for i, c in enumerate(q.get("criteria") or [])}
-            else:
+            elif shape == "fixed":
                 ans["noul"] = round(float(p[1]), 4)
+            else:
+                ans["choice"] = labels[int(p.argmax())]
             out[qid] = ans
         usage = {"input_tokens": total, "output_tokens": 0,
                  "questions": len(built),
@@ -562,13 +636,16 @@ class DecisionModel(wt.Module):
         return {"answers": out, "usage": usage}
 
     @staticmethod
-    def _target_index(qtype, truth, labels):
+    def _target_index(shape, truth, labels, qtype=None):
+        """Which answer a labelled example says is right, as an index into `labels`.
+
+        By shape, like everything else that depends on what an answer means: a `fixed`
+        question's truth is a yes or a no however it was written down, and every other
+        shape's is one of the labels, or its position among them.
+        """
         if isinstance(truth, dict):
-            truth = truth.get(qtype, truth.get("target", truth.get("label")))
-        if qtype == "choice":
-            if truth in labels:
-                return labels.index(truth)
-        elif qtype == "noul":
+            truth = truth.get(qtype, truth.get(shape, truth.get("target", truth.get("label"))))
+        if shape == "fixed":
             if isinstance(truth, str):
                 v = truth.strip().lower()
                 if v in ("true", "yes", "1"): return 1
@@ -578,16 +655,18 @@ class DecisionModel(wt.Module):
         else:
             if isinstance(truth, str) and truth in labels:
                 return labels.index(truth)
-            if isinstance(truth, (int, np.integer)) and 0 <= int(truth) < len(labels):
+            if isinstance(truth, (int, np.integer)) and not isinstance(truth, bool) \
+                    and 0 <= int(truth) < len(labels):
                 return int(truth)
         raise ValueError("label %r is not one of the answers for this %s question (%s)"
-                         % (truth, qtype, ", ".join(labels)))
+                         % (truth, qtype or shape, ", ".join(labels)))
 
     def calibrate(self, examples, by_options=True, min_samples=20):
         """Fit probability temperatures on separate labelled held-out examples.
 
-        Each item is `{"state": ..., "questions": {...}, "answers": {id: truth}}`. Choice
-        truths are option names, score truths are level indices, and noul truths are booleans.
+        Each item is `{"state": ..., "questions": {...}, "answers": {id: truth}}`. A truth is
+        read by the question's SHAPE: a named option (or its position) for `named`, a level
+        index for `ordered`, a yes or a no for `fixed`.
         With `by_options=True` (the default), the same option-count buckets used at inference
         are fitted independently; otherwise one value is fitted per question type.
 
@@ -618,7 +697,8 @@ class DecisionModel(wt.Module):
                 key = temperature_bucket(qtype, len(markers)) if by_options else qtype
                 row = groups.setdefault(key, {"logits": [], "targets": []})
                 row["logits"].append(np.asarray(logits, dtype=np.float64))
-                row["targets"].append(self._target_index(qtype, truths[qid], labels))
+                row["targets"].append(
+                    self._target_index(self.cfg.shape_of(qtype), truths[qid], labels, qtype))
         if not groups:
             raise ValueError("calibrate() needs at least one labelled question")
 
@@ -657,36 +737,36 @@ class DecisionModel(wt.Module):
         files, so a different decision model with different question types describes itself
         differently and the same interface still fits.
         """
-        # Each type is described in the words someone deciding what to ask would use, not in
-        # the model's. `choice`, `score` and `noul` are what the model calls them and what
-        # the request must say, but nobody outside knows what "noul" is, and an interface
-        # that prints it has handed the reader a puzzle. The plain name and the one-line
-        # explanation belong here, with the thing that knows what the type does, rather than
-        # in a table kept by whichever application happens to draw the form.
+        # Described by SHAPE, in the words someone deciding what to ask would use. The type
+        # NAME is whatever the checkpoint calls it -- it is what the request has to say, and
+        # for the checkpoints that never declared one it is a convention this engine supplied
+        # ("noul" means nothing to anyone reading a form). What an interface actually needs is
+        # what the type asks for and what it answers with, and that is the shape. Keyed that
+        # way, a model with types nobody has seen describes itself correctly with no entry
+        # here, which a table keyed by name could never do.
         described = {
-            "choice": {"label": "Pick one", "min": 2, "needs": "options", "options": "named",
-                       "help": "Name the things it may choose between. It answers with one "
-                               "of them and says how likely each was.",
-                       "asks_for": "the options to choose between",
-                       "answer": "one of the options, with a probability for each"},
-            "score":  {"label": "Rate on a scale", "min": 2, "needs": "levels",
-                       "options": "ordered",
-                       "help": "Describe the levels in order, lowest first. It answers with "
-                               "where on that scale this lands.",
-                       "asks_for": "the levels of the scale, in order",
-                       "answer": "where it lands on the scale"},
-            "noul":   {"label": "How likely is this true?", "min": 2, "needs": None,
-                       "options": "fixed",
-                       "help": "Write a statement. It answers with how likely that statement "
-                               "is to hold, from 0 to 100%.",
-                       "asks_for": "nothing -- just the statement",
-                       "answer": "how likely the statement is to hold, in [0, 1]"},
+            "named":   {"label": "Pick one", "min": 2, "needs": "options", "options": "named",
+                        "help": "Name the things it may choose between. It answers with one "
+                                "of them and says how likely each was.",
+                        "asks_for": "the options to choose between",
+                        "answer": "one of the options, with a probability for each"},
+            "ordered": {"label": "Rate on a scale", "min": 2, "needs": "levels",
+                        "options": "ordered",
+                        "help": "Describe the levels in order, lowest first. It answers with "
+                                "where on that scale this lands.",
+                        "asks_for": "the levels of the scale, in order",
+                        "answer": "where it lands on the scale"},
+            "fixed":   {"label": "How likely is this true?", "min": 2, "needs": None,
+                        "options": "fixed",
+                        "help": "Write a statement. It answers with how likely that statement "
+                                "is to hold, from 0 to 100%.",
+                        "asks_for": "nothing -- just the statement",
+                        "answer": "how likely the statement is to hold, in [0, 1]"},
         }
         types = {}
         for t in self.cfg.qtypes:
-            types[t] = dict(described.get(t) or {
-                "label": t, "min": 2, "needs": None, "options": "fixed",
-                "help": "", "asks_for": "", "answer": ""})
+            shape = self.cfg.shape_of(t)
+            types[t] = dict(described.get(shape) or described[GENERAL_SHAPE], shape=shape)
         return {
             "kind": "decision",
             "takes": {"state": {"kinds": ["text", "json"]},

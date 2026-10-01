@@ -167,7 +167,7 @@ async function run({ images, stateObj, questions, nPermutations }) {
   let nTokens = 0;
   const qids = Object.keys(questions);
   for (const [qi, qid] of qids.entries()) {
-    const q = laya.toInternal(questions[qid]);
+    const q = laya.toInternal(cfg, questions[qid]);
     const k = laya.renderOptions(q).length;
     if (k < 2) throw new Error(`question ${qid} needs at least two options`);
     const rows = [];
@@ -178,7 +178,7 @@ async function run({ images, stateObj, questions, nPermutations }) {
       const ids = new ort.Tensor("int64", BigInt64Array.from(it.ids.map(BigInt)), [1, it.ids.length]);
       const h = await sessions.text.run({ input_ids: ids, image_features: feats, option_span: i64(it.option_span) });
       const out = await sessions.head.run({ hidden: h.last_hidden_state, marker_pos: i64(it.markers),
-                                            qtype: i64([laya.QTYPES[q.t]]) });
+                                            qtype: i64([q.index]) });
       const act = laya.softmax(Array.from(out.act_logits.data));
       rows.push({ order, logits: Array.from(out.logits.data), actProb: act[0] });
       details[qid] = { tokens: it.ids.length, state_tokens: it.state_tokens, state_truncated: it.state_truncated };

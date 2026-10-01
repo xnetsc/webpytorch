@@ -342,6 +342,36 @@ allow-list: the tensor structure selects the task, while the architecture value 
 file's own embedded config/tokenizer namespace. Any GGUF tensor encoding supported by the
 generic GGUF decoder is accepted; the decision loader is not restricted to one quantization.
 
+**The question types are the checkpoint's, and the engine runs on their SHAPE.** A type has
+a name and a shape; only the shape says what a caller supplies and what the answer means:
+
+| shape | the caller gives | the answer |
+|---|---|---|
+| `named` | the options to choose between | `choice`, plus a probability for each |
+| `ordered` | the levels, lowest first | `score`, where on that scale it lands, and a `legend` |
+| `fixed` | nothing — just the statement | `noul`, how likely the statement holds, in [0, 1] |
+
+A checkpoint declares both in `question_types` — a list, because its order is the row of the
+type embedding each one is — as names, or as `{"name", "shape"}`:
+
+```json
+"question_types": [{"name": "route", "shape": "named"},
+                   {"name": "severity", "shape": "ordered"},
+                   {"name": "holds", "shape": "fixed"}]
+```
+
+Then `m.decide(state, {"q": {"type": "severity", ...}})` works with nothing added to the SDK,
+and `surface()` describes it correctly — the descriptions are keyed by shape, so an interface
+built from them fits a model whose types nobody has seen. Every answer carries its `shape`
+beside its `type` for the same reason.
+
+The checkpoints published so far declare neither: they say how many types they have (one
+temperature and one type-embedding row each) and nothing more. For those, and only those, the
+engine supplies the conventional `choice`/`score`/`noul` with the shapes above. Nothing else
+in the engine branches on a type's name — a type past the conventional ones is named
+positionally and asked the general (`named`) way, rather than silently taking the shape of
+whichever one happened to be last.
+
 **One loader, whatever the container.** A directory and a self-contained file are the same
 request — "is there a decision model here" — so there is a single `load_decision`, and which
 container answers it is internal. A format-named second entry point would make every caller
