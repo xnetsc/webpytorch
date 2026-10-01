@@ -711,7 +711,10 @@ def _named_first(named, fallbacks):
     """What the checkpoint named, then the conventional places, without repeats."""
     out = []
     for x in ([named] if isinstance(named, str) else list(named or [])) + list(fallbacks):
-        if x and x not in out:
+        # An empty directory names the model root.  Tokenizers commonly live there, so it
+        # is a real fallback rather than a missing value.  `_index` has already discarded
+        # empty paths supplied by a checkpoint; only our explicit fallback can reach here.
+        if x is not None and x not in out:
             out.append(x)
     return out
 

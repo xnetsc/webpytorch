@@ -131,6 +131,7 @@ class TextEncoder(wt.Module):
         # One recorded command list per sequence-length bucket, and a latch for a backend
         # that cannot record at all.
         self._cap = {}
+        self._cap_seen = set()
         self._cap_off = False
         missing = [n for n in (prefix + "embeddings.tok_embeddings.weight",
                                prefix + "final_norm.weight") if n not in self.have]
@@ -421,12 +422,12 @@ class TextEncoder(wt.Module):
         return [Tensor(np.ascontiguousarray(flat[b, :length]))
                 for b, length in enumerate(lengths)]
 
-    # Sequence lengths are rounded up to a multiple of this before a pass is captured.
-    # A capture is only reusable for the exact shape it recorded, and questions are never
-    # the same length twice; rounding turns "every length is new" into a handful of buckets,
-    # and the positions that rounding adds are padding, which the mask already makes
-    # unreadable. 64 because the attention kernels already want their extents in 64s.
-    _BUCKET = 64
+    # A padded pass is mathematically equivalent but not numerically identical on WebGPU:
+    # changing the reduction width moved this checkpoint's logits by up to 0.04 after 22
+    # layers. Capture only the exact shape, and only after a length repeats. Each graph pins
+    # its intermediate buffers, so keep a small hard bound and let one-off lengths use the
+    # ordinary path.
+    _CAP_MAX = 4
 
     def _replayed(self, ids, T, B, valid):
         """One encoder pass through a recorded command list, or None if that is not on.
@@ -441,11 +442,16 @@ class TextEncoder(wt.Module):
         """
         if B != 1 or not self._capture_ok():
             return None
-        Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
+        Tb = T
         if self.cfg.max_positions and Tb > self.cfg.max_positions:
             return None
         slot = self._cap.get(Tb)
         if slot is None:
+            if Tb not in self._cap_seen:
+                self._cap_seen.add(Tb)
+                return None
+            if len(self._cap) >= self._CAP_MAX:
+                return None
             slot = self._cap_make(Tb)
             if slot is None:
                 return None

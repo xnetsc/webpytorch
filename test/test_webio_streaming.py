@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 
 import webtorch.webio as webio
 from webtorch.webio import _read_streaming
@@ -102,3 +103,37 @@ def test_whole_file_read_does_not_start_a_duplicate_prefetch():
     asyncio.run(scenario())
     assert fetches == [("model.json", 0, None)]
     assert sizes == []
+
+
+def test_whole_file_read_fetches_past_a_cached_prefix():
+    body = b'{"complete": true}'
+    fetches = []
+    original_get, original_size = webio.http_get, webio.http_size
+
+    async def fake_get(url, offset=0, length=None, headers=None):
+        fetches.append((url, offset, length))
+        return body[offset:] if length is None else body[offset:offset + length]
+
+    async def fake_size(_url, _headers=None):
+        return len(body)
+
+    async def scenario(cache_dir):
+        read = webio.hub_read(
+            lambda _repo, path: "https://example.test/" + path,
+            cache_dir=cache_dir,
+            prefetch=False,
+        )
+        assert await read("org/repo/config.json", 0, 4) == body[:4]
+        assert await read("org/repo/config.json", 0, None) == body
+
+    webio.http_get, webio.http_size = fake_get, fake_size
+    try:
+        with tempfile.TemporaryDirectory() as cache_dir:
+            asyncio.run(scenario(cache_dir))
+    finally:
+        webio.http_get, webio.http_size = original_get, original_size
+
+    assert fetches == [
+        ("https://example.test/config.json", 0, 4),
+        ("https://example.test/config.json", 4, None),
+    ]

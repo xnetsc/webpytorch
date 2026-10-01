@@ -1,7 +1,41 @@
 import numpy as np
+from types import SimpleNamespace
 
 from webtorch._core import Tensor
-from webtorch.decision import DecisionModel
+from webtorch.decision import DecisionModel, _named_first
+from webtorch.encoder import TextEncoder
+
+
+def test_named_layout_fallback_keeps_the_model_root():
+    assert _named_first(None, ("tokenizer/", "")) == ["tokenizer/", ""]
+
+
+def test_encoder_capture_waits_for_an_exact_length_repeat_and_stays_bounded():
+    class Encoder:
+        _CAP_MAX = TextEncoder._CAP_MAX
+        _replayed = TextEncoder._replayed
+
+        def __init__(self):
+            self.cfg = SimpleNamespace(max_positions=1024)
+            self._cap = {}
+            self._cap_seen = set()
+
+        @staticmethod
+        def _capture_ok():
+            return True
+
+        @staticmethod
+        def _cap_make(_length):
+            raise AssertionError("a first-seen or over-limit length must not be captured")
+
+    enc = Encoder()
+    assert enc._replayed(np.arange(37), 37, 1, None) is None
+    assert enc._cap_seen == {37}
+
+    enc._cap = {n: object() for n in range(enc._CAP_MAX)}
+    enc._cap_seen.add(53)
+    assert enc._replayed(np.arange(53), 53, 1, None) is None
+    assert 53 in enc._cap_seen
 
 
 def test_decide_reuses_identical_encoder_inputs_and_reports_actual_work():

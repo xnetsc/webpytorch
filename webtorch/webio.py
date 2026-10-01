@@ -2020,6 +2020,17 @@ async def read_cache(key, offset=0, length=None, cache_dir=None):
     return bytes(out[:pos]) if pos else None
 
 
+async def _cache_has_complete_tail(key, offset=0, cache_dir=None):
+    """Whether the cache covers every byte from ``offset`` through the known EOF."""
+    root = cache_dir or _default_hub_cache()
+    store = _make_store(root)
+    await store.open()
+    m = await store.meta(key)
+    size = m["size"]
+    reach = _covered_from(m["covered"], offset)
+    return bool(m["complete"] and size is not None and reach is not None and reach >= size)
+
+
 _write_locks = {}
 
 
@@ -2446,7 +2457,9 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             return data
 
         hit = await read_cache(url, offset, length, cdir)
-        if hit is not None and (length is None or len(hit) >= length):
+        complete = (length is None and hit is not None
+                    and await _cache_has_complete_tail(url, offset, cdir))
+        if hit is not None and (complete or (length is not None and len(hit) >= length)):
             _report(url, len(hit), known.get(url))   # cached bytes are loaded bytes too
             return hit
 
@@ -2457,7 +2470,9 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         got = len(hit) if hit else 0
         if await await_inflight(url, offset + got, chunk_mb << 20):
             again = await read_cache(url, offset, length, cdir)
-            if again is not None and (length is None or len(again) >= length):
+            complete = (length is None and again is not None
+                        and await _cache_has_complete_tail(url, offset, cdir))
+            if again is not None and (complete or (length is not None and len(again) >= length)):
                 _report(url, len(again), known.get(url))
                 return again
             hit = again if again is not None else hit
