@@ -1567,6 +1567,10 @@ async function applicationModelSource(spec, validate) {
   available.sort((a, b) => Number(b.measured) - Number(a.measured)
                         || b.rate - a.rate || a.latency - b.latency);
   if (!available.length) throw new Error('No model source is reachable.');
+  // The winner is still the winner -- it is what the reader is keyed by, so a model already
+  // cached stays cached. The ones behind it are kept because they are reachable, and a file
+  // that exists on more than one host has no reason to come from only one of them.
+  available[0].alternates = available.slice(1);
   chosenModelSources.set(key, available[0]);
   return available[0];
 }
@@ -1594,11 +1598,23 @@ async function installApplicationReader(w, spec, selected) {
     await w.run('import webtorch\nwebtorch.set_io_read(webtorch.hub_read('
       + 'lambda repo, path: ' + exact + ' if path == ' + probe + ' else ' + base + ' + path))\n');
   } else {
-    const endpoint = JSON.stringify(source.endpoint);
-    const revision = JSON.stringify(source.revision);
-    const factory = source.kind === 'modelscope' ? 'modelscope_read' : 'hf_read';
-    await w.run('import webtorch\nwebtorch.set_io_read(webtorch.' + factory
-      + '(revision=' + revision + ', endpoint=' + endpoint + '))\n');
+    // Every hub that answered, fastest first. The SDK reads each block from whichever is
+    // keeping up and moves on when one stops, so a hub that dies partway through a 577 MB
+    // download costs a retry instead of the load -- which is not hypothetical: it is how
+    // this model failed before the race was measuring the right file. The first entry names
+    // the file for the cache, so this is the hub the race picked and nothing already
+    // downloaded is orphaned.
+    const hubs = [source, ...(source.alternates || [])].filter(s => s.kind !== 'direct');
+    const url = (s) => 'lambda repo, path: '
+      + JSON.stringify(s.kind === 'modelscope' ? s.endpoint + '/models/' : s.endpoint + '/')
+      + ' + repo + ' + JSON.stringify('/resolve/' + s.revision + '/') + ' + path';
+    const dig = (s) => 'lambda repo, path: webtorch.'
+      + (s.kind === 'modelscope' ? 'modelscope_digest' : 'hf_digest')
+      + '(repo, path, endpoint=' + JSON.stringify(s.endpoint)
+      + ', revision=' + JSON.stringify(s.revision) + ')';
+    await w.run('import webtorch\nwebtorch.set_io_read(webtorch.hub_read(\n'
+      + '  [' + hubs.map(url).join(',\n   ') + '],\n'
+      + '  digest=[' + hubs.map(dig).join(',\n          ') + ']))\n');
   }
   return source;
 }
