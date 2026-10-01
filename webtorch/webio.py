@@ -2432,17 +2432,34 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
         if cdir is None or url in _settled:
             return _settled.get(url, url)
         cands = [url] + list(_alt.get(url, []))
-        found = url
-        if len(cands) > 1:
-            for c in cands:
+        if len(cands) == 1:
+            _settled[url] = url
+            return url
+        held = []
+        for c in cands:
+            try:
+                if await read_cache(c, 0, 1, cdir):
+                    held.append(c)
+            except Exception:
+                continue
+        if not held:
+            _settled[url] = url
+            return url
+        keep = held[0]
+        # More than one copy. They are only the same file if the hosts say so -- `_alt` is a
+        # list of places this file is EXPECTED to be, not proof that it is, and deleting
+        # 678 MB on an expectation is not a thing to get wrong. Where both hosts publish a
+        # hash and the hashes agree, the extra copy goes now rather than waiting for someone
+        # to run a cleanup they do not know exists.
+        for other in held[1:]:
+            a, b = await _published(keep), await _published(other)
+            if a and b and a == b:
                 try:
-                    if await read_cache(c, 0, 1, cdir):
-                        found = c
-                        break
+                    await delete_cache(other, cdir)
                 except Exception:
-                    continue
-        _settled[url] = found
-        return found
+                    pass
+        _settled[url] = keep
+        return keep
 
     def to_key(name):
         """The one url this file is cached under, remembering where else it lives.
