@@ -993,7 +993,7 @@ class CausalLM:
         self._gen_start = 0
         self._con_text = ""
         self.rope_style = "hf"          # qwen2 = HF rotate_half (both GPTQ and GGUF)
-        self.gs = 128; self.bits = 4    # int4 kernel params (GGUF is requantized to this)
+        self.gs = 128; self.bits = 4    # fallback-kernel params; native GGUF keeps its format
 
     def _apply_cfg(self, cfg):
         """Read an HF `config.json` into the engine's shape parameters. Purely config-driven —
@@ -1251,7 +1251,7 @@ class CausalLM:
         self._smoke()               # and the first forward must be usable
         return self
 
-    # ---- GGUF (llama.cpp) loading: dequant -> requant to int4 -> same engine ----
+    # ---- GGUF (llama.cpp) loading: stored-format kernels, conversion only as fallback ----
     async def _grng(self, a, b):
         from . import webio
         return await webio.io_read(self._gguf, a, b - a + 1)     # a..b inclusive

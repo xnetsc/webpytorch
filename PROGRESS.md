@@ -1,5 +1,21 @@
 # Progress
 
+## 2026-10-02 ▸ Local Qwen3 native-format end-to-end gate
+
+- Corrected the distinction between browser-persistent model cache and repository-local
+  model files: the cache settings page intentionally does not enumerate disk files.
+- Added a repeatable browser smoke test for `models/Qwen3-0.6B-Q4_K_M.gguf`. It fetches the
+  served local file with persistence disabled, explicitly requests native weights, checks
+  the live model's packed Linear formats, and performs deterministic generation.
+- Updated the old GGUF example and loader comments that still described every GGUF as being
+  converted to INT4, which has not been true since stored-format kernels became the default.
+
+### Evidence
+
+- Chrome WebGPU: deterministic reply `OK`; 168 Q4_K + 28 Q6_K native Linear modules;
+  load 1.2 s, TTFT 112 ms, captured decode enabled.
+- Python suite: 49 passed. JavaScript suite: 19 passed.
+
 ## 2026-10-02 ▸ Phase-one exact Q5 vector kernels
 
 - Added register-vector candidates that consume Q5_0/Q5_1's original four-bit nibble stream

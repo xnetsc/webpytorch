@@ -1,6 +1,6 @@
 # Current task status
 
-> Last updated: 2026-10-01
+> Last updated: 2026-10-02
 
 ## One-line status
 
@@ -30,6 +30,9 @@ its earlier benchmark conclusions are provisional.**
   15.7% / 26.6% / 27.3% / 30.4% — in 304 ms for 486 input tokens.
 - The browser correctness gate covers 140 stored GGML operator cases plus the device-side
   decision-feature reduction.
+- The repository's complete `models/Qwen3-0.6B-Q4_K_M.gguf` now has a dedicated uncached
+  end-to-end browser smoke test. It loaded in 1.2 s, answered `OK`, and reported 168 Q4_K
+  plus 28 Q6_K native linears; no tensor was converted to another width.
 - Automated verification: 49 Python tests and 19 JavaScript tests passed.
 - The SDK cache token now covers the Python package and both worker bootstraps, not only the
   main-thread JavaScript file.
