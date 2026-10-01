@@ -293,6 +293,15 @@ class DecisionModel(wt.Module):
         self.n_head_layers = 1 + max([-1] + [int(k.split(".")[2]) for k in self.have
                                              if k.startswith("head.layers.")])
 
+    def release(self):
+        """Drop the weights. See `TextEncoder.release` for why a model says this itself."""
+        enc = self.__dict__.get("enc")
+        if enc is not None and callable(getattr(enc, "release", None)):
+            enc.release()
+        self.__dict__.update(enc=None, _ten={}, _src={})
+        self.__dict__["_released"] = True
+        return self
+
     # ---- small helpers over the raw weights -----------------------------------------
     def _t(self, n, transposed=False):
         key = (n, transposed)

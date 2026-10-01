@@ -229,3 +229,56 @@ def test_batched_decisions_keep_encoder_rows_on_device_until_scoring():
     assert model.enc.device_calls == [[[1, 2], [3, 4, 5]]]
     assert model.scored == [[1.0, 2.0], [3.0, 4.0, 5.0]]
     assert execution == {"encoder_tokens": 6, "encoder_passes": 1, "batched": True}
+
+
+def test_releasing_a_model_hands_memory_back_even_when_no_known_name_matched():
+    """`_HEAVY` is a list of attribute names, and a decision model's weights hang off `enc`,
+    which is not one of them. Taking "nothing recognised" for "nothing to give back" left
+    459 MB and 903 buffers on the device after `release()` had returned."""
+    from webtorch import _core, _sdk
+
+    class Weighty(object):
+        """No `_HEAVY` name anywhere in here, and it knows that itself."""
+
+        def __init__(self):
+            self.enc = object()
+            self.dropped = False
+
+        def release(self):
+            self.enc = None
+            self.dropped = True
+
+    calls = []
+    before = _core._gpu_release_memory
+    _core._gpu_release_memory = lambda: calls.append(1)
+    try:
+        obj = Weighty()
+        assert _sdk._free(obj) is True
+        assert obj.dropped and obj.enc is None
+        assert calls == [1], "the device was never told, so the pins were never let go"
+        # And the plain path, where a name does match, still only tells it once.
+        calls.clear()
+        plain = type("Plain", (), {})()
+        plain.layers = [1, 2, 3]
+        assert _sdk._drop_heavy(plain) is True
+        assert calls == [1]
+    finally:
+        _core._gpu_release_memory = before
+
+
+def test_a_decision_model_drops_its_encoder_and_its_tensors():
+    from webtorch.decision import DecisionModel
+
+    enc = _FakeEncoder()
+    enc.released = False
+
+    def release():
+        enc.released = True
+    enc.release = release
+
+    m = DecisionModel.__new__(DecisionModel)
+    m.__dict__.update(enc=enc, _ten={"a": object()}, _src={"b": object()})
+    m.release()
+    assert enc.released
+    assert m.__dict__["enc"] is None and m.__dict__["_ten"] == {}
+    assert m.__dict__["_released"] is True

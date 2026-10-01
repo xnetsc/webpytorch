@@ -139,6 +139,21 @@ class TextEncoder(wt.Module):
             raise ValueError("this checkpoint has no %s -- it does not look like an encoder "
                              "this engine can build" % ", ".join(missing))
 
+    def release(self):
+        """Drop the weights, and everything recorded against them.
+
+        `webtorch.release()` looks for this before falling back to a list of attribute names
+        kept elsewhere, which is the only arrangement that works: what is heavy here is
+        `_ten`, the embedding rows and the recorded graphs, and a list somewhere else cannot
+        be expected to learn those names every time a model family is added. Dropping `_cap`
+        matters as much as the weights -- a recorded pass pins every buffer it touched, and
+        the backend only lets go of those when the release reaches it.
+        """
+        self.__dict__.update(_ten={}, _src={}, _emb_host=None, _rope={}, _cap={},
+                             _cap_seen=set())
+        self.__dict__["_released"] = True
+        return self
+
     # ---- weight access -------------------------------------------------------------
     # Each weight becomes a Tensor exactly ONCE. Building one copies it to wherever the
     # backend keeps arrays, so building inside the forward would re-upload every weight on

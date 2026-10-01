@@ -307,7 +307,7 @@ def release_all():
     for e in list(_IMPL_CACHE.values()):
         impl = e["impl"]
         if not impl.__dict__.get("_released"):
-            _drop_heavy(impl); n += 1
+            _free(impl); n += 1
     _IMPL_CACHE.clear()
     return n
 
@@ -658,10 +658,26 @@ _HEAVY = ("layers", "embed", "head", "final_norm", "mtp", "Kc", "Vc", "h_in", "c
           "_shard_hdr", "conv_state", "rec_state", "_state", "impl", "_impl", "lm", "encoder")
 
 
-# Recursion guard for the GPU-memory cleanup: `_drop_heavy` reaches the GPU release only
-# from its OUTERMOST call that actually dropped something — nested calls (wrappers freeing
-# what they wrap) would fire it while buffers are still being dropped into the pools.
+# Recursion guard for the GPU-memory cleanup: the device only hears about it from the
+# OUTERMOST release — nested calls (wrappers freeing what they wrap) would fire it while
+# buffers are still being dropped into the pools.
 _drop_depth = 0
+
+
+def _gpu_give_back():
+    """Hand the pools, and the pins the captured graphs hold, back to the device.
+
+    Asked once a release has fully unwound, and asked whether or not `_HEAVY` recognised
+    anything. Those are different questions, and treating them as one is how a decision model
+    came to free NOTHING: its weights hang off `enc`, which is not a name in that list, so the
+    drop reported nothing freed and this was skipped -- measured, 459 MB and 903 buffers still
+    held after `release()` returned, and gone the moment this ran by hand. A model's shape is
+    not something the memory it is sitting on depends on.
+    """
+    if _drop_depth:
+        return
+    from . import _core
+    _core._gpu_release_memory()
 
 
 def _drop_heavy(obj, _seen=None):
@@ -688,12 +704,9 @@ def _drop_heavy(obj, _seen=None):
         _drop_depth -= 1
     if freed:
         obj.__dict__["_released"] = True     # so using it afterwards gives a clear error
-        if _drop_depth == 0:
-            # All finalizers the drop set off have run (CPython refcounting runs them
-            # synchronously), so the pools now hold what the model was sitting on. Give
-            # it back to the device — otherwise the next model allocates on top of it.
-            from . import _core
-            _core._gpu_release_memory()
+    # All finalizers the drop set off have run (CPython refcounting runs them synchronously),
+    # so the pools now hold what the model was sitting on.
+    _gpu_give_back()
     return freed
 
 
@@ -702,8 +715,10 @@ def _free(obj, _seen=None):
     one (a shared model's hook does the refcounting — see `_impl_release`)."""
     if obj is None:
         return False
+    global _drop_depth
     own = getattr(obj, "release", None)          # respect a model's own release hook
     if callable(own) and getattr(own, "__self__", None) is obj and not getattr(obj, "_releasing", False):
+        _drop_depth += 1
         try:
             obj._releasing = True
             own(); return True
@@ -711,6 +726,8 @@ def _free(obj, _seen=None):
             return False
         finally:
             obj._releasing = False
+            _drop_depth -= 1
+            _gpu_give_back()                     # this path drops weights too
     return _drop_heavy(obj, _seen)
 
 
@@ -731,7 +748,7 @@ def _impl_release(impl):
                 return False                     # another handle still holds it
             _IMPL_CACHE.pop(key, None)
             break
-    return _drop_heavy(impl)                     # last handle: actually drop the weights
+    return _free(impl)                           # last handle: actually drop the weights
 
 
 def release(model):
