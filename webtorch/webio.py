@@ -2279,20 +2279,38 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     async def size(url):
         return await http_size(url, hdr)
 
+    _said = {}              # url -> hash or None, asked once
+    _mute = set()           # builder indexes that have shown they cannot answer here
+
     async def _published(url):
-        """The hash the host publishes for this file, or None if it will not say."""
+        """The hash the host publishes for this file, or None if it will not say.
+
+        Asked once per file, and once per HOST per session. A hub whose hash lives behind an
+        API that does not answer cross-origin will not start answering: the first failure
+        settles it, and without that this asked again for every one of a checkpoint's 170
+        tensors -- measured at 353 blocked requests and a load that stopped moving.
+        """
+        if url in _said:
+            return _said[url]
         known_at = _digest_of.get(url)
         if not known_at:
             return None
         i, repo, path = known_at
         fn = digests[i] if i < len(digests) else None
-        if fn is None:
+        if fn is None or i in _mute:
             return None
         try:
             got = await fn(repo, path)
         except Exception:
+            _mute.add(i)
+            _said[url] = None
             return None
-        return str(got).strip().strip('"').lower() or None if got else None
+        # No hash for THIS file is not a host that cannot answer: a small file is stored
+        # inline rather than as an LFS object and simply has none. Muting on that would give
+        # up checking the weights because a config was too small to have a hash.
+        out = str(got).strip().strip('"').lower() if got else None
+        _said[url] = out
+        return out
 
     async def _same_file(a, b, sa):
         """Is `b` the file `a` is? Asked before a mirror is ever MIXED IN.
@@ -2467,6 +2485,11 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     return read
 
 
+# Hub APIs that have already shown they cannot be reached from here. Per session, because
+# that is how long the answer stays true: a CORS policy does not change mid-page.
+_API_DEAD = {}
+
+
 async def _final_url(url, headers=None):
     """Where a URL actually lands, after redirects. One byte is fetched to find out."""
     try:
@@ -2476,6 +2499,10 @@ async def _final_url(url, headers=None):
     h = dict(headers or {}); h["Range"] = "bytes=0-0"
     if pyfetch is not None:
         r = await _pyfetch(url, headers=h)
+        # Read the one byte. An unread body is an open connection, and a few hundred of
+        # those is a browser that stops making requests at all.
+        try: await r.bytes()
+        except Exception: pass
         return str(getattr(r, "url", "") or "")
     import urllib.request
     req = urllib.request.Request(url, headers=h)
@@ -2562,7 +2589,12 @@ async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revisi
     import json
     base = endpoint.rstrip("/")
     hdr = {"Authorization": "Bearer " + token} if token else None
+    # Tried once. Where this API is reachable it answers for every file; where it is not --
+    # a browser, because it sends no CORS header -- it will not start, and asking again per
+    # file is a failed request and a console line each time for nothing.
     try:
+        if _API_DEAD.get("modelscope"):
+            raise RuntimeError("asked before")
         body = await http_get("%s/api/v1/models/%s/repo/files?Revision=%s" % (base, repo, revision),
                               0, None, hdr)
         data = json.loads(bytes(body).decode("utf-8")) or {}
@@ -2571,7 +2603,7 @@ async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revisi
                 if f.get("Sha256"):
                     return f["Sha256"]
     except Exception:
-        pass
+        _API_DEAD["modelscope"] = True
     return await lfs_digest("%s/models/%s/resolve/%s/%s" % (base, repo, revision, path), token)
 
 
