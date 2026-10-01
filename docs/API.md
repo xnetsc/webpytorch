@@ -365,8 +365,10 @@ and `surface()` describes it correctly — the descriptions are keyed by shape, 
 built from them fits a model whose types nobody has seen. Every answer carries its `shape`
 beside its `type` for the same reason.
 
-The checkpoints published so far declare neither: they say how many types they have (one
-temperature and one type-embedding row each) and nothing more. For those, and only those, the
+The checkpoints published so far declare neither. How many types there are is still read
+from the model — `type_emb.weight` has one row per type — rather than from the temperature
+list beside it, which is calibration metadata and may be short, scalar or missing without
+the model having fewer types. For those, and only those, the
 engine supplies the conventional `choice`/`score`/`noul` with the shapes above. Nothing else
 in the engine branches on a type's name — a type past the conventional ones is named
 positionally and asked the general (`named`) way, rather than silently taking the shape of
