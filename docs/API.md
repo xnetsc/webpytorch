@@ -1057,17 +1057,32 @@ the same store and management functions (`list_cache` / `clear_cache` / …), ke
   block from whichever is answering, the next one tried when a host stops. Measured on one
   mirrored checkpoint, 64 KB at three offsets: 3.1 / 1.7 / 1.2 s from one hub against
   1.4 / 0.48 / 0.43 s from the other, and the first aborted partway through the real
-  download. A mirror earns that first — same length, and one block from the middle that
-  matches — because mixing blocks from hosts that disagree gives a model that is corrupt
-  with nothing reported. When the FIRST host is unreachable the mirror is used anyway:
+  download. A mirror earns that first, because mixing blocks from hosts that disagree gives
+  a model that is corrupt with nothing reported.
+
+  **How it earns it: the host's own hash, when the host will give one.** `digest` takes one
+  `async digest(repo, path) -> str|None` per builder. A hash the host computed covers the
+  whole file and costs one small request — measured host-side, deciding and reading took
+  three requests in total and fetched no sample blocks at all. Where a host will not answer,
+  the check falls back to equal length plus three blocks spread through the file, which is
+  evidence and not proof, and the alternative is downloading both copies in full to compare.
+  Reachability is not uniform: measured from a browser, Hugging Face's repo API answers with
+  CORS and gives the sha256, while ModelScope's file API does not answer cross-origin — and
+  neither hub's hash survives on the file route itself, one losing the header to its CDN
+  redirect and the other exposing no headers at all. So from a page one hash is available and
+  from a host both are.
+
+  When the FIRST host is unreachable the mirror is used anyway:
   nothing is being mixed then, the file simply comes from elsewhere, which is what a
   single-source reader pointed at that mirror would have done. The first function names the
   file for the cache, so which host a block came from leaves no trace and a resumed download
   does not care that the network changed under it.
+- `webtorch.hf_digest(repo, path, …)` / `webtorch.modelscope_digest(repo, path, …)` — the
+  sha256 each hub publishes for one file, or None where it will not say.
 - `webtorch.mirrored_read(readers=None, **kw)` — the ready-made case of that: the hubs this
-  package already addresses, used together rather than chosen between. A repo that exists on
-  only one of them still works, because a mirror that cannot be proven identical is simply
-  not used.
+  package already addresses, used together rather than chosen between, with the two digest
+  lookups above already wired in. A repo that exists on only one of them still works, because
+  a mirror that cannot be proven identical is simply not used.
   ```python
   webtorch.set_io_read(webtorch.mirrored_read())
   ```

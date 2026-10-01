@@ -2200,7 +2200,7 @@ async def clear_cache(cache_dir=None, host=None):
 
 # ---- model-hub readers: ready-made read callbacks over the HTTP transport ----
 def hub_read(to_url, token=None, cache=True, cache_dir=None, max_parallel=16,
-             prefetch=True, chunk_mb=16, persist=True):
+             prefetch=True, chunk_mb=16, persist=True, digest=None):
     """An `io_read`-shaped callback for ANY host that serves files over HTTP.
 
     `hf_read` and `modelscope_read` are two lines each on top of this -- a lambda that builds
@@ -2227,12 +2227,19 @@ def hub_read(to_url, token=None, cache=True, cache_dir=None, max_parallel=16,
         webtorch.set_io_read(webtorch.hub_read([
             lambda r, p: "https://huggingface.co/%s/resolve/main/%s" % (r, p),
             lambda r, p: "https://modelscope.cn/models/%s/resolve/master/%s" % (r, p)]))
+
+    `digest` is how a mirror is checked properly: one `async digest(repo, path) -> str|None`
+    per builder, returning the hash THAT HOST publishes for the file. A hash the host
+    computed covers the whole file and costs one small request, so it is asked for first and
+    the byte sampling is only what happens when a host will not answer. `hf_digest` and
+    `modelscope_digest` are the two this package ships; `mirrored_read` wires them up.
     """
     return _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb,
-                       persist)
+                       persist, digest=digest)
 
 
-def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist):
+def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_mb, persist,
+                digest=None):
     """The read callback behind `hub_read`, and so behind `hf_read` / `modelscope_read`.
 
     It asks the cache first, and when the cache says it does not have the bytes, it deals
@@ -2258,6 +2265,12 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     # different hosts would land under different keys and neither copy would ever be whole.
     import time
     builders = list(to_url) if isinstance(to_url, (list, tuple)) else [to_url]
+    # One per builder: `async digest(repo, path) -> str | None`, the hash the HOST publishes
+    # for that file. Supplied by whoever knows the hub's API, because `hub_read` knows no
+    # hub. None where a host has no such thing, or will not tell this context.
+    digests = list(digest) if isinstance(digest, (list, tuple)) else [digest] * len(builders)
+    digests += [None] * (len(builders) - len(digests))
+    _digest_of = {}         # url -> the builder index it came from, for asking the right one
     _alt = {}               # canonical url -> [url, ...] the same file is also served at
     mirrors = {}            # canonical url -> [url, ...] proven to be the same bytes
     rate = {}               # url -> bytes per second, last seen
@@ -2266,22 +2279,53 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     async def size(url):
         return await http_size(url, hdr)
 
+    async def _published(url):
+        """The hash the host publishes for this file, or None if it will not say."""
+        known_at = _digest_of.get(url)
+        if not known_at:
+            return None
+        i, repo, path = known_at
+        fn = digests[i] if i < len(digests) else None
+        if fn is None:
+            return None
+        try:
+            got = await fn(repo, path)
+        except Exception:
+            return None
+        return str(got).strip().strip('"').lower() or None if got else None
+
     async def _same_file(a, b, sa):
-        """Is `b` byte-for-byte the file `a` is? Asked before a mirror is ever MIXED IN.
+        """Is `b` the file `a` is? Asked before a mirror is ever MIXED IN.
 
         Mixing blocks from two hosts that disagree produces a model that is corrupt in a way
         nothing reports: every block arrives, the file is the right length, and the weights
-        are nonsense. So the mirror has to earn it -- same length, and one block from the
-        middle that matches. It is evidence rather than proof, and it is the evidence that
-        is affordable: the alternative is downloading both copies to compare them.
+        are nonsense. So a mirror has to earn it.
+
+        The host's own hash settles it when both hosts will give one -- it covers the whole
+        file and costs one small request, which is better in both directions than reading
+        bytes to compare. It is not always reachable: measured from a browser, one hub loses
+        the header to its CDN redirect and exposes nothing on the file route, its API answers
+        but CORS-blocked, while the other hub's API answers fine. So this asks, and falls
+        back when the answer is not available.
+
+        The fallback is evidence rather than proof, and says so: equal length, and three
+        blocks spread through the file. The alternative to evidence here is downloading both
+        copies in full to compare them, which is the thing the mirror existed to avoid.
         """
         try:
+            da, db = await _published(a), await _published(b)
+            if da and db:
+                return da == db                  # the hosts' own word, on the whole file
             if not sa or sa != await size(b):
                 return False
-            at = max(0, (sa // 2) - (sa // 2) % _SAMPLE)
-            ba = await http_get(a, at, _SAMPLE, hdr)
-            bb = await http_get(b, at, _SAMPLE, hdr)
-            return len(ba) == len(bb) and bytes(ba) == bytes(bb)
+            for frac in (0.1, 0.5, 0.9):
+                at = int(sa * frac)
+                at = max(0, min(at - at % _SAMPLE, max(0, sa - _SAMPLE)))
+                ba = await http_get(a, at, _SAMPLE, hdr)
+                bb = await http_get(b, at, _SAMPLE, hdr)
+                if len(ba) != len(bb) or bytes(ba) != bytes(bb):
+                    return False
+            return True
         except Exception:
             return False
 
@@ -2351,6 +2395,8 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             return name
         repo, path = _split_repo(name)
         urls = [b(repo, path) for b in builders]
+        for i, u in enumerate(urls):
+            _digest_of[u] = (i, repo, path)
         if len(urls) > 1:
             _alt.setdefault(urls[0], urls[1:])
         return urls[0]
@@ -2421,6 +2467,42 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
     return read
 
 
+async def hf_digest(repo, path, endpoint="https://huggingface.co", token=None):
+    """The sha256 Hugging Face publishes for one file, or None.
+
+    From the repo API rather than the file's own headers: `X-Linked-ETag` carries it, but a
+    browser following the redirect to the CDN never sees that header, and the CDN's own
+    `ETag` is a different hash entirely. The API answers with CORS, so this works from a page.
+    """
+    import json
+    url = "%s/api/models/%s?blobs=true" % (endpoint.rstrip("/"), repo)
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    body = await http_get(url, 0, None, hdr)
+    for f in (json.loads(bytes(body).decode("utf-8")) or {}).get("siblings") or []:
+        if f.get("rfilename") == path:
+            lfs = f.get("lfs") or {}
+            return lfs.get("sha256") or lfs.get("oid")
+    return None
+
+
+async def modelscope_digest(repo, path, endpoint="https://modelscope.cn", revision="master",
+                            token=None):
+    """The sha256 ModelScope publishes for one file, or None.
+
+    Its file API carries it. Note that the API does not answer cross-origin, so from a
+    browser this returns None and the comparison falls back; from a host it works.
+    """
+    import json
+    url = "%s/api/v1/models/%s/repo/files?Revision=%s" % (endpoint.rstrip("/"), repo, revision)
+    hdr = {"Authorization": "Bearer " + token} if token else None
+    body = await http_get(url, 0, None, hdr)
+    data = json.loads(bytes(body).decode("utf-8")) or {}
+    for f in (data.get("Data") or {}).get("Files") or []:
+        if f.get("Path") == path:
+            return f.get("Sha256")
+    return None
+
+
 def mirrored_read(readers=None, **kw):
     """Read from several hubs at once, taking each block from whichever is answering.
 
@@ -2439,6 +2521,7 @@ def mirrored_read(readers=None, **kw):
             lambda repo, path: "https://huggingface.co/%s/resolve/main/%s" % (repo, path),
             lambda repo, path: "https://modelscope.cn/models/%s/resolve/master/%s" % (repo, path),
         ]
+        kw.setdefault("digest", [hf_digest, modelscope_digest])
     return hub_read(list(readers), **kw)
 
 

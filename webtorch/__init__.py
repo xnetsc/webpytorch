@@ -86,7 +86,7 @@ from .webio import (use_directory, get_directory, migrate_cache, set_storage_ful
                     set_io_read, get_io_read, io_read, set_io_write, get_io_write, io_write,
                     cancel, Cancelled,
                     use_default_io, default_io_read, default_io_write, hub_read,
-                    mirrored_read, hf_read, modelscope_read,
+                    mirrored_read, hf_read, modelscope_read, hf_digest, modelscope_digest,
                     throttle_reads, prefetch_whole_file, await_inflight, http_get, http_size, HttpError,
                     default_cache_dir, list_cache, cache_hosts, cache_size, read_cache,
                     write_cache, delete_cache, clear_cache)
@@ -129,6 +129,8 @@ __all__ = [
     # a reader for a third host two lines rather than a reimplementation of the cache,
     # read-ahead, adaptive concurrency, rate-limit backoff and resumable chunking.
     "hub_read", "mirrored_read", "hf_read", "modelscope_read",
+    # what a host publishes for a file, for checking a mirror without reading it
+    "hf_digest", "modelscope_digest",
     # raw HTTP, for a reader that wants none of the above
     "http_get", "http_size", "HttpError",
     # persistent-cache management (list/read/write/delete, separated by host/domain)
