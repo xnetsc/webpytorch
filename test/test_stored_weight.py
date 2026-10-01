@@ -34,6 +34,20 @@ def test_measured_positive_q4_vector_paths_are_enabled_without_cross_width_routi
         assert "round(" not in wt._GGML_TYPES[name][0]
 
 
+def test_q5_candidates_preserve_the_original_high_bit_plane_and_activation_width():
+    for src in (wt._Q5_0_VEC_DEC, wt._Q5_1_VEC_DEC):
+        assert "U32(" in src
+        assert "B4(" in src
+        assert "ACC4(" in src
+        assert "round(" not in src
+
+
+def test_q5_same_width_selection_keeps_unstable_decode_scalar_and_vectorizes_batches():
+    assert "ACC4(" in wt._GGML_TYPES["Q5_0"][0]
+    assert "fn Q5LO" not in wt._ggml_src("Q5_1", 1)
+    assert "fn Q5LO" in wt._ggml_src("Q5_1", 0, mrow=4)
+
+
 def test_stored_weight_materializes_only_when_an_operator_requests_an_array():
     values = np.arange(-16, 16, dtype=np.int8)
     raw = np.asarray([0.5], dtype=np.float16).tobytes() + values.tobytes()

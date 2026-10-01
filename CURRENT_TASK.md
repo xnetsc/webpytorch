@@ -22,12 +22,15 @@ its earlier benchmark conclusions are provisional.**
 - Q4_0, Q4_1, and Q4_K now consume their original packed nibbles four bytes at a time and
   use exact vec4 multiply-accumulate. Two realistic-size interleaved runs showed 1.01–1.14×
   speedups without any alternate-width weight or activation path.
+- Q5_0 now vectorises its original nibble plus high-bit plane for every shape. Q5_1 keeps
+  scalar GEMV/GEMV2 because decode measurements were unstable, and uses the measured-positive
+  exact vector path only for GEMM; neither path changes weight or activation width.
 - Browser verification after the exact Q8_0 vectorisation: xDecision returned the same
   non-uniform result on the duplicate-charge example — billing 89.7%, true 97.9%, urgency
   15.7% / 26.6% / 27.3% / 30.4% — in 304 ms for 486 input tokens.
 - The browser correctness gate covers 140 stored GGML operator cases plus the device-side
   decision-feature reduction.
-- Automated verification: 47 Python tests and 19 JavaScript tests passed.
+- Automated verification: 49 Python tests and 19 JavaScript tests passed.
 - The SDK cache token now covers the Python package and both worker bootstraps, not only the
   main-thread JavaScript file.
 - Quantized ONNX operator support remains a separate future task.

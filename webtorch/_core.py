@@ -5452,6 +5452,24 @@ fn Q4HI(p: u32) -> vec4<f32> {
 }
 """
 
+_Q5V_FN = """
+fn Q5LO(p: u32, h: u32, j: u32) -> vec4<f32> {
+  return vec4<f32>(
+    f32(p & 15u) + select(0.0, 16.0, (h & (1u << j)) != 0u),
+    f32((p >> 8u) & 15u) + select(0.0, 16.0, (h & (1u << (j + 1u))) != 0u),
+    f32((p >> 16u) & 15u) + select(0.0, 16.0, (h & (1u << (j + 2u))) != 0u),
+    f32((p >> 24u) & 15u) + select(0.0, 16.0, (h & (1u << (j + 3u))) != 0u));
+}
+fn Q5HI(p: u32, h: u32, j: u32) -> vec4<f32> {
+  let k = j + 16u;
+  return vec4<f32>(
+    f32((p >> 4u) & 15u) + select(0.0, 16.0, (h & (1u << k)) != 0u),
+    f32((p >> 12u) & 15u) + select(0.0, 16.0, (h & (1u << (k + 1u))) != 0u),
+    f32((p >> 20u) & 15u) + select(0.0, 16.0, (h & (1u << (k + 2u))) != 0u),
+    f32((p >> 28u) & 15u) + select(0.0, 16.0, (h & (1u << (k + 3u))) != 0u));
+}
+"""
+
 # Q8_0: 32 values / 34 bytes -- f16 d + int8[32].
 _Q8_0_DEC = """
     let o = base + b * 34u;
@@ -6064,6 +6082,27 @@ _Q5_1_DEC = """
     }
 """
 
+_Q5_0_VEC_DEC = """
+    let o = base + b * 22u;
+    let d = F16(o); let qh = U32(o + 2u); let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u; let q = B4(o + 6u + j);
+      ACC4(kb + j, d * (Q5LO(q, qh, j) - vec4<f32>(16.0, 16.0, 16.0, 16.0)));
+      ACC4(kb + 16u + j,
+           d * (Q5HI(q, qh, j) - vec4<f32>(16.0, 16.0, 16.0, 16.0)));
+    }
+"""
+
+_Q5_1_VEC_DEC = """
+    let o = base + b * 24u;
+    let d = F16(o); let mn = F16(o + 2u); let qh = U32(o + 4u); let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u; let q = B4(o + 8u + j);
+      ACC4(kb + j, d * Q5LO(q, qh, j) + vec4<f32>(mn, mn, mn, mn));
+      ACC4(kb + 16u + j, d * Q5HI(q, qh, j) + vec4<f32>(mn, mn, mn, mn));
+    }
+"""
+
 # F16 / F32: not quantized at all, but going through the same kernel keeps an unquantized
 # tensor on the no-conversion path instead of sending it back through the fp32 expansion.
 _F16_DEC = """
@@ -6217,7 +6256,7 @@ _GGML_TYPES = {
     "Q2_0":    (_Q2_0_DEC,    "",                  64,  18, None),
     "Q4_0":    (_Q4_0_VEC_DEC, _Q4V_FN,            32,  18, None),
     "Q4_1":    (_Q4_1_VEC_DEC, _Q4V_FN,            32,  20, None),
-    "Q5_0":    (_Q5_0_DEC,    "",                  32,  22, None),
+    "Q5_0":    (_Q5_0_VEC_DEC, _Q5V_FN,            32,  22, None),
     "Q5_1":    (_Q5_1_DEC,    "",                  32,  24, None),
     "Q8_0":    (_Q8_0_DEC,    "",                  32,  34, None),
     "IQ4_NL":  (_IQ4NL_DEC,   _KV_FN,              32,  18, None),
@@ -6397,6 +6436,13 @@ def _ggml_src(type_name, mode, cfg=None, moe=False, mrow=None):
     `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
     expert from an index buffer instead of being bound to one expert's weights."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    # Same Q5_1 bytes and the same exact block equation on both sides. Realistic-shape
+    # interleaved measurements consistently favour vec4 for batches, while single-token
+    # decode was unstable (+8% in one run, -12% in another). Mode is already a compile-time
+    # kernel variant, so keep the faster/stable scalar decode and vectorise only GEMM.
+    if type_name == "Q5_1" and mode == 0:
+        dec = _Q5_1_VEC_DEC
+        helpers += _Q5V_FN
     # Whether this format's codebook gets staged in workgroup memory. Decided once, because
     # three substitutions below have to agree about it -- and the one that nearly got away is
     # the fill call: it is emitted on a test for `fn kvfill`, which lives in the text this

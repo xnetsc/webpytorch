@@ -1,5 +1,23 @@
 # Progress
 
+## 2026-10-02 ▸ Phase-one exact Q5 vector kernels
+
+- Added register-vector candidates that consume Q5_0/Q5_1's original four-bit nibble stream
+  and separate fifth-bit plane directly. FP32 activations, block scales, minima, and output
+  accumulation semantics are unchanged.
+- Realistic K=4096, N=3072 interleaved runs showed Q5_0 at 1.00–1.13× and 1.01–1.11×
+  across M=1/32/128, so its exact vector path is enabled globally.
+- Q5_1 batch execution was consistently positive (M32 +7–8%, M128 +10–11%), while M1
+  contradicted itself (+8%, then −12%). Production therefore keeps exact scalar GEMV/GEMV2
+  and selects exact vector execution only for GEMM. This is same-width operator routing,
+  not the deferred cross-width phase.
+
+### Evidence
+
+- Final Chrome WebGPU matrix: 140/140 stored-format operator cases; decision-feature CPU/GPU
+  comparison passed.
+- Python suite: 49 passed. JavaScript suite: 19 passed.
+
 ## 2026-10-02 ▸ Phase-one exact Q4 vector kernels
 
 **Constraint:** Optimise within the source format first. No weight re-encoding, activation

@@ -1,4 +1,4 @@
-"""Interleaved phase-one benchmark: exact scalar vs exact vector Q4 decoders.
+"""Interleaved phase-one benchmark: exact scalar vs exact vector Q4/Q5 decoders.
 
 Both sides consume the same original GGML bytes and FP32 activations.  This benchmark is
 allowed to decide only between equivalent same-width implementations; it says nothing about
@@ -48,12 +48,16 @@ SCALAR = {
         ACC(kb + (i0 + 1u) * 32u + l, d2 * f32(q >> 4u) - m2);
       }
     }""",
+    "Q5_0": wt._Q5_0_DEC,
+    "Q5_1": wt._Q5_1_DEC,
 }
 
 VECTOR = {
     "Q4_0": wt._Q4_0_VEC_DEC,
     "Q4_1": wt._Q4_1_VEC_DEC,
     "Q4_K": wt._Q4K_DEC,
+    "Q5_0": wt._Q5_0_VEC_DEC,
+    "Q5_1": wt._Q5_1_VEC_DEC,
 }
 
 
@@ -67,10 +71,18 @@ def make_raw(name, rng):
         elif name == "Q4_1":
             out.extend(np.asarray([0.02, -0.15], np.float16).tobytes())
             out.extend(rng.integers(0, 256, 16, dtype=np.uint8).tobytes())
-        else:
+        elif name == "Q4_K":
             out.extend(np.asarray([0.02, 0.01], np.float16).tobytes())
             out.extend(rng.integers(0, 256, 12, dtype=np.uint8).tobytes())
             out.extend(rng.integers(0, 256, 128, dtype=np.uint8).tobytes())
+        elif name == "Q5_0":
+            out.extend(np.float16(0.02).tobytes())
+            out.extend(rng.integers(0, 256, 4, dtype=np.uint8).tobytes())
+            out.extend(rng.integers(0, 256, 16, dtype=np.uint8).tobytes())
+        else:
+            out.extend(np.asarray([0.02, -0.15], np.float16).tobytes())
+            out.extend(rng.integers(0, 256, 4, dtype=np.uint8).tobytes())
+            out.extend(rng.integers(0, 256, 16, dtype=np.uint8).tobytes())
     assert len(out) == N * (K // vals) * block_bytes
     return bytes(out)
 
@@ -125,12 +137,13 @@ def main():
         raise RuntimeError("WebGPU compute platform is unavailable")
     rng = np.random.default_rng(884)
     result = {"phase": 1, "same_width_only": True, "formats": []}
-    for name in ("Q4_0", "Q4_1", "Q4_K"):
+    for name in ("Q4_0", "Q4_1", "Q4_K", "Q5_0", "Q5_1"):
         scalar_alias = "BENCH_SCALAR_" + name
         vector_alias = "BENCH_VECTOR_" + name
         dec, helpers, vals, block_bytes, grid = wt._GGML_TYPES[name]
         scalar_helpers = helpers.replace(wt._Q4V_FN, "")
-        vector_helpers = scalar_helpers + wt._Q4V_FN
+        vector_helpers = scalar_helpers + (wt._Q5V_FN if name.startswith("Q5_")
+                                            else wt._Q4V_FN)
         wt._GGML_TYPES[scalar_alias] = (SCALAR[name], scalar_helpers,
                                         vals, block_bytes, grid)
         wt._GGML_TYPES[vector_alias] = (VECTOR[name], vector_helpers,
@@ -146,7 +159,7 @@ def main():
         result["formats"].append(row)
         del wt._GGML_TYPES[scalar_alias]
         del wt._GGML_TYPES[vector_alias]
-        print("NATIVE_Q4 %s %s" % (name, ", ".join(
+        print("NATIVE_WIDTH %s %s" % (name, ", ".join(
             "M%d:%.2fx" % (x["M"], x["vector_speedup"]) for x in row["shapes"])))
     result["ok"] = True
     print("RESULT " + json.dumps(result))
