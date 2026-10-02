@@ -1027,6 +1027,10 @@ webtorch.require_gpu("Qwen3-30B")            # fails fast if the handshake was m
 m = await webtorch.load("unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/…Q3_K_XL.gguf")
 ```
 
+- `webtorch.parity_contracts() -> dict` — return the audited WebGPU/WebGL implementation
+  path and lowest efficient common contract for each public capability. Hardware-specific
+  primitives may differ; public API semantics may not.
+
 Show the value in your UI rather than inferring it from how long a reply takes — a silent
 CPU fallback is otherwise indistinguishable from "the model is big".
 

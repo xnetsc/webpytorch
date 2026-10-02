@@ -42,10 +42,55 @@ def test_q5_candidates_preserve_the_original_high_bit_plane_and_activation_width
         assert "round(" not in src
 
 
-def test_q5_same_width_selection_keeps_unstable_decode_scalar_and_vectorizes_batches():
+def test_q5_same_width_selection_keeps_unstable_decode_scalar_and_vectorizes_other_modes():
     assert "ACC4(" in wt._GGML_TYPES["Q5_0"][0]
     assert "fn Q5LO" not in wt._ggml_src("Q5_1", 1)
+    assert "fn Q5LO" in wt._ggml_src("Q5_1", 2)
     assert "fn Q5LO" in wt._ggml_src("Q5_1", 0, mrow=4)
+
+
+def test_q6_candidate_preserves_low_and_high_planes_at_original_width():
+    assert "fn Q6V" in wt._Q6V_FN
+    assert "B4(" in wt._Q6K_VEC_DEC
+    assert "ACC4(" in wt._Q6K_VEC_DEC
+    assert "round(" not in wt._Q6K_VEC_DEC
+
+
+def test_measured_positive_q6_vector_path_is_enabled_for_every_shape():
+    assert wt._GGML_TYPES["Q6_K"][0] is wt._Q6K_VEC_DEC
+    for mode in (1, 2, 0):
+        assert "ACC4(" in wt._ggml_src("Q6_K", mode, mrow=4 if mode == 0 else None)
+
+
+def test_remaining_same_width_candidates_do_not_create_alternate_weight_buffers():
+    for src in (wt._Q1_0_VEC_DEC, wt._Q2_0_VEC_DEC, wt._TQ2_0_VEC_DEC,
+                wt._IQ4NL_VEC_DEC, wt._IQ2XXS_VEC_DEC, wt._TQ1_0_VEC_DEC,
+                wt._MXFP4_VEC_DEC, wt._NVFP4_VEC_DEC, wt._IQ1S_VEC_DEC,
+                wt._IQ1M_VEC_DEC):
+        assert "ACC4(" in src
+        assert "round(" not in src
+
+
+def test_same_width_routing_is_by_storage_format_and_operator_mode():
+    assert "ACC4(" in wt._GGML_TYPES["Q1_0"][0]
+    assert "ACC4(" in wt._GGML_TYPES["IQ2_XXS"][0]
+    for name in ("Q2_0", "TQ2_0", "IQ4_NL"):
+        assert "ACC4(" not in wt._ggml_src(name, 1).replace("fn ACC4", "")
+        assert "ACC4(" in wt._ggml_src(name, 2)
+        assert "ACC4(" in wt._ggml_src(name, 0, mrow=4)
+
+
+def test_iq1_vector_candidates_read_the_original_signed_grid_bytes():
+    assert "fn GI8V" in wt._GRID_FN
+    for src in (wt._IQ1S_VEC_DEC, wt._IQ1M_VEC_DEC):
+        assert "GI8V(" in src
+        assert "G4V(" not in src
+
+
+def test_measured_positive_low_bit_paths_are_enabled_for_every_shape():
+    for name in ("TQ1_0", "MXFP4", "NVFP4", "IQ1_S", "IQ1_M"):
+        assert "ACC4(" in wt._GGML_TYPES[name][0]
+        assert "round(" not in wt._GGML_TYPES[name][0]
 
 
 def test_stored_weight_materializes_only_when_an_operator_requests_an_array():
@@ -70,10 +115,80 @@ def test_non_gguf_quantized_module_uses_the_same_stored_linear_interface():
 
     assert wt.stored_linear(module) is module
     assert module.storage_format == "GPTQ_INT8"
-    assert module.execution == "stored"
+    assert module.execution == "auto"
 
 
-def test_stored_execution_is_the_default_and_policy_is_forwarded_generically():
+def test_gptq_int4_int8_use_exact_packed_weight_fp32_dot_paths():
+    for bits in (4, 8):
+        gemm = wt._gptq_src(wt._GPTQ_WGSL, bits, 32)
+        gemv = wt._gptq_gemv_src(bits, 32)
+        for src in (gemm, gemv):
+            assert "GPTQACC" not in src
+            assert "dot(vec4<f32>" in src
+            assert "round(" not in src
+            assert "dot4I8Packed" not in src
+        scalar = wt._gptq_src(wt._GPTQ_WGSL, bits, 32, vector=False)
+        assert "for (var j: u32" in scalar
+    assert wt._gptq_exact_vector(4) is True
+    assert wt._gptq_exact_vector(8) is False
+
+
+def test_webgl_gptq_has_the_same_exact_packed_vec4_candidate():
+    vector = wt._gptq_src(wt._GL_GPTQ, 4, 32, vector=True)
+    scalar = wt._gptq_src(wt._GL_GPTQ, 4, 32, vector=False)
+    for src in (vector, scalar):
+        assert "GPTQGLACC" not in src
+        assert "round(" not in src
+        assert "dot4I8Packed" not in src
+    assert "part += dot(vec4(" in vector
+    assert "for(int j=0;j<PER;j++)" not in vector
+    assert "for(int j=0;j<8;j++)" in scalar
+
+
+def test_phase_two_cross_width_policy_is_explicit_for_both_browser_backends():
+    route = wt._PHASE2_CROSS_WIDTH["gptq_activation_int8_dp4a"]
+    assert route == {
+        "webgpu": "measured_negative_keep_stored",
+        "webgl": "primitive_unavailable_keep_stored",
+    }
+    assert "requires packed_4x8_integer_dot_product" in wt._GPTQ_DP4A_WGSL
+    assert "dot4I8Packed" in wt._gptq_dp4a_src(4)
+    assert "dot4I8Packed" in wt._gptq_dp4a_src(8)
+    assert "dot4I8Packed" not in wt._GL_GPTQ
+
+
+def test_every_ggml_decoder_can_generate_a_webgl_shader():
+    for name in wt._GGML_TYPES:
+        src = wt._ggml_src_gl(name, False, False)
+        assert "#version 300 es" in src
+        assert "void main()" in src
+        assert "DECODE" not in src
+        assert "ACC4(" not in src.replace("void ACC4(", "") or "dot(vec4" in src
+
+
+def test_webgl_same_width_routing_is_independent_and_shape_bucketed():
+    # Q6_K's WebGL vector path loses for decode/small batch but wins for a large batch;
+    # WebGPU uses its own independently measured routing.
+    assert wt._GGML_GL_MODE_DECODERS["Q6_K"][1][0] is wt._Q6K_DEC
+    assert wt._GGML_GL_MODE_DECODERS["Q6_K"][3][0] is wt._Q6K_DEC
+    assert 0 not in wt._GGML_GL_MODE_DECODERS["Q6_K"]
+    assert wt._ggml_src_gl("Q6_K", False, False, mode=1) != \
+           wt._ggml_src_gl("Q6_K", False, False, mode=0)
+    assert wt._ggml_name_gl("Q6_K", False, False, mode=1) != \
+           wt._ggml_name_gl("Q6_K", False, False, mode=0)
+
+
+def test_gptq_same_width_routing_is_backend_specific(monkeypatch):
+    monkeypatch.setattr(wt, "_adam_backend_ready", lambda: False)
+    monkeypatch.setattr(wt, "_webgl_ready", lambda: True)
+    assert wt._gptq_exact_vector(4, 1) is True
+    assert wt._gptq_exact_vector(4, 64) is False
+    assert wt._gptq_exact_vector(8, 1) is True
+    assert wt._gptq_exact_vector(8, 16) is False
+    assert wt._gptq_exact_vector(8, 64) is True
+
+
+def test_low_level_stored_baseline_and_production_auto_policy_are_explicit():
     assert inspect.signature(wt.ggml_matmul).parameters["execution"].default == "stored"
 
     class EncodedWeight:
@@ -81,7 +196,7 @@ def test_stored_execution_is_the_default_and_policy_is_forwarded_generically():
             return {"bias": bias, "execution": execution}
 
     assert wt.stored_linear(EncodedWeight(), bias="b") == {
-        "bias": "b", "execution": "stored",
+        "bias": "b", "execution": "auto",
     }
     assert wt.stored_linear(EncodedWeight(), execution="auto") == {
         "bias": None, "execution": "auto",

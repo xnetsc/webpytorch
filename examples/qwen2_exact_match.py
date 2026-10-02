@@ -57,7 +57,7 @@ def rope_cos_sin(T, hd, theta):
 
 
 # ------------------- independent NUMPY reference ---------------------------
-def qwen2_numpy(cfg, W, ids):
+def qwen2_numpy(cfg, W, ids, trace=None):
     H, nh, nkv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     hd, eps, theta = H // nh, cfg["rms_norm_eps"], cfg["rope_theta"]
     rep = nh // nkv
@@ -74,6 +74,7 @@ def qwen2_numpy(cfg, W, ids):
 
     mask = np.triu(np.full((T, T), -1e9, np.float32), 1)
     h = W["model.embed_tokens.weight"][ids]                               # (T,H)
+    if trace is not None: trace["embed"] = h.copy()
     for i in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{i}."
         x = rms(h, W[p + "input_layernorm.weight"])
@@ -85,23 +86,29 @@ def qwen2_numpy(cfg, W, ids):
         v = v.reshape(T, nkv, hd).transpose(1, 0, 2)
         q = q * cos + rot(q) * sin
         k = k * cos + rot(k) * sin
+        if trace is not None:
+            trace[f"l{i}.q"] = q.copy(); trace[f"l{i}.k"] = k.copy()
         k = np.repeat(k, rep, axis=0); v = np.repeat(v, rep, axis=0)      # GQA
         att = np.matmul(q, k.transpose(0, 2, 1)) / math.sqrt(hd) + mask
         att = att - att.max(-1, keepdims=True)
         att = np.exp(att); att /= att.sum(-1, keepdims=True)
         o = np.matmul(att, v).transpose(1, 0, 2).reshape(T, H)
+        if trace is not None: trace[f"l{i}.attn"] = o.copy()
         o = o @ W[p + "self_attn.o_proj.weight"].T
         h = h + o
+        if trace is not None: trace[f"l{i}.post_attn"] = h.copy()
         x = rms(h, W[p + "post_attention_layernorm.weight"])
         g = x @ W[p + "mlp.gate_proj.weight"].T
         u = x @ W[p + "mlp.up_proj.weight"].T
         h = h + (g * (1 / (1 + np.exp(-g))) * u) @ W[p + "mlp.down_proj.weight"].T
+        if trace is not None: trace[f"l{i}.post_mlp"] = h.copy()
     h = rms(h, W["model.norm.weight"])
+    if trace is not None: trace["final_hidden"] = h.copy()
     return h @ W["model.embed_tokens.weight"].T                           # tied lm_head
 
 
 # --------------------- webtorch GPU forward --------------------------------
-def qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t):
+def qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t, trace=None):
     T = len(ids)
     H, nh, nkv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     hd = H // nh; rep = nh // nkv; eps = cfg["rms_norm_eps"]
@@ -122,6 +129,7 @@ def qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t):
 
     h = Wt["model.embed_tokens.weight"].numpy()[ids]
     h = wt.Tensor(h)                                                       # (T,H)
+    if trace is not None: trace["embed"] = h.numpy()
     for i in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{i}."
         x = rms(h, Wt[p + "input_layernorm.weight"])
@@ -132,14 +140,21 @@ def qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t):
         k = k.reshape(T, nkv, hd).permute(1, 0, 2)
         v = v.reshape(T, nkv, hd).permute(1, 0, 2)
         q = rope(q); k = rope(k)
+        if trace is not None:
+            trace[f"l{i}.q"] = q.numpy(); trace[f"l{i}.k"] = k.numpy()
         o = wt.gqa_attention(q, k, v, mask_t, scale=1.0 / math.sqrt(hd))   # no KV expansion
+        if trace is not None:
+            trace[f"l{i}.attn"] = o.permute(1, 0, 2).reshape(T, H).numpy()
         o = o.permute(1, 0, 2).reshape(T, H).matmul(Wt[p + "self_attn.o_proj.weight_T"])
         h = h + o
+        if trace is not None: trace[f"l{i}.post_attn"] = h.numpy()
         x = rms(h, Wt[p + "post_attention_layernorm.weight"])
         g = x.matmul(Wt[p + "mlp.gate_proj.weight_T"])
         u = x.matmul(Wt[p + "mlp.up_proj.weight_T"])
         h = h + (wt.silu(g) * u).matmul(Wt[p + "mlp.down_proj.weight_T"])
+        if trace is not None: trace[f"l{i}.post_mlp"] = h.numpy()
     h = rms(h, Wt["model.norm.weight"])
+    if trace is not None: trace["final_hidden"] = h.numpy()
     return h.matmul(Wt["model.embed_tokens.weight_T"])
 
 
@@ -160,14 +175,32 @@ async def main():
                    "num_attention_heads", "num_key_value_heads", "vocab_size", "rope_theta")}
     Wt = to_webtorch(cfg, W)
 
+    # Isolate the very wide LM head from attention/rope/cache.  WebGL texture tiling can be
+    # correct for the small projections and still wrap a vocabulary-sized output; reporting
+    # both widths turns that backend bug into an immediately local result instead of a
+    # mysteriously different generated token eight layers later.
+    probe = np.random.default_rng(2026).standard_normal((6, cfg["hidden_size"])).astype(np.float32)
+    href = probe @ W["model.embed_tokens.weight"].T
+    hgot = wt.Tensor(probe).matmul(Wt["model.embed_tokens.weight_T"]).numpy()
+    narrow_w = np.ascontiguousarray(W["model.embed_tokens.weight"][:512].T)
+    narrow_ref = probe @ narrow_w
+    narrow_got = wt.Tensor(probe).matmul(wt.Tensor(narrow_w)).numpy()
+    r["head_max_abs_err"] = float(np.abs(href - hgot).max())
+    r["head_argmax_match"] = bool((href.argmax(-1) == hgot.argmax(-1)).all())
+    r["head_narrow_max_abs_err"] = float(np.abs(narrow_ref - narrow_got).max())
+
     ids = [3, 14, 159, 26, 53, 58]                                        # fixed prompt (random-weight model)
     H, nh = cfg["hidden_size"], cfg["num_attention_heads"]; hd = H // nh
     cos, sin = rope_cos_sin(len(ids), hd, cfg["rope_theta"])
     cos_t, sin_t = wt.Tensor(cos), wt.Tensor(sin)
     mask_t = wt.Tensor(np.triu(np.full((len(ids), len(ids)), -1e9, np.float32), 1))
 
-    ref = qwen2_numpy(cfg, W, ids)
-    got = qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t).numpy()
+    np_trace, wt_trace = {}, {}
+    ref = qwen2_numpy(cfg, W, ids, np_trace)
+    got = qwen2_webtorch(cfg, Wt, ids, cos_t, sin_t, mask_t, wt_trace).numpy()
+    r["stage_max_abs_err"] = {
+        name: float(np.abs(np_trace[name] - wt_trace[name]).max()) for name in np_trace
+    }
     r["logits_shape"] = list(got.shape)
     r["max_abs_err"] = float(np.abs(ref - got).max())
     r["argmax_match"] = bool((ref.argmax(-1) == got.argmax(-1)).all())
@@ -192,7 +225,9 @@ async def main():
     r["gen_webtorch"] = gwt
     r["gen_numpy"] = gnp
     r["gen_match"] = bool(gwt == gnp)
-    r["ok"] = bool(r["max_abs_err"] < 1e-3 and r["argmax_match"] and r["gen_match"])
+    r["ok"] = bool(r["head_max_abs_err"] < 1e-3 and r["head_argmax_match"]
+                   and r["head_narrow_max_abs_err"] < 1e-3
+                   and r["max_abs_err"] < 1e-3 and r["argmax_match"] and r["gen_match"])
     print("RESULT " + json.dumps(r))
     pythonIO.result = json.dumps(r)
 

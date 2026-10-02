@@ -2266,8 +2266,10 @@ def _weight_execution(family, storage_format, K, N, M, run):
 
     The key contains only operator facts, never a model/repository name.  Nearby batch
     sizes share a power-of-two bucket so a prompt does not pay for a new tune at every
-    length.  A materialized path must win by at least 5%; ties stay stored because that
-    representation uses less device memory and is the correctness baseline.
+    length.  This is the final, device-local level of the routing hierarchy: a candidate
+    that did not win globally can still win for this format and shape bucket.  A
+    materialized path must win by at least 5%; ties stay stored because that representation
+    uses less device memory and is the correctness baseline.
     """
     m = int(M)
     if m <= 2:
@@ -5490,6 +5492,15 @@ _Q8_0_DEC = """
     }
 """
 
+_Q8_0_SCALAR_DEC = """
+    let o = base + b * 34u;
+    let d = F16(o);
+    let kb = b * 32u;
+    for (var j: u32 = 0u; j < 32u; j = j + 1u) {
+      ACC(kb + j, d * I8(o + 2u + j));
+    }
+"""
+
 # IQ4_NL: 32 values / 18 bytes -- f16 d + 16 bytes of paired codebook indices.
 _IQ4NL_DEC = """
     let o = base + b * 18u;
@@ -5499,6 +5510,21 @@ _IQ4NL_DEC = """
       let by = B(o + 2u + j);
       ACC(kb + j, d * kv(by & 15u));
       ACC(kb + 16u + j, d * kv(by >> 4u));
+    }
+"""
+
+_IQ4NL_VEC_DEC = """
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u; let q = B4(o + 2u + j);
+      let c0 = q & 255u; let c1 = (q >> 8u) & 255u;
+      let c2 = (q >> 16u) & 255u; let c3 = (q >> 24u) & 255u;
+      ACC4(kb + j, d * vec4<f32>(kv(c0 & 15u), kv(c1 & 15u),
+                                  kv(c2 & 15u), kv(c3 & 15u)));
+      ACC4(kb + 16u + j, d * vec4<f32>(kv(c0 >> 4u), kv(c1 >> 4u),
+                                        kv(c2 >> 4u), kv(c3 >> 4u)));
     }
 """
 
@@ -5618,6 +5644,40 @@ _Q6K_DEC = """
         ACC(k0 + l + 32u, d * I8(so + ii + 2u) * (f32((c & 15u) | (((h >> 2u) & 3u) << 4u)) - 32.0));
         ACC(k0 + l + 64u, d * I8(so + ii + 4u) * (f32((a >> 4u)  | (((h >> 4u) & 3u) << 4u)) - 32.0));
         ACC(k0 + l + 96u, d * I8(so + ii + 6u) * (f32((c >> 4u)  | (((h >> 6u) & 3u) << 4u)) - 32.0));
+      }
+    }
+"""
+
+_Q6V_FN = """
+// Four Q6_K values remain in their original low-nibble and two-bit high-plane words until
+// this register-local expansion. `qs` and `qh` each contain four consecutive source bytes;
+// no alternate-width weight or activation buffer is produced.
+fn Q6V(qs: u32, qh: u32, qshift: u32, hshift: u32) -> vec4<f32> {
+  return vec4<f32>(
+    f32(((qs >> qshift) & 15u) | (((qh >> hshift) & 3u) << 4u)) - 32.0,
+    f32(((qs >> (8u + qshift)) & 15u) | (((qh >> (8u + hshift)) & 3u) << 4u)) - 32.0,
+    f32(((qs >> (16u + qshift)) & 15u) | (((qh >> (16u + hshift)) & 3u) << 4u)) - 32.0,
+    f32(((qs >> (24u + qshift)) & 15u) | (((qh >> (24u + hshift)) & 3u) << 4u)) - 32.0);
+}
+"""
+
+_Q6K_VEC_DEC = """
+    let o = base + b * 210u;
+    let d = F16(o + 208u);
+    let kb = b * 256u;
+    for (var half: u32 = 0u; half < 2u; half = half + 1u) {
+      let lo = o + half * 64u;
+      let ho = o + 128u + half * 32u;
+      let so = o + 192u + half * 8u;
+      let k0 = kb + half * 128u;
+      for (var lw: u32 = 0u; lw < 8u; lw = lw + 1u) {
+        let l = lw * 4u;
+        let ii = l >> 4u;
+        let a = B4(lo + l); let c = B4(lo + l + 32u); let h = B4(ho + l);
+        ACC4(k0 + l,       d * I8(so + ii)      * Q6V(a, h, 0u, 0u));
+        ACC4(k0 + l + 32u, d * I8(so + ii + 2u) * Q6V(c, h, 0u, 2u));
+        ACC4(k0 + l + 64u, d * I8(so + ii + 4u) * Q6V(a, h, 4u, 4u));
+        ACC4(k0 + l + 96u, d * I8(so + ii + 6u) * Q6V(c, h, 4u, 6u));
       }
     }
 """
@@ -5796,6 +5856,13 @@ fn SGN4(mask: u32, j0: u32) -> vec4<f32> {
 }
 fn BY(w: u32, q: u32) -> f32 { return f32((w >> (8u * q)) & 255u); }
 fn GI8(o: u32) -> f32 { return f32(i32(GB(o) << 24u) >> 24u); }
+fn GI8V(o: u32) -> vec4<f32> {
+  let p = GSRC[o >> 2u];
+  return vec4<f32>(f32(i32((p & 255u) << 24u) >> 24u),
+                   f32(i32(((p >> 8u) & 255u) << 24u) >> 24u),
+                   f32(i32(((p >> 16u) & 255u) << 24u) >> 24u),
+                   f32(i32(((p >> 24u) & 255u) << 24u) >> 24u));
+}
 fn SGN(mask: u32, j: u32) -> f32 { return select(1.0, -1.0, (mask & (1u << j)) != 0u); }
 """
 
@@ -5819,6 +5886,24 @@ _IQ2XXS_DEC = """
           ACC(k0 + j, db * BY(ga, j) * SGN(sm, j));
           ACC(k0 + 4u + j, db * BY(gb, j) * SGN(sm, 4u + j));
         }
+      }
+    }
+"""
+
+_IQ2XXS_VEC_DEC = """
+    let o = base + b * 66u;
+    let d = F16(o);
+    let kb = b * 256u;
+    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+      let ao = o + 2u + ib * 8u;
+      let qw = B4(ao); let a1 = U32(ao + 4u);
+      let db = d * (0.5 + f32(a1 >> 28u)) * 0.25;
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let gx = ((qw >> (8u * l)) & 255u) * 2u;
+        let sm = GB((a1 >> (7u * l)) & 127u);
+        let k0 = kb + ib * 32u + l * 8u;
+        ACC4(k0, G4V(gx) * SGN4(sm, 0u) * db);
+        ACC4(k0 + 4u, G4V(gx + 1u) * SGN4(sm, 4u) * db);
       }
     }
 """
@@ -5974,6 +6059,26 @@ _IQ1S_DEC = """
     }
 """
 
+_IQ1S_VEC_DEC = """
+    let o = base + b * 50u;
+    let d = F16(o);
+    let kb = b * 256u;
+    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+      let qh = U16(o + 34u + ib * 2u);
+      let dl = d * (2.0 * f32((qh >> 12u) & 7u) + 1.0);
+      let delta = select(0.125, -0.125, (qh & 32768u) != 0u);
+      let k0 = kb + ib * 32u;
+      let qw = B4(o + 2u + ib * 4u);
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let gi = 128u + (((qw >> (8u * l)) & 255u) |
+                         (((qh >> (3u * l)) & 7u) << 8u)) * 8u;
+        let dv = vec4<f32>(delta, delta, delta, delta);
+        ACC4(k0 + l * 8u, dl * (GI8V(gi) + dv));
+        ACC4(k0 + l * 8u + 4u, dl * (GI8V(gi + 4u) + dv));
+      }
+    }
+"""
+
 # IQ1_M: 256 values / 56 bytes -- qs[32] | qh[16] | u16 scales[4]. There is no d field: the
 # block scale is assembled from the four scale words' spare nibbles. Each sub-block has two
 # 3-bit half-scales, and each pair of grid indices takes its extra bits and sign offset from
@@ -6000,6 +6105,34 @@ _IQ1M_DEC = """
         for (var j: u32 = 0u; j < 8u; j = j + 1u) {
           ACC(k0 + l * 8u + j, dl * (GI8(gi + j) + delta));
         }
+      }
+    }
+"""
+
+_IQ1M_VEC_DEC = """
+    let o = base + b * 56u;
+    let s0 = U16(o + 48u); let s1 = U16(o + 50u);
+    let s2 = U16(o + 52u); let s3 = U16(o + 54u);
+    let d = HF((s0 >> 12u) | ((s1 >> 8u) & 240u) | ((s2 >> 4u) & 3840u) | (s3 & 61440u));
+    let kb = b * 256u;
+    for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+      var sw: u32 = s0;
+      if (ib >= 6u) { sw = s3; } else if (ib >= 4u) { sw = s2; } else if (ib >= 2u) { sw = s1; }
+      let sh = 6u * (ib & 1u);
+      let dl1 = d * (2.0 * f32((sw >> sh) & 7u) + 1.0);
+      let dl2 = d * (2.0 * f32((sw >> (sh + 3u)) & 7u) + 1.0);
+      let k0 = kb + ib * 32u;
+      let qw = B4(o + ib * 4u);
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let qhb = B(o + 32u + ib * 2u + (l >> 1u));
+        let gi = 128u + (((qw >> (8u * l)) & 255u) |
+                         ((qhb << (8u - 4u * (l & 1u))) & 1792u)) * 8u;
+        let dbit = select(8u, 128u, (l & 1u) != 0u);
+        let delta = select(0.125, -0.125, (qhb & dbit) != 0u);
+        let dl = select(dl1, dl2, l >= 2u);
+        let dv = vec4<f32>(delta, delta, delta, delta);
+        ACC4(k0 + l * 8u, dl * (GI8V(gi) + dv));
+        ACC4(k0 + l * 8u + 4u, dl * (GI8V(gi + 4u) + dv));
       }
     }
 """
@@ -6143,6 +6276,19 @@ fn pow3(n: u32) -> u32 {
 }
 """
 
+_TQ1V_FN = """
+fn TQ4(q: u32, p3: u32) -> vec4<f32> {
+  let q0 = ((q & 255u) * p3) & 255u;
+  let q1 = (((q >> 8u) & 255u) * p3) & 255u;
+  let q2 = (((q >> 16u) & 255u) * p3) & 255u;
+  let q3 = (((q >> 24u) & 255u) * p3) & 255u;
+  return vec4<f32>(f32((q0 * 3u) >> 8u) - 1.0,
+                   f32((q1 * 3u) >> 8u) - 1.0,
+                   f32((q2 * 3u) >> 8u) - 1.0,
+                   f32((q3 * 3u) >> 8u) - 1.0);
+}
+"""
+
 # BF16: the top 16 bits of an fp32, so widening is a shift.
 _BF16_DEC = """
     ACC(b, bitcast<f32>(U16(base + b * 2u) << 16u));
@@ -6177,6 +6323,31 @@ _TQ1_0_DEC = """
     }
 """
 
+_TQ1_0_VEC_DEC = """
+    let o = base + b * 54u;
+    let d = F16(o + 52u);
+    let kb = b * 256u;
+    var k: u32 = 0u;
+    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+      let jo = g * 32u;
+      let cnt = select(32u, 16u, g == 1u);
+      for (var p: u32 = 0u; p < 5u; p = p + 1u) {
+        let p3 = pow3(p);
+        for (var mw: u32 = 0u; mw < cnt / 4u; mw = mw + 1u) {
+          let m = mw * 4u; let q = B4(o + jo + m);
+          ACC4(kb + k + m, TQ4(q, p3) * d);
+        }
+        k = k + cnt;
+      }
+    }
+    let qh = B4(o + 48u);
+    for (var p: u32 = 0u; p < 4u; p = p + 1u) {
+      let p3 = pow3(p);
+      ACC4(kb + k, TQ4(qh, p3) * d);
+      k = k + 4u;
+    }
+"""
+
 # TQ2_0: 256 values / 66 bytes -- qs[64] | f16 d. Two bits per value, one bit-plane at a
 # time across each 32-byte group.
 _TQ2_0_DEC = """
@@ -6195,6 +6366,28 @@ _TQ2_0_DEC = """
     }
 """
 
+_TQ2_0_VEC_DEC = """
+    let o = base + b * 66u;
+    let d = F16(o + 64u);
+    let kb = b * 256u;
+    var k: u32 = 0u;
+    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+      let jo = g * 32u;
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let shift = l * 2u;
+        for (var mw: u32 = 0u; mw < 8u; mw = mw + 1u) {
+          let m = mw * 4u; let q = B4(o + jo + m);
+          let v = vec4<f32>(f32((q >> shift) & 3u) - 1.0,
+                            f32((q >> (8u + shift)) & 3u) - 1.0,
+                            f32((q >> (16u + shift)) & 3u) - 1.0,
+                            f32((q >> (24u + shift)) & 3u) - 1.0);
+          ACC4(kb + k + m, v * d);
+        }
+        k = k + 32u;
+      }
+    }
+"""
+
 # MXFP4: 32 values / 17 bytes -- one E8M0 exponent byte then 16 nibble pairs.
 _MXFP4_DEC = """
     let o = base + b * 17u;
@@ -6204,6 +6397,19 @@ _MXFP4_DEC = """
       let q = B(o + 1u + j);
       ACC(kb + j, fp4(q & 15u) * d);
       ACC(kb + 16u + j, fp4(q >> 4u) * d);
+    }
+"""
+
+_MXFP4_VEC_DEC = """
+    let o = base + b * 17u;
+    let d = e8m0h(B(o));
+    let kb = b * 32u;
+    for (var jw: u32 = 0u; jw < 4u; jw = jw + 1u) {
+      let j = jw * 4u; let q = B4(o + 1u + j);
+      ACC4(kb + j, d * vec4<f32>(fp4(q & 15u), fp4((q >> 8u) & 15u),
+                                  fp4((q >> 16u) & 15u), fp4((q >> 24u) & 15u)));
+      ACC4(kb + 16u + j, d * vec4<f32>(fp4((q >> 4u) & 15u), fp4((q >> 12u) & 15u),
+                                        fp4((q >> 20u) & 15u), fp4((q >> 28u) & 15u)));
     }
 """
 
@@ -6223,6 +6429,21 @@ _NVFP4_DEC = """
     }
 """
 
+_NVFP4_VEC_DEC = """
+    let o = base + b * 36u;
+    let kb = b * 64u;
+    for (var s: u32 = 0u; s < 4u; s = s + 1u) {
+      let d = ue4m3(B(o + s)); let k0 = kb + s * 16u;
+      for (var jw: u32 = 0u; jw < 2u; jw = jw + 1u) {
+        let j = jw * 4u; let q = B4(o + 4u + s * 8u + j);
+        ACC4(k0 + j, d * vec4<f32>(fp4(q & 15u), fp4((q >> 8u) & 15u),
+                                    fp4((q >> 16u) & 15u), fp4((q >> 24u) & 15u)));
+        ACC4(k0 + 8u + j, d * vec4<f32>(fp4((q >> 4u) & 15u), fp4((q >> 12u) & 15u),
+                                         fp4((q >> 20u) & 15u), fp4((q >> 28u) & 15u)));
+      }
+    }
+"""
+
 # Q1_0: 128 values / 18 bytes -- f16 d and one bit per value, +d or -d.
 _Q1_0_DEC = """
     let o = base + b * 18u;
@@ -6230,6 +6451,23 @@ _Q1_0_DEC = """
     let kb = b * 128u;
     for (var j: u32 = 0u; j < 128u; j = j + 1u) {
       ACC(kb + j, select(-d, d, ((B(o + 2u + (j >> 3u)) >> (j & 7u)) & 1u) != 0u));
+    }
+"""
+
+_Q1_0_VEC_DEC = """
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 128u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 2u + j); let k0 = kb + j * 8u;
+      ACC4(k0, vec4<f32>(select(-d, d, (q & 1u) != 0u),
+                          select(-d, d, (q & 2u) != 0u),
+                          select(-d, d, (q & 4u) != 0u),
+                          select(-d, d, (q & 8u) != 0u)));
+      ACC4(k0 + 4u, vec4<f32>(select(-d, d, (q & 16u) != 0u),
+                               select(-d, d, (q & 32u) != 0u),
+                               select(-d, d, (q & 64u) != 0u),
+                               select(-d, d, (q & 128u) != 0u)));
     }
 """
 
@@ -6243,16 +6481,28 @@ _Q2_0_DEC = """
     }
 """
 
+_Q2_0_VEC_DEC = """
+    let o = base + b * 18u;
+    let d = F16(o);
+    let kb = b * 64u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let q = B(o + 2u + j);
+      ACC4(kb + j * 4u,
+           d * vec4<f32>(f32(q & 3u) - 1.0, f32((q >> 2u) & 3u) - 1.0,
+                         f32((q >> 4u) & 3u) - 1.0, f32((q >> 6u) & 3u) - 1.0));
+    }
+"""
+
 # name -> (decode fragment, helper functions, values per block, bytes per block, codebook)
 _GGML_TYPES = {
     "F32":     (_F32_DEC,     "",                   1,   4, None),
     "F16":     (_F16_DEC,     "",                   1,   2, None),
     "BF16":    (_BF16_DEC,    "",                   1,   2, None),
-    "TQ1_0":   (_TQ1_0_DEC,   _POW3_FN,           256,  54, None),
+    "TQ1_0":   (_TQ1_0_VEC_DEC, _POW3_FN + _TQ1V_FN, 256, 54, None),
     "TQ2_0":   (_TQ2_0_DEC,   "",                 256,  66, None),
-    "MXFP4":   (_MXFP4_DEC,   _FP4_FN,             32,  17, None),
-    "NVFP4":   (_NVFP4_DEC,   _FP4_FN,             64,  36, None),
-    "Q1_0":    (_Q1_0_DEC,    "",                 128,  18, None),
+    "MXFP4":   (_MXFP4_VEC_DEC, _FP4_FN,           32,  17, None),
+    "NVFP4":   (_NVFP4_VEC_DEC, _FP4_FN,           64,  36, None),
+    "Q1_0":    (_Q1_0_VEC_DEC, "",                128,  18, None),
     "Q2_0":    (_Q2_0_DEC,    "",                  64,  18, None),
     "Q4_0":    (_Q4_0_VEC_DEC, _Q4V_FN,            32,  18, None),
     "Q4_1":    (_Q4_1_VEC_DEC, _Q4V_FN,            32,  20, None),
@@ -6263,16 +6513,55 @@ _GGML_TYPES = {
     "IQ4_XS":  (_IQ4XS_DEC,   _KV_FN,             256, 136, None),
     "Q4_K":    (_Q4K_DEC,     _K4SC_FN + _Q4V_FN, 256, 144, None),
     "Q5_K":    (_Q5K_DEC,     _K4SC_FN,           256, 176, None),
-    "Q6_K":    (_Q6K_DEC,     "",                 256, 210, None),
+    "Q6_K":    (_Q6K_VEC_DEC, _Q6V_FN,            256, 210, None),
     "Q3_K":    (_Q3K_DEC,     _Q3K_HELP,          256, 110, None),
     "Q2_K":    (_Q2K_DEC,     "",                 256,  84, None),
-    "IQ2_XXS": (_IQ2XXS_DEC,  _GRID_FN,           256,  66, "IQ2XXS_GRID_U8"),
+    "IQ2_XXS": (_IQ2XXS_VEC_DEC, _GRID_FN,        256,  66, "IQ2XXS_GRID_U8"),
     "IQ2_XS":  (_IQ2XS_DEC,   _GRID_FN,           256,  74, "IQ2XS_GRID_U8"),
     "IQ2_S":   (_IQ2S_DEC,    _GRID_FN,           256,  82, "IQ2S_GRID_U8"),
     "IQ3_XXS": (_IQ3XXS_DEC,  _GRID_FN,           256,  98, "IQ3XXS_GRID_U8"),
     "IQ3_S":   (_IQ3S_DEC,    _GRID_FN,           256, 110, "IQ3S_GRID_U8"),
-    "IQ1_S":   (_IQ1S_DEC,    _GRID_FN,           256,  50, "IQ1S_GRID_I8"),
-    "IQ1_M":   (_IQ1M_DEC,    _GRID_FN,           256,  56, "IQ1S_GRID_I8"),
+    "IQ1_S":   (_IQ1S_VEC_DEC, _GRID_FN,          256,  50, "IQ1S_GRID_I8"),
+    "IQ1_M":   (_IQ1M_VEC_DEC, _GRID_FN,          256,  56, "IQ1S_GRID_I8"),
+}
+
+# Exact same-storage decoders selected by operator shape. These never create a second
+# weight buffer or requantise activations: they only regroup the original packed bytes into
+# vec4 FP32 multiply-accumulates. Sub-millisecond M=1 measurements drift enough to invert
+# close results, so marginal/unstable decode paths stay scalar while the consistently faster
+# M=2 and batched variants use the vector decoder. Format and operator mode are the complete
+# key; model/repository names are deliberately absent.
+_GGML_EXACT_MODE_DECODERS = {
+    "Q5_1": {0: (_Q5_1_VEC_DEC, _Q5V_FN), 2: (_Q5_1_VEC_DEC, _Q5V_FN)},
+    "Q2_0": {0: (_Q2_0_VEC_DEC, ""), 2: (_Q2_0_VEC_DEC, ""),
+             3: (_Q2_0_VEC_DEC, "")},
+    "TQ2_0": {0: (_TQ2_0_VEC_DEC, ""), 2: (_TQ2_0_VEC_DEC, ""),
+              3: (_TQ2_0_VEC_DEC, "")},
+    "IQ4_NL": {0: (_IQ4NL_VEC_DEC, ""), 2: (_IQ4NL_VEC_DEC, ""),
+               3: (_IQ4NL_VEC_DEC, "")},
+}
+
+# WebGL phase-one A/B routing. Modes are 1=decode, 2=two-row verification,
+# 3=small/medium batch (3..32), 0=large batch. Every entry consumes the original bytes and
+# FP32 activations; only scalar versus vec4 register accumulation differs. These choices
+# come from WebGL measurements, independently of WebGPU's routing.
+_GGML_GL_MODE_DECODERS = {
+    "MXFP4": {1: (_MXFP4_DEC, _FP4_FN), 2: (_MXFP4_DEC, _FP4_FN)},
+    "NVFP4": {2: (_NVFP4_DEC, _FP4_FN)},
+    "IQ1_M": {2: (_IQ1M_DEC, _GRID_FN)},
+    "Q8_0": {2: (_Q8_0_SCALAR_DEC, "")},
+    "Q4_0": {1: (_Q4_0_DEC, ""), 2: (_Q4_0_DEC, "")},
+    "Q4_1": {3: (_Q4_1_DEC, "")},
+    "Q5_0": {2: (_Q5_0_DEC, ""), 0: (_Q5_0_DEC, "")},
+    "Q5_1": {1: (_Q5_1_VEC_DEC, _Q5V_FN), 2: (_Q5_1_VEC_DEC, _Q5V_FN),
+             3: (_Q5_1_VEC_DEC, _Q5V_FN), 0: (_Q5_1_VEC_DEC, _Q5V_FN)},
+    "Q6_K": {1: (_Q6K_DEC, ""), 2: (_Q6K_DEC, ""), 3: (_Q6K_DEC, "")},
+    "Q2_0": {1: (_Q2_0_DEC, ""), 2: (_Q2_0_VEC_DEC, ""),
+             3: (_Q2_0_DEC, ""), 0: (_Q2_0_VEC_DEC, "")},
+    "TQ2_0": {1: (_TQ2_0_VEC_DEC, ""), 2: (_TQ2_0_VEC_DEC, ""),
+              3: (_TQ2_0_VEC_DEC, ""), 0: (_TQ2_0_VEC_DEC, "")},
+    "IQ4_NL": {1: (_IQ4NL_DEC, _KV_FN), 2: (_IQ4NL_VEC_DEC, _KV_FN),
+               3: (_IQ4NL_VEC_DEC, _KV_FN), 0: (_IQ4NL_DEC, _KV_FN)},
 }
 _ggml_grids = {}
 _ggml_k = {"added": set()}
@@ -6436,13 +6725,10 @@ def _ggml_src(type_name, mode, cfg=None, moe=False, mrow=None):
     `cfg` overrides (WGX, KS) for a narrow output. `moe` selects the variant that reads its
     expert from an index buffer instead of being bound to one expert's weights."""
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
-    # Same Q5_1 bytes and the same exact block equation on both sides. Realistic-shape
-    # interleaved measurements consistently favour vec4 for batches, while single-token
-    # decode was unstable (+8% in one run, -12% in another). Mode is already a compile-time
-    # kernel variant, so keep the faster/stable scalar decode and vectorise only GEMM.
-    if type_name == "Q5_1" and mode == 0:
-        dec = _Q5_1_VEC_DEC
-        helpers += _Q5V_FN
+    override = _GGML_EXACT_MODE_DECODERS.get(type_name, {}).get(mode)
+    if override is not None:
+        dec, extra_helpers = override
+        helpers += extra_helpers
     # Whether this format's codebook gets staged in workgroup memory. Decided once, because
     # three substitutions below have to agree about it -- and the one that nearly got away is
     # the fill call: it is emitted on a test for `fn kvfill`, which lives in the text this
@@ -6628,8 +6914,15 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False, mrow=_AUTO):
     # there is nothing for a shape to trade off, so the sweep below has nothing to sweep.
     if _webgl_ready() and not _adam_backend_ready():
         vals = _GGML_TYPES[type_name][2]
-        _selfcheck_one(type_name, mode, None, moe, *(_selfcheck_shape(None, vals)
-                                                     or (_SMALL_N + 64, 3)))
+        shape = _selfcheck_shape(None, vals) or (_SMALL_N + 64, 3)
+        # Small and large batches are separate production shaders on WebGL because their
+        # fastest exact decoder can differ.  Check both sides of that routing boundary;
+        # validating only M=3 would leave the M>32 route completely unexecuted.
+        if mode == 0:
+            for gl_m in (3, 33):
+                _selfcheck_one(type_name, mode, None, moe, *shape, gl_m=gl_m)
+        else:
+            _selfcheck_one(type_name, mode, None, moe, *shape)
         return
     if mode == 0 and mrow is _AUTO:
         # Both sides of the row-group crossover, because they are two different kernels and
@@ -6655,7 +6948,7 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False, mrow=_AUTO):
     _selfcheck_one(type_name, mode, small, moe, *shape, mrow=mrow)
 
 
-def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None):
+def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None, gl_m=None):
     """One (thread shape, N, blocks) against the reference. Raises on a mismatch."""
     from . import ggufload as G
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
@@ -6699,6 +6992,11 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None):
     # the last group partial and exercises the `mn` clamp at the same time.
     if mode:
         M = mode
+    elif _webgl_ready() and not _adam_backend_ready():
+        # The fragment path has no rows-per-workgroup variant.  It still needs a true
+        # multi-row case, but must not feed the WebGPU-only ``mrow`` (None here) into the
+        # batch-shape construction below.
+        M = gl_m or 3
     else:
         M = 2 * mrow + 1
         for _ in range(64):
@@ -6725,9 +7023,6 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None):
     # not much of a self-check, and without it a sweep of every format reports every one of
     # them broken (the kernel is missing, so nothing runs and the output stays zero).
     if _webgl_ready() and not _adam_backend_ready():
-        moedec = moe and M <= 2
-        if (type_name, moe, moedec) not in _ggml_gl["added"]:
-            _ggml_add_gl(type_name, moe, moedec)
         out_t = _ggml_run_gl(xp.asarray(x), pk, type_name, K, N, eidx=eidx,
                              eslot=(eslot or 0), estride=estride)
     else:
@@ -6942,13 +7237,6 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     if execution == "materialized" and not _adam_backend_ready():
         raise RuntimeError("materialized ggml comparison requires the WebGPU backend")
     if _webgl_ready() and not _adam_backend_ready():
-        moe = eidx is not None
-        moedec = moe and m <= 2
-        hb = bias is not None
-        if (type_name, moe, moedec, hb) not in _ggml_gl["added"]:
-            _ggml_add_gl(type_name, moe, moedec, hb)
-            if not hb:                      # the bias variant differs only in a final fetch
-                _ggml_selfcheck(type_name, m if m <= 2 else 0, None, moe)
         return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
@@ -7749,7 +8037,7 @@ int Ef(int i) { int y = i / _ew; return texelFetch(tex_e, ivec2(i - y * _ew, y),
 """
 
 
-def _ggml_src_gl(type_name, moe, moedec, bias=False):
+def _ggml_src_gl(type_name, moe, moedec, bias=False, mode=1):
     """GLSL ES 3.00 for one (format, routing, bias) combination.
 
     The bias is a compile-time variant rather than a second dispatch. It is one fetch at the
@@ -7758,6 +8046,9 @@ def _ggml_src_gl(type_name, moe, moedec, bias=False):
     was spending more than a hundred of them a token on `out = out + bias`."""
     from . import _wgsl2glsl as w2g
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
+    override = _GGML_GL_MODE_DECODERS.get(type_name, {}).get(mode)
+    if override is not None:
+        dec, helpers = override
     ng = _grid_u32(type_name)
     # Substitutions that inject WGSL text run BEFORE translation, for the same reason they
     # run first on the WebGPU side: what they expand to contains further placeholders.
@@ -7779,7 +8070,12 @@ def _ggml_src_gl(type_name, moe, moedec, bias=False):
                   "U32": "uint", "F16": "float", "HF": "float", "ACC": "void",
                   "ACC4": "void", "kv": "float", "Gf": "uint", "Ef": "int"})
     ty.var.update({"base": "uint", "b": "uint", "nb": "uint", "nrow": "uint",
-                   "acc0": "float", "gm": "GM", "xrow": "uint", "woff": "uint"})
+                   "acc0": "float", "gm": "GM", "xrow": "uint", "woff": "uint",
+                   # The translator rewrites storage indexing to Gf/Ef calls, but type
+                   # inference runs before that rewrite and must still know the element
+                   # type.  Without these declarations every IQ codebook shader failed to
+                   # generate on WebGL even though its WebGPU counterpart passed.
+                   "gr": "uint", "eidx": "int"})
     bufs = {"gr": "Gf", "eidx": "Ef"}
     glsl_h = w2g.translate(prep(h), ty, buffers=bufs) if h.strip() else ""
     glsl_d = w2g.translate(prep(dec), ty, buffers=bufs)
@@ -7820,19 +8116,19 @@ def _gl_rowinit(moe, moedec):
 _ggml_gl = {"added": set()}
 
 
-def _ggml_name_gl(type_name, moe, moedec, bias=False):
-    return "ggml_gl_%s_%s%s" % (type_name.lower().replace("-", "_"),
-                                "md" if moedec else ("mb" if moe else "d"),
-                                "_b" if bias else "")
+def _ggml_name_gl(type_name, moe, moedec, bias=False, mode=1):
+    return "ggml_gl_%s_%s_m%d%s" % (type_name.lower().replace("-", "_"),
+                                    "md" if moedec else ("mb" if moe else "d"), mode,
+                                    "_b" if bias else "")
 
 
-def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False):
-    key = (type_name, moe, moedec, bias)
+def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False, mode=1):
+    key = (type_name, moe, moedec, bias, mode)
     if key in _ggml_gl["added"]:
         return
     plat = _copy_kernel["plat"]
-    plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias),
-                   {"source": _ggml_src_gl(type_name, moe, moedec, bias)})
+    plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias, mode),
+                   {"source": _ggml_src_gl(type_name, moe, moedec, bias, mode)})
     _ggml_gl["added"].add(key)
 
 
@@ -7843,9 +8139,10 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
     moe = eidx is not None
     M = 1 if (moe and xper) else int(xf.shape[0])
     moedec = moe and M <= 2
+    mode = M if M <= 2 else (3 if M <= 32 else 0)
     slots = int(eidx.size) if moedec else 1
     rows = slots * M
-    _ggml_add_gl(type_name, moe, moedec, bias is not None)
+    _ggml_add_gl(type_name, moe, moedec, bias is not None, mode)
     of = _empty((rows, N))
     grid = _ggml_grid(type_name)
     inputs = [{"name": "tex_x", "id": _contig(xf).buffer.buffer_id},
@@ -7858,7 +8155,7 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
         inputs.append({"name": "tex_bias", "id": _contig(bias).buffer.buffer_id})
     U = lambda n, v: {"name": n, "value": int(v), "type": "int"}
     plat = _copy_kernel["plat"]
-    plat.runKernel({"name": _ggml_name_gl(type_name, moe, moedec, bias is not None),
+    plat.runKernel({"name": _ggml_name_gl(type_name, moe, moedec, bias is not None, mode),
                     "inputs": inputs, "output": of.buffer.buffer_id,
                     "uniforms": [U("_ka_tex_output_texture_w", of.buffer.texture_shape.width),
                                  U("u_M", M), U("u_N", N), U("u_K", K),
@@ -8000,12 +8297,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
       for (var t: u32 = 0u; t < kbPerG; t = t + 1u) {
         let qw = qweight[(g * kbPerG + t) * c.N + n];
         let ko = t * PERu;
-        for (var j: u32 = 0u; j < PERu; j = j + 1u) {
-          let qv = f32((qw >> (j * BITSu)) & MASKu) - zv;
-          let kk = ko + j;
-          let xv = vec4<f32>(xs[kk], xs[GSu + kk], xs[2u * GSu + kk], xs[3u * GSu + kk]);
-          part = part + xv * qv;
-        }
+GPTQACC
       }
       acc = acc + sc * part;
     }
@@ -8042,10 +8334,7 @@ void main(){
       int kb = g*kbPerG + t;
       int qw = ifetch(tex_qw, kb*N + n);
       int kb0 = kb*PER;
-      for(int j=0;j<PER;j++){
-        float qv = float((qw>>(j*BITS))&MASK) - zv;
-        part += fetch(tex_x, m*K + kb0 + j) * qv;
-      }
+GPTQGLACC
     }
     sum += sc*part;
   }
@@ -8092,9 +8381,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
       for (var t2: u32 = 0u; t2 < kbPerG; t2 = t2 + 1u) {
         let qw = qweight[(g * kbPerG + t2) * c.N + n];
         let ko = t2 * PERu;
-        for (var j: u32 = 0u; j < PERu; j = j + 1u) {
-          part = part + xsg[ly * GSu + ko + j] * (f32((qw >> (j * BITSu)) & MASKu) - zv);
-        }
+GPTQACC
       }
       sum = sum + sc * part;
     }
@@ -8112,10 +8399,218 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 _GPTQ_KS = 8
 _gptq_k = {"wgpu": set(), "gl": set()}
 
+_PACK_I8_WGSL = """requires packed_4x8_integer_dot_product;
+@group(0) @binding(0) var<storage,read> x: array<f32>;
+@group(0) @binding(1) var<storage,read_write> q: array<u32>;
+@group(0) @binding(2) var<storage,read_write> scales: array<f32>;
+@group(0) @binding(3) var<storage,read_write> sums: array<f32>;
+struct PM { M:u32, K:u32, B:u32, NB:u32, }
+@group(0) @binding(4) var<storage,read> c: PM;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let b = gid.x; let m = gid.y;
+  if (b >= c.NB || m >= c.M) { return; }
+  let xb = m * c.K + b * c.B;
+  var mx: f32 = 0.0;
+  for (var j:u32=0u; j<c.B; j=j+1u) { mx = max(mx, abs(x[xb+j])); }
+  let sc = select(1.0, mx / 127.0, mx > 0.0);
+  let qb = (m * c.NB + b) * (c.B / 4u);
+  var sm:i32 = 0;
+  for (var j:u32=0u; j<c.B; j=j+4u) {
+    let v = vec4<f32>(x[xb+j], x[xb+j+1u], x[xb+j+2u], x[xb+j+3u]);
+    let iv = vec4<i32>(round(v / vec4<f32>(sc)));
+    q[qb + j/4u] = pack4xI8Clamp(iv);
+    sm = sm + iv.x + iv.y + iv.z + iv.w;
+  }
+  scales[m*c.NB+b] = sc; sums[m*c.NB+b] = f32(sm);
+}
+"""
 
-def _gptq_gemv_src(bits, gs, ks=_GPTQ_KS, zoff=0.0):
+_GPTQ_DP4A_WGSL = """requires packed_4x8_integer_dot_product;
+@group(0) @binding(0) var<storage,read> xq: array<u32>;
+@group(0) @binding(1) var<storage,read> xsc: array<f32>;
+@group(0) @binding(2) var<storage,read> xsum: array<f32>;
+@group(0) @binding(3) var<storage,read> qweight: array<u32>;
+@group(0) @binding(4) var<storage,read> qzeros: array<u32>;
+@group(0) @binding(5) var<storage,read> scales: array<f32>;
+@group(0) @binding(6) var<storage,read_write> outp: array<f32>;
+struct C { M:u32, N:u32, K:u32, GS:u32, }
+@group(0) @binding(7) var<storage,read> c: C;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let n=gid.x; let m=gid.y; if(n>=c.N || m>=c.M){return;}
+  let per=PERu; let ng=c.K/c.GS; let qpg=c.GS/per; let xpg=c.GS/4u;
+  let ndp=c.N/per; var acc:f32=0.0;
+  for(var g:u32=0u; g<ng; g=g+1u){
+    let zword=qzeros[g*ndp+n/per];
+    let z=i32((zword>>((n%per)*BITSu))&MASKu)+ZOFFi;
+    var di:i32=0;
+    for(var t:u32=0u; t<qpg; t=t+1u){
+      let qw=qweight[(g*qpg+t)*c.N+n];
+DP4ACC
+    }
+    let xi=m*ng+g;
+    acc=acc+xsc[xi]*scales[g*c.N+n]*(f32(di)-f32(z)*xsum[xi]);
+  }
+  outp[m*c.N+n]=acc;
+}
+"""
+
+_dp4a_k = {"pack": False, "gptq": set()}
+
+# Phase-two cross-width audit.  DP4A was numerically acceptable on WebGPU but slower for
+# every measured GPTQ int4/int8 shape once activation packing was included.  WebGL exposes
+# neither compute packing nor packed integer dot products, so both backends explicitly keep
+# the exact stored path.  This metadata is intentionally model-agnostic and test-visible.
+_PHASE2_CROSS_WIDTH = {
+    "gptq_activation_int8_dp4a": {
+        "webgpu": "measured_negative_keep_stored",
+        "webgl": "primitive_unavailable_keep_stored",
+    },
+}
+
+
+def _pack_i8_rows(xf, K, block):
+    M = int(xf.shape[0]); nb = int(K) // int(block)
+    plat = _adam_kernel["platform"]
+    if not _dp4a_k["pack"]:
+        plat.addKernel("pack_i8_rows", {"source": _PACK_I8_WGSL,
+            "bindingTypes": ["read-only-storage", "storage", "storage", "storage",
+                             "read-only-storage"]})
+        _dp4a_k["pack"] = True
+    q = _empty((M * nb * (int(block) // 4),)); sc = _empty((M * nb,)); sm = _empty((M * nb,))
+    meta = _adam_kernel["make_meta"]((M, int(K), int(block), nb), "u4,u4,u4,u4")
+    plat.runKernel({"name": "pack_i8_rows",
+        "tensors": [xf.buffer.buffer_id, q.buffer.buffer_id, sc.buffer.buffer_id,
+                    sm.buffer.buffer_id, meta.buffer_id],
+        "workGroups": {"x": nb, "y": M, "z": 1}})
+    return q, sc, sm
+
+
+def _gptq_dp4a_src(bits, zoff=0.0):
+    per = 32 // int(bits)
+    if int(bits) == 4:
+        acc = """      let q0=pack4xI8(vec4<i32>(i32(qw&15u),i32((qw>>4u)&15u),i32((qw>>8u)&15u),i32((qw>>12u)&15u)));
+      let q1=pack4xI8(vec4<i32>(i32((qw>>16u)&15u),i32((qw>>20u)&15u),i32((qw>>24u)&15u),i32((qw>>28u)&15u)));
+      let xo=(m*ng+g)*xpg+t*2u;
+      di=di+dot4I8Packed(xq[xo],q0)+dot4I8Packed(xq[xo+1u],q1);"""
+    else:
+        acc = """      let xo=(m*ng+g)*xpg+t;
+      di=di+dot4I8Packed(xq[xo],qw^0x80808080u)+128*xsum_i(xq[xo]);"""
+        # The correction above would need the per-word activation sum. The group sum is
+        # already available outside the loop, so use the equivalent group-level correction.
+        acc = """      let xo=(m*ng+g)*xpg+t;
+      di=di+dot4I8Packed(xq[xo],qw^0x80808080u);"""
+    src = _GPTQ_DP4A_WGSL.replace("DP4ACC", acc)
+    if int(bits) == 8:
+        src = src.replace("(f32(di)-f32(z)*xsum[xi])",
+                          "(f32(di)+f32(128-z)*xsum[xi])")
+    for k, v in (("ZOFFi", str(int(zoff))), ("PERu", f"{per}u"),
+                 ("BITSu", f"{bits}u"), ("MASKu", f"{(1 << bits)-1}u")):
+        src = src.replace(k, v)
+    return src
+
+
+def _gptq_dp4a_matmul(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0):
+    M = int(xf.shape[0]); plat = _adam_kernel["platform"]
+    key = (int(bits), int(gs), int(bool(zoff)))
+    name = "gptq_dp4a_%d_g%d_z%d" % key
+    if key not in _dp4a_k["gptq"]:
+        plat.addKernel(name, {"source": _gptq_dp4a_src(bits, zoff),
+            "bindingTypes": ["read-only-storage"] * 6 + ["storage", "read-only-storage"]})
+        _dp4a_k["gptq"].add(key)
+    xq, xsc, xsum = _pack_i8_rows(xf, K, gs)
+    out = _empty((M, N)); meta = _adam_kernel["make_meta"]((M, N, K, gs), "u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+        "tensors": [xq.buffer.buffer_id, xsc.buffer.buffer_id, xsum.buffer.buffer_id,
+                    qweight.buffer.buffer_id, qzeros.buffer.buffer_id, scales.buffer.buffer_id,
+                    out.buffer.buffer_id, meta.buffer_id],
+        "workGroups": {"x": (N+63)//64, "y": M, "z": 1}})
+    return out
+
+
+def _gptq_acc(bits, gemv=False, vector=True):
+    """Exact packed-weight accumulation; vector=False is retained for the phase-one A/B.
+
+    Both variants read the original GPTQ u32 and FP32 activations. The vector form merely
+    unpacks one stored word into register-local vec4 values and uses FP32 dot products; it
+    does not requantise either operand and therefore remains a same-width implementation.
+    """
+    if not vector:
+        if gemv:
+            return """        for (var j: u32 = 0u; j < PERu; j = j + 1u) {
+          part = part + xsg[ly * GSu + ko + j] *
+              (f32((qw >> (j * BITSu)) & MASKu) - zv);
+        }"""
+        return """        for (var j: u32 = 0u; j < PERu; j = j + 1u) {
+          let qv = f32((qw >> (j * BITSu)) & MASKu) - zv;
+          let kk = ko + j;
+          let xv = vec4<f32>(xs[kk], xs[GSu + kk], xs[2u * GSu + kk], xs[3u * GSu + kk]);
+          part = part + xv * qv;
+        }"""
+    if bits == 8:
+        qvecs = (("q0", "unpack4x8unorm(qw) * 255.0 - vec4<f32>(zv)"),)
+    elif bits == 4:
+        qvecs = (
+            ("q0", "vec4<f32>(f32(qw & 15u), f32((qw >> 4u) & 15u), "
+                   "f32((qw >> 8u) & 15u), f32((qw >> 12u) & 15u)) - vec4<f32>(zv)"),
+            ("q1", "vec4<f32>(f32((qw >> 16u) & 15u), f32((qw >> 20u) & 15u), "
+                   "f32((qw >> 24u) & 15u), f32((qw >> 28u) & 15u)) - vec4<f32>(zv)"),
+        )
+    else:
+        raise ValueError("GPTQ native compute supports int4/int8, got %r" % bits)
+    lines = []
+    for qi, (name, expr) in enumerate(qvecs):
+        off = qi * 4
+        lines.append("        let %s = %s;" % (name, expr))
+        if gemv:
+            lines.append(
+                "        part = part + dot(vec4<f32>(xsg[ly * GSu + ko + %du], "
+                "xsg[ly * GSu + ko + %du], xsg[ly * GSu + ko + %du], "
+                "xsg[ly * GSu + ko + %du]), %s);" %
+                (off, off + 1, off + 2, off + 3, name))
+        else:
+            for row, comp in enumerate("xyzw"):
+                base = ("ko" if row == 0 else "%du * GSu + ko" % row)
+                lines.append(
+                    "        part.%s = part.%s + dot(vec4<f32>(xs[%s + %du], "
+                    "xs[%s + %du], xs[%s + %du], xs[%s + %du]), %s);" %
+                    (comp, comp, base, off, base, off + 1, base, off + 2,
+                     base, off + 3, name))
+    return "\n".join(lines)
+
+
+def _gptq_gl_acc(bits, vector=True):
+    """GLSL equivalent of the exact packed-word GPTQ accumulation.
+
+    WebGL has no compute workgroups, but its fragment shader still has native ``vec4`` and
+    ``dot`` operations.  Like the WGSL path this only regroups the original packed word in
+    registers; weights stay at their stored bit width and activations stay FP32.
+    """
+    if not vector:
+        return """      for(int j=0;j<PER;j++){
+        float qv = float((qw>>(j*BITS))&MASK) - zv;
+        part += fetch(tex_x, m*K + kb0 + j) * qv;
+      }"""
+    if int(bits) == 8:
+        groups = ((0, (0, 8, 16, 24)),)
+    elif int(bits) == 4:
+        groups = ((0, (0, 4, 8, 12)), (4, (16, 20, 24, 28)))
+    else:
+        raise ValueError("GPTQ native compute supports int4/int8, got %r" % bits)
+    lines = []
+    for off, shifts in groups:
+        q = ", ".join("float((qw >> %d) & MASK)" % s for s in shifts)
+        x = ", ".join("fetch(tex_x, m*K + kb0 + %d)" % (off + j)
+                      for j in range(4))
+        lines.append("      part += dot(vec4(%s), vec4(%s) - vec4(zv));" % (x, q))
+    return "\n".join(lines)
+
+
+def _gptq_gemv_src(bits, gs, ks=_GPTQ_KS, zoff=0.0, vector=True):
     per = 32 // bits
-    src = _GPTQ_GEMV_WGSL
+    src = _GPTQ_GEMV_WGSL.replace("GPTQACC", _gptq_acc(bits, gemv=True,
+                                                        vector=vector))
     # longest/most-specific tokens first
     for k, v in [("ZOFFf", "%.1f" % float(zoff)), ("KSxGS", str(ks * gs)),
                  ("KSx64", str(ks * 64)), ("KSu", f"{ks}u"), ("KS", str(ks)),
@@ -8125,8 +8620,12 @@ def _gptq_gemv_src(bits, gs, ks=_GPTQ_KS, zoff=0.0):
     return src
 
 
-def _gptq_src(tmpl, bits, gs=None, zoff=0.0):
+def _gptq_src(tmpl, bits, gs=None, zoff=0.0, vector=True):
     per = 32 // bits
+    if "GPTQACC" in tmpl:
+        tmpl = tmpl.replace("GPTQACC", _gptq_acc(bits, gemv=False, vector=vector))
+    if "GPTQGLACC" in tmpl:
+        tmpl = tmpl.replace("GPTQGLACC", _gptq_gl_acc(bits, vector=vector))
     d = {"ZOFFf": "%.1f" % float(zoff)}
     if gs is not None:                       # tiled dequant-matmul kernel only
         # XSSZu must be substituted before XSSZ; likewise PERu before PER, etc.
@@ -8138,17 +8637,34 @@ def _gptq_src(tmpl, bits, gs=None, zoff=0.0):
     return tmpl
 
 
+def _gptq_exact_vector(bits, rows=1):
+    """Measured same-width packed-word route, independently selected per backend."""
+    bits = int(bits); rows = int(rows)
+    if _webgl_ready() and not _adam_backend_ready():
+        if bits == 4:
+            return rows <= 32
+        if bits == 8:
+            return rows == 1 or rows > 32
+        return False
+    return bits == 4
+
+
 def _gptq_matmul(xf, qweight, qzeros, scales, K, N, gs, bits, zoff=0.0):
     M = int(xf.shape[0])
     gemv = (M == 1)                                   # decode path: split-K GEMV
     zt = 1 if zoff else 0                             # AutoGPTQ stores zero-1
-    key = (bits, gs, gemv, zt)
-    name = f"gptq{'v' if gemv else ''}{bits}_g{gs}_z{zt}"
+    # Exact packed-word vec4 dots consistently win for int4. Int8 is neutral and unstable
+    # (including a measured M=2 regression), so keep its scalar unpack. Both consume the
+    # same original storage and FP32 activations; this is a phase-one implementation choice.
+    exact_vector = _gptq_exact_vector(bits, M)
+    key = (bits, gs, gemv, zt, exact_vector)
+    name = f"gptq{'v' if gemv else ''}{bits}_g{gs}_z{zt}_{'xv' if exact_vector else 'xs'}"
     if _adam_backend_ready():
         plat = _adam_kernel["platform"]
         if key not in _gptq_k["wgpu"]:
-            src = (_gptq_gemv_src(bits, gs, zoff=zoff) if gemv
-                   else _gptq_src(_GPTQ_WGSL, bits, gs, zoff=zoff))
+            src = (_gptq_gemv_src(bits, gs, zoff=zoff, vector=exact_vector) if gemv
+                   else _gptq_src(_GPTQ_WGSL, bits, gs, zoff=zoff,
+                                  vector=exact_vector))
             plat.addKernel(name, {"source": src,
                 "bindingTypes": ["read-only-storage"] * 4 + ["storage", "read-only-storage"]})
             _gptq_k["wgpu"].add(key)
@@ -9095,7 +9611,7 @@ class GGMLWeight(object):
             dtype = np.float32 if self.type_name == "F32" else np.float16
         return out.astype(dtype)
 
-    def as_linear(self, bias=None, execution="stored"):
+    def as_linear(self, bias=None, execution="auto"):
         if len(self.shape) != 2:
             raise ValueError("stored Linear weight must be two-dimensional")
         if not ggml_native_supported(self.type_name):
@@ -9117,7 +9633,7 @@ def materialize_weight(weight, dtype=None):
     return np.asarray(value, dtype=dtype) if dtype is not None else np.asarray(value)
 
 
-def stored_linear(weight, bias=None, execution="stored"):
+def stored_linear(weight, bias=None, execution="auto"):
     """Return a ready native Linear for an encoded weight/module, or None for a dense array.
 
     GGMLWeight and future storage encodings implement ``as_linear``.  AutoGPTQ already
@@ -9137,7 +9653,7 @@ class GGMLLinear(Module):
     are and `ggml_matmul` unpacks each block while it multiplies. That removes the whole
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
-    def __init__(self, raw, type_name, K, N, bias=None, execution="stored"):
+    def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
         if execution not in ("stored", "materialized", "auto"):
             raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         b = np.frombuffer(raw, np.uint8)
@@ -9236,7 +9752,7 @@ class GGMLMoELinear(Module):
 class QuantizedLinear(Module):
     """Inference-only GPTQ-format weight-quantized Linear (group-wise int4/int8)."""
     def __init__(self, qweight, qzeros, scales, bias, Kt, Nt, Kp, Np, gs, bits,
-                 zero_offset=0.0, execution="stored"):
+                 zero_offset=0.0, execution="auto"):
         if execution not in ("stored", "materialized", "auto"):
             raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
         self.qweight = xp.asarray(qweight)     # int32 GPU
@@ -9291,7 +9807,10 @@ class QuantizedLinear(Module):
             return xf @ full
 
         execution = self.execution
-        if execution == "auto" and GPU:
+        # Materialise-and-retune is a WebGPU alternative.  WebGL always executes the
+        # original packed GLSL path; do not enter a WebGPU-only tuner and rely on an
+        # exception as backend routing.
+        if execution == "auto" and _adam_backend_ready():
             execution = _weight_execution("gptq", self.storage_format, self.Kp, self.Np,
                                           int(xf.shape[0]), run)
         elif execution == "auto":

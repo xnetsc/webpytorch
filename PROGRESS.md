@@ -1,5 +1,63 @@
 # Progress
 
+## 2026-10-02 ▸ Two-phase completion and efficient parity
+
+- Completed the original-width phase for all accepted GGML formats and GPTQ INT4/INT8 on
+  both WebGPU and WebGL. Backend-, format- and batch-specific scalar/vec4 routes retain local
+  wins instead of requiring one global winner.
+- Completed measured stored-versus-materialized routing on WebGPU. Decisions are cached by
+  family, format, K/N and shape bucket in the device-specific kernel profile; a candidate
+  needs a 5% latency win to justify the extra persistent/temporary memory.
+- Implemented and measured activation-INT8 DP4A as the phase-two cross-width candidate. It
+  passed accuracy but produced no >5% winning bucket on the target WebGPU, so production
+  correctly keeps exact stored execution. WebGL declares the primitive unavailable and
+  converges at the `QuantizedLinear.forward` contract instead of emulating it badly.
+- Added the WebGPU/WebGL efficient-common-layer manifest and executable parity tests. Scope
+  descends global → backend → format → operator mode → shape bucket → device profile;
+  absence of a global win never discards a local win.
+- Fixed the WebGPU backend wheel so partially constructed buffers cannot raise noisy
+  destructor errors during alternative-allocation probes.
+- Fixed two WebGL end-to-end gaps found only after operator gates passed: the CausalLM smoke
+  proof now uses the growing-cache path when capture is unavailable, and native 3D batched
+  matmul now indexes every batch/head instead of writing only batch zero.
+
+### Evidence
+
+- WebGPU and WebGL: 28 GGML formats × 5 labelled cases = 140/140 per backend; WebGL also
+  executes both M=3 and M=33 batch shader variants inside its GEMM gates.
+- GPTQ INT4/INT8: both backends match an independent NumPy dequant reference, worst relative
+  error `2.15e-6`.
+- Independent Qwen2 reference: WebGPU and WebGL maximum logits error `4.84e-8`, identical
+  argmax and 8/8 greedy tokens. WebGL first-layer attention error after the atomic BMM fix is
+  `7.45e-9` (previously `0.1178`).
+- Local Qwen3-0.6B Q4_K_M: deterministic `OK` on both backends with 168 Q4_K and 28 Q6_K
+  native linears; WebGPU capture and WebGL growing-cache generation both pass.
+- WebGL training: loss `0.614 → 0.0`, accuracy `1.0`.
+- Automated: 66 Python tests, 19 JavaScript tests; wheel freshness and diff checks pass.
+
+## 2026-10-02 ▸ Non-stop two-phase completion rule
+
+**Highest project principle:** Neither a partial benchmark nor a commit is a stopping point.
+Work continues until phase one has completed all same-width correctness and applicable
+hardware optimisation gates, then phase two has completed the full measured performance
+comparison and production routing. Both phases, not merely their start, are required.
+
+## 2026-10-02 ▸ Phase-one exact Q6_K vector kernel
+
+- Added a same-width Q6_K candidate that reads four original low-nibble bytes and their
+  two-bit high plane together, expands only in registers, and keeps FP32 activations.
+- Fixed the benchmark fixture so an already-present helper is not emitted twice; the old
+  duplicate made WGSL registration fail and compared a stale pooled buffer as if it were a
+  candidate result. The numerical gate caught it before timing was accepted.
+- Two independent K=4096, N=3072 runs measured Q6_K at 1.19/1.21/1.22× and
+  1.17/1.28/1.22× for M=1/32/128, so the vector path is enabled for every shape.
+
+### Evidence
+
+- Chrome WebGPU stored matrix: 28 formats × 5 cases = 140/140 after enabling Q6_K.
+- Local Qwen3-0.6B Q4_K_M: 168 Q4_K + 28 Q6_K native linears, deterministic `OK`,
+  103 ms TTFT, captured decode enabled.
+
 ## 2026-10-02 ▸ Local Qwen3 native-format end-to-end gate
 
 - Corrected the distinction between browser-persistent model cache and repository-local

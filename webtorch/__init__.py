@@ -41,7 +41,7 @@ from ._sdk import (install_torch, load, Model, release, loaded_models, release_a
                    register_pipeline, register_task, list_pipelines, OnnxModel)
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
-from .backend import backend, has_gpu, require_gpu
+from .backend import backend, has_gpu, require_gpu, parity_contracts
 from .portable import export_model, import_model, model_groups
 from .lm_engine import TransformerLM, build_lm, SAMPLERS
 # Output constraints. The six verdicts are the whole vocabulary a constraint answers in, so
@@ -104,7 +104,7 @@ __all__ = [
     "set_read_progress", "get_read_progress",
     "set_load_progress", "get_load_progress",
     "export_model", "import_model", "model_groups",
-    "backend", "has_gpu", "require_gpu",
+    "backend", "has_gpu", "require_gpu", "parity_contracts",
     # torch-compatible core
     "install_torch", "Tensor", "core",
     # THE unified entry point: one loader for every model type

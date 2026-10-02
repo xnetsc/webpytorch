@@ -1,9 +1,8 @@
-"""Provisional diagnostic for encoded weights against explicit alternatives.
+"""Phase-two routing benchmark for exact stored weights versus explicit alternatives.
 
-This is deliberately not allowed to drive runtime routing yet.  Matching the independent
-decoder proves correctness, but it does not prove that the original-width kernel has received
-all applicable hardware optimisations.  The comparison becomes routing evidence only after
-that native-path completion gate is satisfied for the format under test.
+Phase one is now gated separately by the full native-width format matrix and the GGML/GPTQ
+same-width A/B suites. This benchmark therefore has routing authority: correctness comes
+first, then the fastest verified implementation wins per family/format/shape/device.
 """
 import json
 import statistics
@@ -18,7 +17,9 @@ from webtorch import core as wt
 
 M_VALUES = (1, 2, 8, 32, 128)
 ROUNDS = 5
-REPEATS = 4
+# Two repetitions keep the largest materialized candidates from retaining several expanded
+# copies in the pool while five interleaved rounds still provide a stable median.
+REPEATS = 2
 K = 1024
 N = 512
 
@@ -138,16 +139,55 @@ def gptq_results():
     return rows
 
 
+def webgl_routes():
+    """WebGL keeps packed execution because it has no storage-buffer materializer.
+
+    This is an explicit backend route, not an exception fallback.  Exercise GPTQ against
+    its source dense layer so phase two still has a numerical gate on the backend where the
+    alternative cannot exist.
+    """
+    ggml = [{"format": name, "selected": "stored",
+             "alternative": "unavailable_on_webgl",
+             "reason": "WebGL fragment backend has no compute storage-buffer materializer"}
+            for name in sorted(wt._GGML_TYPES)]
+    rng = np.random.default_rng(2302)
+    gptq = []
+    for bits in (4, 8):
+        dense = wt.Linear(K, N)
+        encoded = wt.QuantizedLinear.from_linear(dense, group_size=128, bits=bits)
+        shapes = []
+        for m in M_VALUES:
+            x = wt.Tensor(rng.standard_normal((m, K)).astype(np.float32))
+            got = encoded(x).numpy(); ref = dense(x).numpy()
+            rel = float(np.abs(got - ref).max()) / (float(np.abs(ref).max()) + 1e-9)
+            if not np.all(np.isfinite(got)) or rel >= 0.15:
+                raise RuntimeError("WebGL GPTQ_INT%d accuracy gate failed at M%d: %g"
+                                   % (bits, m, rel))
+            shapes.append({"M": m, "relative_error_vs_source": round(rel, 6)})
+        gptq.append({"format": "GPTQ_INT%d" % bits, "selected": "stored",
+                     "alternative": "unavailable_on_webgl", "shapes": shapes})
+    return ggml, gptq
+
+
 def main():
-    if not wt._adam_backend_ready():
-        raise RuntimeError("WebGPU compute platform is unavailable: %s" % wt.backend_reason())
+    if not (wt._adam_backend_ready() or wt._webgl_ready()):
+        raise RuntimeError("WebGPU/WebGL platform is unavailable: %s" % wt.backend_reason())
     started = time.perf_counter()
     print("CORRECTNESS_GATE starting")
     correctness_gate()
     print("CORRECTNESS_GATE passed")
+    if wt._webgl_ready() and not wt._adam_backend_ready():
+        ggml, non_gguf = webgl_routes()
+        result = {"backend": "webgl", "correctness_gate": True,
+                  "routing_authority": True,
+                  "status": "phase_two_production_routing",
+                  "ggml": ggml, "non_gguf": non_gguf,
+                  "seconds": round(time.perf_counter() - started, 3), "ok": True}
+        print("RESULT " + json.dumps(result)); pythonIO.result = json.dumps(result)
+        return
     result = {"backend": cp.get_backend_name(), "correctness_gate": True,
-              "routing_authority": False,
-              "status": "provisional_until_native_width_paths_are_optimized",
+              "routing_authority": True,
+              "status": "phase_two_production_routing",
               "shape": {"K": K, "N": N, "M": list(M_VALUES)},
               "rounds": ROUNDS, "repeats_per_round": REPEATS,
               "ggml": ggml_results(), "non_gguf": gptq_results()}

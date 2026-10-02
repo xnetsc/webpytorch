@@ -334,7 +334,14 @@ class WebGPUBuffer(WebGPUBufferBase):
 
     def __del__(self):
         # TODO: limit pooled size
-        _pool_put(self.texture_shape, self.buffer_id)
+        # Construction can fail before either attribute is assigned (for example while a
+        # browser benchmark is deliberately probing an unsupported allocation).  Python
+        # still invokes ``__del__`` on that partially initialised object; never turn the
+        # original failure into hundreds of noisy ignored AttributeErrors.
+        texture_shape = getattr(self, "texture_shape", None)
+        buffer_id = getattr(self, "buffer_id", None)
+        if texture_shape is not None and buffer_id is not None:
+            _pool_put(texture_shape, buffer_id)
         # get_platform().disposeBuffer(self.buffer_id)
 
     def set_data(self, array: np.ndarray):
@@ -409,9 +416,13 @@ class WebGPUMetaBuffer(WebGPUBufferBase):
         return self._data
 
     def __del__(self):
-        if self.buffer_id in _pinned_ids:
+        buffer_id = getattr(self, "buffer_id", None)
+        data = getattr(self, "_data", None)
+        if buffer_id is None or data is None:
+            return
+        if buffer_id in _pinned_ids:
             return  # pinned by a capture — never recycle
-        _meta_pool[self._data].append(self.buffer_id)
+        _meta_pool[data].append(buffer_id)
 
 
 class WebGPUMetaBufferItem:

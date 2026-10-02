@@ -10,7 +10,46 @@ would rather not run at all than run at that speed.
 
 from . import _core as _wt
 
-__all__ = ["backend", "has_gpu", "require_gpu"]
+__all__ = ["backend", "has_gpu", "require_gpu", "parity_contracts"]
+
+
+# Efficient-common-layer audit for the public browser capabilities. ``common_level`` records
+# where the two paths become semantically identical after correctness, end-to-end latency,
+# persistent/temporary memory, transfers, compilation and first-call cost are considered.
+# Keep it low only when that is also the best complete path; otherwise align one level up.
+_PARITY_CONTRACTS = {
+    "tensor_autograd": {"common_level": "operator", "webgpu": "WGSL kernels",
+                        "webgl": "GLSL kernels"},
+    "dense_linear": {"common_level": "operator", "webgpu": "compute matmul",
+                     "webgl": "fragment matmul"},
+    "ggml_stored_linear": {"common_level": "decoder", "webgpu": "WGSL packed decoder",
+                           "webgl": "translated GLSL packed decoder"},
+    "gptq_stored_linear": {"common_level": "operator", "webgpu": "packed WGSL matmul",
+                           "webgl": "packed GLSL matmul"},
+    "moe_linear": {"common_level": "operator", "webgpu": "routed packed dispatch",
+                   "webgl": "routed packed fragment pass"},
+    "attention": {"common_level": "attention", "webgpu": "flash/fused attention",
+                  "webgl": "fused softmax plus matmul attention"},
+    "kv_cache": {"common_level": "attention", "webgpu": "in-place packed scatter cache",
+                 "webgl": "growing texture cache"},
+    "generation": {"common_level": "api", "webgpu": "captured decode replay",
+                   "webgl": "eager decode"},
+    "gdn_linear_attention": {"common_level": "layer", "webgpu": "scan or step kernel",
+                             "webgl": "step kernel"},
+    "conv_training": {"common_level": "operator", "webgpu": "WGSL forward/backward",
+                      "webgl": "GLSL forward/backward"},
+    "decision_features": {"common_level": "operator", "webgpu": "WGSL reduction",
+                          "webgl": "equivalent tensor reduction"},
+    "onnx_model": {"common_level": "api", "webgpu": "ORT WebGPU when supported",
+                   "webgl": "ORT WASM fallback"},
+    "model_io_cache_progress": {"common_level": "api", "webgpu": "shared transport",
+                                "webgl": "shared transport"},
+}
+
+
+def parity_contracts():
+    """Return the audited WebGPU/WebGL implementation paths for public capabilities."""
+    return {name: dict(contract) for name, contract in _PARITY_CONTRACTS.items()}
 
 
 def backend():

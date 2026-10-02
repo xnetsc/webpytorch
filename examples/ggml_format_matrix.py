@@ -14,8 +14,8 @@ from webtorch import core as wt
 
 
 def main():
-    if not wt._adam_backend_ready():
-        raise RuntimeError("WebGPU compute platform is unavailable: %s" % wt.backend_reason())
+    if not (wt._adam_backend_ready() or wt._webgl_ready()):
+        raise RuntimeError("WebGPU/WebGL platform is unavailable: %s" % wt.backend_reason())
     result = {
         "backend": cp.get_backend_name(),
         "execution": "stored",

@@ -84,9 +84,11 @@ return texelFetch(tex_rhs, ivec2(x, y), 0).r;
 
 void main() {{
     int flat_idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
-    int oi = flat_idx / N;
-    int oj = flat_idx - oi * N;
-    if (oi >= M) {{ return; }}
+    int b = flat_idx / (M * N);
+    int rem = flat_idx - b * M * N;
+    int oi = rem / N;
+    int oj = rem - oi * N;
+    if (b >= BB) {{ return; }}
     // One output per fragment, two dependent texelFetches per multiply, no reuse of either
     // operand. About 34 GFLOPS, against 1246 on WebGPU, and 89% of a decision on this
     // backend is these matmuls. Two ways of attacking that were tried and BOTH lost:
@@ -112,7 +114,7 @@ void main() {{
     // shader, and nobody should spend an afternoon rediscovering either of the above.
     float s = 0.0;
     for (int k = 0; k < K; k++) {{
-        s += get_tex_lhs(oi, k) * get_tex_rhs(k, oj);
+        s += get_lhs(b, oi, k) * get_rhs(b, k, oj);
     }}
     fragColor = s;
 }}

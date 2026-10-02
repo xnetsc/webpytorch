@@ -2101,8 +2101,20 @@ class CausalLM:
         vsz = int(getattr(self.tok, "vocab_size", 0) or 0)
         if vsz:
             ids = [i % vsz for i in ids]
-        self._prefill(ids)
-        lg = np.asarray(self._logits(self._last_prefill_hidden), np.float32)
+        if self._capturable():
+            self._prefill(ids)
+            hidden = self._last_prefill_hidden
+        else:
+            # WebGL and the other non-capturable paths deliberately have no fixed Kc/Vc
+            # arrays.  Their equivalent model-level implementation is the growing cache;
+            # forcing the WebGPU prefill here made a perfectly valid packed WebGL model
+            # fail its load-time proof with ``CausalLM has no attribute Kc`` before a user
+            # could generate a token.  The smoke gate must exercise the same complete path
+            # the public generation API will use on this backend.
+            cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+            self._kv_forward(ids, 0, cache)
+            hidden = self._last_hidden
+        lg = np.asarray(self._logits(hidden), np.float32)
         if lg.size == 0:
             raise ValueError("this model produced no logits on its first forward pass")
         if not np.all(np.isfinite(lg)):
