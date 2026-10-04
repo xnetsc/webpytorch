@@ -13,7 +13,7 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
-**2026-10-04 xDecision GGUF browser regression fixed locally; Pages deployment pending:**
+**2026-10-04 xDecision GGUF browser regression fixed and deployed:**
 Chrome on the published Pages build showed `RecursionError` while validating
 Q8_0 materialization: `ggml_dequant_ok` called the stored `ggml_matmul`
 reference, which unconditionally probed `ggml_dequant_ok` again. The stored
@@ -21,8 +21,11 @@ route now does not probe alternate executions. A regression failed before the
 change and passed after it; host suite: 212 passed, one skipped; JS: 100 passed.
 Chrome on the local updated build loaded the existing disk-backed xDecision
 Q8_0 GGUF and answered three questions (page-reported 152 ms), with no model
-download. The published Pages build still needs the push and fresh browser
-verification. This fixes one load failure, not the remaining project gates.
+download. Commit `136647f` was pushed to `origin/main`; the published Pages
+script version and `_core.py` SHA-1 now match the checkout. A fresh remote
+model-inference run remains unverified because the sole model is currently
+loaded in the local Chrome tab. This fixes one load failure, not the remaining
+project gates.
 
 **2026-10-04 remote checkpoint requested; full project gates remain open:**
 The latest local-Laya WebGL candidate uses row-aligned R16F dense-weight

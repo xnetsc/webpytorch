@@ -2203,3 +2203,10 @@ questions (page-reported 152 ms). No model download was used. This proves the
 recursion is removed on that route, not independent model accuracy or all
 backend and performance gates. Published Pages must still receive the commit
 and be checked after deployment.
+
+Deployment check: commit `136647f` reached `origin/main`. The published Pages
+HTML carries SDK version `cb903a1458`, and the served `_core.py` SHA-1
+`a9c1b642ae9bd3013fb936297ca8ba6ff2ad5e9d` matches the local file.
+No second model was loaded for a remote inference check while Chrome's local
+test tab still held xDecision; deployment byte identity is confirmed, but
+remote end-to-end inference remains a separate browser check.
