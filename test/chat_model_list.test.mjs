@@ -177,8 +177,10 @@ test('local GGUF selection passes a direct disk-backed File to the SDK', () => {
   assert.doesNotMatch(localBranch, /installApplicationReader|applicationModelSource|remoteModelSpec/);
 });
 
-test('local GGUF picker is a visible native file input', () => {
-  assert.match(htmlSource, /id="localModelInput" type="file"[^>]+\/>/);
+test('local GGUF picker has no duplicate visible Settings field', () => {
+  assert.match(htmlSource, /id="localModelInput" type="file"[^>]*hidden/);
+  assert.doesNotMatch(htmlSource, /<span>GGUF on this device<\/span>/);
+  assert.match(appSource, /\['local-file', 'Load a GGUF file from this device/);
   assert.match(appSource, /localPick\('local-file', \(\) => \{\}, event\.target\.files\[0\]\)/);
 });
 

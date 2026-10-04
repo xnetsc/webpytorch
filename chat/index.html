@@ -152,9 +152,7 @@
       <p class="note">The list comes from this repository's <code>models.json</code>.
         “custom” accepts another hub repository. “on this device” reads a file or folder
         from disk — nothing is copied or cached.</p>
-      <label class="field"><span>GGUF on this device</span>
-        <input id="localModelInput" type="file" accept=".gguf,application/octet-stream" />
-      </label>
+      <input id="localModelInput" type="file" accept=".gguf,application/octet-stream" hidden />
       <div class="row btns">
         <button id="loadBtn" class="primary">Load model</button>
         <button id="releaseBtn">Release</button>
