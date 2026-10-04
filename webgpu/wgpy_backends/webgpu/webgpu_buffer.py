@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import List, Optional
+from time import perf_counter
 import numpy as np
 from wgpy_backends.webgpu.webgpu_data_type import WebGPULogicalDType, WebGPUStorageDType
 from wgpy_backends.webgpu.texture import (
@@ -7,6 +8,34 @@ from wgpy_backends.webgpu.texture import (
     get_default_texture_shape,
 )
 from wgpy_backends.webgpu.platform import get_platform
+
+
+_upload_profiles = {}
+
+
+def _upload_auto(key, staged, direct):
+    """Choose by measured end-to-end upload time for this physical buffer shape.
+
+    A never-repeated shape uses the established path once. Later natural
+    uploads alternate paths, one upload per call; the faster median wins.
+    Calibration never makes an extra copy of a weight or uses a fixed benefit
+    threshold or model-name exception.
+    """
+    profile = _upload_profiles.setdefault(key, {"seen": 0, "staged": [],
+                                                 "direct": [], "choice": None})
+    if profile["choice"] is not None:
+        (direct if profile["choice"] == "direct" else staged)()
+        return
+    mode = "staged" if profile["seen"] % 2 == 0 else "direct"
+    start = perf_counter()
+    (staged if mode == "staged" else direct)()
+    profile[mode].append(perf_counter() - start)
+    profile["seen"] += 1
+    trials = 7 if key[0] < 1024 * 1024 else 3
+    if len(profile["direct"]) >= trials and len(profile["staged"]) >= trials:
+        profile["choice"] = (
+            "direct" if sorted(profile["direct"])[trials // 2]
+            < sorted(profile["staged"])[trials // 2] else "staged")
 
 
 performance_metrics = {
@@ -97,11 +126,24 @@ def end_capture_pin():
 
 
 def reset_capture_pins():
-    """Abandon any pin state (a model is being released; captures go with it).
-    Does NOT dispose anything — the ids still need to be read off first."""
-    global _capture_depth
+    """Abandon every recording after JS has dropped its capture references.
+
+    A profiler resets captures while the model is still live.  Leaving
+    ``_pinned_ids`` populated then makes every short-lived buffer look pinned
+    forever, so neither its finalizer nor the reuse pool can return it.  Only
+    orphaned buffers are destroyed here: a live Tensor still owns its buffer
+    and will release it through its normal finalizer.
+    """
+    global _capture_depth, _capture_name
     _capture_depth = 0
+    _capture_name = None
     _pins.clear()
+    _pinned_ids.clear()
+    for bid, shape in list(_orphaned.items()):
+        get_platform().disposeBuffer(bid)
+        performance_metrics["webgpu.buffer.delete"] += 1
+        performance_metrics["webgpu.buffer.buffer_count"] -= 1
+        performance_metrics["webgpu.buffer.buffer_size"] -= shape.byte_length
     _orphaned.clear()
 
 
@@ -285,6 +327,12 @@ def _get_comm_buf(byte_size: int) -> np.ndarray:
     return WebGPUBuffer._comm_buf
 
 
+def release_comm_buffer():
+    """Drop the Python and JS views of the largest host staging array."""
+    WebGPUBuffer._comm_buf = None
+    get_platform().releaseCommBuf()
+
+
 class WebGPUBufferBase:
     buffer_id: int
 
@@ -347,10 +395,29 @@ class WebGPUBuffer(WebGPUBufferBase):
     def set_data(self, array: np.ndarray):
         if self.size == 0:
             return
-        buf = _get_comm_buf(self.texture_shape.byte_length)
-        packed = buf.view(self.texture_shape.storage_dtype_numpy)
-        packed[: array.size] = array.ravel()
-        get_platform().setData(self.buffer_id, self.texture_shape.byte_length)
+        storage_dtype = self.texture_shape.storage_dtype_numpy
+        direct = (array.dtype == storage_dtype and array.flags.c_contiguous
+                  and array.nbytes == self.texture_shape.byte_length)
+        key = (self.texture_shape.byte_length,
+               self.texture_shape.storage_dtype, array.dtype.str)
+        choice = _upload_profiles.get(key, {}).get("choice") if direct else "staged"
+        if choice == "direct":
+            get_platform().setDataFromArray(self.buffer_id, array,
+                                             self.texture_shape.byte_length)
+        elif choice == "staged":
+            buf = _get_comm_buf(self.texture_shape.byte_length)
+            packed = buf.view(storage_dtype)
+            packed[: array.size] = array.ravel()
+            get_platform().setData(self.buffer_id, self.texture_shape.byte_length)
+        else:
+            def staged_upload():
+                buf = _get_comm_buf(self.texture_shape.byte_length)
+                packed = buf.view(storage_dtype)
+                packed[: array.size] = array.ravel()
+                get_platform().setData(self.buffer_id, self.texture_shape.byte_length)
+            _upload_auto(key, staged_upload,
+                         lambda: get_platform().setDataFromArray(
+                             self.buffer_id, array, self.texture_shape.byte_length))
         performance_metrics["webgpu.buffer.write_count"] += 1
         # physical size
         performance_metrics[
@@ -393,10 +460,7 @@ class WebGPUMetaBuffer(WebGPUBufferBase):
             self.buffer_id = WebGPUBuffer.next_id
             WebGPUBuffer.next_id += 1
 
-            buf = _get_comm_buf(len(data))
-            packed = buf.view(np.uint8)
-            packed[: len(data)] = np.frombuffer(data, dtype=np.uint8)
-            get_platform().createMetaBuffer(self.buffer_id, len(data))
+            get_platform().createMetaBuffer(self.buffer_id, data)
 
             performance_metrics["webgpu.buffer.create"] += 1
             performance_metrics["webgpu.buffer.buffer_count"] += 1

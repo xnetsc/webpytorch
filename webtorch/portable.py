@@ -244,9 +244,9 @@ async def import_model(handle, name=None):
     a multi-file model is. Neither touches origin storage; both are read at the offsets the
     loader asks for.
 
-    `handle` is a `FileSystemFileHandle` or `FileSystemDirectoryHandle` from
-    `showOpenFilePicker()` / `showDirectoryPicker()`. `name` overrides the identity the
-    files are registered under: for a single file the caller passes a content fingerprint
+    `handle` is a browser `File`, `FileSystemFileHandle`, or `FileSystemDirectoryHandle`
+    from a file input / picker. `name` overrides the identity the files are registered
+    under: for a single file the caller passes a content fingerprint
     (so the SAME file always maps to the SAME id, whichever way it was picked, and two
     different files that merely share a name never collide); for a directory it is the
     directory's own name, and every file in it is registered as "<dir>/<file>" so two

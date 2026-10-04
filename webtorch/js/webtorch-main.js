@@ -49,12 +49,14 @@
     opts = opts || {};
     const order = opts.backendOrder || ['webgpu', 'webgl'];
     let backend = null;
+    let disposeBackend = null;
     if (typeof root.wgpy === 'undefined') {
       if (opts.requireGpu) throw new Error('load dist/wgpy-main.js before webtorch-main.js');
       console.warn('webtorch: wgpy-main.js not loaded, running on CPU');
     } else if ((backend = pick(order))) {
       try {
-        await root.wgpy.initMain(worker, { backendOrder: [backend] });
+        const started = await root.wgpy.initMain(worker, { backendOrder: [backend] });
+        disposeBackend = started && started.dispose;
       } catch (e) {
         if (opts.requireGpu) throw e;
         console.warn('webtorch: GPU backend init failed, running on CPU:', e);
@@ -66,7 +68,7 @@
     backend = backend || 'cpu';
     // The worker cannot detect this for itself: it has no device and no Python yet.
     worker.postMessage({ __webtorch: 'backend', backend: backend });
-    return { backend: backend, tasks: tasksFor(worker) };
+    return { backend: backend, tasks: tasksFor(worker), dispose: disposeBackend };
   };
 
   /**
@@ -348,9 +350,11 @@
       d.ok ? p.resolve(d.value) : p.reject(new Error(d.value));
     });
 
-    const { backend, tasks } = await wt.initMain(worker, opts);
+    const { backend, tasks, dispose } = await wt.initMain(worker, opts);
+    let closed = false;
 
     function call(method, args, on) {
+      if (closed) return Promise.reject(new Error('webtorch: runtime closed'));
       const id = nextId++;
       const p = new Promise(function (resolve, reject) {
         pending.set(id, { resolve: resolve, reject: reject, on: on || null });
@@ -421,6 +425,18 @@
                               maxContext: rest.maxContext }, on);
       },
       release: function () { return call('release'); },
+      /** End this runtime and release its WASM heap and browser GPU context/device. */
+      close: function () {
+        if (closed) return;
+        closed = true;
+        for (const [, p] of pending) p.reject(new Error('webtorch: runtime closed'));
+        pending.clear();
+        try {
+          worker.terminate();
+        } finally {
+          if (dispose) dispose();
+        }
+      },
       /** Stop a load. Separate from `cancel` only because a suspended load can be told directly. */
       stopLoading: function () { return call('stopLoad'); },
 
@@ -552,7 +568,7 @@
        * any of them, so nothing is reported for them.
        */
       resources: function () {
-        if (!stat || !stat[0]) return null;
+        if (!stat || !stat[4]) return null;
         return { gpuBytes: stat[0], gpuPeak: stat[1], gpuBuffers: stat[2],
                  wasmBytes: stat[3] || null, at: stat[4] };
       },

@@ -1,6 +1,19 @@
 import { nonNull } from '../util';
 import { DType } from '../dtype';
 
+// Opt-in diagnostic only. The link/status checks below can synchronise with
+// the driver; measuring them on a real model separates compile cost from its
+// subsequent draw/readback time without imposing that logging on normal runs.
+const PROFILE_WEBGL_COMPILE = typeof location !== 'undefined'
+  && new URLSearchParams(location.search).get('profile_compile') === '1';
+// Opt-in upload-submission experiment. A large local model can enqueue many gigabytes of
+// texture uploads before its first readback; flushing periodically may bound the driver's
+// pending copies. Zero preserves the measured incumbent until the complete model route wins.
+const WEBGL_UPLOAD_FLUSH_BYTES = typeof location === 'undefined' ? 0 : (() => {
+  const mb = Number(new URLSearchParams(location.search).get('webgl_upload_flush_mb'));
+  return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1048576) : 0;
+})();
+
 // [x y u v] * [upper-left, lower-left, upper-right, lower-right]
 const vertexArray = new Float32Array([-1, +1, -1, -1, +1, +1, +1, -1]);
 const vertex_shader_source_2 = `#version 300 es
@@ -280,7 +293,7 @@ export class WebGLTensorBuffer {
     return buf;
   }
 
-  getDataRaw():
+  getDataRaw(target?: ArrayBufferView):
     | { type: 'Float32Array'; buffer: Float32Array }
     | { type: 'Uint16Array'; buffer: Uint16Array }
     | { type: 'Int32Array'; buffer: Int32Array }
@@ -304,22 +317,26 @@ export class WebGLTensorBuffer {
           this.textureShape.height * this.textureShape.width * this.dimPerPixel;
         switch (this.textureShape.type) {
           case WebGL2RenderingContext.FLOAT: {
-            const buffer = new Float32Array(length);
+            const buffer = target instanceof Float32Array && target.length >= length
+              ? target.subarray(0, length) : new Float32Array(length);
             this.readPixels2D(buffer);
             return { type: 'Float32Array', buffer };
           }
           case WebGL2RenderingContext.HALF_FLOAT: {
-            const buffer = new Uint16Array(length);
+            const buffer = target instanceof Uint16Array && target.length >= length
+              ? target.subarray(0, length) : new Uint16Array(length);
             this.readPixels2D(buffer);
             return { type: 'Uint16Array', buffer };
           }
           case WebGL2RenderingContext.INT: {
-            const buffer = new Int32Array(length);
+            const buffer = target instanceof Int32Array && target.length >= length
+              ? target.subarray(0, length) : new Int32Array(length);
             this.readPixels2D(buffer);
             return { type: 'Int32Array', buffer };
           }
           case WebGL2RenderingContext.UNSIGNED_BYTE: {
-            const buffer = new Uint8Array(length);
+            const buffer = target instanceof Uint8Array && target.length >= length
+              ? target.subarray(0, length) : new Uint8Array(length);
             this.readPixels2D(buffer);
             return { type: 'Uint8Array', buffer };
           }
@@ -333,7 +350,8 @@ export class WebGLTensorBuffer {
         const totalLength = sliceLength * this.textureShape.depth;
         switch (this.textureShape.type) {
           case WebGL2RenderingContext.FLOAT: {
-            const buffer = new Float32Array(totalLength);
+            const buffer = target instanceof Float32Array && target.length >= totalLength
+              ? target.subarray(0, totalLength) : new Float32Array(totalLength);
             this.readPixels2DArray(
               buffer,
               sliceLength,
@@ -342,7 +360,8 @@ export class WebGLTensorBuffer {
             return { type: 'Float32Array', buffer };
           }
           case WebGL2RenderingContext.HALF_FLOAT: {
-            const buffer = new Uint16Array(totalLength);
+            const buffer = target instanceof Uint16Array && target.length >= totalLength
+              ? target.subarray(0, totalLength) : new Uint16Array(totalLength);
             this.readPixels2DArray(
               buffer,
               sliceLength,
@@ -351,7 +370,8 @@ export class WebGLTensorBuffer {
             return { type: 'Uint16Array', buffer };
           }
           case WebGL2RenderingContext.INT: {
-            const buffer = new Int32Array(totalLength);
+            const buffer = target instanceof Int32Array && target.length >= totalLength
+              ? target.subarray(0, totalLength) : new Int32Array(totalLength);
             this.readPixels2DArray(
               buffer,
               sliceLength,
@@ -360,7 +380,8 @@ export class WebGLTensorBuffer {
             return { type: 'Int32Array', buffer };
           }
           case WebGL2RenderingContext.UNSIGNED_BYTE: {
-            const buffer = new Uint8Array(totalLength);
+            const buffer = target instanceof Uint8Array && target.length >= totalLength
+              ? target.subarray(0, totalLength) : new Uint8Array(totalLength);
             this.readPixels2DArray(
               buffer,
               sliceLength,
@@ -377,6 +398,7 @@ export class WebGLTensorBuffer {
 
   setDataRaw(data: ArrayBufferView): void {
     const ctx = getNNWebGLContext();
+    ctx.assertAlive();
     this.bindToReadTexture(0);
     switch (this.textureShape.dim) {
       case '2D':
@@ -413,6 +435,8 @@ export class WebGLTensorBuffer {
         throw new Error('not implemented');
     }
     this.unbindFromReadTexture();
+    ctx.submittedUpload(data.byteLength);
+    ctx.assertAlive();
   }
 
   private readPixels2D(buf: ArrayBufferView) {
@@ -420,6 +444,7 @@ export class WebGLTensorBuffer {
     // Mac + Firefoxではさらに、RGBA8UIも読み出せない
     // packRToRGBAで基本的に回避しているが、これを経由せずRGBA8UIを直接使うコードがあるとエラーになりうる
     const ctx = getNNWebGLContext();
+    ctx.assertAlive();
     this.bindToDrawTexture();
     ctx.gl.readPixels(
       0,
@@ -431,6 +456,7 @@ export class WebGLTensorBuffer {
       buf
     );
     this.unbindFromDrawTexture();
+    ctx.assertAlive();
   }
 
   private readPixels2DArray(
@@ -439,6 +465,7 @@ export class WebGLTensorBuffer {
     depth: number
   ) {
     const ctx = getNNWebGLContext();
+    ctx.assertAlive();
     for (let layer = 0; layer < depth; layer++) {
       this.bindToDrawTexture(layer);
       ctx.gl.readPixels(
@@ -452,6 +479,7 @@ export class WebGLTensorBuffer {
         sliceLength * layer
       );
       this.unbindFromDrawTexture();
+      ctx.assertAlive();
     }
   }
 }
@@ -476,7 +504,7 @@ function initWebGL() {
   } else {
     throw new Error(`gl.MAX_TEXTURE_SIZE is too small (${allowedTextureSize})`);
   }
-  return { gl, maxTextureSize };
+  return { gl, maxTextureSize, canvas };
 }
 
 export interface WebGLKernelInputBuffer {
@@ -488,6 +516,7 @@ export type WebGLKernelInput = WebGLKernelInputBuffer;
 
 export class NNWebGLContext {
   gl: WebGL2RenderingContext;
+  private contextLost = false;
   maxTextureSize: number;
   fb: WebGLFramebuffer;
   supportsTexture32bit: boolean;
@@ -503,12 +532,24 @@ export class NNWebGLContext {
       xyAttribLoc: number;
     }
   > = new Map();
+  private compileCount = 0;
+  private compileMs = 0;
+  private pendingUploadBytes = 0;
+  private uploadFlushCount = 0;
   private vshader!: WebGLShader;
+  private vertexBuffer!: WebGLBuffer;
 
   constructor() {
-    const { gl, maxTextureSize } = initWebGL();
+    const { gl, maxTextureSize, canvas } = initWebGL();
     this.gl = gl;
     this.maxTextureSize = maxTextureSize;
+    // A lost context accepts draws/readPixels but returns zero-filled arrays.
+    // Once its textures disappear the loaded model cannot be restored in place:
+    // keep this instance invalid even if the browser later restores the context.
+    canvas.addEventListener('webglcontextlost', (event) => {
+      event.preventDefault();
+      this.contextLost = true;
+    });
 
     if (gl.getExtension('EXT_color_buffer_float')) {
       // Enable color mode of gl.R32F
@@ -537,8 +578,8 @@ export class NNWebGLContext {
     gl.cullFace(gl.BACK);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-    const vertexBuffer = this.createArrayBuffer(vertexArray);
-    this.bindArrayBuffer(vertexBuffer);
+    this.vertexBuffer = this.createArrayBuffer(vertexArray);
+    this.bindArrayBuffer(this.vertexBuffer);
     this.fb = nonNull(gl.createFramebuffer());
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fb);
     // バグ回避
@@ -550,6 +591,26 @@ export class NNWebGLContext {
       (ua.includes('Macintosh') && ua.includes('Firefox/')) ||
       (ua.includes('Linux') && ua.includes('Firefox/'));
     this.canReadNon32bitTexture = this.canReadRedTexture = !problemCase;
+  }
+
+  assertAlive(): void {
+    if (this.contextLost || this.gl.isContextLost()) {
+      this.contextLost = true;
+      throw new Error('WebGL context lost; release and reload the model');
+    }
+  }
+
+  submittedUpload(bytes: number): void {
+    if (!WEBGL_UPLOAD_FLUSH_BYTES) return;
+    this.pendingUploadBytes += bytes;
+    if (this.pendingUploadBytes >= WEBGL_UPLOAD_FLUSH_BYTES) {
+      this.gl.flush();
+      this.pendingUploadBytes = 0;
+      this.uploadFlushCount++;
+      if (PROFILE_WEBGL_COMPILE && this.uploadFlushCount % 64 === 0) {
+        console.info('webgl upload flushes', this.uploadFlushCount);
+      }
+    }
   }
 
   createArrayBuffer(vertexArray: Float32Array): WebGLBuffer {
@@ -565,6 +626,7 @@ export class NNWebGLContext {
   }
 
   createTexture(textureShape: TensorTextureShape): WebGLTexture {
+    this.assertAlive();
     if (
       textureShape.dim === '2DArray' &&
       (textureShape.width === 1 || textureShape.height === 1)
@@ -636,12 +698,22 @@ export class NNWebGLContext {
     if (this.programs.has(name)) {
       return;
     }
+    const started = PROFILE_WEBGL_COMPILE ? performance.now() : 0;
     const program = this.compileKernel(sourceCode, name);
     this.programs.set(name, {
       program,
       uniformLocations: new Map(),
       xyAttribLoc: this.gl.getAttribLocation(program, '_xy'),
     });
+    if (PROFILE_WEBGL_COMPILE) {
+      const elapsed = performance.now() - started;
+      this.compileCount++;
+      this.compileMs += elapsed;
+      if (elapsed >= 20 || this.compileCount % 32 === 0) {
+        console.info('webgl compile', name, elapsed.toFixed(2) + 'ms',
+          'total', this.compileMs.toFixed(2) + 'ms', 'programs', this.compileCount);
+      }
+    }
   }
 
   hasKernel(name: string): boolean {
@@ -677,6 +749,10 @@ export class NNWebGLContext {
     uniforms: WebGLUniformItem[],
     drawLayer: number | null = null
   ): void {
+    // This flag is set by the browser event, with no driver query per draw.
+    // Readback additionally calls isContextLost() so loss during a queued draw
+    // cannot leak a fabricated all-zero model output to the API.
+    if (this.contextLost) this.assertAlive();
     const outputBuffer = output;
     if (outputBuffer.textureShape.dim === '2DArray' && drawLayer == null) {
       for (let d = 0; d < outputBuffer.textureShape.depth; d++) {
@@ -766,6 +842,17 @@ export class NNWebGLContext {
 
     outputBuffer.unbindFromDrawTexture();
   }
+
+  dispose(): void {
+    for (const { program } of this.programs.values()) this.gl.deleteProgram(program);
+    this.programs.clear();
+    if (this.vshader) this.gl.deleteShader(this.vshader);
+    this.gl.deleteFramebuffer(this.fb);
+    if (this.vertexBuffer) this.gl.deleteBuffer(this.vertexBuffer);
+    // Mirrors WebGPU device destruction: relinquish the backing browser context,
+    // not just the SDK's texture ledger, when the whole runtime is closed.
+    this.gl.getExtension('WEBGL_lose_context')?.loseContext();
+  }
 }
 
 let context: NNWebGLContext | null = null;
@@ -779,4 +866,10 @@ export function getNNWebGLContext(): NNWebGLContext {
     throw new Error('WebGL Context does not exist');
   }
   return context;
+}
+
+export function disposeNNWebGLContext(): void {
+  const old = context;
+  context = null;
+  if (old) old.dispose();
 }

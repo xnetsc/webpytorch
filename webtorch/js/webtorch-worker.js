@@ -122,7 +122,10 @@
   // stores and a property read.
   root.__gpustat = function (held, peak, n) {
     if (!STAT) return;
-    STAT[0] = held; STAT[1] = peak; STAT[2] = n; STAT[4] = Date.now();
+    // WebGL's texture ledger is written directly by main-thread JS into the same
+    // shared memory. A null GPU reading here is only a signal to refresh WASM size.
+    if (held != null) { STAT[0] = held; STAT[1] = peak; STAT[2] = n; }
+    STAT[4] = Date.now();
     try {
       const m = root.pyodide && root.pyodide._module && root.pyodide._module.HEAP8;
       if (m) STAT[3] = m.byteLength;
@@ -309,7 +312,8 @@
       say('installing the ' + wanted + ' backend…');
       try {
         const mp = pyodide.pyimport('micropip');
-        await mp.install(base + 'dist/wgpy_' + wanted + '-1.0.0-py3-none-any.whl');
+        await mp.install(base + 'dist/wgpy_' + wanted + '-1.0.0-py3-none-any.whl'
+                         + (opts.version ? '?v=' + encodeURIComponent(opts.version) : ''));
       } catch (e) { warn('backend', 'the ' + wanted + ' backend could not be installed, so '
                           + 'this runs on the CPU: ' + ((e && e.message) || e)); }
     }

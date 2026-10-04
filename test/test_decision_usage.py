@@ -260,6 +260,31 @@ def test_decision_action_features_keep_the_two_option_entropy_denominator():
     assert np.allclose(got, [1.0, 1.0, 0.0, 2.0 / 255.0])
 
 
+def test_final_head_selected_rows_match_full_bidirectional_layer():
+    rng = np.random.default_rng(19)
+    model = DecisionModel.__new__(DecisionModel)
+    model.heads = 2
+    model.head_dim = 2
+    weights = {
+        "head.layers.0.self_attn.in_proj": rng.standard_normal((4, 12), dtype=np.float32) * 0.1,
+        "head.layers.0.self_attn.out_proj": rng.standard_normal((4, 4), dtype=np.float32) * 0.1,
+        "head.layers.0.linear1": rng.standard_normal((4, 7), dtype=np.float32) * 0.1,
+        "head.layers.0.linear2": rng.standard_normal((7, 4), dtype=np.float32) * 0.1,
+    }
+
+    model._ln = lambda x, _name: x
+    model._lin = lambda x, name: x.matmul(Tensor(weights[name]))
+    hidden = Tensor(rng.standard_normal((6, 4), dtype=np.float32))
+    rows = [0, 2, 5]
+    full = model._head_layer(hidden, 0)
+    expected = model._select_rows(full, rows).numpy()
+
+    selected_full = model._last_head_selected(hidden, 0, rows, queries_only=False).numpy()
+    selected_q = model._last_head_selected(hidden, 0, rows, queries_only=True).numpy()
+    np.testing.assert_allclose(selected_full, expected, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(selected_q, expected, rtol=2e-5, atol=2e-6)
+
+
 def test_releasing_a_model_hands_memory_back_even_when_no_known_name_matched():
     """`_HEAVY` is a list of attribute names, and a decision model's weights hang off `enc`,
     which is not one of them. Taking "nothing recognised" for "nothing to give back" left

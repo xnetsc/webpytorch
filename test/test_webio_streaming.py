@@ -222,3 +222,34 @@ def test_one_origins_dead_api_does_not_silence_the_other():
     webio._API_DEAD["modelscope@https://modelscope.cn"] = True
     assert not webio._API_DEAD.get("modelscope@https://modelscope.ai")
     webio._API_DEAD.clear()
+
+
+def test_mirrored_reader_deletes_a_proven_duplicate_cache_copy_immediately():
+    hf = lambda repo, path: "https://hf.test/%s/%s" % (repo, path)
+    ms = lambda repo, path: "https://ms.test/%s/%s" % (repo, path)
+    deleted = []
+    original_read, original_delete = webio.read_cache, webio.delete_cache
+
+    async def cached(_key, _offset=0, _length=None, _cache_dir=None):
+        return b"x"
+
+    async def remove(key, _cache_dir=None):
+        deleted.append(key)
+        return True
+
+    async def same_digest(_repo, _path):
+        return "a" * 64
+
+    webio.read_cache, webio.delete_cache = cached, remove
+    try:
+        reader = webio._hub_reader(
+            [hf, ms], token=None, cache=True, cache_dir="fake-cache",
+            max_parallel=1, prefetch=False, chunk_mb=1, persist=False,
+            digest=[same_digest, same_digest],
+        )
+        got = asyncio.run(reader("org/repo/weights.bin", 0, 1))
+    finally:
+        webio.read_cache, webio.delete_cache = original_read, original_delete
+
+    assert got == b"x"
+    assert deleted == ["https://ms.test/org/repo/weights.bin"]

@@ -23,7 +23,10 @@ h() { shasum -a 1 "$1" | cut -c1-10; }
 # by webtorch.start(): both worker bootstraps, the module manifest, and all Python modules.
 sdk_hash() {
   {
-    for f in webtorch/js/webtorch-main.js webtorch/js/webtorch-host.js \
+    for f in dist/wgpy-main.js dist/wgpy-worker.js \
+             dist/wgpy_webgpu-1.0.0-py3-none-any.whl \
+             dist/wgpy_webgl-1.0.0-py3-none-any.whl \
+             webtorch/js/webtorch-main.js webtorch/js/webtorch-host.js \
              webtorch/js/webtorch-worker.js webtorch/modules.json; do
       shasum -a 1 "$f"
     done

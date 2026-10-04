@@ -23,7 +23,7 @@
   // same way the host serves everything else. The SDK has no policy of its own here.
   const VERSION = Q.get('v') || null;
   const VQ = VERSION ? ('?v=' + encodeURIComponent(VERSION)) : '';
-  importScripts(BASE + 'dist/wgpy-worker.js');
+  importScripts(BASE + 'dist/wgpy-worker.js' + VQ);
   importScripts(BASE + 'webtorch/js/webtorch-worker.js' + VQ);
 
   let pyodide = null, tasks = null, ready = false, ioSequence = 0;
@@ -65,6 +65,8 @@
   // unless `start({rememberTuning: true})` asked for it. The shape of what gets stored
   // stays in here, because that is the SDK's and a host has no business knowing it.
   let remember = false;
+  let backendName = null;
+  let profileKey;
   const KP_DB = 'webtorch-kernel-profile';
   function kpOpen() {
     return new Promise((res, rej) => {
@@ -75,11 +77,26 @@
     });
   }
   async function kpKey() {
+    if (profileKey !== undefined) return profileKey;
     try {
+      // A WebGL run must not reuse WebGPU's same-build shape votes. The two backends
+      // can prefer different packed kernels even on the same physical GPU. Identify
+      // WebGL from its own context, and keep CPU out of the device-profile cache.
+      if (backendName === 'webgl') {
+        if (typeof OffscreenCanvas === 'undefined') return (profileKey = null);
+        const gl = new OffscreenCanvas(1, 1).getContext('webgl2');
+        if (!gl) return (profileKey = null);
+        const debug = gl.getExtension('WEBGL_debug_renderer_info');
+        const vendor = gl.getParameter(debug ? debug.UNMASKED_VENDOR_WEBGL : gl.VENDOR);
+        const renderer = gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER);
+        return (profileKey = ['webgl', vendor, renderer, gl.getParameter(gl.VERSION)].join('/'));
+      }
+      if (backendName !== 'webgpu' || !navigator.gpu) return (profileKey = null);
       const a = await navigator.gpu.requestAdapter();
-      const i = (a && (a.info || {})) || {};
-      return [i.vendor, i.architecture, i.device, i.description].join('/') || 'unknown';
-    } catch (e) { return null; }      // no adapter, nothing to key on, nothing to keep
+      if (!a) return (profileKey = null);
+      const i = a.info || {};
+      return (profileKey = ['webgpu', i.vendor, i.architecture, i.device, i.description].join('/'));
+    } catch (e) { return (profileKey = null); } // no adapter, nothing to keep
   }
   async function kpGet(key) {
     try {
@@ -153,6 +170,7 @@
         onStatus: (t) => emit(0, 'status', t),
       });
       pyodide = r.pyodide; tasks = r.tasks;
+      backendName = r.backend;
       remember = !!(a && a.rememberTuning);
       await py('import json, webtorch\n_MODEL = {"m": None, "id": None}\n');
       ready = true;
@@ -281,6 +299,13 @@ finally:
     webtorch.set_read_progress(None)
     webtorch.set_download_progress(None)
     webtorch.set_load_progress(None)
+    # The largest transfer array is only needed while weight bytes are crossing the
+    # worker boundary.  Drop both its Python and JS views even on a failed load.
+    import webtorch._core as _wt_core
+    _wt_core._release_transfer_memory()
+    for _wt_tmp in ("m", "src", "lmax", "_kp", "_n", "_e"):
+        globals().pop(_wt_tmp, None)
+    globals().pop("_wt_tmp", None)
 import json as _json
 _json.dumps({"kind": getattr(_MODEL["m"], "kind", ""),
              "surface": _MODEL["m"].surface()})
@@ -350,8 +375,7 @@ if _MODEL["m"] is not None:
                                n: (n == null ? null : Number(n)), at: performance.now() });
         }
       };
-      try {
-        return await pyJSONTask(task, `
+      const work = py(`
 import json, js
 m = _MODEL["m"]
 if m is None:
@@ -365,7 +389,7 @@ _msgs = _o.get("messages") or None        # full conversation; falls back to the
 # rather than being overridden with a guess.
 # "tools" rides here too: the SDK hands it to the model's own chat template, so which models
 # can be told about tools is a question about their template, not about this list.
-_PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
+_PASS = ("temperature", "top_p", "top_k", "min_p", "seed", "do_sample", "repetition_penalty",
          "presence_penalty", "frequency_penalty", "min_new_tokens", "max_length", "stop",
          "tools", "constraint", "require_known_tools")
 _kw = dict(max_new=_n or None, stream=True, channels=True, enable_thinking=_think)
@@ -408,31 +432,73 @@ else:
 _s = getattr(getattr(m, "impl", m), "last_stream", None) or {}
 json.dumps({"n": int(_s.get("n") or 0), "truncated": bool(_s.get("truncated")),
             "ttft_s": _s.get("ttft_s"), "tok_s": _s.get("tok_s"),
+            "prefill_s": _s.get("prefill_s"),
+            "post_prefill_s": _s.get("post_prefill_s"),
+            "prefill_route": _s.get("prefill_route"),
             "context": _s.get("context"),
             "gpu_ms": _s.get("gpu_ms"), "pick_ms": _s.get("pick_ms"),
             "gpu_ms_head": _s.get("gpu_ms_head"), "gpu_ms_tail": _s.get("gpu_ms_tail"),
             "gpu_ms_curve": _s.get("gpu_ms_curve"),
             "recaptured_at": _s.get("recaptured_at"), "pins": _s.get("pins"),
+            "decode_plan": _s.get("decode_plan"),
             "prefilled": _s.get("prefilled"), "prefill_d": _s.get("prefill_d"),
+            "prefill_tune_s": _s.get("prefill_tune_s"),
+            "prefill_tune_calls": _s.get("prefill_tune_calls"),
             "path": _s.get("path")})
 `);
-      } finally {
+      const cleaned = work.finally(async () => {
         if (task.current()) root.__chunk = null;
+        // Pyodide executes these templates in one persistent module namespace.  Without
+        // clearing it, `m`, `_gen`, image arrays and the last logits remain live after a
+        // reply, so gc.collect cannot return their CPU or GPU buffers.
         // The boundary where the memory actually comes back. A collect can only free what
         // nothing refers to, and while a reply is being written the frames on the stack
         // still refer to most of it -- the same collect frees far more here, with the call
         // graph unwound, than it does from inside the allocation path. Measured: 20.78GB
         // held falls to 11.43GB, and to 9.2GB once the pool is trimmed with it.
         try {
-          await py('import wgpy_backends.webgpu.webgpu_buffer as _b\n'
-                 + 'if hasattr(_b, "reap_now"): _b.reap_now()');
+          await py(`
+for _wt_tmp in ("m", "_o", "_n", "_think", "_msgs", "_kw", "_k", "_v",
+                "_media", "_lst", "_im", "_buf", "_w", "_h", "_r", "_txt",
+                "_gen", "_live", "_c", "_s", "_np"):
+    globals().pop(_wt_tmp, None)
+globals().pop("_wt_tmp", None)
+import gc as _wt_gc
+_wt_gc.collect()
+import webtorch._core as _wt_core
+# Both backends own reusable temporary buffers. Keep the live model/KV cache,
+# but return completed scratch at each reply boundary so a near-capacity WebGL
+# context is not carrying the previous answer's pool into the next one.
+_wt_core._gpu_release_idle_pool()
+try:
+    import wgpy_backends.webgpu.webgpu_buffer as _wt_b
+    _wt_b.reap_now()
+except ImportError:
+    pass
+`);
         } catch (e) {
           // This is where a reply's memory actually comes back. Failing here is the
           // difference between a session that stays usable and one that climbs until the
           // tab dies, so it does not get to be silent.
           report('memory', 'could not release what this reply held: ' + ((e && e.message) || e));
         }
+        clearGlobals({ prompt: '_prompt', imgs: '_imgs', opts: '_opts' });
+      });
+      const result = JSON.parse(await task.until(cleaned));
+      // Prefill encounters batch buckets that load-time smoke cannot predict. Persist the
+      // measurements made while answering too; otherwise every page reload repeats the
+      // same large-weight tournament before its first visible token.
+      if (remember && task.current()) {
+        try {
+          const kpk = await kpKey();
+          if (kpk) await kpPut(kpk, JSON.parse(await py(
+            'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
+        } catch (e) {
+          report('tuning', 'could not keep the reply-time shape measurements: '
+                 + ((e && e.message) || e));
+        }
       }
+      return result;
     },
 
     async decide(a) {

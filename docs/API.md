@@ -709,7 +709,11 @@ this is what makes GGUF work without a GPU).
 ## Generic ONNX  (`webtorch.OnnxModel`)
 - `await webtorch.OnnxModel.from_source(src, io=None)` — `src`: url | bytes | async
   callback (str urls read via the global `io_read`; `io=` overrides per call).
-  `.run({name: ndarray}) -> [outputs]`. ~50 ops; runs any registered graph.
+  `.run({name: ndarray}) -> [outputs]`. ~50 ops; runs graphs whose operators are registered.
+- Quantized operators include `QuantizeLinear`, `DequantizeLinear`,
+  `DynamicQuantizeLinear`, `MatMulInteger`, `QLinearMatMul`, `ConvInteger` and
+  `QLinearConv`. Integer matmul/convolution retain INT8/UINT8 operands and accumulate in
+  INT32 as ONNX specifies; this is format capability, not a model-name exception.
 
 ## Bringing up the GPU backend  (`webtorch.initMain` / `initWorker` / `backend`)
 
@@ -894,9 +898,18 @@ await wt.run(code, vars);    // any Python, with page values bound as globals
 await wt.io.start();                         // begin raw IO; clears an earlier stop
 await wt.io.read(name, offset, length);       // calls the installed webtorch.io_read
 await wt.io.write(name, bytes, offset);       // calls the installed webtorch.io_write
+await wt.release();          // free the loaded model's tensors
+wt.close();                  // terminate Python and destroy this WebGPU/WebGL device
+// A later load starts with a new `await webtorch.start(...)` runtime.
 ```
 
-Also on it: `release()`, `stopLoading()`, `decide(state, questions)`,
+`release()` leaves the Python runtime available; its WebAssembly heap cannot shrink, and a
+browser GPU process may retain physical allocations after individual buffers are destroyed.
+Call `close()` when finished with that runtime to reclaim both. It is idempotent, rejects
+outstanding calls, and makes further calls on that instance fail. Recreate it with `start()`;
+disk-backed File handles must be selected or registered again in the new worker.
+
+Also on it: `stopLoading()`, `decide(state, questions)`,
 `calibrate(heldOutExamples, { byOptions, minSamples })`, `splitReasoning(text)`,
 `stats()`, `tools.{supported,calls,result,suggest,round,render}` and
 `cache.{list,delete,clear,export,import,migrate,watch}`.

@@ -81,8 +81,8 @@ class WebGPUPlatform:
         self._gpu_note(buffer_id, byte_length)
         return gpu.createBuffer(buffer_id, byte_length)
 
-    def createMetaBuffer(self, buffer_id: int, byte_length: int):
-        return gpu.createMetaBuffer(buffer_id, byte_length)
+    def createMetaBuffer(self, buffer_id: int, data: bytes):
+        return gpu.createMetaBuffer(buffer_id, len(data), data)
 
     def disposeBuffer(self, buffer_id: int):
         self._gpu_note(buffer_id, None)
@@ -111,18 +111,50 @@ class WebGPUPlatform:
         self._latest_comm_buf = buffer
         return gpu.setCommBuf(buffer)
 
+    def releaseCommBuf(self):
+        self._latest_comm_buf = None
+        return gpu.releaseCommBuf()
+
     def setData(self, buffer_id: int, byte_length: int):
-        if not gpu.setData(buffer_id, byte_length):
+        result = int(gpu.setData(buffer_id, byte_length))
+        if result < 0:
+            raise RuntimeError("WebGPU buffer upload failed on the browser main thread")
+        if not result:
             # WASM buffer may reallocated
             self.setCommBuf(self._latest_comm_buf)
-            if not gpu.setData(buffer_id, byte_length):
+            result = int(gpu.setData(buffer_id, byte_length))
+            if result < 0:
+                raise RuntimeError("WebGPU buffer upload failed on the browser main thread")
+            if not result:
                 raise ValueError("setData failed twice")
 
+    def setDataFromArray(self, buffer_id: int, array: np.ndarray, byte_length: int):
+        """Upload an exact, contiguous NumPy array without a Python staging copy."""
+        result = int(gpu.setDataFromArray(buffer_id, array, byte_length))
+        if result < 0:
+            raise RuntimeError("WebGPU direct upload failed on the browser main thread")
+
     def getData(self, buffer_id: int, byte_length: int):
-        if not gpu.getData(buffer_id, byte_length):
+        result = int(gpu.getData(buffer_id, byte_length))
+        if result < 0:
+            raise RuntimeError("WebGPU buffer readback failed on the browser main thread")
+        if not result:
             self.setCommBuf(self._latest_comm_buf)
-            if not gpu.getData(buffer_id, byte_length):
+            result = int(gpu.getData(buffer_id, byte_length))
+            if result < 0:
+                raise RuntimeError("WebGPU buffer readback failed on the browser main thread")
+            if not result:
                 raise ValueError("getData failed twice")
+
+    def sampleLogits(self, buffer_id: int, byte_length: int, count: int, options: dict) -> int:
+        """Select a token in JS from a GPU readback; Python handles only IDs/options."""
+        return int(gpu.sampleLogits(buffer_id, byte_length, count, options))
+
+    def routeHost(self, logits_id: int, logits_bytes: int, index_id: int,
+                  weight_id: int, rows: int, experts: int, k: int, renormalize: bool):
+        """Route a GPU logits buffer entirely in JS; Python passes buffer handles."""
+        return gpu.routeHost(logits_id, logits_bytes, index_id, weight_id,
+                             rows, experts, k, renormalize)
 
     def addKernel(self, name, descriptor):
         # Kept so a dispatch that turns out not to fit can be recompiled from the same
@@ -197,8 +229,11 @@ class WebGPUPlatform:
         # stop being pinned. Without it every generation pinned a fresh set that was never
         # released until the model was.
         from wgpy_backends.webgpu.webgpu_buffer import begin_capture_pin
+        # The worker->main channel is FIFO.  Replace the JS recording first, then send
+        # disposals for orphaned ids from its predecessor; otherwise JS still refuses them.
+        result = gpu.beginCapture(name)
         begin_capture_pin(name)
-        return gpu.beginCapture(name)
+        return result
 
     def endCapture(self):
         from wgpy_backends.webgpu.webgpu_buffer import end_capture_pin
@@ -207,11 +242,13 @@ class WebGPUPlatform:
 
     def resetCaptures(self):
         """Drop every recorded capture graph and its pins, JS side included.
-        Sent at model release, BEFORE the buffered disposeBuffer messages, so
-        those are no longer refused by the JS-side pin set."""
+        JS must drop its pin set BEFORE Python disposes orphaned buffers;
+        otherwise JS refuses those disposals.  This is also used after layer
+        profiling while the model remains live, not only at model release."""
         from wgpy_backends.webgpu.webgpu_buffer import reset_capture_pins
+        result = gpu.resetCaptures()
         reset_capture_pins()
-        return gpu.resetCaptures()
+        return result
 
     def replay(self, name):
         return gpu.replay(name)

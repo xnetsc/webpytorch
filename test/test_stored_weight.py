@@ -6,6 +6,15 @@ from webtorch import _core as wt
 from webtorch import ggufload
 
 
+def test_original_width_decode_shape_candidates_cover_distinct_workgroup_splits():
+    assert wt._cfg_for("balanced", 256) == (32, 8)
+    assert wt._cfg_for("compact", 256) == (32, 4)
+    assert wt._selfcheck_shape("balanced", 256)[1] >= 3
+    assert wt._selfcheck_shape("compact", 256)[1] >= 3
+    source = inspect.getsource(wt._ggml_shape_for)
+    assert '("narrow", "balanced", "compact", "shortk", None)' in source
+
+
 def test_every_decodable_gguf_type_has_a_native_compute_kernel():
     """A storage type may not be accepted and then silently converted for lack of a kernel."""
     assert set(ggufload.SUPPORTED_NAMES) == set(wt._GGML_TYPES)
@@ -148,13 +157,16 @@ def test_webgl_gptq_has_the_same_exact_packed_vec4_candidate():
 def test_phase_two_cross_width_policy_is_explicit_for_both_browser_backends():
     route = wt._PHASE2_CROSS_WIDTH["gptq_activation_int8_dp4a"]
     assert route == {
-        "webgpu": "measured_negative_keep_stored",
+        "webgpu": "measured_per_format_shape_device",
         "webgl": "primitive_unavailable_keep_stored",
     }
     assert "requires packed_4x8_integer_dot_product" in wt._GPTQ_DP4A_WGSL
     assert "dot4I8Packed" in wt._gptq_dp4a_src(4)
     assert "dot4I8Packed" in wt._gptq_dp4a_src(8)
     assert "dot4I8Packed" not in wt._GL_GPTQ
+    forward = inspect.getsource(wt.QuantizedLinear.forward)
+    assert '("stored", "dp4a", "materialized")' in forward
+    assert "_gptq_dp4a_matmul" in forward
 
 
 def test_every_ggml_decoder_can_generate_a_webgl_shader():
@@ -218,10 +230,55 @@ def test_execution_policy_is_shape_based_cached_and_profiled():
         else:
             wt._TUNED[key] = before
 
-    # Decode and two-row verification stay in the original representation; every measured
-    # format won there, so neither should pay a runtime tune.
-    assert wt._weight_execution("gptq", "GPTQ_INT4", 1024, 512, 2,
-                                lambda _which: None) == "stored"
+    # Decode and two-row verification are measured too: a local win must not be discarded
+    # merely because a broader batch bucket did not win.
+    calls = []
+
+    class Ready:
+        def get(self):
+            return None
+
+    assert wt._weight_execution("gptq", "GPTQ_INT4_TEST", 1024, 512, 2,
+                                lambda which: calls.append(which) or Ready()) in {
+                                    "stored", "materialized"
+                                }
+    assert calls
+
+
+def test_phase_two_dp4a_choice_round_trips_through_device_profile():
+    key = ("weight_exec", "gptq", "GPTQ_INT4", 4096, 3072, 2)
+    before = wt._TUNED.get(key)
+    try:
+        wt._TUNED[key] = "dp4a"
+        profile = wt.kernel_profile()
+        assert profile["tuned"]["weight_exec|gptq|GPTQ_INT4|4096|3072|2"] == "dp4a"
+        wt._TUNED.pop(key)
+        assert wt.use_kernel_profile(profile) >= 1
+        assert wt._TUNED[key] == "dp4a"
+    finally:
+        if before is None:
+            wt._TUNED.pop(key, None)
+        else:
+            wt._TUNED[key] = before
+
+
+def test_execution_choice_has_no_percentage_cutoff_and_rejects_noise():
+    # A repeatable 1% win is a win; no arbitrary 5% policy may erase it.
+    stable = {
+        "stored": [1.0] * 9,
+        "candidate": [0.99] * 9,
+    }
+    assert wt._paired_faster(stable, "candidate", "stored")
+    assert wt._measured_choice(stable, ("stored", "candidate")) == "candidate"
+
+    # A larger median that alternates direction is not stable evidence.  The lower-memory
+    # first candidate remains selected until the local measurements prove a benefit.
+    noisy = {
+        "stored": [1.0] * 9,
+        "candidate": [0.8, 1.2, 0.8, 1.2, 0.8, 1.2, 0.8, 1.2, 0.8],
+    }
+    assert not wt._paired_faster(noisy, "candidate", "stored")
+    assert wt._measured_choice(noisy, ("stored", "candidate")) == "stored"
 
 
 def test_autogptq_zero_offset_is_part_of_the_materialized_shader():

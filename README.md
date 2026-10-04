@@ -67,7 +67,9 @@ what makes **tool calling** work on small models — `tools=[...]`, and the call
 of whatever delimiters the model's own template uses, with `require_known_tools=True` making
 an invented tool name unrepresentable rather than merely unlikely.
 
-**A generic ONNX runtime.** Any `.onnx`, a pure-Python parser and ~50 ops, no dependencies.
+**A generic ONNX runtime.** Registered ONNX graphs, a pure-Python parser and ~50 ops, no
+dependencies; quantized integer matmul and convolution keep INT8/UINT8 inputs with INT32
+accumulation instead of silently widening the stored tensors to floating point.
 
 **Task pipelines, an open registry.** `pipeline("text-generation" | "text-to-speech" |
 "object-detection" | "image-to-text" | …)`. The built-in names are *pre-registered* loaders;

@@ -20,19 +20,52 @@ class WebGLPlatform:
         self._latest_comm_buf = buffer
         return gl.setCommBuf(buffer)
 
+    def releaseCommBuf(self):
+        self._latest_comm_buf = None
+        return gl.releaseCommBuf()
+
     def setData(self, buffer_id: int, js_ctor_type: str, size: int):
-        if not gl.setData(buffer_id, js_ctor_type, size):
+        status = gl.setData(buffer_id, js_ctor_type, size)
+        if status == -1:
+            raise RuntimeError("WebGL upload failed; release and reload the model")
+        if not status:
             # WASM buffer may reallocated
             self.setCommBuf(self._latest_comm_buf)
-            if not gl.setData(buffer_id, js_ctor_type, size):
+            status = gl.setData(buffer_id, js_ctor_type, size)
+            if status == -1:
+                raise RuntimeError("WebGL upload failed; release and reload the model")
+            if not status:
                 raise ValueError("setData failed twice")
 
+    def setDataFromArray(self, buffer_id: int, array: np.ndarray,
+                         js_ctor_type: str, byte_length: int):
+        """Upload an exact, contiguous NumPy array without a Python staging copy."""
+        status = gl.setDataFromArray(buffer_id, array, js_ctor_type, byte_length)
+        if status < 0:
+            raise RuntimeError("WebGL direct upload failed; release and reload the model")
+
     def getData(self, buffer_id: int, js_ctor_type: str, size: int):
-        if not gl.getData(buffer_id, js_ctor_type, size):
+        status = gl.getData(buffer_id, js_ctor_type, size)
+        if status == -1:
+            raise RuntimeError("WebGL readback failed; release and reload the model")
+        if not status:
             # WASM buffer may reallocated
             self.setCommBuf(self._latest_comm_buf)
-            if not gl.getData(buffer_id, js_ctor_type, size):
+            status = gl.getData(buffer_id, js_ctor_type, size)
+            if status == -1:
+                raise RuntimeError("WebGL readback failed; release and reload the model")
+            if not status:
                 raise ValueError("getData failed twice")
+
+    def sampleLogits(self, buffer_id: int, size: int, options: dict) -> int:
+        """Select a token in JS from a GPU readback; Python handles only IDs/options."""
+        return int(gl.sampleLogits(buffer_id, size, options))
+
+    def routeHost(self, logits_id: int, index_id: int, weight_id: int,
+                  rows: int, experts: int, k: int, renormalize: bool):
+        """Route a GPU logits buffer entirely in JS; Python passes buffer handles."""
+        return gl.routeHost(logits_id, index_id, weight_id,
+                            rows, experts, k, renormalize)
 
     def addKernel(self, name, descriptor):
         return gl.addKernel(name, descriptor)
@@ -42,8 +75,9 @@ class WebGLPlatform:
 
     def beginCapture(self, name):
         from wgpy_backends.webgl.webgl_buffer import begin_capture_pin
-        begin_capture_pin()
-        return gl.beginCapture(name)
+        result = gl.beginCapture(name)
+        begin_capture_pin(name)
+        return result
 
     def endCapture(self):
         from wgpy_backends.webgl.webgl_buffer import end_capture_pin

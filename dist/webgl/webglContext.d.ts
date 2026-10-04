@@ -84,7 +84,7 @@ export declare class WebGLTensorBuffer {
     bindToDrawTexture(layer?: number): void;
     unbindFromDrawTexture(): void;
     getDataRawFloat32(): Float32Array;
-    getDataRaw(): {
+    getDataRaw(target?: ArrayBufferView): {
         type: 'Float32Array';
         buffer: Float32Array;
     } | {
@@ -108,6 +108,7 @@ export interface WebGLKernelInputBuffer {
 export type WebGLKernelInput = WebGLKernelInputBuffer;
 export declare class NNWebGLContext {
     gl: WebGL2RenderingContext;
+    private contextLost;
     maxTextureSize: number;
     fb: WebGLFramebuffer;
     supportsTexture32bit: boolean;
@@ -115,8 +116,15 @@ export declare class NNWebGLContext {
     canReadRedTexture: boolean;
     canReadNon32bitTexture: boolean;
     private programs;
+    private compileCount;
+    private compileMs;
+    private pendingUploadBytes;
+    private uploadFlushCount;
     private vshader;
+    private vertexBuffer;
     constructor();
+    assertAlive(): void;
+    submittedUpload(bytes: number): void;
     createArrayBuffer(vertexArray: Float32Array): WebGLBuffer;
     bindArrayBuffer(buffer: WebGLBuffer): void;
     createTexture(textureShape: TensorTextureShape): WebGLTexture;
@@ -126,6 +134,8 @@ export declare class NNWebGLContext {
     compileKernel(sourceCode: string, name?: string): WebGLProgram;
     runKernel(name: string, inputs: WebGLKernelInput[], output: WebGLTensorBuffer, uniforms: WebGLUniformItem[], drawLayer?: number | null): void;
     private runKernelSingleDrawLayer;
+    dispose(): void;
 }
 export declare function initializeNNWebGLContext(): Promise<void>;
 export declare function getNNWebGLContext(): NNWebGLContext;
+export declare function disposeNNWebGLContext(): void;

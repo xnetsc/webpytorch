@@ -2,6 +2,11 @@ import { WgpyBackend } from './backend';
 import { GLKernelRunDescriptor } from './webgl/webglComputeContext';
 import { TensorTextureShape } from './webgl/webglContext';
 import { GPUKernelRunDescriptor } from './webgpu/webgpuComputeContext';
+import { commandQueue } from './commandQueue';
+import { sharedUploader } from './sharedUpload';
+import { sampleLogits, SamplingOptions } from './sampleLogits';
+import { routeTopKInto } from './routeTopK';
+import { sharedReadbackArena } from './sharedReadback';
 
 export interface WgpyInitWorkerResult {
   backend: WgpyBackend;
@@ -19,11 +24,29 @@ function postToMain(obj: any, transfer: Transferable[] = []) {
   postMessage({ namespace: 'wgpy', ...obj }, transfer);
 }
 
+// Opt-in, worker-local diagnosis of the complete token-selection boundary. A Python
+// caller may set `js.self.__wgpyProfileSample = true` and read the aggregate JSON;
+// ordinary inference pays only the final branch and never moves logits to Python.
+function recordSampleProfile(backend: string, bytes: number,
+                             readMs: number, prepareMs: number, sampleMs: number) {
+  const root = globalThis as any;
+  if (!root.__wgpyProfileSample) return;
+  const all = root.__wgpySampleProfile || (root.__wgpySampleProfile = {});
+  const row = all[backend] || (all[backend] = {
+    count: 0, bytes: 0, readMs: 0, prepareMs: 0, sampleMs: 0,
+  });
+  row.count++;
+  row.bytes += bytes;
+  row.readMs += readMs;
+  row.prepareMs += prepareMs;
+  row.sampleMs += sampleMs;
+}
+
 function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
-  let sharedBufferSent = false;
-  let notifyBuffer: SharedArrayBuffer | undefined = undefined;
-  let notifyBufferView: Int32Array | undefined = undefined;
-  let placeholderBuffer: SharedArrayBuffer | undefined = undefined;
+  const commands = commandQueue('gl', postToMain);
+  const uploader = sharedUploader('gl', postToMain);
+  let samplerCounts = new Map<number, number>();
+  const readback = sharedReadbackArena();
   let commBuf: any = undefined;
   let commBufUint8Array: Uint8Array | undefined = undefined;
   (globalThis as any).gl = {
@@ -34,14 +57,14 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
       return glDeviceInfo;
     },
     createBuffer: (id: number, textureShape: TensorTextureShape) => {
-      postToMain({
+      commands.enqueue({
         method: 'gl.createBuffer',
         id,
         textureShape: dictToObj(textureShape),
       });
     },
     disposeBuffer: (id: number) => {
-      postToMain({ method: 'gl.disposeBuffer', id });
+      commands.enqueue({ method: 'gl.disposeBuffer', id });
     },
     setCommBuf: (data: any) => {
       if (commBuf) {
@@ -51,6 +74,11 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
       // data.destroy() takes relatively long time, so use the same buffer for every setData / getData.
       data.destroy();
       commBufUint8Array = commBuf.data;
+    },
+    releaseCommBuf: () => {
+      if (commBuf) commBuf.release();
+      commBuf = undefined;
+      commBufUint8Array = undefined;
     },
     setData: (id: number, ctorType: string, size: number) => {
       const ctor = {
@@ -74,14 +102,26 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
       } catch (e) {
         return false;
       }
-      const transferData = new ctor(size);
-      transferData.set(dataSrc);
-      postToMain({ method: 'gl.setData', id, data: transferData }, [
-        transferData.buffer,
-      ]);
-      return true;
+      commands.flush();
+      return uploader.upload(id, new Uint8Array(dataSrc.buffer,
+        dataSrc.byteOffset, dataSrc.byteLength), ctorType);
     },
-    getData: (id: number, ctorType: string, size: number) => {
+    setDataFromArray: (id: number, data: any, ctorType: string, byteLength: number) => {
+      let view: any;
+      try {
+        view = data.getBuffer();
+        if (view.data.byteLength !== byteLength) {
+          throw new Error('WebGL direct upload size mismatch');
+        }
+        commands.flush();
+        return uploader.upload(id, new Uint8Array(view.data.buffer,
+          view.data.byteOffset, byteLength), ctorType);
+      } finally {
+        if (view) view.release();
+        data.destroy();
+      }
+    },
+    getData: (id: number, ctorType: string, size: number, copyToWasm = true) => {
       const ctor = {
         Float32Array: Float32Array,
         Int32Array: Int32Array,
@@ -91,82 +131,105 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
       if (!ctor) {
         throw new Error('ctorType unknown ' + ctorType);
       }
-      let dataSrc: Float32Array | Int32Array | Uint16Array | Uint8Array;
-      try {
-        // same as setData
-        dataSrc = new ctor(
-          commBufUint8Array!.buffer,
-          commBufUint8Array!.byteOffset,
-          size
-        );
-      } catch (e) {
-        return false;
+      let dataSrc: Float32Array | Int32Array | Uint16Array | Uint8Array | undefined;
+      if (copyToWasm) {
+        try {
+          dataSrc = new ctor(commBufUint8Array!.buffer,
+            commBufUint8Array!.byteOffset, size);
+        } catch (e) {
+          return false;
+        }
       }
-      if (!notifyBuffer) {
-        notifyBuffer = new SharedArrayBuffer(4);
-        notifyBufferView = new Int32Array(notifyBuffer);
-        notifyBufferView[0] = 0;
-      }
-      if (!placeholderBuffer) {
-        placeholderBuffer = new SharedArrayBuffer(16 * 1024 * 1024 * 4);
-      }
-
-      if (size * ctor.BYTES_PER_ELEMENT > placeholderBuffer.byteLength) {
-        throw new Error(
-          `buffer size insufficient: ${size * ctor.BYTES_PER_ELEMENT
-          } bytes required`
-        );
-      }
-      notifyBufferView![0] = 0;
-      if (sharedBufferSent) {
-        postToMain({ method: 'gl.getData', id, ctorType });
-      } else {
-        postToMain({
-          method: 'gl.getData',
-          id,
-          data: placeholderBuffer,
-          notify: notifyBuffer,
-          ctorType,
-        });
-        sharedBufferSent = true;
-      }
+      const { memory, status, binding } = readback.begin(size * ctor.BYTES_PER_ELEMENT);
+      commands.flush();
+      postToMain({ method: 'gl.getData', id, ctorType, ...binding });
       // if buffer[0] = 1 is written before Atomics.wait, it does not wait.
-      Atomics.wait(notifyBufferView!, 0, 0);
+      Atomics.wait(status, 0, 0);
 
-      const placeholderData = new ctor(placeholderBuffer, 0, size);
-      dataSrc.set(placeholderData);
-      return true;
+      if (Atomics.load(status, 0) < 0) {
+        return -1;
+      }
+
+      const placeholderData = new ctor(memory, 0, size);
+      if (copyToWasm) {
+        dataSrc!.set(placeholderData);
+        return true;
+      }
+      return placeholderData;
+    },
+    sampleLogits: (id: number, size: number, options: SamplingOptions) => {
+      const started = performance.now();
+      const data = (globalThis as any).gl.getData(id, 'Float32Array', size, false);
+      if (data === -1) throw new Error('WebGL logit readback failed; release and reload the model');
+      if (!(data instanceof Float32Array)) throw new Error('WebGL logit readback is not float32');
+      const readDone = performance.now();
+      const opts = dictToObj(options) as SamplingOptions;
+      if (Array.isArray(opts.seen)) {
+        samplerCounts = new Map<number, number>();
+        for (const seen of opts.seen) {
+          if (Number.isInteger(seen) && seen >= 0 && seen < data.length)
+            samplerCounts.set(seen, (samplerCounts.get(seen) || 0) + 1);
+        }
+      }
+      opts.seenCounts = samplerCounts;
+      const prepared = performance.now();
+      const token = sampleLogits(data, opts);
+      const sampled = performance.now();
+      samplerCounts.set(token, (samplerCounts.get(token) || 0) + 1);
+      recordSampleProfile('webgl', size * Float32Array.BYTES_PER_ELEMENT,
+        readDone - started, prepared - readDone, sampled - prepared);
+      return token;
+    },
+    routeHost: (logitsId: number, indexId: number, weightId: number,
+                rows: number, experts: number, k: number, renormalize: boolean) => {
+      const data = (globalThis as any).gl.getData(logitsId, 'Float32Array', rows * experts, false);
+      if (!(data instanceof Float32Array)) throw new Error('WebGL MoE router readback failed');
+      const count = rows * k;
+      const halfBytes = count * 4;
+      const staging = uploader.prepare(halfBytes * 2);
+      try {
+        const indices = new Int32Array(staging.buffer, staging.byteOffset, count);
+        const weights = new Float32Array(staging.buffer, staging.byteOffset + halfBytes, count);
+        routeTopKInto(data, rows, experts, k, renormalize, indices, weights);
+        commands.flush();
+        if (uploader.uploadPrepared(indexId, 0, halfBytes, 'Int32Array') < 0 ||
+            uploader.uploadPrepared(weightId, halfBytes, halfBytes, 'Float32Array') < 0) {
+          throw new Error('WebGL MoE router upload failed');
+        }
+      } finally {
+        uploader.releasePrepared();
+      }
     },
     addKernel: (name: string, descriptor: { source: string }) => {
-      postToMain({
+      commands.enqueue({
         method: 'gl.addKernel',
         name,
         descriptor: dictToObj(descriptor),
       });
     },
     runKernel: (descriptor: GLKernelRunDescriptor) => {
-      postToMain({ method: 'gl.runKernel', descriptor: dictToObj(descriptor) });
+      commands.enqueue({ method: 'gl.runKernel', descriptor: dictToObj(descriptor) });
     },
     beginCapture: (name: string) => {
-      postToMain({ method: 'gl.beginCapture', name });
+      commands.enqueue({ method: 'gl.beginCapture', name });
     },
     endCapture: () => {
-      postToMain({ method: 'gl.endCapture' });
+      commands.enqueue({ method: 'gl.endCapture' });
     },
     replay: (name: string) => {
-      postToMain({ method: 'gl.replay', name });
+      commands.enqueue({ method: 'gl.replay', name });
     },
     resetCaptures: () => {
-      postToMain({ method: 'gl.resetCaptures' });
+      commands.enqueue({ method: 'gl.resetCaptures' });
     },
   };
 }
 
 function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
-  let sharedBufferSent = false;
-  let notifyBuffer: SharedArrayBuffer | undefined = undefined;
-  let notifyBufferView: Int32Array | undefined = undefined;
-  let placeholderBuffer: SharedArrayBuffer | undefined = undefined;
+  const commands = commandQueue('gpu', postToMain);
+  const uploader = sharedUploader('gpu', postToMain);
+  let samplerCounts = new Map<number, number>();
+  const readback = sharedReadbackArena();
   let commBuf: any = undefined;
   let commBufUint8Array: Uint8Array | undefined = undefined;
   (globalThis as any).gpu = {
@@ -180,7 +243,7 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
       id: number,
       byteLength: number,
     ) => {
-      postToMain({
+      commands.enqueue({
         method: 'gpu.createBuffer',
         id,
         byteLength,
@@ -189,23 +252,25 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     createMetaBuffer: (
       id: number,
       byteLength: number,
+      data: any,
     ) => {
-      const dataSrc = new Uint8Array(
-        commBufUint8Array!.buffer,
-        commBufUint8Array!.byteOffset,
-        byteLength
-      );
-      const transferData = new Uint8Array(byteLength);
-      transferData.set(dataSrc);
-      postToMain({
-        method: 'gpu.createMetaBuffer',
-        id,
-        byteLength,
-        data: transferData
-      }, [transferData.buffer]);
+      let view: any;
+      try {
+        view = data.getBuffer();
+        if (view.data.byteLength !== byteLength) {
+          throw new Error('WebGPU meta-buffer size mismatch');
+        }
+        commands.flush();
+        const result = uploader.upload(id, new Uint8Array(view.data.buffer,
+          view.data.byteOffset, byteLength), undefined, 'sharedMetaBuffer');
+        if (result < 0) throw new Error('WebGPU meta-buffer upload failed');
+      } finally {
+        if (view) view.release();
+        data.destroy();
+      }
     },
     disposeBuffer: (id: number) => {
-      postToMain({ method: 'gpu.disposeBuffer', id });
+      commands.enqueue({ method: 'gpu.disposeBuffer', id });
     },
     setCommBuf: (data: any) => {
       if (commBuf) {
@@ -215,6 +280,11 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
       // data.destroy() takes relatively long time, so use the same buffer for every setData / getData.
       data.destroy();
       commBufUint8Array = commBuf.data;
+    },
+    releaseCommBuf: () => {
+      if (commBuf) commBuf.release();
+      commBuf = undefined;
+      commBufUint8Array = undefined;
     },
     setData: (id: number, byteLength: number) => {
       // When wasm buffer is reallocated, commBufUint8Array is detached.
@@ -229,87 +299,144 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
       } catch (e) {
         return false;
       }
-      const transferData = new Uint8Array(byteLength);
-      transferData.set(dataSrc);
-      postToMain({ method: 'gpu.setData', id, data: transferData }, [
-        transferData.buffer,
-      ]);
-      return true;
+      commands.flush();
+      // 1 is success, 0 is the detached-WASM-buffer retry above and -1 is a
+      // GPU upload failure.  The shared arena is never overwritten before ack.
+      return uploader.upload(id, dataSrc);
     },
-    getData: (id: number, byteLength: number) => {
-      let dataSrc: Uint8Array;
+    setDataFromArray: (id: number, data: any, byteLength: number) => {
+      let view: any;
       try {
-        // same as setData
-        dataSrc = new Uint8Array(
-          commBufUint8Array!.buffer,
-          commBufUint8Array!.byteOffset,
-          byteLength
-        );
-      } catch (e) {
-        return false;
+        view = data.getBuffer();
+        if (view.data.byteLength !== byteLength) {
+          throw new Error('WebGPU direct upload size mismatch');
+        }
+        commands.flush();
+        return uploader.upload(id, new Uint8Array(view.data.buffer,
+          view.data.byteOffset, byteLength));
+      } finally {
+        if (view) view.release();
+        data.destroy();
       }
-      if (!notifyBuffer) {
-        notifyBuffer = new SharedArrayBuffer(4);
-        notifyBufferView = new Int32Array(notifyBuffer);
-        notifyBufferView[0] = 0;
+    },
+    getData: (id: number, byteLength: number, copyToWasm = true) => {
+      let dataSrc: Uint8Array | undefined;
+      if (copyToWasm) {
+        try {
+          dataSrc = new Uint8Array(commBufUint8Array!.buffer,
+            commBufUint8Array!.byteOffset, byteLength);
+        } catch (e) {
+          return false;
+        }
       }
-      if (!placeholderBuffer) {
-        placeholderBuffer = new SharedArrayBuffer(16 * 1024 * 1024 * 4);
-      }
-
-      if (byteLength > placeholderBuffer.byteLength) {
-        throw new Error(
-          `buffer size insufficient: ${byteLength
-          } bytes required`
-        );
-      }
-      notifyBufferView![0] = 0;
-      if (sharedBufferSent) {
-        postToMain({ method: 'gpu.getData', id });
-      } else {
-        postToMain({
-          method: 'gpu.getData',
-          id,
-          data: placeholderBuffer,
-          notify: notifyBuffer,
-        });
-        sharedBufferSent = true;
-      }
+      const { memory, status, binding } = readback.begin(byteLength);
+      commands.flush();
+      postToMain({ method: 'gpu.getData', id, ...binding });
 
       // if buffer[0] = 1 is written before Atomics.wait, it does not wait.
-      Atomics.wait(notifyBufferView!, 0, 0);
+      Atomics.wait(status, 0, 0);
 
-      const placeholderData = new Uint8Array(placeholderBuffer, 0, byteLength);
-      dataSrc.set(placeholderData);
-      return true;
+      if (Atomics.load(status, 0) < 0) {
+        return -1;
+      }
+
+      const placeholderData = new Uint8Array(memory, 0, byteLength);
+      if (copyToWasm) {
+        dataSrc!.set(placeholderData);
+        return true;
+      }
+      return placeholderData;
+    },
+    sampleLogits: (id: number, byteLength: number, count: number, options: SamplingOptions) => {
+      const started = performance.now();
+      const opts = dictToObj(options) as SamplingOptions;
+      if (opts.execution === 'gpu' && opts.doSample && (opts.topP ?? 1) >= 1
+          && (opts.topK ?? 0) <= 0 && (opts.minP ?? 0) <= 0
+          && (opts.repetitionPenalty ?? 1) === 1
+          && !(opts.presencePenalty || opts.frequencyPenalty || opts.blockEos)
+          && (opts.temperature ?? 1) > 0) {
+        const { memory, status, binding } = readback.begin(4);
+        commands.flush();
+        postToMain({ method: 'gpu.sampleLogitsDevice', id, count,
+          temperature: opts.temperature ?? 1, random: opts.random ?? 0, ...binding });
+        Atomics.wait(status, 0, 0);
+        if (Atomics.load(status, 0) < 0)
+          throw new Error('WebGPU device sampling failed; release and reload the model');
+        const token = new DataView(memory).getInt32(0, true);
+        if (token < 0 || token >= count)
+          throw new Error('WebGPU device sampler selected an invalid token');
+        samplerCounts.set(token, (samplerCounts.get(token) || 0) + 1);
+        recordSampleProfile('webgpu', 4, performance.now() - started, 0, 0);
+        return token;
+      }
+      const data = (globalThis as any).gpu.getData(id, byteLength, false);
+      if (data === -1) throw new Error('WebGPU logit readback failed; release and reload the model');
+      if (!(data instanceof Uint8Array)) throw new Error('WebGPU logit readback is not bytes');
+      const readDone = performance.now();
+      if (Array.isArray(opts.seen)) {
+        samplerCounts = new Map<number, number>();
+        for (const seen of opts.seen) {
+          if (Number.isInteger(seen) && seen >= 0 && seen < count)
+            samplerCounts.set(seen, (samplerCounts.get(seen) || 0) + 1);
+        }
+      }
+      opts.seenCounts = samplerCounts;
+      const prepared = performance.now();
+      const token = sampleLogits(new Float32Array(data.buffer, data.byteOffset, count), opts);
+      const sampled = performance.now();
+      samplerCounts.set(token, (samplerCounts.get(token) || 0) + 1);
+      recordSampleProfile('webgpu', byteLength,
+        readDone - started, prepared - readDone, sampled - prepared);
+      return token;
+    },
+    routeHost: (logitsId: number, logitsBytes: number, indexId: number, weightId: number,
+                rows: number, experts: number, k: number, renormalize: boolean) => {
+      const data = (globalThis as any).gpu.getData(logitsId, logitsBytes, false);
+      if (!(data instanceof Uint8Array)) throw new Error('WebGPU MoE router readback failed');
+      const count = rows * k;
+      const halfBytes = count * 4;
+      const staging = uploader.prepare(halfBytes * 2);
+      try {
+        const indices = new Int32Array(staging.buffer, staging.byteOffset, count);
+        const weights = new Float32Array(staging.buffer, staging.byteOffset + halfBytes, count);
+        routeTopKInto(new Float32Array(data.buffer, data.byteOffset,
+          rows * experts), rows, experts, k, renormalize, indices, weights);
+        commands.flush();
+        if (uploader.uploadPrepared(indexId, 0, halfBytes) < 0 ||
+            uploader.uploadPrepared(weightId, halfBytes, halfBytes) < 0) {
+          throw new Error('WebGPU MoE router upload failed');
+        }
+      } finally {
+        uploader.releasePrepared();
+      }
     },
     addKernel: (
       name: string,
       descriptor: { source: string; bindingTypes: GPUBufferBindingType[] }
     ) => {
-      postToMain({
+      commands.enqueue({
         method: 'gpu.addKernel',
         name,
         descriptor: dictToObj(descriptor),
       });
     },
     runKernel: (descriptor: GPUKernelRunDescriptor) => {
-      postToMain({
+      commands.enqueue({
         method: 'gpu.runKernel',
         descriptor: dictToObj(descriptor),
       });
     },
     beginCapture: (name: string) => {
-      postToMain({ method: 'gpu.beginCapture', name });
+      commands.enqueue({ method: 'gpu.beginCapture', name });
     },
     endCapture: () => {
-      postToMain({ method: 'gpu.endCapture' });
+      commands.enqueue({ method: 'gpu.endCapture' });
     },
     replay: (name: string) => {
-      postToMain({ method: 'gpu.replay', name });
+      commands.enqueue({ method: 'gpu.replay', name });
     },
     resetCaptures: () => {
-      postToMain({ method: 'gpu.resetCaptures' });
+      commands.enqueue({ method: 'gpu.resetCaptures' });
     },
   };
 }

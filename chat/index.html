@@ -131,6 +131,9 @@
 <dialog id="settingsDlg">
   <div class="dlg-head"><h2>Settings</h2><button id="closeSettings">✕</button></div>
 
+  <!-- A single-file local model remains a disk-backed File/Blob and is read in slices by
+       the worker. It is never turned into an HTTP URL or copied into the model cache. -->
+
   <nav class="tabs" id="tabs">
     <button data-tab="model" class="on">Model</button>
     <button data-tab="gen">Generation</button>
@@ -149,6 +152,9 @@
       <p class="note">The list comes from this repository's <code>models.json</code>.
         “custom” accepts another hub repository. “on this device” reads a file or folder
         from disk — nothing is copied or cached.</p>
+      <label class="field"><span>GGUF on this device</span>
+        <input id="localModelInput" type="file" accept=".gguf,application/octet-stream" />
+      </label>
       <div class="row btns">
         <button id="loadBtn" class="primary">Load model</button>
         <button id="releaseBtn">Release</button>
@@ -345,8 +351,8 @@
 </dialog>
 
 <script src="pyodide-version.js"></script>
-<script src="../dist/wgpy-main.js?v=7215ccd69e"></script>
-<script src="../webtorch/js/webtorch-main.js?v=16ea2f9a33"></script>
+<script src="../dist/wgpy-main.js?v=16c9ea97d3"></script>
+<script src="../webtorch/js/webtorch-main.js?v=9ef7514292"></script>
 <script src="../webtorch/js/decision-vision.js"></script>
 <!-- The SDK needs the document cross-origin isolated or the model runs on the CPU. On a
      static host that means a service worker, and a client has only one, so it is the SDK's.
@@ -364,6 +370,6 @@ webtorch.installServiceWorker({
 });
 </script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=16eecc573d"></script>
+<script src="app.js?v=76dfea11a1"></script>
 </body>
 </html>

@@ -31,6 +31,21 @@ export interface ComputeContextGLMessageSetData {
     id: number;
     data: Float32Array;
 }
+export interface ComputeContextGLMessageUploadMemory {
+    method: 'gl.uploadMemory';
+    memory: SharedArrayBuffer;
+    notify: SharedArrayBuffer;
+}
+export interface ComputeContextGLMessageSharedUpload {
+    method: 'gl.sharedUpload';
+    id: number;
+    byteOffset?: number;
+    byteLength: number;
+    ctorType: string;
+}
+export interface ComputeContextGLMessageReleaseUploadMemory {
+    method: 'gl.releaseUploadMemory';
+}
 export interface ComputeContextGLMessageGetData {
     method: 'gl.getData';
     id: number;
@@ -63,13 +78,23 @@ export interface ComputeContextGLMessageReplay {
 export interface ComputeContextGLMessageResetCaptures {
     method: 'gl.resetCaptures';
 }
-export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures;
+export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageUploadMemory | ComputeContextGLMessageSharedUpload | ComputeContextGLMessageReleaseUploadMemory | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures;
 export declare class ComputeContextGL {
     tensorBuffers: Map<number, WebGLTensorBuffer>;
+    commandError: unknown;
+    private resourceStats;
+    private textureBytes;
+    private heldTextureBytes;
+    private peakTextureBytes;
     private capturing;
     private captures;
+    private capturePins;
     private pinned;
     init(): Promise<void>;
+    setResourceStats(memory: SharedArrayBuffer | null): void;
+    private writeResourceStats;
+    private textureStorageBytes;
+    dispose(): void;
     getDeviceInfo(): {
         maxTextureSize: number;
         supportsTexture32bit: boolean;
@@ -85,11 +110,14 @@ export declare class ComputeContextGL {
     replay(name: string): void;
     setData(id: number, data: ArrayBufferView): void;
     getData(id: number): Promise<Uint16Array>;
+    getDataInto(id: number, target: SharedArrayBuffer, ctorType: string): void;
     addKernel(name: string, descriptor: {
         source: string;
     }): void;
     runKernel(descriptor: GLKernelRunDescriptor): void;
     mdata: SharedArrayBuffer | null;
     mnotify: Int32Array | null;
+    uploadMemory: SharedArrayBuffer | null;
+    uploadNotify: Int32Array | null;
     handleMessage(message: ComputeContextGLMessage, worker: Worker): void;
 }

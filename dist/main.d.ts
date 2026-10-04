@@ -4,5 +4,6 @@ export interface WgpyInitOptions {
 }
 export interface WgpyInitResult {
     backend: WgpyBackend;
+    dispose: () => void;
 }
 export declare function initMain(worker: Worker, options: WgpyInitOptions): Promise<WgpyInitResult>;

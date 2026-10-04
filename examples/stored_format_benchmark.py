@@ -16,9 +16,9 @@ from webtorch import core as wt
 
 
 M_VALUES = (1, 2, 8, 32, 128)
-ROUNDS = 5
+ROUNDS = 9
 # Two repetitions keep the largest materialized candidates from retaining several expanded
-# copies in the pool while five interleaved rounds still provide a stable median.
+# copies in the pool while nine interleaved rounds provide paired stability evidence.
 REPEATS = 2
 K = 1024
 N = 512
@@ -54,9 +54,18 @@ def compare(stored, alternative):
     sm = statistics.median(samples["stored"])
     am = statistics.median(samples["alternative"])
     ratio = am / sm
-    verdict = "stored_faster" if ratio > 1.05 else ("stored_slower" if ratio < 0.95 else "neutral")
+    if wt._paired_faster(samples, "stored", "alternative"):
+        verdict = "stored_faster"
+    elif wt._paired_faster(samples, "alternative", "stored"):
+        verdict = "stored_slower"
+    else:
+        verdict = "inconclusive_keep_stored"
+    evidence = wt._paired_evidence(samples, "alternative", "stored")
     return {"stored_ms": round(sm, 4), "alternative_ms": round(am, 4),
-            "stored_speedup": round(ratio, 3), "verdict": verdict}
+            "stored_speedup": round(ratio, 3), "verdict": verdict,
+            "alternative_paired_wins": evidence["wins"],
+            "paired_rounds": evidence["pairs"],
+            "one_sided_p": round(evidence["p"], 6)}
 
 
 def ggml_results():
@@ -105,7 +114,9 @@ def gptq_results():
     for bits in (4, 8):
         dense = wt.Linear(K, N)
         encoded = wt.QuantizedLinear.from_linear(dense, group_size=128, bits=bits)
-        row = {"format": "GPTQ_INT%d" % bits, "alternative": "materialized_f32", "shapes": []}
+        row = {"format": "GPTQ_INT%d" % bits,
+               "production_candidates": ["stored", "dp4a", "materialized_f32"],
+               "alternative": "materialized_f32", "shapes": []}
         for m in M_VALUES:
             x = wt.Tensor(rng.standard_normal((m, K)).astype(np.float32))
             # Correctness before speed for this non-GGUF storage path as well.

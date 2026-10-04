@@ -50,7 +50,10 @@ def blob(path):
 
 
 def sdk_hash(length):
-    fixed = ['webtorch/js/webtorch-main.js', 'webtorch/js/webtorch-host.js',
+    fixed = ['dist/wgpy-main.js', 'dist/wgpy-worker.js',
+             'dist/wgpy_webgpu-1.0.0-py3-none-any.whl',
+             'dist/wgpy_webgl-1.0.0-py3-none-any.whl',
+             'webtorch/js/webtorch-main.js', 'webtorch/js/webtorch-host.js',
              'webtorch/js/webtorch-worker.js', 'webtorch/modules.json']
     p = subprocess.run(['git', 'ls-files', '--cached', '--', 'webtorch'],
                        stdout=subprocess.PIPE, check=True, text=True)

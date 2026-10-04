@@ -44,6 +44,7 @@ webtorch.onError(function (e) {
 
 function afterRelease() {
   modelLoaded = false; modelImage = false;
+  loadedFromDisk = false;
   modelSurface = null;
   const imageRow = $('#dImageRow');
   if (imageRow) imageRow.hidden = true;
@@ -91,8 +92,9 @@ const SDK_VERSION = (() => {
 
 // `?backend=webgl` (or `webgpu`, or `cpu`) pins the order, for reproducing a report on the
 // backend the reporter actually had. Without it, the best available wins.
+const BACKEND_WANT = new URLSearchParams(location.search).get('backend');
 const BACKEND_ORDER = (() => {
-  const want = new URLSearchParams(location.search).get('backend');
+  const want = BACKEND_WANT;
   if (want === 'webgl') return ['webgl'];
   if (want === 'webgpu') return ['webgpu'];
   if (want === 'cpu') return [];
@@ -105,7 +107,8 @@ const BACKEND_ORDER = (() => {
 // backends to try, which Pyodide release, where model files come from, whether they are
 // cached at all, and whether anything about this device is kept between visits.
 let wt = null;
-const sdk = webtorch.start({
+let sdk;
+function startSdk() { return webtorch.start({
   baseURL: '../',
   backendOrder: BACKEND_ORDER,
   pyodideIndexURL: PYODIDE_URL,
@@ -126,7 +129,8 @@ const sdk = webtorch.start({
             + 'webtorch.set_io_write(webtorch.default_io_write)\n');
   showBackend(w.backend, w.reason);
   return w;
-});
+}); }
+sdk = startSdk();
 // Conversations live in IndexedDB so the sidebar survives a reload.
 // Each: {id, title, updated,
 //        messages:[{role, content, attachments:[{kind,name,text,dataUrl}], meta}]}
@@ -159,6 +163,7 @@ let convs = [];
 let curId = null;
 let attachments = [];
 let modelLoaded = false;
+let loadedFromDisk = false;
 let visionDecision = null;
 let visionLoadAbort = null;
 // Does the loaded model see images? Decides whether camera / image attachments are offered —
@@ -388,13 +393,20 @@ function onLoadProgress(m) { if (m.total) { expected = m.total; expectedIsReal =
 }
 
 function onLoadStage(m) {
-    if (m.stage === 'reading' || !stageLog.length && m.after === null) stageLog = [];
     // The byte meter has stopped and the load has not. Say which of the remaining steps is
     // running, in the words of what it is FOR rather than the function's name: someone
     // watching a 13 GB model wants to know it is still working, not which method is on the
     // stack.
     const say = {
       warming:  'measuring kernel shapes for this model',
+      'warm-state': 'preparing decode state',
+      'warm-oracle': 'checking exact decode reference',
+      'warm-record': 'recording exact decode reference',
+      'warm-replay': 'checking sequential decode reference',
+      'warm-search': 'comparing correct decode routes',
+      'warm-step': 'warming one decode step',
+      'warm-greedy': 'settling token selection',
+      tuning:   'checking and timing complete decode paths',
       checking: 'checking the weights against the file',
       proving:  'running one forward pass to prove it works',
       ready:    '',
@@ -403,7 +415,12 @@ function onLoadStage(m) {
     // being remembered as "it hung somewhere".
     if (m.after && m.elapsed >= 1) stageLog.push(m.after + ' ' + m.elapsed.toFixed(1) + 's');
     if (say) {
-      const n = m.total ? ' (' + m.done + '/' + m.total + ')' : '';
+      // A malformed producer must not turn the status into impossible progress (9/6).
+      // Counts are shown as a fraction only when they are the same unit and internally
+      // consistent; otherwise retain the useful completed count without inventing a ratio.
+      const n = m.total && m.done <= m.total
+        ? ' (' + m.done + '/' + m.total + ')'
+        : (m.done ? ' (' + m.done + ' completed)' : '');
       const past = stageLog.length ? '  [' + stageLog.join(' · ') + ']' : '';
       $('#progressText').textContent = say + n + ' …' + past;
       // An indeterminate stage: the bar stops pretending to measure and just moves, which
@@ -422,6 +439,7 @@ function afterLoad(m) {
     if (stageLog.length) console.log('load stages: ' + stageLog.join(' · '));
     probeTools();            // asked once per model, before any reply needs the answer
     modelLoaded = true; modelImage = !!imageOK;
+    loadedFromDisk = localModelIds.has(m.id);
     applySurface(m.surface || null);
     // Done is done: leaving the last mid-load fraction on screen reads as a load that
     // stalled just short of the end.
@@ -469,7 +487,7 @@ function onToken(m) {
     }
     if (live && live.ans.isConnected) {
       const el = $('#messages');
-      const follow = atBottom(el);          // asked before the reply grows under us
+      const follow = atBottom(el);
       fillBody(streaming.body, reply, streaming.live);
       keepAtBottom(el, follow);
     }
@@ -486,7 +504,9 @@ function showBackend(name, why) {
     $('#envInfo').textContent = envSummary() + (name === 'cpu'
       ? ' — GPU backend unavailable, running on CPU (expect minutes per reply)'
       : name === 'webgl'
-      ? ' — compute: WebGL (no WebGPU here; about ' + WEBGL_SLOWDOWN + ' slower)'
+      ? ' — compute: WebGL (' + (BACKEND_WANT === 'webgl'
+          ? 'selected for this session' : 'WebGPU unavailable')
+        + '; see live load, first-token and decode timings)'
       : ' — compute: ' + name);
     if (name === 'webgl') warnWebglFallback(why || null);
     // Only for no GPU at all. WebGL is a GPU backend -- slower than WebGPU, but a dialog
@@ -514,9 +534,15 @@ const CPU_MAX_GB = 2;
 //   Qwen3-30B-A3B MoE       34.8 -> 5.1          6.8x
 //   Qwen3.8-27B hybrid       6.8 -> 0.76         8.9x   (i-quant, 48 of 64 layers recurrent)
 //
-// Stated inline rather than as a dialog: WebGL works and answers correctly, it is only
-// slower, and the dialog is reserved for the case where the model will not run at all.
-const WEBGL_SLOWDOWN = '5-9x';
+// These were settled decode measurements, not a universal backend ratio. In particular,
+// cold WebGL steps can be far slower than the settled rate; the current run's own load,
+// first-token and token timings must be shown rather than concealed behind one multiplier.
+function webglBackendCause(requested, webgpuAvailable) {
+  if (requested === 'webgl') return 'WebGL was explicitly selected for this session. ';
+  return webgpuAvailable
+    ? 'WebGPU is present but did not start, so the models run on WebGL. '
+    : 'This browser has no WebGPU, so the models run on WebGL. ';
+}
 // WebGL is a working backend, so this is not the CPU dialog's problem -- but the gap is
 // large enough that a user who does not know which backend they got will read it as the
 // model being slow rather than the browser lacking WebGPU. Same shape as the CPU dialog,
@@ -531,13 +557,12 @@ function warnWebglFallback(sdkWhy) {
   // Which of the two it is, rather than assuming the first: WebGPU can be present and still
   // fail to start (the same distinction the CPU dialog makes), and telling someone their
   // browser has no WebGPU when the environment line above says it does is simply wrong.
-  p1.textContent = (ENV.webgpu
-      ? 'WebGPU is present but did not start, so the models run on WebGL. '
-      : 'This browser has no WebGPU, so the models run on WebGL. ')
-    + 'Replies are correct \u2014 every quantization format is checked against the reference '
-    + 'decoder on this backend too \u2014 but they arrive about ' + WEBGL_SLOWDOWN + ' slower.';
+  p1.textContent = webglBackendCause(BACKEND_WANT, ENV.webgpu)
+    + 'WebGL uses equivalent model APIs, but its load, first-token and settled decode '
+    + 'times must each be checked on this device. There is no universal speed ratio.';
   const p2 = document.createElement('p');
-  p2.innerHTML = 'Measured here, same prompt and same warm-up: '
+  p2.innerHTML = 'Earlier settled-decode measurements here, same prompt and warm-up '
+    + '(not cold-load or first-token guarantees): '
     + '<strong>Qwen3-0.6B</strong> 19.8 tok/s against 108.0 on WebGPU; '
     + '<strong>Qwen 3B</strong> 5.3 against 35.7; '
     + '<strong>Qwen3-30B-A3B</strong> (MoE) 5.1 against 34.8; '
@@ -550,10 +575,12 @@ function warnWebglFallback(sdkWhy) {
     + 'which costs more than reading the weights does.'
     + (ENV.webgpu ? '' : ' For WebGPU: Chrome or Edge 113+, or Safari 18+; Firefox does not '
                        + 'enable it by default yet.')
-    + (sdkWhy ? ' The runtime reports: ' + sdkWhy + '.' : '');
+    + (BACKEND_WANT !== 'webgl' && sdkWhy
+        ? ' The runtime reports: ' + sdkWhy + '.' : '');
   const diag = {
     backend: 'webgl',
-    reason: sdkWhy || null,
+    requestedBackend: BACKEND_WANT || null,
+    reason: BACKEND_WANT === 'webgl' ? null : (sdkWhy || null),
     navigatorGPU: !!navigator.gpu,
     webgpuAdapter: ENV.webgpu ? (ENV.gpuName || 'yes') : false,
     crossOriginIsolated: !!window.crossOriginIsolated,
@@ -829,32 +856,31 @@ function renderAnswers(answers) {
     const calibratedHere = calibratedGroups.includes(a.type)
       || calibratedGroups.includes(a.type + ':' + size);
 
-    if (a.choice !== undefined) {
+    if (a.score !== undefined) {
+      // An ordered answer is still a distribution over the declared levels.  Its
+      // prediction is the maximum-probability level, just like training/evaluation;
+      // the expectation is useful extra location information but must not replace the
+      // predicted class (rounding it used to produce a headline that contradicted the
+      // largest bar directly below it).
+      const legend = a.legend || {};
+      const peak = top && (legend[top[0]] || top[0]);
+      const near = Math.round(a.score);
+      const balance = legend[String(near)] || ('level ' + near);
+      verdict.textContent = peak || balance;
+      const summary = peak !== balance
+        ? 'This is the single most likely level at ' + Math.round(top[1] * 100)
+          + '%. The probability-weighted balance falls at “' + balance + '”.'
+        : 'This is both the most likely level and where the probability-weighted balance falls.';
+      says.textContent = summary + (calibratedHere
+        ? ' Its probability scale was fitted on held-out examples.'
+        : ' Percentages below are model scores, not measured success rates.');
+    } else if (a.choice !== undefined) {
       verdict.textContent = a.choice;
       const pct = Math.round((top ? top[1] : 0) * 100);
       says.textContent = calibratedHere
         ? 'It picked this one at ' + pct + '% after calibration on held-out examples.'
         : 'It assigned this option ' + pct + '%. That is a model score, not a measured '
           + pct + '% success rate.';
-    } else if (a.score !== undefined) {
-      // The score is an expected level, so it usually sits BETWEEN two of the levels that
-      // were written. Naming the nearest one answers the question; saying which way it
-      // leans keeps the number from being thrown away.
-      const legend = a.legend || {};
-      const near = Math.round(a.score);
-      verdict.textContent = legend[String(near)] || ('level ' + near);
-      // On an ordered scale the balance of the odds and the single most likely level are
-      // different things, and they often land on different rungs: here the weight sat on
-      // "soon" while the balance came out at "normal". Shown side by side without a word
-      // they read as a contradiction, so the sentence names both.
-      const peak = top && (legend[top[0]] || top[0]);
-      const summary = (peak && peak !== verdict.textContent)
-        ? 'That is where the balance of the odds falls. The single most likely one is “'
-          + peak + '” at ' + Math.round(top[1] * 100) + '%.'
-        : 'That is both the most likely level and where the balance falls.';
-      says.textContent = summary + (calibratedHere
-        ? ' Its probability scale was fitted on held-out examples.'
-        : ' Percentages below are model scores, not measured success rates.');
     } else {
       const p = a.noul != null ? a.noul : 0;
       verdict.textContent = calibratedHere ? likelihood(p) : (p >= 0.5 ? 'Leaning yes' : 'Leaning no');
@@ -978,8 +1004,9 @@ function warnCpuFallback(name, sdkWhy) {
 //
 // The thresholds are per model size because tokens per second means nothing without it: a
 // 0.6B and a 30B that both answer at 5 tok/s are one broken machine and one normal one.
-// Deliberately well under what the same models actually reach here (0.6B at 149, a 30B MoE
-// at 39), so this fires on something being wrong rather than on a slow afternoon.
+// These are WebGPU-only diagnostic floors, deliberately well under what the same models
+// actually reach here (0.6B at 149, a 30B MoE at 39). WebGL has a different execution path
+// and no size-only floor justified by these numbers; it has its own backend warning above.
 const SLOW_LIMITS = [
   { maxGB: 1, floor: 40, label: 'under 1 GB' },
   { maxGB: 10, floor: 10, label: '1-10 GB' },
@@ -1000,6 +1027,15 @@ function modelSizeGB() {
 let slowState = null;
 function checkSlow(stats) {
   if (!stats || stats.tok_s == null) return;             // too short to have measured
+  if (ENV.backend !== 'webgpu') {
+    // A normal WebGL 0.6B run is around 19 tok/s on the device whose WebGPU run is
+    // around 140. Claiming it must reach the WebGPU 40 tok/s floor is a false alert.
+    // CPU and WebGL already have backend-specific explanations. Do not infer a
+    // universal cross-backend ratio or a model-name exception from one benchmark.
+    slowState = null;
+    paintSlowNote();
+    return;
+  }
   const gb = modelSizeGB();
   if (!gb) return;
   const lim = SLOW_LIMITS.find(l => gb <= l.maxGB);
@@ -1308,6 +1344,7 @@ let envReady = false;
 function syncButtons() {
   const boot = !envReady;
   $('#loadBtn').disabled = boot || modelLoaded;
+  $('#localModelInput').disabled = boot || modelLoaded;
   $('#releaseBtn').disabled = boot || !modelLoaded;
   $('#loadBtn').title = boot ? 'Waiting for the compute backend…'
     : modelLoaded ? 'Release the current model first' : '';
@@ -1455,7 +1492,7 @@ function fillPresets() {
   // it lives in the same dropdown: a single .gguf file, or a whole model folder (GGUF
   // file(s), or an HF-format dir: config.json + *.safetensors, incl. GPTQ).
   [['local-file', 'Load a GGUF file from this device…'],
-   ['local-dir',  'Load a model folder from this device (GGUF or HF safetensors)…'],
+   ['local-dir',  'Load a model folder from this device (extract a ZIP first)…'],
   ].forEach(([value, label]) => {
     const o = document.createElement('option');
     o.value = value; o.textContent = label;
@@ -1690,6 +1727,32 @@ async function decisionSource(preset) {
   return { spec, selected };
 }
 
+// IDs registered from File/FileSystem handles belong to the worker's local-file reader.
+// They must never be parsed as hub coordinates or sent through source probing.
+const localModelIds = new Set();
+
+// A failed load can leave a partly populated Pyodide heap and GPU allocations even when no
+// model was published as ready. There is no Release button in that state, so replace the
+// entire runtime before allowing another attempt. Closing also handles a lost WebGL context.
+async function restartRuntimeAfterFailedLoad(wasLocal) {
+  let cleanupError = null;
+  if (visionDecision) {
+    try { visionDecision.release(); } catch (e) { cleanupError = e; }
+    visionDecision = null;
+  }
+  try { wt?.close(); } catch (e) { cleanupError ||= e; }
+  wt = null;
+  envReady = false;
+  if (wasLocal) {
+    localModelIds.clear();
+    $('#modelId').value = '';  // its File handle belonged to the closed worker
+  }
+  sdk = startSdk();
+  afterRelease();
+  try { await sdk; } catch (e) { return { cleanupError, restartError: e }; }
+  return { cleanupError, restartError: null };
+}
+
 $('#loadBtn').onclick = async () => {
   if (loading) {
     // Say so at once. The flag is set immediately now, but the load still has to reach its
@@ -1708,8 +1771,13 @@ $('#loadBtn').onclick = async () => {
   loading = true;
   $('#loadBtn').disabled = false;
   $('#loadBtn').textContent = 'Stop loading';
-  $('#loadBtn').title = 'Stop this load — what is already loaded stays cached';
+  $('#loadBtn').title = localModelIds.has(id)
+    ? 'Stop this load — the original file stays on this device'
+    : 'Stop this load — what is already loaded stays cached';
   setBar(0); expected = 0; expectedIsReal = false; lastLoadedBytes = 0;
+  // A local File load may begin at a decode/warm stage without ever emitting "reading".
+  // Reset per attempt here, otherwise the next load reports prior models' timings.
+  stageLog = [];
   const chosen = PRESETS[$('#preset').value];
   if (chosen && chosen.gb) expected = chosen.gb * 1e9;   // a label, not a byte count
   // Checked BEFORE the download, not after it. Without a GPU the weights go into the WASM
@@ -1747,26 +1815,48 @@ $('#loadBtn').onclick = async () => {
       showStatus('ready: ' + visionDecision.model + ' on ' + visionDecision.backend);
     } else {
       const runner = await sdk;
-      const spec = remoteModelSpec(id, chosen);
-      const source = await installApplicationReader(runner, spec);
-      showStatus('loading from ' + source.label + '…');
-      const loadTarget = spec.repo
-        ? (spec.file ? spec.repo + '/' + spec.file : spec.repo)
-        : 'registry/direct-' + PRESETS.indexOf(chosen) + '/' + spec.probe;
-      await runner.load(loadTarget, { file: '', maxContext: lmaxValue(),
-                                    onProgress: onLoadProgress, onStage: onLoadStage });
+      if (localModelIds.has(id)) {
+        showStatus('loading straight from this device…');
+        // cache.import registered the File in webio; install the SDK reader so load() can
+        // reach that registry. default_io checks local files before every URL path, so this
+        // branch performs no source probing and emits no model HTTP request.
+        await runner.run('import webtorch\nwebtorch.use_default_io()\n');
+        await runner.load(id, { file: '', maxContext: lmaxValue(),
+                                onProgress: onLoadProgress, onStage: onLoadStage });
+      } else {
+        const spec = remoteModelSpec(id, chosen);
+        const source = await installApplicationReader(runner, spec);
+        showStatus('loading from ' + source.label + '…');
+        const loadTarget = spec.repo
+          ? (spec.file ? spec.repo + '/' + spec.file : spec.repo)
+          : 'registry/direct-' + PRESETS.indexOf(chosen) + '/' + spec.probe;
+        await runner.load(loadTarget, { file: '', maxContext: lmaxValue(),
+                                      onProgress: onLoadProgress, onStage: onLoadStage });
+      }
     }
-    note('Model ready. Large models take a while on first load; afterwards they come from the cache.');
+    note(loadedFromDisk
+      ? 'Model ready. It was read from the selected file on this device; no cache copy was made.'
+      : 'Model ready. Downloaded model files stay in the browser cache for later loads.');
   }
   catch (e) {
+    const wasLocal = localModelIds.has(id);
+    const recovery = await restartRuntimeAfterFailedLoad(wasLocal);
     // The SDK raises one distinctive message for a stop the person asked for; that is a
     // normal ending, not a failure — say so, and put the meter back where it started.
     if (/load cancelled/.test(e.message)) {
       $('#modelStatus').textContent = 'load stopped';
-      note('Load stopped. What was already loaded stays cached, so the next load resumes.');
+      note(wasLocal
+        ? 'Load stopped. The original local file is unchanged; select it again to retry.'
+        : 'Load stopped. Downloaded files already cached can be reused on the next load.');
       setBar(0); expected = 0; $('#progressText').textContent = '';
     } else {
       $('#modelStatus').textContent = 'load failed: ' + e.message; note(e.message);
+    }
+    if (recovery.cleanupError) console.warn('failed-load cleanup:', recovery.cleanupError);
+    if (recovery.restartError) {
+      showStatus('compute runtime restart failed: ' + recovery.restartError.message);
+      note('The previous load ended, but the runtime did not restart: '
+        + recovery.restartError.message);
     }
   }
   finally {
@@ -1775,14 +1865,35 @@ $('#loadBtn').onclick = async () => {
   }
 };
 $('#releaseBtn').onclick = async () => {
+  const wasLocal = loadedFromDisk;
   if (visionDecision) {
     visionDecision.release(); visionDecision = null; afterRelease();
   } else {
-    await (await sdk).release();
+    const runner = await sdk;
+    let releaseError = null;
+    try { await runner.release(); } catch (e) { releaseError = e; }
+    // The Python model is gone, but WASM memory cannot shrink and a WebGPU/WebGL
+    // device may retain physical allocations after its buffer ledger reaches zero.
+    // Close both halves of this runtime and create a fresh one before another load.
+    try { runner.close(); } catch (e) { releaseError ||= e; }
+    afterRelease();
+    wt = null;
+    envReady = false;
+    if (wasLocal) {
+      localModelIds.clear();
+      $('#modelId').value = '';  // a closed worker no longer owns that File handle
+    }
+    syncButtons();
+    sdk = startSdk();
+    try { await sdk; }
+    catch (e) { showStatus('compute runtime restart failed'); note(String(e)); }
+    if (releaseError) note('The old runtime was closed after a release error: ' + releaseError);
   }
   setBar(0);
   $('#progressText').textContent = ''; syncButtons();
-  note('Model released. Its files stay cached, so loading it again is fast.');
+  note(wasLocal
+    ? 'Model released. The original file remains on this device; select it again to load.'
+    : 'Model released. Downloaded files remain cached for later loads.');
 };
 
 // ---- cache ----
@@ -1976,7 +2087,9 @@ async function offerDirectory(key) {
 //   * a folder is registered under its own name, every file as "<dir>/<file>", so the
 //     folder itself IS the model id and same-named files in different folders stay apart.
 async function localFileId(handle) {
-  const file = await handle.getFile();
+  // A standard file input already returns the readable File. A FileSystem handle resolves
+  // to the same object. Supporting both keeps this direct-disk path independent of HTTP.
+  const file = handle.getFile ? await handle.getFile() : handle;
   const head = await file.slice(0, 1 << 20).arrayBuffer();
   const sized = new Uint8Array(head.byteLength + 8);
   new DataView(sized.buffer).setBigUint64(0, BigInt(file.size));
@@ -1999,15 +2112,35 @@ async function localFileId(handle) {
 
 // Runs one of the "from this device" dropdown entries: open the picker, register the model
 // under its identity, start the load. The dropdown restores its previous pick on cancel.
-async function localPick(which, onCancel) {
+let localPickWaiting = false;
+async function localPick(which, onCancel, selectedFile = null) {
   const dir = which === 'local-dir';
   try {
-    const handle = dir
-      ? await window.showDirectoryPicker({ mode: 'read' })
-      : (await window.showOpenFilePicker({
-          multiple: false,
-          types: [{ description: 'GGUF model', accept: { 'application/octet-stream': ['.gguf'] } }],
-        }))[0];
+    let handle;
+    if (dir) {
+      handle = await window.showDirectoryPicker({ mode: 'read' });
+    } else {
+      // Blob slices stay backed by the chosen disk file. Passing this File to the worker
+      // does not upload, fetch, cache, or assemble a second copy of the model.
+      const input = $('#localModelInput');
+      if (selectedFile) handle = selectedFile;
+      else {
+        input.value = '';
+        localPickWaiting = true;
+        try {
+          handle = await new Promise((resolve, reject) => {
+            input.onchange = () => resolve(input.files && input.files[0]);
+            input.addEventListener('cancel', () => reject(new DOMException('cancelled', 'AbortError')),
+                                   { once: true });
+            input.click();
+          });
+        } finally {
+          localPickWaiting = false;
+          input.onchange = null;
+        }
+      }
+      if (!handle) throw new DOMException('cancelled', 'AbortError');
+    }
     const name = dir ? handle.name : await localFileId(handle);
     const names = await (await sdk).cache.import(handle, name);
     if (!names.length) {
@@ -2022,6 +2155,7 @@ async function localPick(which, onCancel) {
       id = names.some(n => n.endsWith('/config.json') || n === 'config.json')
          ? handle.name : (gguf || names[0]);
     }
+    localModelIds.add(id);
     note('Reading ' + names.length + ' file' + (names.length > 1 ? 's' : '')
          + ' straight from disk' + (dir ? ' (folder ' + handle.name + ')' : '')
          + ' — no download, no cache copy.');
@@ -2033,8 +2167,17 @@ async function localPick(which, onCancel) {
   } catch (e) {
     if (e.name !== 'AbortError') note('Import failed: ' + e.message);
     onCancel();
+  } finally {
+    $('#localModelInput').value = '';
   }
 }
+
+// A visible native file input remains usable when the dropdown's synthetic click is not
+// available (keyboard accessibility and some embedded-browser file chooser adapters).
+$('#localModelInput').addEventListener('change', event => {
+  if (!localPickWaiting && event.target.files && event.target.files[0])
+    localPick('local-file', () => {}, event.target.files[0]);
+});
 
 
 
@@ -2509,17 +2652,18 @@ function messageNode(m, live) {
   // shows live counts while streaming); user messages and failed replies have none
   if (m.role === 'assistant' && m.stats && m.stats.tok_s != null) {
     const f = document.createElement('div'); f.className = 'tokrate';
-    // The split, when there is one: a reply slow because the device is busy and one slow
-    // because the host is between steps read the same from outside and are different
-    // problems. Only shown when a token cost enough to be worth explaining.
+    // These are decode-loop timing scopes, not hardware-versus-host attribution. In the
+    // WebGPU sampled replay, `pick_ms` includes GPU sampling and readback completion;
+    // calling it "host" incorrectly points a slow GPU wait at Python or the page.
     let extra = '';
-    // Shown whenever both are known, at any speed. The threshold that used to hide this
-    // below 20 ms had it backwards: the faster the model, the larger the share the host
-    // takes, and hiding the split exactly there is hiding it where it decides the answer.
+    // Shown whenever both are known, at any speed. The historical stats keys remain
+    // stable for saved conversations and SDK consumers, but the UI names the measured
+    // scopes without claiming an unavailable CPU/GPU split.
     const g = m.stats.gpu_ms, k = m.stats.pick_ms;
     if (g != null && k != null) {
       const dp = (g + k) < 20 ? 2 : 0;      // a 6 ms step is not "6 ms + 2 ms"
-      extra = '  ·  GPU ' + Number(g).toFixed(dp) + ' ms + host ' + Number(k).toFixed(dp) + ' ms';
+      extra = '  ·  step ' + Number(g).toFixed(dp) + ' ms + pick/readback '
+            + Number(k).toFixed(dp) + ' ms';
       // The mean alone cannot say whether a reply was slow throughout, slow until it warmed
       // up, or slowing as it went, and those want different answers. When the cost actually
       // moved across the reply, show it moving: one figure per tenth, in order. Shown only
@@ -2549,7 +2693,12 @@ function messageNode(m, live) {
       // a prompt that was all new from one that re-used its prefix and computed a handful.
       if (m.stats.prefilled != null) {
         extra += ' (' + m.stats.prefilled + ' rows'
-               + (m.stats.prefill_d ? ', ' + m.stats.prefill_d + 'd' : '') + ')';
+               + (m.stats.prefill_d ? ', ' + m.stats.prefill_d + 'd' : '')
+               + (m.stats.prefill_route === 'decode_replay' ? ', decode replay' : '') + ')';
+      }
+      if (m.stats.prefill_tune_s >= 0.1) {
+        extra += '  ·  tuning ' + Number(m.stats.prefill_tune_s).toFixed(1)
+               + ' s/' + m.stats.prefill_tune_calls + ' shapes';
       }
     }
     if (m.stats.path && m.stats.path !== 'replay') extra += '  ·  ' + m.stats.path;
@@ -2637,10 +2786,10 @@ function openLightbox(src, name) {
 // short and concrete: a long style guide costs context on every turn and models follow the
 // specific instructions better than the general ones.
 const UI_SYSTEM = [
-  'Format every reply as Markdown.',
-  'Put code in fenced blocks with a language tag (```python).',
-  'Write mathematics as LaTeX: $inline$ and $$display$$.',
-  'Use tables, lists and headings where they make the answer clearer.',
+  'Follow the user’s requested output format exactly.',
+  'When plain text is requested, do not add Markdown, code fences, tables or explanations.',
+  'Otherwise use Markdown, fence actual code with a language tag, and write math as LaTeX.',
+  'Use tables, lists and headings only where they make the answer clearer.',
   // A tool result is already on screen, in a panel beside the reply. Small models imitate
   // their context and start the next round by re-typing the result they were just handed;
   // this costs the reader nothing to ignore but costs the model a good share of its reply.
@@ -3134,6 +3283,17 @@ function renderMarkdown(text) {
 // The counter and the thinking pane are not throttled with it: those are textContent writes,
 // and they are what makes the reply feel live.
 const STREAM_RENDER_MS = 60;
+const FAST_STREAM_RENDER_MS = 200;
+function streamRenderInterval() {
+  // A fast stream can emit several tokens within one frame. Re-parsing Markdown
+  // for every 60 ms update slowed the complete chat path on the measured device,
+  // while 200 ms retained live output and improved throughput. Slow streams keep
+  // the original cadence; the choice follows measured token gaps, not a model name.
+  if (res.steps.length < 8) return STREAM_RENDER_MS;
+  let total = 0;
+  for (let i = res.steps.length - 8; i < res.steps.length; i++) total += res.steps[i];
+  return total < 8 * 12 ? FAST_STREAM_RENDER_MS : STREAM_RENDER_MS;
+}
 const liveRender = { t: 0, timer: 0, el: null, text: '' };
 function flushLiveRender() {
   if (liveRender.timer) { clearTimeout(liveRender.timer); liveRender.timer = 0; }
@@ -3175,8 +3335,9 @@ function setRenderedStream(el, text) {
 function setRenderedLive(el, text) {
   liveRender.el = el; liveRender.text = text;
   const due = performance.now() - liveRender.t;
-  if (due >= STREAM_RENDER_MS) { flushLiveRender(); return; }
-  if (!liveRender.timer) liveRender.timer = setTimeout(flushLiveRender, STREAM_RENDER_MS - due);
+  const interval = streamRenderInterval();
+  if (due >= interval) { flushLiveRender(); return; }
+  if (!liveRender.timer) liveRender.timer = setTimeout(flushLiveRender, interval - due);
 }
 function resetLiveRender() {
   if (liveRender.timer) { clearTimeout(liveRender.timer); liveRender.timer = 0; }
@@ -3523,6 +3684,10 @@ function stopDots(live) {
   clearInterval(live.dotsTimer); live.dots.remove(); live.dots = null;
 }
 function note(t) { $('#hintbar').textContent = t || ''; }
+function clearStopNote() {
+  const hint = $('#hintbar');
+  if (hint.textContent === 'Stopping…') hint.textContent = '';
+}
 function promptFor(m) {
   let p = '';
   (m.attachments || []).forEach(a => {
@@ -3650,7 +3815,7 @@ async function runTurn(conv, msg, existing) {
         // template disagreeing with the probe. Drop them and answer -- a turn lost to a
         // tool definition is worse than a turn without tools -- and stop offering them to
         // this model rather than failing the same way on every message after it.
-        if (!withTools) throw err;
+        if (!withTools || lostGpuRuntime(err)) throw err;
         modelTakesTools = false;
         delete opts.tools;
         console.warn('webtorch: this model rejected tool definitions, continuing without:',
@@ -3720,15 +3885,27 @@ async function runTurn(conv, msg, existing) {
     // A stop is not a failure. What it leaves behind is the answer as far as it got, which
     // is the thing the person asked to keep -- putting an "Error:" line under it says the
     // opposite of what happened.
-    if (!webtorch.isCancelled(err)) {
+    if (lostGpuRuntime(err)) {
+      // A lost GPU may have supplied zero-filled readbacks before it was
+      // detected. None of the partial answer is a verified model result.
+      reply.content = 'Error: the GPU context was lost. This partial answer was '
+        + 'discarded because its values cannot be trusted. The model has been '
+        + 'released; select the local file again to retry.';
+      try { await $('#releaseBtn').onclick(); }
+      catch (releaseErr) { note('Could not fully release the lost GPU runtime: ' + releaseErr); }
+    } else if (!webtorch.isCancelled(err)) {
       reply.content = (reply.content ? reply.content + '\n\n' : '') + 'Error: ' + err.message;
     } else if (!reply.content.trim()) {
       reply.content = '(stopped before the reply began)';
     }
-  } finally { stopDots(live); resetLiveRender(); }
+  } finally {
+    stopDots(live);
+    resetLiveRender();
+  }
   resEndRun();          // the gap to the next reply is not a decode step
   streaming = null;
   syncButtons();                                      // Stop becomes Send again
+  clearStopNote();                                    // finished, not still stopping
   conv.updated = Date.now();
   // A run that produced nothing is not written. When this is answering a question
   // AGAIN, what is on disk is still the previous answer -- and that is the one worth
@@ -3889,6 +4066,9 @@ async function runToolCall(c) {
 // do; this is the record of what actually ran and what came back, which is the part the
 // model could otherwise report inaccurately.
 function _stopRequested() { return streaming === null; }
+function lostGpuRuntime(err) {
+  return /WebGL context lost|WebGPU device lost/.test(String((err && err.message) || err));
+}
 
 function toolTrace(calls, results) {
   return calls.map((c, i) => {
@@ -4636,7 +4816,10 @@ function resRead() {
   // unconditionally is how a reply's peak stayed on screen after the memory behind it had
   // been handed back.
   const live = wt && wt.resources();
-  if (live && live.at >= (res.statsAt || 0)) {
+  // WebGL's texture ledger is written by main-thread JS, so it is authoritative even
+  // after a later worker stats poll that knows only the Python/WASM side. WebGPU's worker
+  // ledger retains the timestamp comparison because its live array may stop updating.
+  if (live && (wt.backend === 'webgl' || live.at >= (res.statsAt || 0))) {
     res.stats = { gpuBytes: live.gpuBytes, gpuPeak: live.gpuPeak,
                   gpuBuffers: live.gpuBuffers,
                   wasmBytes: live.wasmBytes || (res.stats && res.stats.wasmBytes) || null };
@@ -4986,8 +5169,9 @@ $('#dRun').onclick = async () => {
     renderAnswers(res.answers);
     const usage = res.usage || {};
     const cache = usage.vision_cache_hits ? ' · image features reused' : '';
+    const head = usage.head_execution ? ' · head ' + usage.head_execution.replaceAll('_', ' ') : '';
     $('#dTiming').textContent = Math.round(performance.now() - t0) + ' ms · '
-      + (usage.input_tokens || 0) + ' tokens read' + cache;
+      + (usage.input_tokens || 0) + ' tokens read' + head + cache;
   } catch (e) {
     $('#dTiming').textContent = '';
     note('Error: ' + (e && e.message ? e.message : e));

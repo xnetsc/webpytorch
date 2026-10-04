@@ -1,17 +1,1428 @@
 # Progress
 
+## 2026-10-04 ▸ serial WebGL 0.6B and 30B browser check (open)
+
+- Following the user's provisional acceptance of current WebGPU performance,
+  selected only the local Qwen3-0.6B Q4_K_M GGUF on explicit WebGL. With
+  reasoning and autonomous Python tools off, the actual chat page copied
+  lines 1–40 correctly in 110 tokens at 18.2 tok/s and 2.4 s first token.
+  A WebGL layer trace measured 42.065 ms for an unsplit synthetic step; its
+  split stage sums are diagnostic, not additive production time. The explicit
+  correctness-gated full-decoder calibration selected the existing `auto` / full
+  path (41.9225 ms diagnostic median); a second correct page reply ran at
+  18.4 tok/s. No positive route or source change was claimed. The lower
+  same-format WebGL SwiGLU route was already tuned to fused on this device.
+- Released 0.6B and observed GPU buffers 0 KB / WASM 42 MB before choosing the
+  sole local Qwen3-30B-A3B-Instruct Q3_K_XL GGUF through the native file input;
+  no model bytes crossed HTTP and no two models were resident. The 13.83 GB
+  load reached ready, but `warming` took 4.0 s and `proving` took 16.1 s,
+  violating the 10 s load-stage requirement. Declared WebGL textures were
+  12.73 GB after load, peak 13.33 GB, and WASM 1.40 GB.
+- On the complete-answer 1–40 prompt, the first visible token appeared only
+  after roughly 20 s; 13 generated tokens had reached about 0.3 tok/s with
+  the product reporting tight paging and severe frame delay (up to 1951 ms).
+  This was not a completed accuracy or settled-throughput sample. To avoid
+  prolonging severe memory pressure, generation was stopped and the 30B was
+  released. Verified afterward: GPU buffers 0 KB, WASM 42 MB. Prior evidence
+  of ~9 GB swap activity in a serial 30B layer sweep makes cross-layer weight
+  residency/paging the leading diagnosis, not a proved sole mechanism.
+- WebGL 0.6B throughput optimisation, 30B <=10 s load and seconds-level first
+  token, broad format/API parity, decision-model work and final acceptance
+  remain open. No source optimisation or final commit occurred in this check.
+
+## 2026-10-04 ▸ restore and validate historical 0.6B path (in progress)
+
+- User clarified the acceptance meaning: ordinary throughput should return to the
+  historical 140+ tok/s regime, with occasional falls no lower than about 135;
+  a 135 tok/s median with frequent 120s is not acceptance. Prior recorded evidence
+  has direct SDK 139–141 tok/s and visible chat 136.41–137.54 tok/s on the same
+  local Qwen3-0.6B GGUF. Do not relabel direct SDK measurements as page speed.
+- The current ordinary WebGPU page, one local model, 231 context / 110 generated
+  tokens, initially returned the correct 1–40 sequence at 119.64–130.27 tok/s
+  over eight runs. A lower-level `down=balanced` win did not transfer by itself
+  to the full API. `o=balanced` plus `down=balanced`, fused add/RMS and compact
+  fused QKV preserved the full answer and had a 135.28 tok/s median over twelve
+  page runs, but lower results remained well below the user's condition. It is
+  not accepted as a substitute for the historical state.
+- The historically recorded full fusion (add/RMS, QKV, QK norm/RoPE, KV write,
+  compact head, stored Q4_K and GPU sampling) was restored as a runtime trial;
+  on the prior loaded build its twelve correct page runs were 101.7–135.82
+  tok/s. On the newest locally reloaded build, explicit fused QKV physical
+  shapes reached ~139.7 tok/s in some complete SDK replies but the visible
+  page did not reproduce ordinary 140+. The old machine profile had been
+  overwritten by a later `decode_plan_v3` entry; only the newer cache remains.
+- Added a generic, correctness-gated upper-level projection-shape composition
+  stage plus explicit historical fused combinations to the offline candidate
+  tournament; no model name or category selects a route. Existing eight-field
+  profiles still load; a ninth field carries independently addressable `o` and
+  `down` shapes. Invalid saved shapes are rejected. 170 Python and 79 JS tests
+  pass. Stamped browser SDK `9ef7514292` was released/reloaded from the same
+  disk GGUF; GPU buffers were 0 KB and WASM 42 MB before load. A one-model
+  explicit offline complete-API tune was started (result below). No network model download,
+  WebGL/decision completion claim, final commit, or clean-worktree claim.
+- The explicit offline tune finished after 332.4 s and chose the older
+  composed/auto/separate plan (10.66 ms diagnostic median). Three actual page
+  replies on that plan were correct at 109.16/124.30/124.21 tok/s, so this
+  tuner result was not accepted as the user's historical-performance baseline.
+  The recorded full-fusion plan was installed in the current device-local
+  `decode_plan_v3` profile and verified by releasing the only model, reaching
+  0 KB GPU / 42 MB WASM, reloading the same disk GGUF, and checking
+  `profile_reused=True` with all six recorded upper-layer route fields.
+  Twelve post-reload page replies were exact 1–40 but only 115.01–133.53
+  tok/s. This proves route persistence on the same build, **not** recovery
+  of the 140+ product speed or safe reuse after a source-stamp change.
+- An independent empty-history page at `127.0.0.1` initially measured about
+  60 tok/s, but it was **not a controlled comparison**: that origin defaulted
+  to reasoning and autonomous Python tools on, while the original page had
+  both off. The tool constraint forced JS rather than GPU sampling and changed
+  output semantics. Those rates and wrong-format replies must not be used to
+  attribute the slowdown to chat history. The browser turn interruption then
+  closed the temporary tabs; no model remains loaded. The next check must
+  align both toggles and the same source/device profile before comparing.
+- The controlled follow-up copied the *same-build, same-device* kernel profile
+  into a separate local browser origin with only 13 test chats, then selected
+  the same GGUF via the native disk chooser. Both pages had reasoning and
+  Python tools off, `full/gpu` sampling, 231 context and 110 generated tokens;
+  the fresh page confirmed `profile_reused=True`. Its 24 exact 1–40 chat
+  replies ranged 126.88–138.90 tok/s, roughly 135 median, whereas the prior
+  729-chat page had ranged 115.01–133.53. This is evidence that page state
+  matters, but origin and prior runtime activity also changed, so it is not
+  proof that the chat count alone is causal. Eight fixed-seed complete SDK
+  replies on the clean page were exact at 137.09–143.39 tok/s (median 141.83);
+  the *SDK* historical 140+ regime is reproduced, while the *chat product*
+  acceptance remains open. Unseeded direct calls likewise reached 141–145
+  with two lower outliers. Paired page/direct runs varied, so no deterministic
+  UI tax is claimed. Temporary per-token callback timing was only 10.22 ms
+  over 440 tokens; live rendering was 9.68 ms over four replies. Neither alone
+  accounts for the whole page/direct gap. Both wrappers were restored.
+- A regression now round-trips a compatible complete fusion plan through
+  `kernel_profile()` / `use_kernel_profile()` and verifies that reload restores
+  all six upper routes, original-width Q4 execution, compact head and GPU
+  sampler identity. Full local checks: 172 Python, 79 JavaScript, and clean
+  `git diff --check`. A source-stamp change still invalidates device profiles
+  by design, and the current browser-only profile is not a universal default.
+- The measured same-build/device profile is now checked in as
+  `profiles/webgpu_apple_metal3_2026-10-04.json`, including its exact route,
+  source fingerprint, build stamp and separate SDK/page outcome labels. A
+  regression imports the artifact and checks the route and GPU sampler; it
+  does not add a runtime model-name branch or claim portability to other
+  devices/builds. The sole locally selected model remains ready in the in-app
+  WebGPU page, whose latest visible 110-token answer is correct at 136.9 tok/s.
+  Current scoped checks: 173 Python, 79 JavaScript, `git diff --check` clean.
+  This is historical-path preservation, **not** a claim that normal chat-page
+  throughput has reached stable 140+, nor that the other project gates passed.
+- Six additional same-page 231-context/110-token replies confirmed
+  `profile_reused=True`, stored Q4_K execution, fused upper path and full GPU
+  sampling. All six were exact; actual page rates were 128.41, 136.55, 139.08,
+  136.98, 134.71 and 136.02 tok/s. A preserved route therefore did not remove
+  the occasional sub-135 dip. Do not mark the 0.6B product gate complete.
+
+## 2026-10-04 ▸ same-instance sampler submission experiment (rejected)
+
+- On the sole native-file Qwen3-0.6B Q4_K_M in the in-app WebGPU browser,
+  five additional 231-context/110-token product replies were correct but
+  104.92–128.55 tok/s, below stable 140+.
+- Fixed the decode-plan status when returning from an unprofiled greedy call
+  to the already measured sampled route. Its stale `mode_profile_missing`
+  marker is now cleared; a browser check showed active `full/gpu` and no
+  missing marker. Regression added; 168 scoped Python tests passed.
+- Prototyped queuing the sampler's 16-byte metadata before submitting the
+  pending decoder graph so the decoder and sampler could share one submit.
+  Eight interleaved real-page pairs preserved the 1–40 output but favored
+  that candidate only 3/8 times. Eight fixed-seed full-SDK pairs preserved
+  identical complete text and favored the incumbent two-submit path 8/8.
+  The candidate source and test were removed; fewer submissions was not a
+  positive upper-API optimization on this device. No fixed percentage cutoff
+  was used. The final `380ffcae77` SDK stamp was loaded from the same native
+  GGUF after GPU buffers/WASM heap returned to 0 KB/42 MB. Four more complete
+  browser replies were correct at 117.23/107.85/128.69/128.27 tok/s, and
+  active plan diagnostics showed `full/gpu` without a stale missing marker.
+  A same-instance position-231 layer trace measured 7.94 ms whole-step and
+  2.079/1.1475/1.1355/1.0841 ms aggregate MLP/QKV/attention-output/head
+  net stages. Five subsequent correct page replies measured 84.59–128.87
+  tok/s; profiler-related buffers returned from a transient 606 MB to the
+  555 MB steady level, with 984 capture pins. System memory was 64% free and
+  macOS reported no thermal/performance warning; this does not prove a GPU
+  frequency or contention cause.
+  Maintained suites: 168 Python, 79 JS; `git diff --check` clean. The 0.6B
+  performance gate and seven-point acceptance remain open, so no final commit.
+
+## 2026-10-04 ▸ current `bf9fed4c0b` local 0.6B browser continuation (open)
+
+- Subsequently fixed a profile-key gap: WebGPU's complete-decode key is v3
+  and distinguishes the *effective* JS/GPU sampling path, including fallback
+  when an option such as top-p makes GPU sampling ineligible. WebGL's v1
+  topology/key is preserved. A regression covers both distinct WebGPU keys
+  and identical WebGL keys. Rebuilt/stamped to `72e61e0a7b`, released the
+  prior single model (GPU 0 KB/WASM 42 MB), and selected the same disk GGUF
+  alone. Its saved GPU sampler route was reused; the missing v3 upper plan
+  correctly fell back to a budget-limited stored-width path. One baseline
+  product answer was correct at 121.24 tok/s. The explicit v3 GPU-sampler
+  full-composition tune finished in 216.57 s, chose a stored-width route with
+  separate QKV and composed QK norm/RoPE (8.46 ms diagnostic median), and
+  saved its profile. Eight correct full product replies were 86.79–128.52
+  tok/s, still not 140+. The former JS-tuned fused route won only 5/8 real-page
+  pairs under GPU sampling and was restored to the v3 winner.
+- A 12-run worker profile associated slow 73–87 tok/s replies with 10.9–12.9
+  ms GPU-completion/readback waits, versus 7.38–7.48 ms on 127–130 tok/s
+  replies. An opt-in hardware timestamp run on the same sole model then showed
+  5.90–6.42 ms main-compute-pass medians for faster diagnostic replies and
+  10.49–13.17 ms for slower ones, with the same 562 main dispatches and one
+  sampler dispatch per token. Profiling perturbs absolute rate; it does establish
+  that GPU execution itself varies substantially, not just page rendering.
+  External contention, GPU clock behavior and other causes are not isolated.
+  The browser was returned from `profile_gpu=1` to ordinary WebGPU; the same
+  local file reloaded with `profile_reused=True` and four correct replies at
+  119.71/120.37/128.02/128.78 tok/s.
+- Fixed idle greedy-graph retention under normal sampled generation. The
+  loaded-model intervention lowered capture pins from 2,956/19.55 MB to
+  984/4.65 MB with a correct answer. The new SDK stamp `303f1177d3` leaves
+  zero pins at load and holds 984/4.65 MB after four sampled replies. A forced
+  chunk-2 greedy test reproduced the scalar greedy's full 110-token answer;
+  returning to sampled chat automatically freed its graph and returned to
+  984/4.65 MB. The forced route was restored to the measured choice. This
+  does not close throughput. Maintained suites: 167 Python, 79 JS;
+  acceptance and final commit remain open.
+- Rechecked the prior fused QKV/QK combination under GPU sampling. A 16-pair
+  alternating product test gave only 7/16 fused wins; all 32 replies were
+  correct. A graph-route switch leaves roughly 3.45 MB temporarily in the
+  reuse pool, so first-after-switch timings are not clean steady-state
+  comparisons. Six two-run paired blocks (compare second runs) split 3/6;
+  four continuous eight-run A/B/A/B blocks still drifted within each route
+  (settled medians 125.8/130.4/110.9/90.9 tok/s). The v3 measured route
+  was restored. `powermetrics` requires superuser on this host; no thermal or
+  GPU-frequency root cause is claimed. The same local 0.6B is left loaded on
+  the ordinary in-app WebGPU page.
+- Kept exactly one local Qwen3-0.6B Q4_K_M GGUF loaded in the in-app browser;
+  there was no model download or parallel model load. The explicit v2 full
+  decoder search finished in 222.86 s, chose stored Q4_K arithmetic and
+  measured an 8.525 ms diagnostic median. Six actual chat replies were all
+  semantically correct at 86.93–123.76 tok/s, not stable 140+.
+- The loaded-model layer profiler reported 6.565 ms at position 0; MLP, head,
+  QKV and attention-output net stage sums were 1.991/1.059/1.005/0.653 ms.
+  JS full-vocabulary sampling added about 0.65 ms per token in its diagnostic
+  worker scope; 4-byte GPU sampling removed that JS sampling work, but still
+  waited for GPU completion. Do not label the 6.565 ms value product latency.
+- Five order-alternated, complete real-page JS/GPU sampling pairs all preserved
+  the 1–40 answer and favored GPU (132.06–134.04 versus 72.12–123.05
+  tok/s). Eight fixed-seed full-SDK pairs agreed in entire output but favored
+  GPU only 5/8. Set the measured local device/vocabulary profile to GPU and
+  verified 111 selections read back 444 bytes in total. Six further page
+  replies remained correct but measured 111.41–133.67 tok/s, so this has not
+  closed the 140+ gate. Disabled profiling before those six calls.
+- An upper-level candidate combining fused add/RMS, fused KV write and compact
+  output-head shape preserved the complete fixed-seed output in ten paired
+  SDK comparisons but won only 6/10; its temporary runtime overrides were
+  restored. No unsupported speed claim or unproven source route was adopted.
+
+## 2026-10-04 ▸ actual-sampler upper composition and loaded 0.6B (open)
+
+- Rebuilt and stamped `793af5ae3d`, released the previous sole 0.6B model to
+  0 GPU buffers / 42 MB WASM, then reselected that same GGUF from the native
+  browser file chooser. No additional model or remote weight source was used.
+- Fixed the WebGPU top-level decode tuner to time the actual seeded JS/GPU
+  sampling path instead of full-logit readback plus argmax; semantic screening
+  compares the selected token sequence as well as four steps of logits.
+  Only old WebGPU whole-decode profiles are invalidated (`decode_plan_v2`);
+  WebGL's previously real-path profiles retain v1.
+- The explicit full-model v2 search finished in 217.4 s and kept the
+  original-width composition (`median_ms=9.6925` in its diagnostic context).
+  A new behavioral test proves that matching logits with divergent sampled
+  tokens cannot enter the timed candidate set; it also checks restoration of
+  the prior sampling state.
+- Seven post-search, single-model product replies all returned the requested
+  1–40 sequence at 120.22/123.66/110.46/127.51/128.30/124.08/94.58 tok/s
+  (231 context, 110 generated tokens). The 140+ settled-product goal is **not**
+  met. GPU buffers were 570 MB and JS heap 146 MB after the search. Releasing
+  the only model returned to GPU 0 KB / WASM 42 MB; a page reload lowered the
+  JS heap from 172 MB to 22 MB. The same local file then reloaded with
+  `profile_reused=True` for the v2 plan; six further correct page replies
+  measured 127.57/130.07/122.84/130.46/121.67/125.36 tok/s. The sole 0.6B
+  is left loaded for subsequent work.
+- Current source suites pass: 163 Python, 79 JavaScript. A blanket root
+  `pytest` discovery also picked up legacy Pyodide-only tests and failed at
+  collection; the maintained local suite is `test/test_*.py`. No final commit.
+- A first same-instance Q4_K `balanced`/`compact` A/B is invalid: the diagnostic
+  helper changed Python attributes but failed at an incorrect `_adam_kernel`
+  module reference before invalidating the captured graph. Its speed/output
+  observations must not select a route. Explicitly clearing the temporary
+  graph reduced capture pins to 0; one ordinary reply recaptured 984 pins /
+  5.58 MB and six more replies held that count exactly, so no steady per-turn
+  pin accumulation was observed. The A/B below has now been rerun with reset
+  success asserted.
+- Corrected A/B verified every 168-matrix route switch and graph reset, then
+  ran fixed-seed whole-SDK pairs: `balanced` won 10/18; `compact` won 8/8
+  initially but only 6/12 on an independent repeat. On the real chat page
+  `compact` won only 6/10. Every fixed-seed full text matched and every page
+  reply preserved 1–40, but no repeatable containing-API win was established.
+  Restored all linears to `auto`; the final correct page reply was 126.88 tok/s.
+- The existing opt-in WebGPU readback-buffer pool was screened in 8 alternating
+  product pairs. Speed fluctuated widely on both sides (79–131 tok/s) without
+  a repeatable benefit, so it remains off. The source was not changed.
+- A `narrow` Q4_K layout lost all 8 fixed-seed, complete-SDK pairs (about
+  101–108 versus 128–133 tok/s) with identical full text. It remains disabled.
+  The adapter offers shader-f16/subgroups/timestamp queries; feature presence
+  alone does not justify a width change or establish a fast, semantic route.
+- A diagnostic Q4_K `tiny` (16×4) same-width workgroup passed the independent
+  packed-weight GPU selfcheck and kept identical fixed-seed full text, but won
+  only 2/8 complete-SDK pairs. Its source changes were reverted.
+- Rebuilding an unchanged backend wheel had changed the browser SDK stamp
+  because wheel ZIP timestamps differed. Added a default fixed
+  `SOURCE_DATE_EPOCH` to the WebGPU, WebGL and test wheel entrypoints.
+  Consecutive independent builds of all three produced identical SHA-256
+  hashes; the stamp script ran twice without changing `bf9fed4c0b`.
+  This fixes needless tuning-profile invalidation across same-source builds.
+
+## 2026-10-04 ▸ loaded 0.6B product performance and rejected candidates (open)
+
+- Used only the Qwen3-0.6B Q4_K_M GGUF selected from disk in the in-app browser.
+  The current tab initially showed the model ready on WebGPU. Five complete,
+  same-prompt 231-context, 110-token page runs all returned numbers 1–40 in
+  order at 118.56/124.44/106.84/135.82/123.26 tok/s. This is still below
+  a reproducible 140+ product result, despite earlier direct-SDK 140+ samples.
+- A loaded-model layer profile gave 6.38 ms for the unsplit one-token step at
+  position 0 and 6.785 ms at position 231. The latter staged diagnosis summed
+  to 6.771 ms net, dominated by MLP 2.313, attention output 1.263, head
+  1.257 and QKV 1.253 ms. These are diagnostic complete-step and staged
+  measurements, not additive production GPU timestamps. Python input setup
+  was 0.260 ms median (embedding row 0.155, RoPE 0.015), so moving that work
+  alone cannot account for the whole product-speed gap.
+- An existing device-side Q6_K embedding-row route reproduced the original
+  packed row and both RoPE inputs bit-for-bit at three token/position probes.
+  A runtime-only A–B–A over nine full page replies gave baseline
+  121.27/106.22/133.96, GPU-row 139.60/137.31/106.33, returning baseline
+  130.84/136.94/137.31 tok/s. It was restored, not promoted to `auto`.
+- A TypeScript candidate coalesced decode replay and GPU vocabulary sampling
+  into one shared-memory signal after the readback arena was registered. It
+  passed the queue unit test and six complete browser replies with the same
+  output, but its rates 125.43/123.89/136.97/130.50/137.52/114.64 had
+  median 127.97 tok/s. After reverting, rebuilding and reloading the same
+  disk GGUF, the ordinary route gave 134.69/131.71/133.96/137.05/134.67/
+  122.77 (median 134.32). The candidate source and test were removed;
+  no unproven optimisation is enabled. The restored SDK stamp is `4bbb2e651f`.
+- Four alternating direct-SDK/page pairs on the restored instance showed
+  overlapping, time-varying rates rather than a consistent page-only tax.
+  Runtime-only complete-SDK comparisons then examined the upper-level output
+  head, gate/up and QKV physical layouts without changing source. A narrow
+  Q6_K head was substantially slower; balanced and short-K head layouts were
+  mixed against the returning compact baseline. Fused gate/up did not beat
+  separate repeatably. With a fixed sampling seed, gate/up routes produced
+  identical complete text. Twelve order-alternated fixed-seed QKV pairs gave
+  `fused:compact` only 6/12 wins over `fused:default`, with mean delta
+  −1.46 tok/s; all 24 outputs were identical. All instance overrides were
+  restored. A final page reply returned the 1–40 sequence at 132.19 tok/s.
+  A temporary, bounded diagnostic cache for decoded embedding rows and RoPE
+  values lowered Python input preparation from 0.220 to 0.090 ms/call, an
+  upper-bound saving of about 0.13 ms/token; it was **not** added to the
+  product because Python-side data caching conflicts with the JS/GPU ownership
+  requirement and is too small to explain the observed 1–2 ms rate variance.
+  The temporary instance override, its bound-method reference, cached arrays
+  and diagnostic globals were removed from the live Python worker.
+  An opt-in sampler-boundary diagnostic measured 913.1 ms over 111 calls,
+  which includes waiting for the preceding GPU decode and cannot isolate the
+  sampler's own arithmetic. One incorrectly initialised diagnostic object
+  caused a test reply to fail; its temporary flag was removed and the next
+  full 1–40 reply succeeded. The browser was left with only the restored local
+  0.6B loaded. Full local checks: 79 JavaScript, 161 Python tests, webpack,
+  stamp and whitespace checks pass. The seven-point acceptance and final
+  commit remain open.
+
+## 2026-10-04 ▸ WebGL 0.6B browser rerun and slow-warning correction (open)
+
+- The only observable in-app tab was `?backend=webgl`, initially with no
+  resident model. Selected the sole local Qwen3-0.6B Q4_K_M through the
+  native GGUF chooser; no model HTTP transfer or concurrent model. It loaded
+  332.9 MB from disk. A completed 216-context, 110-token chat reply was
+  exactly lines 1–40 at 18.76 tok/s, 2.231 s first-token latency. The saved
+  WebGL upper plan was reused. Visible GPU buffers read 448 MB.
+- Browser-verified the UI correction: WebGL 18.76 tok/s no longer triggers
+  the WebGPU-only 40 tok/s slow warning. The functional VM test also checks
+  that the same rate still warns on WebGPU. Full local regression on this
+  source: 161 Python, 77 JavaScript, TypeScript build, stamp, diff check.
+- This closes only that warning regression and one WebGL correctness/speed
+  sample; the seven-point project gate and stable WebGPU product 140+
+  requirement remain open. No final commit.
+- After WebGL release (0 KB GPU, 42 MB WASM), reloaded the same local GGUF
+  alone under WebGPU. Reused full upper plan and GPU sampler. A default
+  six-reply series returned the 1–40 sequence at
+  114.95/132.43/125.52/100.92/121.00/133.16 tok/s; the observed slowdown
+  tracks the mixed GPU-sampling/completion/readback/host scope
+  (7.1–9.3 ms/token); the separate 0.3–0.4 ms scope is replay submission,
+  **not** a measurement of GPU arithmetic. A same-prompt 1024→2048→1024 dispatch
+  flush A–B–A gave six-run medians ~123.3/130.5/130.9 tok/s. The candidate
+  had no repeatable gain against the returning default, so source remained
+  at the default 1024. All replies preserved the number sequence (some added
+  a code fence). The default WebGPU model is the sole resident instance.
+- A 512-dispatch six-run candidate measured
+  122.75/133.64/137.19/121.02/123.44/136.95 tok/s, followed by a
+  default-1024 series at 121.34/130.72/112.93/108.58/115.42/100.92.
+  The same route drifted strongly over time; neither 512 nor 2048 is a
+  repeatable positive winner, and production stays at default 1024. An
+  isolated fresh tab produced 119.23–136.76 tok/s in six page runs and
+  112.03–142.50 in three direct SDK runs. Do not call 140+ stable.
+- Repeated release reported 0 KB GPU and 42 MB WASM, but the shared browser
+  GPU process RSS moved only ~1.81→1.78 GB immediately and ~1.65 GB after
+  empty-page reload / temporary-tab closure. Driver caching versus retained
+  resources is unresolved. Corrected the page's false `GPU + host` breakdown:
+  GPU sampling plus completion/readback happens inside the historic `pick_ms`
+  scope, so the UI now says `step + pick/readback`. The new stamped browser
+  showed 0.34 + 7.25 ms at 129.85 tok/s with 1–40 sequence intact.
+  Targeted UI test and all 78 JavaScript tests pass; `git diff --check` passes.
+- Corrected the attribution with the existing opt-in WebGPU hardware timestamp
+  path, one resident local 0.6B. In two warm three-token diagnostics, the
+  first 366-dispatch compute pass took ~15.0 ms, the next two ~6.29–6.42 ms.
+  A 12-token diagnostic's following main passes ranged 6.29–7.21 ms,
+  plus ~2.03 ms summed over its small auxiliary passes. Timestamp query
+  instrumentation changes the short-run wall speed, so this is not a new
+  product throughput result. It establishes that the old 0.3–0.4 ms `gpu_ms`
+  was submit time, not GPU arithmetic, and that the pick/readback scope
+  includes substantial real GPU work.
+- Fixed the page's unconditional Markdown/fenced-code system instruction that
+  contradicted an explicit plain-text user prompt. Both backends now receive
+  a model-agnostic "user format first" display default. The same sole local
+  Qwen3-0.6B produced unfenced 1–40 sequences in three WebGPU product runs
+  (127.72/129.06/130.92 tok/s, 231 context) and two sequential WebGL runs
+  (18.36/18.47 tok/s, 2.607/0.055 s first token). The model still generated
+  trailing spaces on some lines; this is not byte-exact copying. WebGL's
+  WebGPU-only slow warning stayed absent. A shorter system prompt gave mixed
+  direct-API paired results and was not adopted without page-level evidence.
+  Browser returned to one locally loaded WebGPU 0.6B on stamp `76dfea11a1`.
+  Full local suites pass: 161 Python, 79 JavaScript; diff check is clean.
+
+## 2026-10-04 ▸ 0.6B sampled-path A/B and current product regression (open)
+
+- Used only the user-selected local Qwen3-0.6B Q4_K_M in the in-app browser.
+  Tested a generic two-token GPU sampling graph under the same full-decoder
+  plan as baseline. Three fixed-seed 1–40 outputs were identical, but the
+  candidate lost every paired throughput comparison (134.04/135.10/136.12
+  versus 134.82/138.68/139.36 tok/s). Removed the candidate from Python and
+  WGSL source and its test; no slower fallback remains selected.
+- Released the experimental resident model (0 GPU buffers, 42 MB WASM),
+  stamped the reverted source, and reselected the same local GGUF. A fresh
+  build lacking the saved source-version profile used a budget-limited exact
+  plan and yielded one correct 110.8 tok/s page reply. Reusing the prior
+  correctness-checked full plan on this build and pairing JS/GPU sampling with
+  identical 115-token outputs gave GPU 138.50–139.37 versus JS
+  115.12–127.50 tok/s across five interleaved pairs. `auto` again selects the
+  GPU route; the next fresh load must verify profile persistence.
+- Actual `auto` chat-page replies counted 1–40 correctly at
+  122.3/135.4/132.4 tok/s. A 115-token callback cost 4.25 ms total;
+  increasing Markdown refresh interval from adaptive 200 ms to 1000 ms did
+  not improve the three-run product outcome and was not retained. The 140+
+  product target, source-version profile behavior, broader model/backend
+  acceptance, full regression, and final clean commit remain open.
+- A release/reselect of the same native local file on the clean `?backend=webgpu`
+  page confirmed the full decode plan and GPU vocabulary sampler were restored
+  automatically from device-local profile. Three correct product replies were
+  114.6/130.2/135.7 tok/s, with the first cold. Five direct API replies using
+  the product's unseeded sampling produced four warm 140.24–141.30 tok/s runs
+  and one 126.45 outlier. Delaying page token-event consumption by 16 ms was
+  not a repeatable win; 50 ms batching was worse, and an unseeded 4-token
+  reply leaves its semantic cause unresolved.
+  Both diagnostic wrappers were restored. A full offline upper-composition
+  search was then run on the one loaded 0.6B. It completed in 295.9 s after
+  four-step semantic checks and chose the same prior plan; diagnostic median
+  10.215 ms, no new upper-layer winner. Three post-search direct replies were
+  138.03/140.50/133.74 tok/s and three page replies 133.1/135.0/135.8 tok/s,
+  all exact 1–40. Search raised main JS heap to ~153 MB; model release returned
+  GPU buffers to zero and WASM to 42 MB, and page reload lowered JS heap to
+  ~23 MB. The same local GGUF was reselected; its measured plan automatically
+  reused. Three clean-reload product replies were correct at
+  123.1/134.5/137.1 tok/s. Synchronous pair-coalescing and a collapsed
+  resources panel also did not yield a safe speed win; neither was kept.
+  Latest automated checks: 161
+  Python, 76 JavaScript, webpack build, version stamp and diff check pass.
+
+## 2026-10-03 ▸ Qwen3-0.6B current-build baseline and route diagnosis (open)
+
+- Shifted the active performance check to the one local
+  `models/Qwen3-0.6B-Q4_K_M.gguf` as requested. In-app browser native file
+  chooser, no model HTTP source, one resident model at a time. Each WebGPU/WebGL
+  run ended by release: GPU 0 KB, WASM 42 MB. The user now accepts stable 140+
+  tok/s rather than pursuing 150; this target has **not** been met on the
+  current build.
+- WebGPU product at default sampling: 183 tokens at 118.8 tok/s with an
+  incorrect code/table presentation, then a correct 1–40 copy at 115 tokens,
+  110.6 tok/s, 216-token context. A timestamp-instrumented 63.4 tok/s run is
+  diagnostic overhead, not a production regression. On an uninstrumented fresh
+  runtime a seeded complete API reply stayed correct at 120.5 tok/s. The
+  opt-in worker timing separated the reported `host` bucket into mean
+  GPU-completion/full-logit readback 7.19 ms/token, options preparation 0.015 ms,
+  JS sampling 0.64 ms. The old label conflates GPU waiting with host work.
+- Lower-level WebGPU stage profile at position 128: complete deterministic
+  step 7.1 ms, segmented net sum 6.62 ms; head 1.04, dense MLP 2.16,
+  attention out 1.37, QKV 1.20 ms (segmented timings are diagnostic, not an
+  additive production prediction). Four separate/fused QKV/MLP whole-API
+  candidates were correct with fixed seed and measured 119.0–125.5 tok/s.
+  An offline correctness-gated full composition search finished after about
+  two minutes, chose fused add/RMS and per-shape stored/DP4A Q4_K routes;
+  its correct 1–40 reply was only 123.8 tok/s. That result was persisted and
+  auto-reused on the next load, which still measured 120.5 tok/s. Neither is
+  sufficient evidence of a stable local win or the accepted 140+ target.
+- WebGL product, same local file/prompt: correct 1–40, 115 tokens at 18.2
+  tok/s, 2.4 s first token. A separate direct seeded reply measured 20.68
+  tok/s; worker split was 39.3 ms/token readback/wait and 0.71 ms sampling.
+  Unsplit whole-step WebGL profile at position 128 was 45.5 ms, versus a
+  107.7 ms segmented net sum with boundary synchronizations. WebGL still needs
+  backend-specific optimization and a device-appropriate accepted speed gate.
+- Added an opt-in JS-worker sample-timing aggregate for both backends; Python
+  only flips the diagnostic flag and reads the final JSON. TypeScript/webpack
+  build and version stamp pass; the broader automated suite and complete
+  seven-point acceptance have **not** been rerun/closed for this change.
+
+## 2026-10-03 ▸ WebGL 30B context-loss recovery and upload experiment (open)
+
+- A profiled local-file 30B load showed one `cat2_gl` compile/link/status path
+  taking 6994.82 ms after weights had been uploaded, followed by WebGL context
+  loss at the required first-forward readback. The failed page retained about
+  1.40 GB of WASM heap with Release disabled. The load-failure path now closes
+  the entire SDK runtime, releases its GPU context, invalidates the old local
+  File registration, and starts a fresh worker. A tiny invalid local GGUF and
+  a real 30B context-loss load both recovered to ready(WebGL) with about 42 MB
+  WASM and a usable Load button. No model was fetched from the network.
+- The generic WebGL growing-KV append shader is now registered before the
+  large GGUF weight upload. On the next profiled 30B load it had no long
+  compilation log, but the context still failed during the full-forward
+  proof. This removes a local compilation stall; it is **not** a complete
+  load-time or context-loss fix. A Python regression checks one-time kernel
+  registration before weight upload.
+- An opt-in 64 MiB periodic WebGL upload flush candidate loaded the sole
+  local 13.83 GB model without context loss: warming 2.4 s, proving 33.4 s.
+  Its product answer reached only 18 in the 1–40 count at roughly 0.4 tok/s
+  before the run was stopped, so it has neither a complete semantic result nor
+  a demonstrated performance win; the candidate remains disabled in default
+  routing. A later no-flush load also succeeded but spent 35.4 s proving, so
+  context loss and timing vary and this A/B does **not** isolate flushing.
+- The JS-side WebGL texture ledger now writes directly to existing shared
+  memory, closing a backend-parity hole where the product showed GPU memory as
+  “—”. The real no-flush 30B load held 12.73 GB after loading and peaked at
+  13.33 GB declared texture storage; this excludes driver copies. Its independent
+  98-context product reply counted 1–40 correctly: 114 tokens, 2.9 tok/s
+  overall, 2.8 s first token, and about 180–185 ms in the last ten GPU steps.
+  Release visibly changed GPU buffers to 0 KB and WASM from 1.40 GB to 42 MB.
+  Physical free memory fell to tens of MiB and the host compressor held several
+  GiB during these runs. The precise driver-versus-OS memory cause and the
+  ≤10 s WebGL proof/warm gate remain open. The test tab was closed.
+- 0.6B performance has **not** been retested or accepted on this build.
+  WebGL 30B load/proving and seconds-level first-token gates, both 0.6B backend
+  performance gates, Laya, all seven final acceptance items, and final commit
+  remain open. Only one model was resident at a time. Local regression after
+  these edits: 160 Python tests, 71 JavaScript tests, TypeScript/webpack build,
+  and `git diff --check` pass. The invalid-file browser fixture was removed.
+
+## 2026-10-03 ▸ new-session native 30B WebGL regression (open)
+
+- The earlier file-picker failure was specific to an old in-app browser tab
+  that was no longer owned by the current browser-control session; a fresh tab
+  selected the **local disk GGUF** successfully. The model loaded without an
+  HTTP model endpoint or network download. One full product reply at a
+  240-token context counted 1–40 correctly: 114 tokens, 3.8 tok/s, 27.1 s
+  first token. This is not a clean-context latency baseline.
+- An independent 96-context reply also completed the correct 1–40: 114 tokens,
+  1.5 tok/s overall, 3.8 s first token; its first steps took up to 2.1 s while
+  the settled tail took about 180–190 ms/token. The load log showed warming
+  2.4 s and proving 20.9 s, so the strict ≤10 s load gate **fails**. During
+  the run the host showed about 100 MiB free physical memory and 6.5 GiB in
+  compressor; this supports memory pressure as a contributor, not a proven
+  sole cause. A transient single digit seen while streaming was not a final
+  correctness error; the final answer was correct.
+- Releasing the sole model returned the WASM heap from 1.40 GB to 50 MB.
+  Opt-in WebGL program-compile timing was added to distinguish compile/link
+  stalls from subsequent execution, built and locally tested. A diagnostic
+  reload currently cannot be counted: two native-file chooser attempts after
+  page navigation emitted no chooser event. No HTTP fallback, no second model,
+  and no final commit. 0.6B performance remains untested on this source.
+
+## 2026-10-03 ▸ readback memory and synchronous failure handling (open)
+
+- WebGPU and WebGL previously allocated a 64 MiB shared readback arena on the
+  first read, even for a 4-byte token. The shared arena now begins at 64 KiB,
+  grows to the required power-of-two capacity, and rebinds the main thread on
+  growth. The worker still reads directly from the shared buffer, without an
+  RPC tensor payload or additional copy. An arena unit test covers reuse,
+  growth and rebinding.
+- A WebGPU readback could throw synchronously before a Promise existed and
+  leave the worker asleep in `Atomics.wait`. It now catches both synchronous
+  and asynchronous failures and wakes with an error, as WebGL already does.
+  The targeted regression test passes. Full local checks: 159 Python, 68 JS,
+  TypeScript build, clean `git diff --check`; source stamps were regenerated.
+- The sole local-disk 30B browser retest is **not** complete: the native file
+  picker did not emit a chooser event. A separate no-model WebGL test page
+  stalled during backend initialisation, so this source is not browser-verified.
+  No model was loaded via HTTP, no network model fetch was made, and no commit
+  was created. WebGL 30B latency, 0.6B and Laya remain open.
+
+## 2026-10-03 ▸ upload calibration does not duplicate tensors (open)
+
+- Replaced duplicate-upload calibration with alternating natural calls: each
+  `set_data` uploads exactly once while a repeated physical shape gathers
+  samples, then uses the faster median path. Both browser backends returned
+  the same final 16-value tensor after 15 writes, with 7 staged and 7 direct
+  measured calls and one settled-path call. A regression test checks that
+  calibration never duplicates an upload.
+- A failed WebGPU mapped metadata write now unmaps and releases its GPU
+  allocation. The complete local run is 159 Python and 65 JavaScript tests,
+  TypeScript build passing; `git diff --check` is clean. Full 30B browser
+  regression remains blocked by the locked Mac's native local-file chooser.
+  No alternate HTTP model route was used; no commit.
+
+## 2026-10-03 ▸ fewer hot-path copies, measured upload choices (open)
+
+- WebGL 2D/2DArray readback now passes its existing shared target directly to
+  `readPixels`; WebGPU maps its staging buffer into the same worker-visible
+  target. This removes the prior extra main-thread tensor copy, but not the
+  unavoidable GPU staging transfer. Browser checks covered WebGL float32,
+  half-float, int32, uint8 and 2DArray plus WebGPU arithmetic; results matched.
+- MoE host routing now writes indices and weights directly into two regions of
+  reusable shared upload memory, without allocating/copying two output arrays.
+  Its top-k scratch arrays are reused across rows and exponentials calculated
+  once; WebGL and WebGPU browser routes both returned the same 2-row indices
+  `[1,2,1,2]` and weights. LLM token-history counts now stay incrementally in
+  JS instead of being rebuilt from the entire history every token. Both
+  backends' consecutive-token browser check returned `[2,1]` as expected.
+- An optional direct NumPy-buffer upload avoids Python's intermediate WASM
+  staging copy for exact contiguous physical formats. Paired browser timings
+  showed mixed gains/losses by backend and byte size, so it is **not** forced
+  globally. A never-repeated shape uses the established upload; repeated
+  physical shapes alternate paths across natural calls, with exactly one
+  upload per call, and settle on the faster median, with no fixed percentage
+  gate. Unit and both-backend browser checks
+  verified identical output. WebGPU per-op metadata now moves Python bytes to
+  shared JS staging in one copy and a signal-only RPC, eliminating the old
+  Python comm-buffer and transferred-array intermediates.
+- The SDK cache stamp now covers both generated JS bundles and both backend
+  wheels; the wheel install URL carries that version so a browser reload does
+  not silently reuse a stale wheel. 159 Python, 64 JavaScript tests and the
+  TypeScript build pass. A full 30B reload is not verified on this source:
+  the Mac is locked, and its native local-file chooser does not open in the
+  in-app browser. CDP cannot set files by protocol on this surface. No HTTP
+  model load or network model fetch was substituted. The latest prior WebGL
+  30B result remains 2.6 tok/s with a 21.0 s proving stage, so performance
+  gates and the broader seven-point acceptance remain open. No commit.
+
+## 2026-10-03 ▸ shared-memory transport and JS token selection (open)
+
+- Both WebGL and WebGPU now batch ordered nonblocking GPU descriptors into
+  shared-memory slots; worker↔main hot-path messages only identify ready slots.
+  Tensor uploads use reusable shared staging with a completion signal instead
+  of transferring a fresh data array in each RPC. An oversized upload arena is
+  released after acknowledgement. Both backends' no-model browser arithmetic
+  returned `[5,10,15,20]` from `((a+b)*a)` and JS-side greedy sampling returned
+  token 2 from `[0,1,2]` without changing the GPU tensor.
+- Forced browser WebGL context loss exposed an additional synchronous readback
+  throw before Promise creation. This is now caught, sends -1 to the blocked
+  worker and raises immediately in Python; no infinite wait. Forced WebGPU
+  device destruction also raised immediately. Temporary WebGPU test tab was
+  closed, and the user's WebGL tab remains.
+- The ordinary unconstrained LLM sampling path now reads logits into JS shared
+  memory and applies top-k/top-p/min-p, penalties and selection in JS; Python
+  gets only the selected scalar. The worker retains token history, so the
+  whole prompt ID list crosses the bridge only on the first selection. This
+  **does not** cover constrained sampling or all NumPy/model-loader paths.
+- On the sole native-file 30B WebGL model, the complete product reply counted
+  1–40 correctly, 114 tokens at 2.6 tok/s, ~180 ms hot tail, 9.7 s first
+  token. The runtime reported JS sampling active. Load stages were warming
+  2.4 s and proving 21.0 s: the strict ≤10 s load gate is still FAILED. The
+  model was released; WASM heap returned from 1.40 GB to 50 MB. No other model
+  was loaded concurrently, and no network model fetch was used.
+- 155 Python tests, 53 JavaScript tests and TypeScript compilation passed on
+  this source. MoE prefill host routing still computes in Python and must be
+  moved or removed only after equivalent correctness/performance evidence;
+  30B WebGL latency, 0.6B/Laya, full JS ownership and seven-point acceptance
+  remain open. No commit.
+
+## 2026-10-03 ▸ JS ownership of hot GPU paths (open)
+
+- The user tightened the architecture requirement: both WebGPU and WebGL must
+  keep high-frequency tensor data movement, arithmetic and GPU execution in
+  JS/GPU; Python should schedule with handles and make as few bridge calls as
+  possible. This is a new acceptance gate, not satisfied by command batching.
+- Source audit shows GPU buffers already live on the JS/GPU side, but Python
+  still constructs each operation, converts its descriptor through Pyodide,
+  performs NumPy sampling and routing, and sometimes reads full logits back.
+  WebGPU has a JS-side captured decode replay; WebGL's growing-KV path does
+  not. Both backends now queue nonblocking GPU commands in bounded 128-command
+  JS batches, flushing before upload/readback. The queue has ordering tests for
+  both backends and TypeScript compilation passes. This reduces worker/main
+  messages but **does not yet remove per-op Python→JS calls**.
+- A confirmed WebGL context-loss failure produced zero-valued readbacks and
+  garbage replies. Loss guards now reject uploads/dispatch/readbacks, WebGL
+  readback failures notify a blocked worker with -1, and Python raises instead
+  of retrying stale bytes. WebGPU keeps the analogous device-loss path. The
+  browser product has not yet been reloaded/tested on this source. The single
+  30B model was released; no model is currently resident.
+- New JS build and WebGL wheel were packed and source stamps updated. The
+  30B WebGL warm≤10 s, first-token, semantic and throughput gates remain open,
+  as do the broader JS-ownership migration and full seven-point acceptance.
+
+## 2026-10-03 ▸ WebGL 30B paired MoE route and browser loss (open)
+
+- The complete 128-token product response on the sole local Q3_K_XL 30B correctly
+  listed 1–40: 114 generated tokens at 2.7 tok/s, 3.7 s to first token and
+  about 0.17–0.20 s per token after its slow initial steps. Earlier apparent
+  number repetitions were incomplete streamed numerals, not final output errors.
+- The corrected underlying-model T=4 A/B showed a positive *combined* device
+  router plus device row-repeat result: host 31.648/21.347 s versus device
+  21.827/7.812 s, identical greedy token 5 and hidden-state relative error
+  8.7e-7. A GPU router or GPU repeat alone did not improve whole-model timing.
+  Five paired hot single-layer runs also favored the combined route with
+  relative error 3.76e-8. WebGPU and WebGL now expose the same generic
+  `repeat_rows` primitive; 151 Python tests passed.
+- A new source-stamped browser load (`bdb2e13a3f`) chose `host` in two
+  cold, single-layer auto profiles even though the whole-model combination
+  favored `device`. It took `warming 3.3s · proving 13.7s`: improved from
+  36.6 s, but beyond the strict 10 s limit. A separate forced-device T=4
+  complete forward on this same resident model took 20.016 s, returned token
+  5 and a finite hidden norm; timing variability remains significant.
+- A subsequent single-row browser diagnostic never returned: CDP timed out
+  twice and the in-app-browser tab disappeared. It supplies no valid latency
+  measurement. The renderer loss/crash mechanism is not yet established.
+  There is currently no resident browser model. Do not count the WebGL load,
+  first-token, performance, or full seven-point acceptance gates as closed.
+  Continue 30B before 0.6B, then Laya; never co-load models.
+
+## 2026-10-03 ▸ WebGL 30B cross-layer residency diagnosis and bounded expert assembly (open)
+
+- On the user-loaded, native-file Q3_K_XL 30B in the in-app browser, a 30-token
+  product reply ran at 0.7 tok/s with 30.4 s first token. Its per-tenth GPU
+  step curve fell from 5573/3423/2230/2251/2166 ms to about 174–213 ms;
+  this is a cold-to-hot cliff, not a stable 0.7 tok/s arithmetic baseline.
+  That reply was capped at 30 tokens, so its incomplete 1–40 text is not an
+  accuracy result.
+- The first synthetic MoE route script assigned controls to the SDK `Model`
+  wrapper, not its `.impl`. Its route timings and varying sampled token IDs
+  are **invalid evidence**, not a WebGL correctness failure. After correcting
+  the harness, T=4 host/device/host/device forwards took
+  47.165/47.791/47.774/47.453 s. All chose token 5; final hidden states
+  differed by at most 8.7e-7 relative. A GPU repeat-row alternative hit 49
+  gathers but still took 47.356 s with identical hidden state and token,
+  so neither candidate has a measured positive whole-model result.
+- A hot repeated layer-0 MoE MLP took 13–15 ms after its first pass. A
+  48-layer serial sweep took 41.931 s (median 0.908 s/layer), close to the
+  47-second whole-model forward. System swap-ins and swap-outs rose by about
+  9 GB during that sweep. This localizes the cold whole-model cost to
+  cross-layer weight residency/OS paging much more strongly than to row
+  indexing, but does not prove a unique driver-level mechanism. The product
+  panel's GPU pressure is based on the last reply's timing spread, not live
+  VRAM occupancy, so it is not used as memory proof.
+- GGUF expert assembly now passes memoryviews of the original gate/up bytes
+  and concatenates only in the bounded WebGPU expert upload or the single
+  WebGL staging array. Six targeted regressions and 147 Python tests pass.
+  Browser Release reduced the GPU process from about 14 GB to 551 MB. On the
+  stamped reload of the same local file, the WASM heap was about 1.40 GB
+  versus 1.48 GB before, but load `proving` worsened to 36.6 s; this change
+  is memory hygiene, **not** a WebGL latency fix. A complete 1–40 product
+  reply with a 128-token cap is in progress. The ≤10 s load and seconds-level
+  first-token gates remain open; no 0.6B/Laya switch or final commit is claimed.
+
+## 2026-10-03 ▸ in-app-browser WebGL 30B and inference graph lifetime (open)
+
+- The sole local `Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf` was loaded through
+  the browser's native file chooser on explicit `backend=webgl`; no model was
+  downloaded or co-loaded. The WebGL renderer is ANGLE Metal on Apple M5, not a
+  CPU software fallback. The initial build spent `warm-state 250.1s` in a
+  synchronous full-API composition tournament and answered a 12-token product
+  prompt at 0.3 tok/s, 11.6s to first token, with 3273 ms per decode step.
+- Interactive WebGL load now reuses a measured device/model profile when available
+  and otherwise exposes an exact `profile_pending` baseline; its full semantic
+  tournament remains explicitly callable offline. Python and profile roundtrip
+  tests pass. The next stamped load removed the 250-second tournament but spent
+  26.5s in the first-forward `proving` stage. The user-refreshed load of the same
+  local file measured `warming 2.6s · proving 17.5s`. Seconds-level load is
+  still unmet; the work was shifted, not declared complete.
+- A live WebGL trace at 107 cached rows attributed 19.2s of 21.3s instrumented
+  stage time to MoE MLP, with a large instrumentation penalty; uninstrumented
+  production is the speed authority. An old-source cache probe after one decode
+  found 384 reachable inference tensors and 288 parent edges. `Tensor` now keeps
+  autograd parents only when `requires_grad`, with regressions for inference
+  release and gradient parent order. On the new stamped browser, the same cache
+  roots have zero parent edges. The new 12-token product reply improved to 0.4
+  tok/s and normal GPU pressure, but its first token took 34.1s and its decode
+  averaged 2114ms; this is memory hygiene, not a solved speed or load gate.
+- Explicit WebGL selection no longer claims WebGPU failed. The current model
+  remains loaded for serial WebGL operator and layer optimization. No WebGL
+  acceptance, 0.6B/Laya work, seven-point completion, or final commit is claimed.
+
+## 2026-10-03 ▸ independent Chrome 30B reload and prompt-size diagnosis (open)
+
+- The only resident model was the same 13.83 GB local
+  `Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf`, chosen through Chrome's native
+  file picker after the in-app browser released its model (0 KB GPU, 42 MB WASM).
+  No model was fetched over HTTP or loaded alongside another model.
+- Fresh Chrome load logged `warming 11.6s` and `warm-step 14.5s`, both beyond the
+  10-second warm-step acceptance bound. Its first product 1–40 reply was correct
+  but ran at 25.9 tok/s with a 55.4s first token: 1168 context tokens, 21223
+  prefill dispatches, 47.689s prefill and 7.689s after prefill. Its saved
+  decode composition was still budget-limited and had tested no full-API candidates.
+- This prompt-size discrepancy was traced exactly, without blaming chat history:
+  the conversation contained one 26-character user turn, and the model's own
+  tokenizer rendered 98 tokens without tools versus 1168 with the page's seven
+  default tool definitions. The tools are a real product capability and were
+  restored after a temporary A/B test. A fresh 98-token no-tool product reply
+  still took 52.6s to first token (46.442s prefill, 6.188s after), so tool
+  inflation is not the sole cause. A subsequent same-prompt, one-token top-level
+  API call took 7.403s to first token; another 98-row call took 19.567s.
+- On the same resident model, a direct full 1168-row MoE prefill comparison was
+  host 41.853s versus device 48.472s, with the same first token ID (16). For
+  98 rows, a nearby pair was host 4.490s versus device 10.893s, with the same
+  first token ID (13874) and 0.000158 relative final-hidden-state difference.
+  The host route varied from 4.49 to 12.79 seconds even on this loaded model;
+  neither device-route comparison establishes a positive result. Experimental
+  execution overrides and the temporary GPUQueue timing wrapper were restored.
+- These observations keep the Chrome warm, first-token, and near-40 tok/s gates
+  open. They do not authorize a move to 0.6B or Laya, a performance winner, or
+  a final commit. The cause of long GPU queue/residency delays on this host is
+  still not isolated, and Chrome's profile/capability path is not directly
+  comparable to the in-app browser's saved execution plan.
+
+## 2026-10-03 ▸ actual GPU/WASM release across both backends (WebGPU browser passed)
+
+- A no-model 4-byte copy on a separate WebGPU device finished in about 2.3 ms
+  while the 30B's first token waited 18.128 s. The problem is specific to the
+  30B queue/resources rather than a whole-GPU outage. The model held 13.79 GB
+  of GPU buffers, only 19 MB capture pins and 47 MB of reusable scratch; there
+  was no gigabyte-scale pool to trim. These measurements strengthen, but do not
+  uniquely prove, a residency/driver-preparation cause.
+- Browser Release previously reported `GPU buffers 0 KB` but left the browser
+  GPU process at roughly 14 GB and the Pyodide WASM heap at 987 MB. Reloading
+  the page dropped the GPU process to roughly 118 MB, proving that model-buffer
+  deletion alone was not the final physical resource boundary on this device.
+- SDK `close()` now terminates the worker and destroys the backend device/context;
+  `wgpy.initMain` exposes an idempotent disposer. WebGPU and WebGL each release
+  their captured buffers and context resources at the same API level. The chat
+  page uses `release()` followed by `close()` and starts a fresh runtime, clears
+  stale local-file IDs, and asks for the native file again. An SDK close test
+  covers pending-call rejection, idempotency and backend disposal.
+- On the stamped build, the sole local 30B loaded correctly. After Release,
+  without a page reload, the GPU process fell from about 14 GB to 813 MB and
+  the WASM heap from 987 to 42 MB; the chat then selected the same disk file
+  and loaded it successfully. Its first correct 1–40 reply after the restart
+  ran at 38.34 tok/s with 4.685 s first-token latency. The two latest loads
+  still showed `warm-step 14.1s` and 13.7s, so the strict ≤10 s gate remains
+  failed. WebGL browser disposal/parity, repeatable TTFT, and full seven-point
+  acceptance are still open. No second model or network model transfer occurred.
+
+## 2026-10-03 ▸ 30B sampled-route browser reload and GPU queue stall (open)
+
+- The full offline composition search now measured all valid candidates on the
+  actual sampling/full-logit path, took 112.355 s, and retained the incumbent
+  fused/add-RMS plus lower-layer auto plan at a 25.37 ms median. The profile was
+  persisted and reused after a source-stamped browser reload (`pick_mode=full`);
+  no greedy-only result was substituted for this chat route.
+- The same local 13.83 GB GGUF, selected through the native file picker, produced
+  correct 1–40 replies at 35.83, 36.96, 36.38 and 34.53 tok/s. Their first-token
+  times were 4.428, 6.405, 3.254 and 20.035 s respectively. The last run's
+  one-row graph replay spent 19.994 s in the first full-logit readback, while
+  input setup and command enqueue were under 3 ms total. A subsequent cold
+  load displayed `warm-step 10.2s`, failing the strict 10-second gate; another
+  measured 8.8 s. Neither warm-up nor first-token repeatability is accepted.
+- An opt-in main-thread WebGPU timestamp run measured 13.419 s and 16.613 s
+  first-token latencies on two one-row replays. The first compute passes actually
+  occupied only 32.57 and 30.08 ms on GPU; the second passes took 22.68 and
+  22.94 ms. The 607,744-byte logits map and independent 16-byte timestamp map
+  both waited roughly 13.38/16.58 s after queue submission and resolved together.
+  This localizes the outlier to pre-execution queue/residency delay, not slow
+  matrix arithmetic, Python input setup, a 607 KB transfer, or page rendering.
+  Concurrent 1-second macOS VM samples showed heavy page-ins, decompression and
+  swap-ins under a 24 GB machine with the 13.8 GB model resident. Memory pressure
+  is strongly implicated but not proven to be the only driver cause.
+- A temporary diagnostic change to forward page query parameters to the Python
+  Worker was reverted after inspection showed that the WebGPU device and
+  `dispatch_flush`/`profile_gpu` parsing already live on the main thread.
+  Earlier flush comparisons therefore remain valid. Main-thread timestamp
+  instrumentation and the one-token reply cap were restored after the test.
+  The SDK/page source stamp was restored to `adbdb8d679` / `297ab34597`;
+  the current browser tab remains on the earlier, functionally equivalent
+  diagnostic build until the next reload. No model was downloaded or co-loaded.
+
+## 2026-10-03 ▸ real-sampling 30B composition audit (open)
+
+- The user reloaded the same native local 30B GGUF; no model download or second model was
+  used. Its saved whole-decoder plan was reused. `warm-step` displayed 10.0 s; the first
+  correct 1–40 reply measured 3.486 s first token and 34.46 tok/s, and the repeated
+  cached-prefix reply measured 0.212 s and 35.55 tok/s. Earlier identical one-row
+  replays still had 7.579 and 12.3 s first-token outliers, so latency repeatability
+  and near-40 tok/s throughput are not accepted.
+- A 12.3 s replay was instrumented at the actual blocking call: input writes took
+  about 0.001 s and `logits.numpy()` waited 12.2256 s. The call samples at temperature
+  0.6, so forcing device greedy selection would change semantics. The Mac concurrently
+  showed heavy swapping; this is strong residency evidence, not sole-cause proof.
+- Native Q3_K MoE route tests matched the output token; host/device hidden states differed
+  by at most 0.004459, logits by 0.003614 on a 39.67 scale, and top-16 rank was unchanged.
+  Paired timings were unstable under memory pressure, so no route was promoted. MoE
+  gate/up and down physical-shape variants were bit-identical on the tested tensors;
+  alternatives did not reliably beat the existing `balanced`/default choices.
+- The prior complete-decoder tuner timed device greedy even though the product default
+  samples and reads full logits. A 49.614 s same-model search of the real readback path
+  proposed composed residuals plus separate KV writes, but a direct five-pair comparison
+  against the incumbent won only 2/5 pairs and was not adopted. Source now keys plans by
+  actual pick mode, keeps a measured incumbent in the final tournament, and times every
+  correctness-passing offline candidate rather than only the first four. WebGL's top-level
+  tuner likewise runs the default sampling path. Browser verification of this new source
+  and the expanded offline search are still pending; 140 Python, 35 JavaScript, and the
+  TypeScript checks pass.
+
+## 2026-10-03 ▸ one-row cached-prefix first-token fix (30B source verified; task open)
+
+- A repeated native-file 30B turn reproduced 15.717 s first-token latency with one new
+  prefill row and 1,109 prefill dispatches. An instrumented repeat took 12.060 s;
+  11.943 s was inside the final head/logit readback, while the following captured
+  decode took 0.039 s. System swap counters climbed during another 6.582 s run,
+  supporting device residency pressure but not proving a sole external cause.
+- A runtime-only test reused the already captured decode graph for the single new
+  prefix row. The 1–40 answer stayed correct and first-token latency fell to 1.742 s.
+  On the same cached row, full-vocabulary logits differed by at most 0.000979,
+  the top-16 ranking was identical, and all 16 paired seeded sampling draws matched.
+- The generic SDK now uses that path only with an existing cached prefix, exactly
+  one new row, no embedding override, full-attention capability, and an identical
+  graph key/buffer plan. Streaming and non-streaming APIs share it; WebGL/CPU and any
+  incompatible graph retain the general prefill. The product stats now carry the
+  prefill/after-prefill split and route. 135 Python tests, 35 JavaScript tests,
+  TypeScript checking and whitespace checking pass; the SDK stamp is `6809862eb3`.
+- On the new source stamp, the user-loaded local 30B was the only model. The cold
+  product turn answered 1–40 correctly at 33.6 tok/s, 5.493 s first token, and
+  `warm-step 8.6s`. The same prompt as a fresh chat then answered 1–40 correctly
+  at 34.9 tok/s with `decode_replay` prefill, 0.194 s first token (0.167 s prefill,
+  0.027 s after) and zero prefill dispatches. This validates the specific latency
+  route; it does **not** establish a repeatable ≤10 s cold bound, near-40 tok/s
+  throughput, complete upper-API auto optimisation, WebGL browser results, or the
+  seven-point project acceptance.
+- Subsequent same-model alternating chat trials exposed a `decode_replay` turn with
+  12.261 s first token and zero prefill dispatches. Thus graph reuse removed one
+  command-building path, **not** the underlying GPU residency/queue stall; the
+  section title's "fix" is scoped to one-row command reuse, not the latency gate.
+  Under the same local model, five latest paired 1–40 replies all favoured the
+  fused add/RMS + Q/K norm/RoPE route on token throughput, but the first fused
+  switch took 14.163 s to first token and another baseline replay took 12.261 s.
+  Fused is a positive settled candidate, not yet a safe automatic whole-API
+  choice or a cold/first-token latency solution. No alternative model was loaded.
+- An explicit offline full-composition search on that same loaded 30B completed in
+  52.166 s. It selected fused add/RMS, per-layer `auto` for QKV, Q/K norm/RoPE,
+  gate/up, KV write and head shape, plus device greedy when sampling allows it;
+  its median complete-step sample was 25.67 ms. The search's synthetic KV rows
+  were invalidated before product use. The first post-search 1–40 chat was
+  correct but 34.6 tok/s and 14.7 s first token (98 fresh rows); the next was
+  correct at 35.63 tok/s and 0.245 s first token with one-row graph reuse.
+  This is an actual upper-layer selection, but it does not prove the product's
+  best throughput or solve system-paging cold latency. A source fix now always
+  invalidates KV prefix metadata after explicit tuner traces, with regression.
+
+## 2026-10-03 ▸ stamped 30B reload and product-path retest (open)
+
+- Reloaded the existing browser page after the SDK source stamp changed and selected the
+  same local `Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf` through the native file
+  chooser. No hub download or localhost model HTTP transfer occurred. The new Python
+  source stamp was `fab66f35a9`; the page showed the 13.83 GB model ready.
+- Two correct 1–40 chat turns on the new source measured 33.2 tok/s with 4.6 s first
+  token at 98 context rows, then 33.3 tok/s with 2.9 s first token at 243 rows. The
+  runtime graph signature was present after the second turn. This is a browser regression
+  pass for correctness and a positive first-token observation, not proof of a
+  repeatable latency bound or near-40 tok/s throughput.
+- The interactive complete-API plan still reported `budget_limited` and
+  `tested_candidates: 0`, so `auto` is not yet proven optimal. A runtime-only fused
+  add/RMS + Q/K norm/RoPE + device-pick reply measured 34.1 tok/s, while an immediately
+  paired baseline/candidate pair measured 33.6/33.7 tok/s. All gave the same ordered
+  1–40 answer. This does not establish a repeatable product-path benefit, so the browser
+  worker was restored to composed/full and the diagnostic capture freed.
+- Native Q3_K MoE gate/up shape testing on the loaded 30B favoured the existing balanced
+  route (0.140 ms median). A Q3_K down-projection compact shape initially appeared
+  faster, but a 31-pair retest won only 12/31 and had medians 0.166 versus 0.163 ms.
+  It was not selected. The active MoE weights are Q3_K gate/up in all 48 layers and
+  Q3_K down in 35 layers, Q4_K down in 13; this is a format/shape observation, not a
+  model-name routing rule.
+- The user clarified that WebGL performance work follows WebGPU optimisation. WebGL
+  token/s targets may be lower, informed by comparable industry benchmarks and measured
+  same-device ratios rather than one universal multiplier. Its load and first-token
+  latency must still be seconds-level, with type-by-type semantic parity and the same
+  layered API obligations.
+- A fresh same-file 30B browser load with `dispatch_flush=2048` displayed `warm-step
+  9.9s`: one successful run but too close to the 10-second boundary to prove a stable
+  guarantee. Its first correct 1–40 chat ran at 33.7 tok/s with 3.6 s first token.
+  A three-pair loaded-model comparison of 2048 against 512 dispatches measured
+  36.8/37.9, 36.3/35.7 and 36.6/35.3 tok/s. Against production-default 1024,
+  three pairs measured 35.5/35.8, 37.2/36.2 and 37.0/36.3 tok/s. All answers
+  remained correct, but neither alternative wins repeatably. The browser was reset to
+  2048; the opt-in live-threshold diagnostic was removed from source and its bundle
+  rebuilt/restamped.
+- One baseline reply took 18.9 s to its first token despite just one new prefill row.
+  This remains a real latency failure even while other settled turns took under one
+  second. The same 30B complete-step profile measured 25.945 ms, led by MoE MLP
+  12.473 ms, attention output 4.004 ms, QKV 3.157 ms and head 2.343 ms.
+- A one-layer Q3_K MoE candidate fused SwiGLU activation into the original-width
+  down-projection shader without changing weights. It matched the existing output
+  exactly, but 21 paired captures measured 0.0970 versus 0.0963 ms median and it
+  won only 13/21. No source kernel was added; diagnostic captures and temporary
+  Python/GPU references were released.
+
+
+## 2026-10-03 ▸ user-confirmed 30B warm run, throughput and chat status (open)
+
+- The sole resident model was the user-selected local 30B Q3_K GGUF. The current
+  `dispatch_flush=2048` load displayed `warming 1.9s` and `warm-step 7.4s`;
+  the user confirmed latency is met for this run. An actual 97-context chat
+  produced the correct 1–40 reply: 114 tokens, 33.6 tok/s, 28 ms GPU + 1 ms
+  host per token, 5.4 s first token. Another same-model chat produced the same
+  answer at 35.1 tok/s and 1.9 s first token. These are product-path results;
+  they do not erase earlier >10 s cold-run variance or meet the near-40 target.
+- The loaded model's top-level `decode_plan` says `budget_limited` and
+  `tested_candidates: 0`, selecting composed add/RMS, separate QKV, composed
+  Q/K norm+RoPE, separate KV write and full-vocabulary greedy readback. A
+  stage profile measured about 24.5 ms for a whole token, about 12.7 ms of
+  which is MoE MLP. Automatic complete-API routing remains unproven.
+- A completed reply retained the composer hint `Stopping…` after the button
+  returned to `Send`. The chat source now clears that hint on turn completion
+  without erasing a different status; a functional JavaScript regression
+  passes. The live tab's stale hint was cleared in place, without reloading
+  or releasing its model. Source stamping is updated for a later safe reload.
+  All 35 JavaScript tests and `git diff --check` pass. This is not the full
+  seven-point acceptance or a final commit.
+- On the resident 30B, a runtime-only complete-step check compared composed
+  add/RMS plus Q/K norm+RoPE to their fused combination. Four sequential
+  full-logit outputs and chosen tokens matched exactly on the tested state;
+  nine alternating captured-step pairs favoured fused 8/9 times, with medians
+  26.92 versus 24.85 ms. Real chat still only measured 35.6 tok/s on one
+  fused run, and a later baseline/fused pair measured 33.6/34.9 tok/s, all
+  with the correct 1–40 answer. One diagnostic baseline recapture had 15.2 s
+  first-token latency despite just one new prefill row, so capture/paging
+  variance is part of the upper-API decision. The experiment reset its
+  diagnostic graphs and restored composed/full in the running worker; fused
+  is not persisted as `auto` on this evidence alone.
+- An alternating same-graph position check gave 25.748 ms at 97 context rows
+  versus 25.825 ms at 200 (later slower in only 9/16 pairs). The product
+  decode-rate drift is therefore not explained by this context increase alone.
+  Another correct baseline 1–40 reply measured 35.3 tok/s but took 7.8 s to
+  first token despite just one new prefill row. During that run macOS sampled
+  a three-second interval with 42,186 swap-in and 5,372 swap-out 16-KiB pages,
+  while wired memory spiked and then returned. This is system-wide correlation
+  with severe memory movement, not proof that any one model buffer or process
+  alone caused the first-token delay. The user's 30B remains the only model.
+- At an idle post-reply boundary, the already-supported GPU idle-pool release
+  freed 131,202,540 bytes without changing the 1,833 pinned decode buffers.
+  The next correct product reply was slower, 32.9 tok/s with 17.2 s first
+  token for one new prefill row. This single run is not a causal proof that
+  release itself caused the stall, but it supplies no positive performance
+  evidence for automatically draining the pool between replies. No new
+  per-reply pool eviction was added; the existing bounded pool/release path
+  remains in place on both backends.
+- The scalar WebGPU generate/stream APIs always re-recorded `decode` at the start
+  of every reply, even with unchanged full-attention buffers and execution
+  route. A new capability-checked path retains its output tensor and replays
+  that graph across compatible turns; KV capacity, GPU split, device-pick
+  semantics, execution overrides and new weight tuning invalidate reuse.
+  Recurrent layers intentionally re-record because prefill may replace their
+  state buffers. WebGL remains eager behind the same generation API. Both
+  streaming and non-streaming mock tests cover single execution, reuse,
+  invalidation and synchronous first-token accounting; full local suites pass
+  (132 Python, 35 JavaScript, TypeScript,
+  whitespace). The SDK source stamp is updated. The live 30B browser worker
+  still runs the older source and was not reloaded, so the size of the actual
+  first-token win and any browser-only regression are **unverified**.
+
+## 2026-10-03 ▸ early transfer-window release trial (warm gate still open)
+
+- The GGUF loader now releases the CPU/JS transfer window immediately after
+  the last weight upload, before model warm-up, on the shared WebGPU/WebGL SDK
+  path; the host's final release remains idempotent. This is a resource-lifetime
+  correction, not a proven latency optimisation. A backend-routing unit test
+  covers both implementations.
+- Three same-file, same-build native-file cold 30B loads at
+  `dispatch_flush=2048` measured first/second decode GPU sync at
+  8.966/0.042, 15.899/0.050 and 13.789/0.042 seconds. The 8.966-second run's
+  `warm-step` UI stage was 9.1 seconds, and a correct 1–40 product reply ran
+  at 34.6 tok/s with 2.9-second first-token latency. The next two cold runs
+  fail the strict ≤10-second gate; do not attribute a stable warm-up gain to
+  this change. No other model was loaded or downloaded.
+- During the third local cold load, 1-second macOS VM samples showed available
+  pages falling from roughly 807,000 to below 4,000 (16 KiB/page), while the
+  compressor grew from roughly 620,000 to 1.4 million pages and bursts of
+  20,000–54,000 swap-out pages/sec occurred. This strongly supports physical
+  memory pressure as part of the cold queue wait, but does not exclude lazy
+  GPU-driver work. It is system-wide evidence, not proof of which process owns
+  every page. The 30B warm gate remains open; no 0.6B or Laya test has replaced
+  this priority.
+- The third cold load also answered the same 1–40 chat prompt correctly at
+  35.1 tok/s; first token was 6.1 s for 98 prompt rows. A post-load GC
+  diagnostic collected only three objects and did not change GPU bytes
+  (13,723,627,352) or pinned bytes (zero before the next reply), so an
+  unreaped Python cycle after load is not the observed resident-memory gap.
+- After the source change and SDK version stamp: 127 Python tests, 34 JavaScript
+  tests, TypeScript, wheel consistency and `git diff --check` all pass. This is
+  not the full seven-point browser/format/API acceptance and no final commit
+  has been made.
+
+## 2026-10-03 ▸ 30B 512-dispatch and loaded-model fusion check (open)
+
+- The user-selected sole local 30B GGUF was cold-loaded with the diagnostic
+  `dispatch_flush=512` setting. Construction took 16.7 s; the first/second decode
+  GPU synchronisations took 18.166/0.950 s. A correct 1–40 product reply ran at
+  36.5 tok/s with 2.8 s first-token latency. This is not a warm-up win against
+  the prior 2048-dispatch run (10.393/0.041 s sync, 34.5 tok/s), nor paired
+  evidence that 512 is the best complete-API route.
+- On that already-loaded model, a runtime-only fused add/RMS plus Q/K norm/RoPE
+  plus device-greedy candidate still returned 1–40 correctly. Its first use
+  was 36.1 tok/s with 18.5 s first-token latency; the next fresh-chat reply
+  was 37.6 tok/s. The first-use stall and lack of a paired cold comparison
+  disqualify automatic production selection. The worker's diagnostic execution
+  fields were restored to the original composed/full route after the test.
+- OS sampling with the model resident showed the Codex service using about
+  14 GB, physical memory 23 GB used of 24 GB, roughly 200 MB unused, and an
+  11 GB compressor. This makes memory pressure a serious candidate for the
+  cold queue wait, but does not isolate it from driver first-use work. The
+  30B ≤10 s warming gate and near-40 tok/s target remain open; 0.6B and Laya
+  have not been loaded concurrently or advanced ahead of this gate.
+- On the same loaded model at decoder position 98, five output-head shape
+  candidates were screened on a complete captured decode. `balanced` first
+  appeared 0.49 ms faster than the baseline, but 30 interleaved pairs split
+  exactly 15/30 (24.190 versus 23.915 ms medians); `shortk` won only 11/30
+  (23.500 versus 23.685 ms). Both preserved the argmax and had <6e-7 relative
+  logits error. Neither has a repeatable positive win, so neither was selected.
+  Diagnostic captures were reset, pinned ids returned to zero and both head
+  blocks were restored to their original `auto`/null setting.
+
+## 2026-10-03 ▸ 30B loaded-session rerun and stream state correction (open)
+
+- The sole browser model was again the same 13,833,048,480-byte local 30B Q3_K GGUF,
+  selected through the native file input. Baseline cold first decode sync was 10.503 s,
+  above the strict 10 s gate; its correct 1–40 chat reply was 34.4 tok/s. On that loaded
+  instance, the previously numerically checked fused add/RMS and Q/K norm/RoPE pair
+  produced the same ordered answer at 36.4 and 36.6 tok/s. This is a candidate, not
+  a proven complete-API auto route or a near-40 acceptance result.
+- A diagnostic-only duplicate `createComputePipelineAsync` trial finished 29/29 promises
+  without errors but had 11.729 s cold first-sync on the same local file. It did not
+  meet the 10 s limit or prove a gain, so its code and URL gate were removed. A separate
+  runtime-only fused-plus-device-argmax product reply gave 37.0 tok/s and the same 1–40
+  content, but its cold 98-row first-token time was 13.1 s; that does not establish a
+  complete-API route win. The unmodified source is rebuilt and restamped.
+- Source review exposed a separate correctness/performance bug: streaming generation
+  executed a decode step while recording the graph and then replayed that **same** token
+  position. This wastes one step and doubles the recurrent-state transition. It now
+  consumes the capture's logits just as non-streaming `generate` does. Both captured
+  WebGPU and non-captured/WebGL paths stop before a forward for the final output token.
+  Three new mock regressions cover the token sequence, execution count and committed KV
+  prefix. Complete local tests: 126 Python, 34 JavaScript,
+  TypeScript and both wheel consistency checks pass. No final commit; 30B warm gate open.
+- After reloading the stamped Python fix, the same local 30B gave a correct 1–40
+  streamed reply at 34.5 tok/s; the worker source contained the captured-step
+  correction. Cold first sync was still 10.393 s, so the warm gate remains open.
+  At decoder position 0, a GQA single-kernel candidate matched four sequential
+  greedy tokens within 1.8e-5 relative logits error and won 25/30 full-graph pairs
+  (23.385 versus 24.028 ms). This was **not** the real chat context. At actual
+  position 98, it won only 19/30 pairs (23.857 versus 23.895 ms), output differed
+  by 6.1e-5 relative, and a runtime-only product reply slowed to 33.8 tok/s.
+  It was not selected; browser diagnostic overrides were restored.
+- A source-gated early-MoE test queued one single-row MLP immediately after each stacked
+  expert layer loaded, attempting to overlap first-use work with the subsequent GGUF
+  reads. On the same local 30B the model-construction interval was 17.1 s, but the
+  first decode sync worsened to 17.675 s versus 10.393 s on the prior baseline run.
+  It failed both the strict warm gate and total-work test, so the experimental source
+  flag and warm calls were removed and the production assets restamped.
+- A second gated trial selected the numerically checked fused add/RMS plus QK-norm/RoPE
+  route *before* the first decode warm step, rather than only for steady replies. The
+  same local 30B constructed in 16.8 s but first sync took 12.041 s, slower than the
+  10.393 s baseline and still above the limit. Warm-stage and steady-state choices
+  therefore cannot be conflated; the diagnostic flag was removed and assets restamped.
+
+## 2026-10-03 ▸ 30B first-decode submission root cause and verified correction (open)
+
+- Reused the user-selected local 30B Q3_K GGUF exclusively; no HTTP model load or second
+  resident model. A 50-pass WebGPU timestamp trace of two warm decode steps recorded
+  exactly 1061 dispatches each. The first was fragmented into 49 passes (65.99 ms total
+  GPU time) while the second was one pass (61.67 ms). Host warm-step stage was 19.52 s,
+  including 16.99 s first sync. Pipeline creation on the JavaScript host was 0.09 ms
+  total across 25 registrations, but that alone does not rule out lazy driver work.
+- The fragmentation matched 48 MoE layers: each first T=1 route allocated a zeroed
+  tiny weight buffer. `setDataRaw` flushed pending work before each upload, even though
+  `moe_route` overwrites all output slots before consumers read them. Replaced this with
+  a device-native empty buffer for the shared WebGPU/WebGL layer contract and added a
+  regression using NaN-filled mock storage to prove complete overwrite.
+- Same-file, same diagnostic build after the change: first warm step became one 1061-
+  dispatch pass (52.10 ms GPU execution), second one pass (40.30 ms). First sync fell
+  to 10.435 s and second to 0.043 s; host stage was 10.573 s. Correct browser output
+  remained 1–40, with 33.5 tok/s and 3.0 s first token. This is an improvement but the
+  ≤10 s warm limit and near-40 tok/s target remain **open**. First-request latency has
+  shown large variance (a prior same-model reply took 29.0 s), still unresolved.
+- Two further uninstrumented cold loads of that same local file measured 13.085 s and
+  12.942 s first sync, so the 10.435 s diagnostic run cannot be called a pass. A queue
+  completion probe on another cold run showed its critical submission took 0.005 ms on
+  the JavaScript host yet `GPUQueue.onSubmittedWorkDone()` resolved at 12.395 s, matching
+  Python's 12.351 s wait. Thus the remaining wait is in GPU queue completion, not the
+  JS upload call, `mapAsync` readback, or the chat UI. GPU timestamps show the arithmetic
+  itself is only tens of milliseconds; driver-side compilation/residency is not yet split.
+- System VM sampling: with this 13.8 GB model released, swap activity fell to essentially
+  zero; during a loaded idle sample it reached about 1,091 swap-ins and 7,540 swap-outs
+  of 16 KiB pages in one second. During a local reload, physical free pages fell from
+  roughly 770,000 to under 5,000 and compressed pages rose sharply. This supports
+  memory pressure as a contributing condition, not proof that it is the sole cause of
+  the GPU queue wait. Production browser replies after the fix were correct at 35.7
+  tok/s baseline and 36.1 tok/s for a runtime-only fused combination; the latter has
+  not been made an automatic route based on those isolated product readings.
+- TypeScript, 33 JavaScript tests, the 15-test MoE route subset and `git diff --check`
+  passed after the change. A subsequent full collection of `test/test_*.py` passed
+  123/123; all 33 JavaScript tests, TypeScript, wheel consistency and whitespace checks
+  passed. The WebGL browser check and final acceptance
+  matrix still need rerun. No final commit has been made.
+- A separate failure-path audit found `WebGPUTensorBuffer.getDataRaw()` could strand its
+  temporary GPU readback buffer if `mapAsync`, copy encoding, or the data copy threw.
+  It now destroys that buffer in `finally`, and a unit test covers successful readback
+  and rejected mapping. WebGL reads through its persistent framebuffer and allocates
+  no corresponding temporary GPU readback buffer. This does not claim a throughput gain.
+
+## 2026-10-03 ▸ Same 30B browser A/B and progress-log correction (open)
+
+- The only resident model was the same native-file-picked 30B Q3_K GGUF. A reverse layer
+  upload-order trial gave 14.17 s first decode GPU sync; a same-build default-order
+  follow-up gave 12.09 s (second sync 0.28 s). Upload order therefore has no proved win;
+  its diagnostic source branch was removed. Default-order load was ready after 24.5 s of
+  model construction and answered 1–40 correctly at 35.0 tok/s, first token 5.5 s.
+- Layer profiling on that instance: unsplit whole step 24.13 ms; MoE MLP 12.16 ms, QKV
+  3.24 ms, attention out 3.42 ms, head 2.13 ms. A real-file routed-Q3 shape comparison
+  found the current balanced gate/up and default down shapes fastest among the tested
+  original-width variants; alternative outputs differed by at most 3.5e-7 relative.
+- The fused add+RMSNorm plus Q/K norm+RoPE candidate matched full-step logits exactly
+  on the tested input. An expanded 20-pair, order-alternated, complete-graph measurement
+  favoured it 17/20 times: median 24.71 versus 25.32 ms, one-sided exact sign-test
+  p=0.00129. Ten actual default-sampling browser replies all contained 1–40 in order;
+  fused and composed page rates remained roughly 35–38 tok/s and did not reach the
+  30B target. This candidate is not yet an automatic, profile-persisted API route.
+- Fixed the chat load-stage log reset at the start of **every** load attempt. Native-file
+  loads may emit no `reading` stage, which previously made the status and console append
+  timings from earlier loads. A regression test passes. Browser verification of this
+  source change awaits a later safe reload; the currently loaded 30B was not discarded.
+- Rebuilt both Python wheels and updated the asset stamp after removing the unsuccessful
+  upload-order trial. Current subset checks: 119 Python, 32 JavaScript, TypeScript
+  type-check, and `git diff --check` pass. Warm ≤10 s, 30B near-40 tok/s, WebGL browser
+  parity and the remaining seven-point acceptance gates remain open. No commit made.
+- WebGPU's stacked MoE constructor was synchronising a four-byte transpose flag after
+  **every expert**. It now keeps source and metadata buffers alive in bounded 32-expert
+  windows and synchronises once per window. WebGL retains its equivalent one-pass stack
+  at the same `GGMLMoELinear` interface. Three new mock tests cover lifetime, bounded
+  windows and WebGL routing; the full Python suite rose to 122 passing tests.
+- On fresh workers with the same local 30B and same source build, a runtime transport
+  control measured window 1 at 19.4 s model construction / 17.34 s first GPU sync,
+  window 8 at 16.9 / 17.62 s, and window 32 at 16.8 / 16.20 s. The default 32 window
+  improved construction against its same-build single-expert control and answered 1–40
+  correctly at 35.5 tok/s, first token 2.7 s. It did **not** meet the ≤10 s warming gate;
+  no warm-latency benefit is claimed. The running worker's experimental window was
+  restored to 32 after the control.
+
+## 2026-10-03 ▸ 30B upper-API candidate and cold MoE residency (open)
+
+- The same locally picked 30B Q3_K GGUF was the only resident model. Four-step sequential
+  logits/token checks passed for fused add+RMSNorm and fused Q/K norm+RoPE. Fused QKV was
+  numerically eligible but about 47 ms versus 24 ms per full step, so rejected.
+- Five interleaved complete-generation pairs (90 tokens, greedy, same prompt) all favoured
+  the combined fused add/QK route: median 40.99 versus 39.38 tok/s. Browser chat with the
+  live combination still answered 1–40 correctly at 37.8 tok/s under default sampling.
+  This is a verified candidate, **not yet automatic production routing**; the two API
+  conditions and the initial context work differ.
+- A bounded large-upload path now waits for each tensor's queued GPU copies to finish
+  before destroying staging sources and acknowledging the blocked worker. Unit tests cover
+  byte identity, source lifetime, and asynchronous success/failure wakeup; TypeScript
+  type-check and JS build pass. The first fresh same-file load still had 16.06 s of first
+  decode GPU sync, so this change is not accepted as a warmup fix.
+- A second cold load with an ephemeral per-stage probe put 15.81 of 16.66 s in MoE MLP,
+  primarily layers 9–24 at 0.7–0.97 s each. QKV summed to 0.35 s. The ordinary step
+  immediately after this probe needed 1.97 s then 0.044 s of GPU sync. Browser pipeline
+  creation totaled 0.085 ms over 33 pipelines. The data points to cold expert-weight
+  residency or paging, but that causal hypothesis still needs a controlled fix/test.
+- Both model releases returned WebGPU buffers to zero. No network model download, second
+  model, commit, or completion claim. The ≤10 s warm gate and remaining seven-point gates
+  are open.
+- Bounded direct `queue.writeBuffer` was separately tested on the same local model. First
+  decode GPU sync was 28.38 s, worse than the bounded mapped-staging trial's 16.06 s;
+  the direct-write candidate and its flag were removed from source and the JS bundle
+  restored to the mapped-staging build.
+- A runtime-only GPU kernel touched the pages of the eight actually selected experts
+  before their first MoE projection. It read 96 stacked buffers; the corrected cold load
+  measured 14.41 s first GPU sync against 16.06/16.41 s on two bounded-staging loads.
+  With non-paired variance and the ≤10 s gate still failed, it is **not** selected. The
+  monkeypatch was restored and all 96 temporary GPU scratch buffers were released.
+- Releasing only completed idle GPU scratch immediately before the decode warm step
+  recovered 280,951,332 bytes in 0.0017 s on a fresh same-file load. The first/second
+  GPU syncs were still 15.147/1.865 s, so the route did not meet the ≤10 s gate.
+  The safe pool cleanup was retained in source for both WebGPU and WebGL and has a
+  mock-backed regression test; it does not release weights or capture pins.
+- A separate runtime-only trial skipped the whole-model decode warm step after releasing
+  and re-picking the **same local file**. The later required full-forward proof then took
+  11.5 s by itself; the first independent 98-context chat answered 1–40 correctly at
+  32.4 tok/s, 2.6 s first token, but its capture pinned 1,929 buffers rather than the
+  previously warmed route's 1,833. The 96 additional pins may be persistent MoE routing
+  buffers first allocated inside capture; pin counts alone do not prove extra dispatches.
+  This moves cold work; it
+  neither meets the ≤10 s loading gate nor establishes an API win. The monkeypatch was
+  restored and no skip was added to source.
+- Reordering the existing correctness proof before decode warming and reducing its
+  probe to two positions was also tested only in the running worker. The first proof
+  still took 12.296 s, and the subsequent two-step decode warm took 0.559 s
+  (first/second GPU sync 0.437/0.024 s). Combined 12.855 s misses the same gate;
+  the original methods were restored. The same local GGUF was the only resident model.
+- After the pool experiment, the running worker's temporary warm-step monkeypatch was
+  restored. The Python suite passed 117 tests, JavaScript suite 29, TypeScript type-check
+  and diff whitespace check passed. These are subset gates, not final acceptance.
+- Browser reload on the source-stamped build using the same local GGUF confirmed the
+  local-file status no longer claims a cache copy. The browser's IndexedDB now has a
+  `webgpu/apple/metal-3//` key distinct from the legacy unprefixed key, and contains the
+  measured flash/format entries for this backend. The actual first decode GPU sync was
+  still 17.210 s (second 0.767 s), so warm latency remains open. Host profile keys now
+  distinguish WebGPU/WebGL and cache the identity once per worker; GQA, flash and several
+  layer-composition choices have validated profile round-trips. Unit suites: 119 Python,
+  31 JavaScript; this does not replace a WebGL browser run.
+- On that source-stamped WebGPU page, the first independent 98-context chat returned the
+  correct 1–40 sequence (114 tokens) at 36.7 tok/s; first token was 6.7 s, including
+  1.5 s of seven new prefill shape measurements. This is a product-path result, not the
+  fused upper-route candidate's result and not evidence that the 17.210 s warm gate passed.
+
+## 2026-10-02 ▸ 30B cold-warm root-cause investigation (gate remains open)
+
+- Serially released and reloaded only the same disk-backed 30B GGUF through the browser
+  file picker. The model was never fetched over HTTP and never co-resident with another
+  full model. A release plus explicit cleanup returned WebGPU buffers to zero; one
+  diagnostic reference temporarily held a 124 MB head buffer and was cleaned before
+  the next load.
+- An interactive-load check based on *remaining* time still let a 16.6 s semantic oracle
+  recording start, because the operation is indivisible. Loading now selects the exact
+  original-width composition without starting that oracle; explicit offline composition
+  tuning remains available. An automated regression tests both expired and ample future
+  deadlines. The source also records first/second decode dispatch and GPU-sync timings.
+- Removing the oracle did not meet ≤10 s. Baseline 30B `warm-step` runs took 13.3 and
+  18.3 s at dispatch flush 2048, and 15.4 s at flush 512. Their first GPU synchronisations
+  were 12.74 and 14.69 s, while host dispatch was about 0.05–0.10 s and the second GPU
+  synchronisation was 0.41–0.61 s. A further baseline run under heavier system pressure
+  took 40.7 s warm-step, 37.79 s of it first GPU synchronisation. GPU pipeline creation
+  accumulated under 1 ms, and bind-group creation only a few ms during these runs.
+- Two opt-in upload hypotheses were tested on the real local model and rejected: touching
+  9.1 GB of buffers during upload made shape warming 6.8 s and warm-step 27.6 s; replacing
+  staging copies with `queue.writeBuffer` for 13.4 GB made warm-step 21.6 s. Both candidates
+  were removed and the checked-in JS bundle rebuilt. The 512-flush product run answered
+  1–40 correctly at 37.0 tok/s versus a separate 2048-flush run at 35.4 tok/s; that
+  unpaired comparison does not establish a route winner.
+- During a serial baseline load on the 24 GB Apple M5, system VM counters registered large
+  increases in decompressions and swap-ins while available pages became scarce. This is
+  consistent with cold resource residency, but a controlled causal test is still needed.
+  Do not label the ≤10 s warmup or the full seven-point acceptance matrix complete.
+- Python unit suite: 116 passed. Browser worker/source and HTML were rebuilt/stamped after
+  removing negative candidates; no final commit has been made.
+
+## 2026-10-02 ▸ Loaded 30B MoE routing/reduction measurements and WebGL parity repair
+
+**Trigger:** The user had the local 30B GGUF loaded and asked that its real API path,
+first-answer latency, memory and warmup be improved without another model download.
+
+### Changes
+
+- Generalised the device MoE router to a batch of token rows. A previous per-prefill-layer
+  host readback was measured at 26.89 s across 48 layers during a 27.49 s cold prefill.
+  A first-layer auto calibration that executed both routes was measured negative and removed;
+  route choices now accept device/backend/format/shape/cold-or-warm profile data with a host
+  fallback, plus explicit containing-layer overrides.
+- Simplified normalised top-k by cancelling the full-expert softmax denominator on both GPU
+  backends. The non-normalised branch retains the full softmax. This does not change the
+  quantised weight representation or activation width.
+- Fixed a real WebGL shader compile failure: `flat` is a GLSL qualifier, so the batched
+  router's local variable prevented both shaders from compiling and silently yielded zeros.
+- Added an equivalent WebGPU/WebGL fused routed-expert weighted sum, leaving both the fused
+  and composed routes addressable at the operator and containing-layer levels.
+- Corrected the source first-token timer to include the post-prefill decode-graph capture.
+  The already-loaded browser worker predates this timer change, so its UI timing is not
+  accepted as post-capture latency evidence.
+
+### Measurements and correctness evidence
+
+- WebGPU router: old/new indices identical for 1, 4 and 98 rows, both normalised and
+  unnormalised; worst weight relative difference 3.1e-7. Isolated normalised routing won
+  9/9 paired rounds at 1 and 98 rows. Complete captured 30B token step at position 98:
+  old median 27.795 ms, new 26.845 ms, new route faster 8/9 paired rounds.
+- WebGL real browser, with no second model loaded: fixed router matched an independent
+  NumPy top-k/softmax reference for 1, 3 and 98 rows, both normalisation modes; worst
+  weight absolute error 1.7e-7. Fake-projection MoE layer host/device outputs differed by
+  at most 7.5e-9. The original shader returned all-zero outputs before the compile fix.
+- Fused weighted sum: WebGPU and WebGL outputs matched the composed operator to about
+  1.6e-7 relative at the real 30B shape (k=8, H=2048). The isolated primitive won 9/9
+  paired rounds on both backends at 1 and 98 rows. On the real 30B, four interleaved
+  full-step combinations gave medians 25.315/25.070 ms (old router, composed/fused) and
+  24.395/24.210 ms (new router, composed/fused); all picked the same token. The fused
+  route by itself had been inconclusive in an earlier 5/9 paired comparison, so the
+  combined whole-API result matters.
+- Real chat with the same loaded 30B, runtime hotpatched but no reload: correct ordered
+  1–40 response, 114 tokens, 36.2 tok/s, GPU 26.08 ms and host pick 1.19 ms, versus
+  32.6 tok/s immediately before these candidates. The prompt hit a one-row prefix cache,
+  so it does not establish cold prefill or warmup performance. The current browser URL's
+  build stamp still refers to the pre-hotpatch build.
+- Local tests: 114 Python and 29 JavaScript passed. `pytest test` without a file filter
+  incorrectly collects the Pyodide-only top-level-`await` runner; the valid local command
+  is `pytest test/test_*.py`.
+
+### Explicit limits
+
+- Warmup ≤10 s is **not** verified; a live repeat of two decode warm steps took 16.13 s
+  once and 0.18 s when settled. The initial load's exact semantic recording remains the
+  next critical-path investigation. The source timer fix also awaits a fresh browser build.
+- No full 30B WebGL model was loaded alongside WebGPU. WebGL evidence here covers the
+  real GPU operators and equivalent MoE layer interface, not 30B product throughput.
+- The new operator choices are not yet integrated into an automatic, persisted top-API
+  composition tuner for fresh builds; the loaded-tab run used explicit runtime overrides.
+  The seven-point acceptance matrix is therefore still open. 0.6B and the BERT-based Laya
+  decision path follow the remaining 30B gates, in the user's order.
+
+### Unchanged
+
+- The local 30B model remains loaded in the original browser tab. No model bytes were
+  downloaded or read over localhost HTTP; only SDK source was fetched for hotpatch tests.
+
+## 2026-10-02 ▸ 30B latency diagnosis, not yet accepted
+
+- Direct local GGUF WebGPU load and full-chat generation produced the correct ordered 1–40
+  output twice at 34.4 and 33.5 tok/s. Model release returned GPU buffers from 13.19 GB
+  to effectively zero; no second model was resident.
+- The first bounded-warm build still spent 23.1 s warming. Fine-grained stage reporting
+  located 20.2 s in the four eager sequential logits forwards used as the exact-width
+  semantic oracle. This is above the required 10 s and remains open.
+- First-token waits of 13.6 and 17.0 s were prefill, not decode: the later turn reprocessed
+  436 prompt rows after a page reload, including 11,816 GPU dispatches. Browser-persisted
+  tuning held weight-execution buckets 1 and 4, but not the larger batch bucket reached
+  by that prompt. A first-time measurement was therefore on the answer's critical path.
+- Current unverified fix captures and replays the exact sequential oracle instead of four
+  eager command streams; it registers nested stacked-MoE weight shapes before the oracle,
+  trims redundant large-batch calibration repetitions while retaining paired sign-test
+  evidence, and saves new shape decisions after generation as well as after load.
+- Next gate: rebuild/stamp, one local 30B browser rerun, verify both warm ≤10 s and
+  first-token latency with correctness and GPU/CPU memory. Do not claim completion before
+  that evidence; then 0.6B, then Laya decision model, in the requested order.
+
+## 2026-10-02 ▸ Correction — no arbitrary phase-two gain cutoff
+
+**This supersedes the percentage-margin statements in the earlier completion entry below.**
+
+- Removed the fixed latency-gain cutoff and the special-case that skipped M=1/M=2. Routing
+  now uses nine interleaved paired rounds and an exact one-sided sign test. A stable small
+  win is enabled; inconclusive timings keep the lower-memory implementation.
+- Connected activation-INT8 DP4A to production `QuantizedLinear(auto)` routing on WebGPU.
+  Candidate availability and numerical correctness are checked before it is timed, and the
+  cache key remains model-agnostic: family, stored format, K/N, shape bucket and device
+  runtime only. WebGL converges at the same `QuantizedLinear.forward` result contract.
+- Re-ran the target WebGPU. DP4A speedups versus exact stored were INT4
+  `0.569/0.946/0.546/0.503×` and INT8 `0.612/0.928/0.384/0.393×` for M=1/2/32/128, so every
+  bucket selected stored from negative or inconsistent paired evidence—not from a minimum
+  gain rule. AutoGPTQ zero-offset validation also passed below 0.7% maximum relative error.
+- Re-ran stored versus materialized across all accepted formats. Stable local wins remain
+  enabled (for example F16 M=8/32/128 and several packed M=128 buckets), while noisy results
+  are explicitly reported as inconclusive and keep stored memory use.
+- Final browser gates: 140/140 native GGML cases on WebGPU and 140/140 on WebGL; phase-two
+  WebGL explicit-equivalence gates; local Qwen3 native Q4_K/Q6_K smoke `OK` on both backends.
+  Automated gates: 67 Python tests and 19 JavaScript tests.
+
 ## 2026-10-02 ▸ Two-phase completion and efficient parity
 
 - Completed the original-width phase for all accepted GGML formats and GPTQ INT4/INT8 on
   both WebGPU and WebGL. Backend-, format- and batch-specific scalar/vec4 routes retain local
   wins instead of requiring one global winner.
 - Completed measured stored-versus-materialized routing on WebGPU. Decisions are cached by
-  family, format, K/N and shape bucket in the device-specific kernel profile; a candidate
-  needs a 5% latency win to justify the extra persistent/temporary memory.
-- Implemented and measured activation-INT8 DP4A as the phase-two cross-width candidate. It
-  passed accuracy but produced no >5% winning bucket on the target WebGPU, so production
-  correctly keeps exact stored execution. WebGL declares the primitive unavailable and
-  converges at the `QuantizedLinear.forward` contract instead of emulating it badly.
+  family, format, K/N and shape bucket in the device-specific kernel profile. The original
+  percentage rule recorded here is superseded by the correction above.
+- Implemented and measured activation-INT8 DP4A as the phase-two cross-width candidate. The
+  benchmark-only conclusion recorded here is superseded: DP4A is now a production candidate
+  and is selected per device/format/shape from stable paired evidence. WebGL declares the
+  primitive unavailable and converges at the `QuantizedLinear.forward` contract.
 - Added the WebGPU/WebGL efficient-common-layer manifest and executable parity tests. Scope
   descends global → backend → format → operator mode → shape bucket → device profile;
   absence of a global win never discards a local win.
@@ -207,3 +1618,83 @@ operator performance. The browser also reported 527.9 MB loaded for a 402.5 MB G
 
 - Dense FP16/BF16/F32 execution remains available.
 - The model list still exposes only the published xDecision Q8 GGUF artifact.
+# 2026-10-03 ▸ latest 30B live-browser cold/replay and release evidence
+
+- The user-selected sole model was the native local `Qwen3-30B-A3B-Instruct-2507-UD-Q3_K_XL.gguf`.
+  A settled cached-prefix chat on the previous diagnostic build answered 1–40 correctly
+  at 35.6 tok/s, but needed 15.3s to first token for one replay row; timestamp-query
+  put the first GPU compute pass at only 31.2ms. The next same-model run was correct
+  at 36.4 tok/s with 1.2s first token. This is latency variance, not a slow steady kernel.
+- `Release` without page reload showed 0KB page GPU buffers and 42MB WASM heap. The page
+  then loaded the newest stamped production bundle (no diagnostic URL settings), and
+  reselected that exact local GGUF through the native file picker. The cold load showed
+  `warm-step 9.3s` (first GPU sync 9.025s, second 0.050s). A correct 1–40 full-prefill
+  chat ran at 34.1 tok/s, 3.6s first token; a second correct cached-prefix chat ran
+  at 35.2 tok/s with 4.9s first token. This is one passing warm sample; previous
+  13–14s warms and the new 15.3s replay keep both latency gates open.
+- System VM sampling during reply work showed major transient wired-page growth and
+  decompression/swap activity, consistent with resource-residency pressure but not a
+  controlled attribution of the whole stall. The 677-dispatch captured step is smaller
+  than both 1024 and 2048 flush thresholds; those settings do not split its main replay,
+  so small unpaired tok/s differences between these thresholds cannot establish a
+  causal winner for this decode path.
+- Hardened `close()` so backend disposal still runs if `Worker.terminate()` throws; both
+  backend singleton references clear before disposal, and main-thread teardown attempts
+  WebGL even if WebGPU teardown throws. New exceptional-path test passes. Local checks:
+  140 Python, 37 JavaScript, TypeScript compiler, and `git diff --check`. Not committed.
+- A 256-byte-aligned shared WebGPU metadata-buffer arena was tested as a candidate to
+  reduce the roughly 642 small metadata allocations held by this 30B. It passed local
+  alias/lifetime tests and browser 1–40 correctness. Two serial native-file cold loads
+  displayed `warm-step 10.0s` and `10.4s`; the first full reply ran at 35.2 tok/s,
+  and its cached-prefix repeat at 35.1 tok/s, versus a nearby unpooled baseline at
+  9.3s warm and 34.1/35.2 tok/s. This did **not** establish a positive latency or
+  throughput result (the 10.4s load fails the hard limit). The arena experiment and
+  its tests were removed; the bundle was rebuilt and restamped to the previous
+  unpooled implementation. No candidate is enabled on allocation count alone.
+  The restored production bundle was itself reloaded with the same local 30B:
+  `warm-step 9.2s`, correct 1–40 at 35.5 tok/s and 3.9s first token. The model is
+  left loaded in the browser; this still does not prove a stable ≤10s warm bound.
+
+## 2026-10-03 ▸ 0.6B exact-output WebGPU profile and complete chat-path retest
+
+- The only loaded model was the native local Qwen3-0.6B Q4_K_M GGUF
+  (`ce11278f` fingerprint). Each script reload released it first, verified zero
+  GPU buffers and about 42 MB WASM, then used the browser's disk file picker for
+  the same file. No network model read and no simultaneous model load occurred.
+- A device-local IndexedDB kernel profile reuses the measured full-sampling
+  composition: fused add/RMS, fused QKV, separate gate/up, fused QK norm/RoPE,
+  fused KV write, compact head, five Q4_K stored-format shapes, and GPU full-vocab
+  selection. The profile is keyed by backend/device/source, not by model name.
+  Four-step complete logits matched the stored-width reference exactly in a
+  diagnostic readback, and seeded complete 1–40 replies matched the reference
+  text. Direct SDK settled around 139–141 tok/s; this is not a chat-page claim.
+- Fixed-seed chat-page generation with the same 115-token output was measured
+  repeatedly. The original 60 ms Markdown refresh typically settled near
+  134–136 tok/s; an adaptive 200 ms refresh on streams under 12 ms/token raised
+  the seven settled runs to 136.41–137.54 tok/s, after a 127.85 opening run.
+  All eight replies were correct; the product has **not** demonstrated stable
+  140+ tok/s. The per-token callback itself averaged 0.051 ms; 20 live Markdown
+  renders cost about 19.5 ms total. This performance finding is about the
+  complete visible chat path, not a one-kernel microbenchmark.
+- Same-file, same-seed interleaved A/B gave no stable benefit from combining
+  compute and readback into one WebGPU submission, four-byte readback-buffer
+  pooling, or worker notification batches of four/eight. Those candidate
+  implementations were removed; the pool stays disabled. The adaptive render
+  cadence is generic and has a unit test. Its final stamped build still needs
+  WebGL product regression, so backend parity is not claimed complete.
+- Final local checks: 76 JavaScript tests, 161 Python tests, TypeScript build,
+  `git diff --check`. Worktree is intentionally uncommitted and dirty while the
+  remaining seven-point gates are open. Next: close the 0.6B product-path speed
+  gap without changing output semantics, then continue WebGL and Laya gates.
+- The final stamped build was also loaded as the sole WebGL model through the
+  native picker. Two fixed-seed complete chat replies matched 1–40 at 18.29 and
+  18.68 tok/s; first-token times were 2.231 and 0.057 s. All 115 live updates
+  in both runs took the original 60 ms render route, so the fast-stream UI
+  change did not get imposed on WebGL's slower stream. Releasing WebGL returned
+  WASM to about 42 MB and the page displayed 0 KB GPU buffers. The browser was
+  then returned to WebGPU with the same local 0.6B file loaded; no other model
+  was resident at the same time.
+- A later ten-reply fixed-seed product run used `dispatch_flush=4096` on the
+  same local 0.6B. All outputs remained correct, but settled throughput was
+  135.4–137.0 tok/s, no better than the default build. The candidate URL was
+  removed and the same local model restored on the original WebGPU URL.

@@ -7,6 +7,7 @@ attention / more ops come later; the autograd core here is what everything else
 builds on.
 """
 import re
+import time
 import numpy as np
 
 # Why the GPU is not being used, when it is not. Every step that can fail writes its reason
@@ -91,7 +92,12 @@ class Tensor:
         self.requires_grad = requires_grad
         self.grad = None
         self._backward = lambda: None
-        self._prev = tuple(_children)   # NOT a set — allow __eq__ override (torch shim)
+        # Inference never traverses an autograd graph. Retaining parents anyway makes a
+        # growing KV cache retain every prior cache texture and the forward intermediates
+        # that produced each new K/V row. WebGL appends a row every token, so that chain
+        # grows for the entire conversation even though no gradient can be requested.
+        # Keep the ordered parents only when backward is actually possible.
+        self._prev = tuple(_children) if requires_grad else ()
         self._op = _op
 
     def _setback(self, fn):
@@ -1162,18 +1168,23 @@ var<storage,read> lg: array<f32>;
 var<storage,read_write> eidx: array<i32>;
 @group(0) @binding(2)
 var<storage,read_write> ew: array<f32>;
-struct RM { ne: u32, k: u32, norm: u32, pad: u32, }
+struct RM { ne: u32, k: u32, norm: u32, rows: u32, }
 @group(0) @binding(3)
 var<storage,read> rm: RM;
 var<workgroup> v: array<f32, 512>;
 var<workgroup> red: array<f32, 128>;
 var<workgroup> ridx: array<u32, 128>;
 @compute @workgroup_size(128)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let row = wid.x;
+  if (row >= rm.rows) { return; }
+  let base = row * rm.ne;
+  let out_base = row * rm.k;
   let t = lid.x;
   // stage the router's scores; anything past ne is -inf so it never wins a pass
   for (var e: u32 = t; e < 512u; e = e + 128u) {
-    v[e] = select(-1e30, lg[e], e < rm.ne);
+    v[e] = select(-1e30, lg[base + e], e < rm.ne);
   }
   workgroupBarrier();
   // k passes of argmax, each taking the winner out of the running
@@ -1195,26 +1206,38 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
       r = r / 2u;
     }
     if (t == 0u) {
-      eidx[s] = i32(ridx[0]);
-      ew[s] = red[0];
+      eidx[out_base + s] = i32(ridx[0]);
+      ew[out_base + s] = red[0];
       v[ridx[0]] = -1e30;
     }
     workgroupBarrier();
   }
-  // softmax over ALL experts, then renormalise across the chosen ones (the Qwen convention);
-  // with norm == 0 the raw softmax weights are kept.
+  // For normalised top-k, the full-expert softmax denominator cancels exactly:
+  // (exp(s_i)/sum_all exp) / sum_selected(exp(s_j)/sum_all exp)
+  // = exp(s_i)/sum_selected exp. Only the unnormalised mode needs all experts.
   if (t == 0u) {
-    var mx: f32 = -1e30;
-    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { mx = max(mx, lg[e]); }
-    var den: f32 = 0.0;
-    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { den = den + exp(lg[e] - mx); }
-    var tot: f32 = 0.0;
-    for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
-      let p = exp(ew[s] - mx) / den;
-      ew[s] = p; tot = tot + p;
+    if (rm.norm == 1u) {
+      var picked_max: f32 = -1e30;
+      for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+        picked_max = max(picked_max, ew[out_base + s]);
+      }
+      var picked_den: f32 = 0.0;
+      for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+        picked_den = picked_den + exp(ew[out_base + s] - picked_max);
+      }
+      if (picked_den > 0.0) {
+        for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+          ew[out_base + s] = exp(ew[out_base + s] - picked_max) / picked_den;
+        }
+      }
+      return;
     }
-    if (rm.norm == 1u && tot > 0.0) {
-      for (var s: u32 = 0u; s < rm.k; s = s + 1u) { ew[s] = ew[s] / tot; }
+    var mx: f32 = -1e30;
+    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { mx = max(mx, lg[base + e]); }
+    var den: f32 = 0.0;
+    for (var e: u32 = 0u; e < rm.ne; e = e + 1u) { den = den + exp(lg[base + e] - mx); }
+    for (var s: u32 = 0u; s < rm.k; s = s + 1u) {
+      ew[out_base + s] = exp(ew[out_base + s] - mx) / den;
     }
   }
 }
@@ -1223,12 +1246,25 @@ _moe_r = {"added": False}
 
 
 def moe_route(logits, eidx, ew, ne, k, norm=True):
-    """Router scores -> chosen experts and their weights, entirely on the device.
+    """Router scores -> chosen experts and weights for one or many rows on-device.
 
     Doing this on the host means reading the router's output back once per MoE layer, which
     at 48 layers is most of a decode step -- and it is a tiny amount of data, so the cost is
     all round-trip. Keeping it here also keeps the step capturable: the indices land in a
     buffer the expert matmuls already read, and no command depends on their value."""
+    ne = int(ne); k = int(k)
+    shape = tuple(int(v) for v in logits.shape)
+    if len(shape) == 1:
+        rows, width = 1, shape[0]
+    elif len(shape) == 2:
+        rows, width = shape
+    else:
+        raise ValueError("MoE router logits must be a vector or matrix")
+    if not (rows >= 1 and 1 <= ne <= 512 and 1 <= k <= ne and width == ne):
+        raise ValueError("MoE router requires rows >= 1, 1 <= k <= ne <= 512, "
+                         "and logits width == ne")
+    if int(eidx.size) < rows * k or int(ew.size) < rows * k:
+        raise ValueError("MoE router output buffers are too small")
     if _webgl_ready() and not _adam_backend_ready():
         return _webgl_moe_route(logits, eidx, ew, ne, k, norm)
     plat = _adam_kernel["platform"]
@@ -1237,11 +1273,125 @@ def moe_route(logits, eidx, ew, ne, k, norm=True):
                                      "bindingTypes": ["read-only-storage", "storage",
                                                       "storage", "read-only-storage"]})
         _moe_r["added"] = True
-    meta = _adam_kernel["make_meta"]((int(ne), int(k), 1 if norm else 0, 0), "u4,u4,u4,u4")
+    meta = _adam_kernel["make_meta"]((ne, k, 1 if norm else 0, rows), "u4,u4,u4,u4")
     plat.runKernel({"name": "moe_route",
                     "tensors": [logits.buffer.buffer_id, eidx.buffer.buffer_id,
                                 ew.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": 1, "y": 1, "z": 1}})
+                    "workGroups": {"x": rows, "y": 1, "z": 1}})
+
+
+_MOE_REDUCE_WGSL = """@group(0) @binding(0) var<storage,read> y: array<f32>;
+@group(0) @binding(1) var<storage,read> w: array<f32>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f32>;
+struct RR { rows: u32, k: u32, h: u32, pad: u32, }
+@group(0) @binding(3) var<storage,read> rr: RR;
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= rr.rows * rr.h) { return; }
+  let row = i / rr.h;
+  let col = i - row * rr.h;
+  var acc: f32 = 0.0;
+  for (var slot: u32 = 0u; slot < rr.k; slot = slot + 1u) {
+    let p = row * rr.k + slot;
+    acc = acc + y[p * rr.h + col] * w[p];
+  }
+  outp[i] = acc;
+}
+"""
+_moe_reduce_added = {"webgpu": False}
+_MOE_REDUCE_REJECTED = {}
+
+
+def moe_weighted_sum(values, weights, k, execution="auto"):
+    """Sum routed expert rows into token rows, on either GPU backend.
+
+    ``auto`` is this operator's measured shape/device route. A containing MoE layer may
+    explicitly choose a different route when its whole-layer timing favours it. Until a
+    route is measured, the established two-operation path is the lower-risk baseline.
+    """
+    if execution not in ("auto", "composed", "fused"):
+        raise ValueError("MoE reduction execution must be auto, composed, or fused")
+    yd = values.data if isinstance(values, Tensor) else values
+    wd = weights.data if isinstance(weights, Tensor) else weights
+    k = int(k)
+    if len(yd.shape) != 2 or k < 1 or int(yd.shape[0]) % k:
+        raise ValueError("MoE values must have a multiple of k rows")
+    rows, h = int(yd.shape[0]) // k, int(yd.shape[1])
+    if int(wd.size) < rows * k:
+        raise ValueError("MoE weights buffer is too small")
+    backend = ("webgl" if _webgl_ready() and not _adam_backend_ready() else
+               "webgpu" if _adam_backend_ready() else "cpu")
+    bucket = 1 << (rows - 1).bit_length()
+    key = ("moe_reduce", backend, k, h, bucket)
+    def composed():
+        yy = values if isinstance(values, Tensor) else Tensor(yd)
+        ww = weights if isinstance(weights, Tensor) else Tensor(wd)
+        return (yy * ww.reshape(rows * k, 1)).reshape(rows, k, h).sum(axis=1)
+
+    def fused():
+        if backend == "webgl":
+            return _webgl_moe_weighted_sum(yd, wd, rows, k, h)
+        plat = _adam_kernel["platform"]
+        if not _moe_reduce_added["webgpu"]:
+            plat.addKernel("moe_weighted_sum", {"source": _MOE_REDUCE_WGSL,
+                           "bindingTypes": ["read-only-storage", "read-only-storage",
+                                            "storage", "read-only-storage"]})
+            _moe_reduce_added["webgpu"] = True
+        out = _empty((rows, h))
+        meta = _adam_kernel["make_meta"]((rows, k, h, 0), "u4,u4,u4,u4")
+        plat.runKernel({"name": "moe_weighted_sum",
+                        "tensors": [yd.buffer.buffer_id, wd.buffer.buffer_id,
+                                    out.buffer.buffer_id, meta.buffer_id],
+                        "workGroups": {"x": (rows * h + 127) // 128, "y": 1, "z": 1}})
+        return Tensor(out)
+
+    if backend == "cpu":
+        return composed()
+    mode = execution
+    if mode == "auto":
+        mode = _TUNED.get(key)
+        if mode is None:
+            # Calibrating inside a graph recording would bake the comparison's many
+            # dispatches into EVERY future decode token. Defer just this unknown bucket;
+            # the independent load-time one-row warm pass normally populates it first.
+            if backend == "webgpu":
+                from wgpy_backends.webgpu import webgpu_buffer as _wb
+            else:
+                from wgpy_backends.webgl import webgl_buffer as _wb
+            if getattr(_wb, "_capture_depth", 0):
+                mode = "composed"
+            else:
+                import time as _time
+                try:
+                    reference = np.asarray(composed().numpy(), np.float32)
+                    candidate = np.asarray(fused().numpy(), np.float32)
+                    scale = max(1e-6, float(np.abs(reference).max()))
+                    if (not np.all(np.isfinite(candidate))
+                            or float(np.abs(reference - candidate).max()) / scale > 2e-5):
+                        raise RuntimeError("fused MoE reduction failed its numerical gate")
+                    # A single tiny dispatch plus readback measures synchronisation
+                    # jitter more than kernel work. Batch enough identical calls for
+                    # the per-operator positive result to survive that noise, without
+                    # keeping more than one output alive at a time.
+                    repeat = 16 if rows <= 128 else 4
+                    samples = {"composed": [], "fused": []}
+                    for turn in range(9):
+                        order = (("composed", "fused") if not (turn & 1)
+                                 else ("fused", "composed"))
+                        for route in order:
+                            t0 = _time.perf_counter()
+                            for _ in range(repeat):
+                                out = composed() if route == "composed" else fused()
+                            out.numpy()
+                            samples[route].append((_time.perf_counter() - t0) / repeat)
+                    mode = _measured_choice(samples, ("composed", "fused"),
+                                            default="composed")
+                except Exception as exc:
+                    _MOE_REDUCE_REJECTED[key] = "%s: %s" % (type(exc).__name__, exc)
+                    mode = "composed"
+                _TUNED[key] = mode
+    return fused() if mode == "fused" else composed()
 
 
 def _empty_i32(shape):
@@ -2259,32 +2409,92 @@ _GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 #    raising, and a kernel that does nothing is very fast. A candidate that cannot be shown
 #    to compute the right answer is dropped before it is ever timed.
 _TUNED = {}
+_WEIGHT_TUNE_SECONDS = 0.0
+_WEIGHT_TUNE_CALLS = 0
 
 
-def _weight_execution(family, storage_format, K, N, M, run):
-    """Choose stored blocks or an explicit materialized path from measurements.
+def _paired_evidence(samples, candidate, baseline):
+    """Exact paired sign-test evidence for one latency candidate."""
+    import math as _math
+    import statistics as _s
+    a = list(samples.get(candidate, ()))
+    b = list(samples.get(baseline, ()))
+    pairs = [(x, y) for x, y in zip(a, b) if x != y]
+    wins = sum(x < y for x, y in pairs)
+    n = len(pairs)
+    p = (sum(_math.comb(n, k) for k in range(wins, n + 1)) / float(2 ** n)
+         if n else 1.0)
+    return {
+        "wins": wins,
+        "pairs": n,
+        "p": p,
+        "candidate_median": _s.median(a) if a else float("inf"),
+        "baseline_median": _s.median(b) if b else float("inf"),
+    }
+
+
+def _paired_faster(samples, candidate, baseline, alpha=0.05):
+    """Return whether ``candidate`` has a repeatable paired latency win.
+
+    There is deliberately no minimum percentage here.  The magnitude of a positive win
+    is a measurement result, not a policy threshold.  We instead use the exact one-sided
+    sign test: a candidate is accepted only when its paired samples beat the incumbent
+    often enough that the result is unlikely to be measurement-order noise.  Equal samples
+    carry no evidence either way.  This makes a stable 1% win usable while rejecting a
+    larger but alternating win/loss result.
+    """
+    evidence = _paired_evidence(samples, candidate, baseline)
+    return (evidence["pairs"] > 0
+            and evidence["candidate_median"] < evidence["baseline_median"]
+            and evidence["p"] <= float(alpha))
+
+
+def _measured_choice(samples, candidates, default=None):
+    """Choose faster implementations without discarding small local wins.
+
+    ``candidates`` is ordered from lower to higher memory cost.  A higher-cost candidate
+    replaces the current choice only when paired measurements prove it faster.  Thus an
+    inconclusive timing naturally resolves to the lower-memory implementation, while every
+    statistically repeatable positive latency result is retained regardless of magnitude.
+    """
+    candidates = tuple(candidates)
+    if not candidates:
+        return default
+    chosen = default if default in candidates else candidates[0]
+    for candidate in candidates:
+        if candidate != chosen and _paired_faster(samples, candidate, chosen):
+            chosen = candidate
+    return chosen
+
+
+def _weight_execution(family, storage_format, K, N, M, run,
+                      candidates=("stored", "materialized"), check=None, rounds=9,
+                      repeat=4):
+    """Choose a correct implementation from device-local paired measurements.
 
     The key contains only operator facts, never a model/repository name.  Nearby batch
     sizes share a power-of-two bucket so a prompt does not pay for a new tune at every
     length.  This is the final, device-local level of the routing hierarchy: a candidate
-    that did not win globally can still win for this format and shape bucket.  A
-    materialized path must win by at least 5%; ties stay stored because that representation
-    uses less device memory and is the correctness baseline.
+    that did not win globally can still win for this format and shape bucket.  There is no
+    model/repository allow-list and no percentage cutoff.  Any repeatable local
+    latency win is retained.  If the samples do not prove a winner, the earlier candidate
+    wins; callers therefore order candidates by memory cost, with the original stored
+    representation first.
     """
     m = int(M)
-    if m <= 2:
-        return "stored"
     bucket = 1 << (m - 1).bit_length()
     key = ("weight_exec", str(family), str(storage_format), int(K), int(N), bucket)
     if key in _TUNED:
         return _TUNED[key]
     import time as _t
-    import statistics as _s
-    candidates = ("stored", "materialized")
-    # Four dispatches amortize a readback without queueing many simultaneous expanded
-    # copies of a very large weight.  More repetitions improved tiny synthetic timings but
-    # multiplied peak transient memory on the models where this choice matters most.
-    repeat = 4
+    _tune_started = _t.perf_counter()
+    candidates = tuple(candidates)
+    # Small decode kernels need repeated work to rise above readback noise. A large
+    # prefill is already milliseconds of GPU work per candidate; repeating it four times
+    # both multiplies transient expanded-weight memory and puts thousands of calibration
+    # dispatches before the first answer. Keep the same paired correctness/evidence gate,
+    # but size each sample to the operator's work rather than a fixed repetition count.
+    repeat = max(1, min(int(repeat), 1 if m >= 128 else 2 if m >= 32 else 4))
 
     def batch(which):
         out = None
@@ -2295,19 +2505,39 @@ def _weight_execution(family, storage_format, K, N, M, run):
         return (_t.perf_counter() - t0) / repeat
 
     try:
+        valid = []
         for which in candidates:
-            batch(which)                         # compile/warm before timing
-        times = {which: [] for which in candidates}
-        for r in range(5):
-            order = candidates if not (r & 1) else tuple(reversed(candidates))
+            try:
+                if check is not None and not check(which):
+                    raise RuntimeError("%s failed the correctness gate" % which)
+                batch(which)                     # compile/warm before timing
+                valid.append(which)
+            except Exception:
+                continue
+        if not valid:
+            raise RuntimeError("no correct execution candidate")
+        valid = tuple(valid)
+        times = {which: [] for which in valid}
+        for r in range(max(5, int(rounds))):
+            order = valid if not (r & 1) else tuple(reversed(valid))
             for which in order:
                 times[which].append(batch(which))
-        stored = _s.median(times["stored"])
-        materialized = _s.median(times["materialized"])
-        chosen = "materialized" if materialized < stored * 0.95 else "stored"
+            # Five unanimous paired rounds are already p=1/32; more repetitions cannot
+            # make that decision more necessary. If ANY pair remains inconclusive, keep
+            # measuring through the requested rounds instead of dropping a local win.
+            if r >= 4 and all(
+                    _paired_faster(times, a, b) or _paired_faster(times, b, a)
+                    for i, a in enumerate(valid) for b in valid[:i]):
+                break
+        chosen = _measured_choice(times, valid, default=valid[0])
     except Exception:
-        chosen = "stored"
+        chosen = candidates[0]
     _TUNED[key] = chosen
+    # Aggregate only actual cache misses, not the hot-path lookup.  The upper API can
+    # then distinguish a slow prefill from calibration spent before that prefill.
+    global _WEIGHT_TUNE_SECONDS, _WEIGHT_TUNE_CALLS
+    _WEIGHT_TUNE_SECONDS += _t.perf_counter() - _tune_started
+    _WEIGHT_TUNE_CALLS += 1
     return chosen
 
 
@@ -2334,20 +2564,20 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None):
         _TUNED[key] = default
         return default
     times = {v: [] for v in ok}
-    for _ in range(rounds):
-        for v in ok:
+    for r in range(rounds):
+        # Alternate the queue order so a candidate cannot win merely because it always
+        # follows (or always precedes) another implementation.  This is the same paired
+        # evidence rule used by the stored-weight and containing-layer tuners.
+        order = ok if not (r & 1) else tuple(reversed(ok))
+        for v in order:
             apply(v)
             t0 = _t.perf_counter()
             bench()
             times[v].append(_t.perf_counter() - t0)
-    best, best_ms = None, None
-    for v, xs in times.items():
-        xs.sort()
-        med = xs[len(xs) // 2]
-        if best_ms is None or med < best_ms:
-            best, best_ms = v, med
-    _TUNED[key] = best
-    return best
+    chosen = _measured_choice(times, ok,
+                              default=(default if default in ok else ok[0]))
+    _TUNED[key] = chosen
+    return chosen
 
 
 # Which thread shape the decode matmul should use for one (format, N, K), decided by running
@@ -2446,7 +2676,8 @@ def _ggml_shape_for(type_name, N, K, packed):
 
     _t0 = _t.perf_counter()
     try:
-        return tune(key, ("narrow", "shortk", None), apply, bench, check=check,
+        return tune(key, ("narrow", "balanced", "compact", "shortk", None),
+                    apply, bench, check=check,
                     default=fallback)
     finally:
         _TUNE_COST["tune_s"] += _t.perf_counter() - _t0
@@ -2480,7 +2711,8 @@ def _kernel_build():
     import hashlib
     import inspect
     h = hashlib.sha1()
-    for fn in (_ggml_src, _ggml_name, _cfg_for):
+    for fn in (_ggml_src, _ggml_name, _cfg_for, _ggml_parallel_src,
+               _ggml_src_gl, _ggml_name_gl):
         try:
             h.update(inspect.getsource(fn).encode())
         except Exception:
@@ -2539,6 +2771,7 @@ def kernel_profile():
     return {
         "build": _kernel_build(),
         "tuned": {"|".join(str(x) for x in k): v for k, v in _TUNED.items()},
+        "gqa_tuned": {"|".join(str(x) for x in k): v for k, v in _GQA_TUNED.items()},
         "checked": {"|".join(str(x) for x in k): bool(v) for k, v in _CHECKED.items()},
         "dequant_ok": dict(_DEQ_OK),
     }
@@ -2558,13 +2791,115 @@ def use_kernel_profile(profile):
     n = 0
     for k, v in (profile.get("tuned") or {}).items():
         parts = k.split("|")
+        if (len(parts) == 3 and parts[0] == ("decode_plan_v3" if parts[1] == "webgpu"
+                                               else "decode_plan_v1")
+                and parts[1] in ("webgpu", "webgl") and len(parts[2]) == 24
+                and all(c in "0123456789abcdef" for c in parts[2])
+                and isinstance(v, dict)):
+            plan = v.get("plan")
+            ms = v.get("median_ms")
+            valid_ms = (ms is None or (type(ms) in (float, int)
+                                    and 0 <= ms < float("inf")))
+            if parts[1] == "webgl":
+                if (valid_ms and isinstance(plan, (list, tuple)) and len(plan) == 2
+                        and plan[0] in ("auto", "separate", "fused")
+                        and plan[1] in ("full", "device")):
+                    _TUNED[(parts[0], parts[1], parts[2])] = {
+                        "plan": list(plan), "median_ms": ms}
+                    n += 1
+                continue
+            group = ("auto", "fused", "separate", "fused:default",
+                     "fused:balanced", "fused:compact", "fused:narrow")
+            if (isinstance(plan, (list, tuple)) and len(plan) in (8, 9)
+                    and plan[0] in ("composed", "fused")
+                    and isinstance(plan[1], (list, tuple)) and len(plan[1]) <= 32
+                    and all(x in ("auto", "stored", "dp4a") for x in plan[1])
+                    and plan[2] in ("device", "full")
+                    and plan[3] in group and plan[4] in group
+                    and plan[5] in ("auto", "composed", "fused")
+                    and plan[6] in ("auto", "separate", "fused")
+                    and plan[7] in ("auto", None, "balanced", "compact",
+                                    "narrow", "shortk")
+                    and (len(plan) == 8 or
+                         (isinstance(plan[8], (list, tuple)) and len(plan[8]) == 2
+                          and all(route in ("auto", "balanced", "compact", "narrow")
+                                  for route in plan[8])))):
+                if valid_ms:
+                    _TUNED[(parts[0], parts[1], parts[2])] = {
+                        "plan": [plan[0], list(plan[1]), *plan[2:]],
+                        "median_ms": ms,
+                    }
+                    n += 1
+            continue
         if len(parts) == 4 and parts[0] == "ggml_shape":
             _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]))] = v
             n += 1
-        elif len(parts) == 6 and parts[0] == "weight_exec" and v in ("stored", "materialized"):
+        elif (len(parts) == 3 and parts[0] == "add_rmsnorm"
+              and v in ("fused", "composed")):
+            _TUNED[(parts[0], int(parts[1]), int(parts[2]))] = v
+            n += 1
+        elif (len(parts) == 3 and parts[0] == "vocab_sample_full"
+              and parts[2] == "webgpu" and v in ("js", "gpu")
+              and parts[1].isdigit() and 0 < int(parts[1]) <= 1 << 24):
+            _TUNED[(parts[0], int(parts[1]), parts[2])] = v
+            n += 1
+        elif (len(parts) == 6 and parts[:2] == ["weight_exec", "repeat_rows"]
+              and parts[2] in ("webgpu", "webgl") and v in ("host", "device")):
             _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
             n += 1
+        elif (len(parts) == 6 and parts[0] == "weight_exec"
+              and v in ("stored", "dp4a", "materialized", "full",
+                        "selected_full", "selected_q", "base", "alternate")):
+            _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
+                    int(parts[5]))] = v
+            n += 1
+        elif (len(parts) == 8 and parts[0] in ("moe_prefill_route", "moe_prefill_route_js_v2", "moe_prefill_route_js_v3")
+              and parts[1] in ("webgpu", "webgl")
+              and parts[7] in ("cold", "warm") and v in ("host", "device")):
+            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+                    int(parts[4]), parts[5], parts[6], parts[7])] = v
+            n += 1
+        elif (len(parts) == 5 and parts[0] in ("moe_prefill_api_v1", "moe_prefill_api_v2", "moe_prefill_api_v3")
+              and parts[1] in ("webgpu", "webgl") and len(parts[2]) == 24
+              and all(c in "0123456789abcdef" for c in parts[2])
+              and parts[4] in ("cold", "warm") and v in ("host", "device")):
+            try:
+                bucket = int(parts[3])
+            except ValueError:
+                continue
+            if bucket > 1 and bucket <= 1 << 20 and bucket & (bucket - 1) == 0:
+                _TUNED[(parts[0], parts[1], parts[2], bucket, parts[4])] = v
+                n += 1
+        elif (len(parts) == 5 and parts[0] == "moe_reduce"
+              and parts[1] in ("webgpu", "webgl")
+              and v in ("composed", "fused")):
+            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+                    int(parts[4]))] = v
+            n += 1
+        elif (len(parts) == 5 and parts[0] == "qk_norm_rope"
+              and v in ("composed", "fused")):
+            _TUNED[(parts[0], *(int(x) for x in parts[1:]))] = v
+            n += 1
+        elif (len(parts) == 5 and parts[0] == "kv_write_pair"
+              and parts[4] in ("True", "False")
+              and v in ("separate", "fused")):
+            _TUNED[(parts[0], int(parts[1]), int(parts[2]), int(parts[3]),
+                    parts[4] == "True")] = v
+            n += 1
+        elif (len(parts) == 5 and parts[0] == "embedding_row"
+              and v in ("transposed", "compact")):
+            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+                    int(parts[4]))] = v
+            n += 1
+        elif (len(parts) == 4 and parts[0] == "flash_tile"
+              and isinstance(v, (list, tuple)) and len(v) == 2):
+            tile = tuple(int(x) for x in v)
+            hd = int(parts[3])
+            if (tile in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32))
+                    and 2 * tile[0] * hd + tile[1] * hd + tile[0] * tile[1] <= 8192):
+                _TUNED[(parts[0], int(parts[1]), int(parts[2]), hd)] = tile
+                n += 1
     for k, v in (profile.get("checked") or {}).items():
         parts = k.split("|")
         if len(parts) == 4:
@@ -2574,6 +2909,13 @@ def use_kernel_profile(profile):
     for k, v in (profile.get("dequant_ok") or {}).items():
         _DEQ_OK[str(k)] = bool(v)
         n += 1
+    for k, v in (profile.get("gqa_tuned") or {}).items():
+        parts = k.split("|")
+        if len(parts) == 4 and type(v) is int and v in (4, 8, 16, 32):
+            key = tuple(int(x) for x in parts)
+            if all(x > 0 for x in key):
+                _GQA_TUNED[key] = v
+                n += 1
     return n
 
 
@@ -2845,6 +3187,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+# K and V are independent destinations with identical scatter geometry.  WebGPU can write
+# both in one dispatch without changing either stored value.  Keep this as a separate
+# addressable operator rather than silently replacing ``kv_write``: its own ``auto`` route
+# is device/shape measured, and a containing decoder may explicitly request either physical
+# implementation when a different composition wins at that higher layer.
+_KVWRITE_PAIR_WGSL = """@group(0) @binding(0) var<storage,read_write> kc: array<f32>;
+@group(0) @binding(1) var<storage,read_write> vc: array<f32>;
+@group(0) @binding(2) var<storage,read> ks: array<f32>;
+@group(0) @binding(3) var<storage,read> vs: array<f32>;
+struct M { pos:u32, T:u32, NKV:u32, HD:u32, LMAX:u32, }
+@group(0) @binding(4) var<storage,read> m: M;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let one = m.NKV * m.T * m.HD; let i = gid.x;
+  if (i >= one * 2u) { return; }
+  let which = i / one; let j = i - which * one;
+  let hd = j % m.HD; let t = (j / m.HD) % m.T;
+  let kv = j / (m.HD * m.T);
+  let dst = kv * m.LMAX * m.HD + (m.pos + t) * m.HD + hd;
+  if (which == 0u) { kc[dst] = ks[j]; } else { vc[dst] = vs[j]; }
+}
+"""
+
+_KVWRITE_PAIR_F16_WGSL = """@group(0) @binding(0) var<storage,read_write> kc: array<u32>;
+@group(0) @binding(1) var<storage,read_write> vc: array<u32>;
+@group(0) @binding(2) var<storage,read> ks: array<f32>;
+@group(0) @binding(3) var<storage,read> vs: array<f32>;
+struct M { pos:u32, T:u32, NKV:u32, HD:u32, LMAX:u32, }
+@group(0) @binding(4) var<storage,read> m: M;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let hd2 = m.HD / 2u; let one = m.NKV * m.T * hd2; let i = gid.x;
+  if (i >= one * 2u) { return; }
+  let which = i / one; let j = i - which * one;
+  let d = j % hd2; let t = (j / hd2) % m.T; let kv = j / (hd2 * m.T);
+  let so = kv * m.T * m.HD + t * m.HD + d * 2u;
+  let dst = kv * m.LMAX * hd2 + (m.pos + t) * hd2 + d;
+  if (which == 0u) {
+    kc[dst] = pack2x16float(vec2<f32>(ks[so], ks[so + 1u]));
+  } else {
+    vc[dst] = pack2x16float(vec2<f32>(vs[so], vs[so + 1u]));
+  }
+}
+"""
+
 # Unpack a used span back to f32, for the prefill path. Prefill already copies the span it
 # attends over (`_contig(K.data[:, :end, :])`), so widening happens inside a copy that was
 # there anyway and the three prefill attention kernels never learn about any of this.
@@ -2948,6 +3335,7 @@ def _f16_kv_source(src):
 
 
 _kvw = {"added": False}
+_kvwp = {"f32": False, "f16": False}
 
 
 def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
@@ -2983,6 +3371,111 @@ def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
         "tensors": [cache.buffer.buffer_id, src.buffer.buffer_id, meta_id],
         "workGroups": {"x": (total + 63) // 64, "y": 1, "z": 1}})
     return cache
+
+
+def _kv_write_pair_fused(kcache, vcache, ksrc, vsrc, pos, T, nkv, hd, lmax,
+                         ctl=None):
+    """One WebGPU dispatch for two exactly equivalent KV scatter writes."""
+    plat = _adam_kernel["platform"]
+    packed = ((int(kcache.shape[-1]) * 2 == int(hd))
+              and (int(vcache.shape[-1]) * 2 == int(hd)) and int(hd) % 2 == 0)
+    name = "kv_write_pair_f16" if packed else "kv_write_pair"
+    flag = "f16" if packed else "f32"
+    if not _kvwp[flag]:
+        plat.addKernel(name, {
+            "source": _KVWRITE_PAIR_F16_WGSL if packed else _KVWRITE_PAIR_WGSL,
+            "bindingTypes": ["storage", "storage", "read-only-storage",
+                             "read-only-storage", "read-only-storage"]})
+        _kvwp[flag] = True
+    meta_id = (ctl.buffer.buffer_id if ctl is not None else
+               _adam_kernel["make_meta"](
+                   (int(pos), int(T), int(nkv), int(hd), int(lmax)),
+                   "u4,u4,u4,u4,u4").buffer_id)
+    one = int(nkv) * int(T) * (int(hd) // 2 if packed else int(hd))
+    plat.runKernel({"name": name,
+        "tensors": [kcache.buffer.buffer_id, vcache.buffer.buffer_id,
+                    ksrc.buffer.buffer_id, vsrc.buffer.buffer_id, meta_id],
+        "workGroups": {"x": (2 * one + 63) // 64, "y": 1, "z": 1}})
+    return kcache, vcache
+
+
+def _kv_pair_auto(nkv, hd, lmax, packed):
+    """Device-local exactness gate and paired timing for the KV layer operation."""
+    key = ("kv_write_pair", int(nkv), int(hd), int(lmax), bool(packed))
+    if key in _TUNED:
+        return _TUNED[key]
+    import time as _t
+    try:
+        width = int(hd) // 2 if packed else int(hd)
+        shape = (int(nkv), int(lmax), width)
+        src_shape = (int(nkv), 1, int(hd))
+        # Deterministic non-special values exercise both half packing lanes as well as sign.
+        base = (np.arange(np.prod(src_shape), dtype=np.float32).reshape(src_shape) % 37
+                - 18.0) / 11.0
+        ks = xp.asarray(base); vs = xp.asarray(base * np.float32(-0.625) + np.float32(0.125))
+
+        def fresh():
+            return xp.asarray(np.zeros(shape, np.float32)), xp.asarray(np.zeros(shape, np.float32))
+
+        ak, av = fresh(); bk, bv = fresh()
+        kv_write(ak, ks, 3, 1, nkv, hd, lmax)
+        kv_write(av, vs, 3, 1, nkv, hd, lmax)
+        _kv_write_pair_fused(bk, bv, ks, vs, 3, 1, nkv, hd, lmax)
+        aa, ab = np.asarray(ak.get()), np.asarray(av.get())
+        ba, bb = np.asarray(bk.get()), np.asarray(bv.get())
+        if not (np.array_equal(aa.view(np.uint32), ba.view(np.uint32)) and
+                np.array_equal(ab.view(np.uint32), bb.view(np.uint32))):
+            _TUNED[key] = "separate"
+            return "separate"
+
+        candidates = ("separate", "fused")
+        samples = {name: [] for name in candidates}
+
+        def bench(name):
+            ck, cv = fresh(); t0 = _t.perf_counter()
+            for _ in range(16):
+                if name == "fused":
+                    _kv_write_pair_fused(ck, cv, ks, vs, 3, 1, nkv, hd, lmax)
+                else:
+                    kv_write(ck, ks, 3, 1, nkv, hd, lmax)
+                    kv_write(cv, vs, 3, 1, nkv, hd, lmax)
+            cv.get()
+            return (_t.perf_counter() - t0) / 16.0
+
+        bench("separate"); bench("fused")
+        for r in range(9):
+            order = candidates if not (r & 1) else tuple(reversed(candidates))
+            for name in order:
+                samples[name].append(bench(name))
+        chosen = _measured_choice(samples, candidates, default="separate")
+    except Exception:
+        chosen = "separate"
+    _TUNED[key] = chosen
+    return chosen
+
+
+def kv_write_pair(kcache, vcache, ksrc, vsrc, pos, T, nkv, hd, lmax, ctl=None,
+                  execution="auto"):
+    """Write K and V with one common layer contract on WebGPU and WebGL.
+
+    ``auto`` means the locally fastest exact route.  ``separate`` and ``fused`` remain
+    addressable so a containing decoder can choose its own best composition.  WebGL cannot
+    portably render to two independently sampled cache textures in this abstraction, so its
+    nearest equivalent layer implementation composes the same two writes.
+    """
+    if execution not in ("auto", "separate", "fused"):
+        raise ValueError("KV pair execution must be auto, separate, or fused")
+    if _webgl_ready() and not _adam_backend_ready():
+        return (kv_write(kcache, ksrc, pos, T, nkv, hd, lmax, ctl=ctl),
+                kv_write(vcache, vsrc, pos, T, nkv, hd, lmax, ctl=ctl))
+    packed = ((int(kcache.shape[-1]) * 2 == int(hd)) and int(hd) % 2 == 0)
+    route = (_kv_pair_auto(nkv, hd, lmax, packed)
+             if execution == "auto" else execution)
+    if route == "fused":
+        return _kv_write_pair_fused(kcache, vcache, ksrc, vsrc, pos, T, nkv, hd,
+                                    lmax, ctl=ctl)
+    return (kv_write(kcache, ksrc, pos, T, nkv, hd, lmax, ctl=ctl),
+            kv_write(vcache, vsrc, pos, T, nkv, hd, lmax, ctl=ctl))
 
 
 class KVCache:
@@ -4172,8 +4665,34 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 }
 """
 _rms_k = {"added": False}
+_add_rms_k = {"added": False}
 _RMS_FUSED = True      # A/B switch for the fused path
 _ROPE_FUSED = True     # A/B switch for the fused rope
+
+
+_ADD_RMS_WGSL = """@group(0) @binding(0) var<storage,read> residual: array<f32>;
+@group(0) @binding(1) var<storage,read> update: array<f32>;
+@group(0) @binding(2) var<storage,read> weight: array<f32>;
+@group(0) @binding(3) var<storage,read_write> summed: array<f32>;
+@group(0) @binding(4) var<storage,read_write> normed: array<f32>;
+struct ARM { T:u32, H:u32, epsbits:u32, pad:u32, }
+@group(0) @binding(5) var<storage,read> am: ARM;
+var<workgroup> red: array<f32,256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>){
+  let row=wg.x; if(row>=am.T){return;} let t=lid.x; let base=row*am.H;
+  var s:f32=0.0; var i=t;
+  loop { if(i>=am.H){break;} let v=residual[base+i]+update[base+i];
+    summed[base+i]=v; s=s+v*v; i=i+256u; }
+  red[t]=s; workgroupBarrier(); var k=128u;
+  loop { if(k==0u){break;} if(t<k){red[t]=red[t]+red[t+k];}
+    workgroupBarrier(); k=k/2u; }
+  let scale=inverseSqrt(red[0]/f32(am.H)+bitcast<f32>(am.epsbits)); var j=t;
+  loop { if(j>=am.H){break;} let v=residual[base+j]+update[base+j];
+    normed[base+j]=v*scale*weight[j]; j=j+256u; }
+}
+"""
 
 
 _SWIGLU_WGSL = """@group(0) @binding(0)
@@ -4291,6 +4810,93 @@ def rmsnorm(x, w, eps):
     return Tensor(of.reshape(*shape))
 
 
+def add_rmsnorm(residual, update, w, eps, execution="auto"):
+    """Return ``(residual + update, rmsnorm(residual + update, w))``.
+
+    WebGPU writes both layer-boundary values in one dispatch.  WebGL has no portable
+    multi-output fragment pass, so the same operator contract uses its exact add followed
+    by the existing fused RMSNorm.  That is the nearest common layer with the best path on
+    each backend; callers never lose the capability because one backend lacks an atomic
+    primitive.  Inference-only, matching :func:`rmsnorm`.
+    """
+    if execution not in ("auto", "fused", "composed"):
+        raise ValueError("execution must be 'auto', 'fused', or 'composed'")
+    rd = residual.data if isinstance(residual, Tensor) else residual
+    ud = update.data if isinstance(update, Tensor) else update
+    wd = w.data if isinstance(w, Tensor) else w
+    if tuple(rd.shape) != tuple(ud.shape):
+        raise ValueError("add_rmsnorm inputs must have identical shapes")
+    shape = tuple(rd.shape); H = int(shape[-1]); T = 1
+    for d in shape[:-1]:
+        T *= int(d)
+    def composed():
+        summed = Tensor(rd) + Tensor(ud)
+        normed = rmsnorm(summed, w, eps)
+        if normed is None:
+            normed = (summed / ((summed * summed).mean(axis=-1, keepdims=True)
+                                + eps).sqrt()) * w
+        return summed, normed
+    if not _adam_backend_ready():
+        return composed()
+    if execution == "auto":
+        key = ("add_rmsnorm", int(T), int(H))
+        execution = _TUNED.get(key)
+        if execution is None:
+            # The common-layer API owns this choice: callers that stop here still get the
+            # best complete add+norm implementation for their device and shape.
+            import time as _t
+            candidates = ("fused", "composed")
+            samples = {q: [] for q in candidates}
+
+            def candidate(q):
+                return add_rmsnorm(Tensor(rd), Tensor(ud), Tensor(wd), eps, execution=q)
+
+            valid = []
+            reference = None
+            for q in candidates:
+                try:
+                    pair = candidate(q)
+                    got = (np.asarray(pair[0].data.get()), np.asarray(pair[1].data.get()))
+                    if reference is None:
+                        reference = got
+                    if all(np.allclose(a, b, rtol=2e-5, atol=2e-5)
+                           for a, b in zip(got, reference)):
+                        valid.append(q)
+                except Exception:
+                    continue
+            for r in range(9):
+                order = valid if not (r & 1) else list(reversed(valid))
+                for q in order:
+                    t0 = _t.perf_counter(); pair = None
+                    for _ in range(8):
+                        pair = candidate(q)
+                    pair[1].data.get()
+                    samples[q].append((_t.perf_counter() - t0) / 8.0)
+            execution = _measured_choice(samples, valid, default=(valid[0] if valid else None))
+            if execution is None:
+                execution = "composed"
+            _TUNED[key] = execution
+    if execution == "composed":
+        return composed()
+    plat = _adam_kernel["platform"]
+    if not _add_rms_k["added"]:
+        plat.addKernel("add_rmsnorm", {"source": _ADD_RMS_WGSL,
+            "bindingTypes": ["read-only-storage", "read-only-storage",
+                             "read-only-storage", "storage", "storage",
+                             "read-only-storage"]})
+        _add_rms_k["added"] = True
+    rd = _contig(rd); ud = _contig(ud); wd = _contig(wd)
+    summed = _empty((T, H)); normed = _empty((T, H))
+    ebits = int(np.float32(eps).view(np.uint32))
+    meta = _adam_kernel["make_meta"]((T, H, ebits, 0), "u4,u4,u4,u4")
+    plat.runKernel({"name": "add_rmsnorm",
+                    "tensors": [rd.buffer.buffer_id, ud.buffer.buffer_id,
+                                wd.buffer.buffer_id, summed.buffer.buffer_id,
+                                normed.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": T, "y": 1, "z": 1}})
+    return Tensor(summed.reshape(*shape)), Tensor(normed.reshape(*shape))
+
+
 # Rope written as `x*cos + rotate_half(x)*sin` is about eight dispatches per tensor: two or
 # three slices, a negation, a concat, then two multiplies and an add. Twice per layer across
 # a deep model that is the largest single block of launches in a decode step. Fused, it is
@@ -4329,6 +4935,96 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 _rope_k = {"added": False}
+
+
+# Per-head Q/K RMSNorm followed immediately by rotary embedding.  Decode always consumes
+# those as one layer operation; keeping them separate costs four dispatches per transformer
+# layer (Q norm, K norm, Q rope, K rope).  A workgroup owns one head, reduces its original
+# fp32 projection values, and writes the same two results in one dispatch.  WebGL keeps the
+# composed layer-equivalent path because a fragment pass cannot reduce and render two output
+# textures portably.
+_QK_NORM_ROPE_WGSL = """
+@group(0) @binding(0) var<storage,read> qr: array<f32>;
+@group(0) @binding(1) var<storage,read> kr: array<f32>;
+@group(0) @binding(2) var<storage,read> qw: array<f32>;
+@group(0) @binding(3) var<storage,read> kw: array<f32>;
+@group(0) @binding(4) var<storage,read> cb: array<f32>;
+@group(0) @binding(5) var<storage,read> sb: array<f32>;
+@group(0) @binding(6) var<storage,read_write> qo: array<f32>;
+@group(0) @binding(7) var<storage,read_write> ko: array<f32>;
+struct QM { nh:u32, nkv:u32, hd:u32, rd:u32, epsbits:u32, pad0:u32, pad1:u32, pad2:u32, }
+@group(0) @binding(8) var<storage,read> qm: QM;
+var<workgroup> red: array<f32,256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>) {
+  let head=wg.x; if(head>=qm.nh+qm.nkv){return;}
+  let isq=head<qm.nh; var h=head; if(!isq){h=head-qm.nh;}
+  let base=h*qm.hd; let t=lid.x; var sum:f32=0.0; var i=t;
+  loop { if(i>=qm.hd){break;} var v:f32;
+    if(isq){v=qr[base+i];}else{v=kr[base+i];}
+    sum=sum+v*v; i=i+256u; }
+  red[t]=sum; workgroupBarrier(); var n=128u;
+  loop { if(n==0u){break;} if(t<n){red[t]=red[t]+red[t+n];}
+    workgroupBarrier(); n=n/2u; }
+  let sc=inverseSqrt(red[0]/f32(qm.hd)+bitcast<f32>(qm.epsbits));
+  let half=qm.rd/2u; var j=t;
+  loop { if(j>=qm.hd){break;} var v:f32; var w:f32;
+    if(isq){v=qr[base+j];w=qw[j];}else{v=kr[base+j];w=kw[j];}
+    let nv=v*sc*w; var outv=nv;
+    if(j<qm.rd){var p:u32;var sign:f32;
+      if(j<half){p=j+half;sign=-1.0;}else{p=j-half;sign=1.0;}
+      var pv:f32;var pw:f32;
+      if(isq){pv=qr[base+p];pw=qw[p];}else{pv=kr[base+p];pw=kw[p];}
+      outv=nv*cb[j]+sign*(pv*sc*pw)*sb[j]; }
+    if(isq){qo[base+j]=outv;}else{ko[base+j]=outv;}
+    j=j+256u; }
+}
+"""
+_qk_norm_rope_added = False
+
+
+def qk_norm_rope_decode(q, k, qweight, kweight, cos, sin, HD, rd, eps):
+    """One-dispatch per-head Q/K norm + rope for a single decode position.
+
+    Returns ``None`` when this exact primitive is unavailable; the decoder then composes
+    the same layer operation from the backend's norm and rope primitives.
+    """
+    global _qk_norm_rope_added
+    if not _adam_backend_ready() or qweight is None or kweight is None:
+        return None
+    qd = _contig(q.data if isinstance(q, Tensor) else q)
+    kd = _contig(k.data if isinstance(k, Tensor) else k)
+    qwd = _contig(qweight.data if isinstance(qweight, Tensor) else qweight)
+    kwd = _contig(kweight.data if isinstance(kweight, Tensor) else kweight)
+    if int(qwd.size) != int(HD) or int(kwd.size) != int(HD):
+        return None                         # full-projection norm is a different operation
+    if int(qd.size) % int(HD) or int(kd.size) % int(HD):
+        return None
+    nh, nkv = int(qd.size) // int(HD), int(kd.size) // int(HD)
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+    if int(cd.size) != int(HD) or int(sd.size) != int(HD):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _qk_norm_rope_added:
+        plat.addKernel("qk_norm_rope_decode", {"source": _QK_NORM_ROPE_WGSL,
+            "bindingTypes": ["read-only-storage"] * 6 + ["storage"] * 2
+                            + ["read-only-storage"]})
+        _qk_norm_rope_added = True
+    qo, ko = _empty(tuple(qd.shape)), _empty(tuple(kd.shape))
+    ebits = int(np.float32(eps).view(np.uint32))
+    meta = _adam_kernel["make_meta"](
+        (nh, nkv, int(HD), int(rd), ebits, 0, 0, 0),
+        "u4,u4,u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "qk_norm_rope_decode",
+                    "tensors": [qd.buffer.buffer_id, kd.buffer.buffer_id,
+                                qwd.buffer.buffer_id, kwd.buffer.buffer_id,
+                                cd.buffer.buffer_id, sd.buffer.buffer_id,
+                                qo.buffer.buffer_id, ko.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": nh + nkv, "y": 1, "z": 1}})
+    return Tensor(qo), Tensor(ko)
 
 
 def rope_decode(x, cos, sin, HD, rd, T=1):
@@ -4770,6 +5466,41 @@ def _gpu_release_memory():
         plat.resetCaptures()
         _wb.release_capture_buffers()
         _wb.release_pooled_buffers()
+        _wb.release_comm_buffer()
+    except Exception:
+        pass
+
+
+def _gpu_release_idle_pool():
+    """Free completed temporary buffers without disturbing a live model or its captures.
+
+    A 30B load left 281 MB of reusable scratch after shape checks.  Those sizes are not
+    needed by the following one-token warm step, and on unified memory they compete with
+    the model's cold expert weights.  Unlike ``_gpu_release_memory``, this deliberately
+    leaves live tensors and capture pins alone.  WebGPU and WebGL expose the same contract.
+    """
+    try:
+        if _adam_backend_ready():
+            from wgpy_backends.webgpu.webgpu_buffer import release_pooled_buffers
+        elif _webgl_ready():
+            from wgpy_backends.webgl.webgl_buffer import release_pooled_buffers
+        else:
+            return
+        release_pooled_buffers()
+    except Exception:
+        pass
+
+
+def _release_transfer_memory():
+    """Drop upload staging after loading, without releasing the live model buffers."""
+    try:
+        if _adam_backend_ready():
+            from wgpy_backends.webgpu.webgpu_buffer import release_comm_buffer
+        elif _webgl_ready():
+            from wgpy_backends.webgl.webgl_buffer import release_comm_buffer
+        else:
+            return
+        release_comm_buffer()
     except Exception:
         pass
 
@@ -5584,6 +6315,234 @@ _Q4K_DEC = """
       }
     }
 """
+
+# Phase two, Q4_K decode: quantise each 32-value activation sub-block to signed int8 in
+# workgroup memory, then use WebGPU's packed four-way integer dot product against the
+# ORIGINAL Q4_K nibbles.  The weight buffer is neither converted nor duplicated; only the
+# ephemeral activation row changes width.  Every candidate is compared with the exact
+# stored-Q4_K path before it may enter the per-device/shape route.
+_Q4K_DP4A_WGSL = """requires packed_4x8_integer_dot_product;
+@group(0) @binding(0) var<storage,read> x: array<f32>;
+@group(0) @binding(1) var<storage,read> w: array<u32>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f32>;
+struct QM { N:u32, K:u32, rowb:u32, pad:u32, }
+@group(0) @binding(3) var<storage,read> qm: QM;
+var<workgroup> xq: array<u32, 256>;
+var<workgroup> xsc: array<f32, 32>;
+var<workgroup> xsum: array<f32, 32>;
+var<workgroup> psum: array<f32, 256>;
+
+var<private> nrow: u32;
+fn W(wo:u32)->u32 { return w[wo * qm.N + nrow]; }
+fn B4(o:u32)->u32 {
+  let wo=o>>2u; let sh=(o&3u)*8u; let lo=W(wo);
+  if(sh==0u){return lo;} return (lo>>sh)|(W(wo+1u)<<(32u-sh));
+}
+fn B(o:u32)->u32 { return (W(o>>2u)>>((o&3u)*8u))&255u; }
+fn U16(o:u32)->u32 { return B4(o)&65535u; }
+fn HF(h:u32)->f32 {
+  let m=h&1023u; let e=(h>>10u)&31u; var v:f32;
+  if(e==0u){v=f32(m)*5.9604644775390625e-8;}
+  else if(e==31u){v=65504.0;}
+  else {v=exp2(f32(i32(e)-15))*(1.0+f32(m)*0.0009765625);}
+  return select(v,-v,(h&32768u)!=0u);
+}
+fn F16(o:u32)->f32 { return HF(U16(o)); }
+fn k4sc(so:u32,j:u32)->vec2<f32>{
+  if(j<4u){return vec2<f32>(f32(B(so+j)&63u),f32(B(so+j+4u)&63u));}
+  let a=B(so+j+4u);
+  return vec2<f32>(f32((a&15u)|((B(so+j-4u)>>6u)<<4u)),
+                   f32((a>>4u)|((B(so+j)>>6u)<<4u)));
+}
+
+@compute @workgroup_size(64,4)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>) {
+  let n=gid.x; let lx=lid.x; let ly=lid.y; nrow=n;
+  let nb=qm.K/256u; let steps=(nb+3u)/4u; var acc:f32=0.0;
+  for(var st:u32=0u; st<steps; st=st+1u){
+    let b=st*4u+ly;
+    // Eight independent Q4_K sub-blocks. One lane quantises one 32-value activation
+    // sub-block, so no second dispatch or global temporary is needed.
+    if(lx<8u){
+      let ib=lx; let si=ly*8u+ib; var mx:f32=0.0;
+      if(b<nb){
+        let xb=b*256u+ib*32u;
+        for(var j:u32=0u;j<32u;j=j+1u){mx=max(mx,abs(x[xb+j]));}
+      }
+      let sc=select(1.0,mx/127.0,mx>0.0); var sm:i32=0;
+      for(var j:u32=0u;j<32u;j=j+4u){
+        var iv=vec4<i32>(0); if(b<nb){let xb=b*256u+ib*32u+j;
+          iv=vec4<i32>(round(vec4<f32>(x[xb],x[xb+1u],x[xb+2u],x[xb+3u])/sc));}
+        xq[si*8u+j/4u]=pack4xI8Clamp(iv); sm=sm+iv.x+iv.y+iv.z+iv.w;
+      }
+      xsc[si]=sc; xsum[si]=f32(sm);
+    }
+    workgroupBarrier();
+    if(b<nb && n<qm.N){
+      let o=b*144u; let d=F16(o); let dm=F16(o+2u); let so=o+4u; let qo=o+16u;
+      for(var g:u32=0u;g<4u;g=g+1u){
+        let i0=2u*g; let s0=k4sc(so,i0); let s1=k4sc(so,i0+1u);
+        let xi0=ly*8u+i0; let xi1=xi0+1u; var di0:i32=0; var di1:i32=0;
+        for(var j:u32=0u;j<8u;j=j+1u){
+          let q=B4(qo+g*32u+j*4u);
+          let q0=pack4xI8(vec4<i32>(i32(q&15u),i32((q>>8u)&15u),
+                                     i32((q>>16u)&15u),i32((q>>24u)&15u)));
+          let q1=pack4xI8(vec4<i32>(i32((q>>4u)&15u),i32((q>>12u)&15u),
+                                     i32((q>>20u)&15u),i32((q>>28u)&15u)));
+          di0=di0+dot4I8Packed(xq[xi0*8u+j],q0);
+          di1=di1+dot4I8Packed(xq[xi1*8u+j],q1);
+        }
+        acc=acc+xsc[xi0]*(d*s0.x*f32(di0)-dm*s0.y*xsum[xi0]);
+        acc=acc+xsc[xi1]*(d*s1.x*f32(di1)-dm*s1.y*xsum[xi1]);
+      }
+    }
+    workgroupBarrier();
+  }
+  psum[ly*64u+lx]=acc; workgroupBarrier();
+  if(ly==0u && n<qm.N){
+    outp[n]=psum[lx]+psum[64u+lx]+psum[128u+lx]+psum[192u+lx];
+  }
+}
+"""
+
+_q4k_dp4a_added = False
+
+
+def _q4k_dp4a_matmul(xf, packed, K, N):
+    """Approximate one-row Q4_K matmul using native packed INT8 dot products."""
+    global _q4k_dp4a_added
+    if int(xf.shape[0]) != 1:
+        raise RuntimeError("Q4_K DP4A is a one-row decode candidate")
+    plat = _adam_kernel["platform"]
+    if not _q4k_dp4a_added:
+        plat.addKernel("q4k_dp4a", {"source": _Q4K_DP4A_WGSL,
+            "bindingTypes": ["read-only-storage", "read-only-storage", "storage",
+                             "read-only-storage"]})
+        _q4k_dp4a_added = True
+    out = _empty((1, int(N)))
+    rowb = (int(K) // 256) * 144
+    meta = _adam_kernel["make_meta"]((int(N), int(K), rowb, 0), "u4,u4,u4,u4")
+    plat.runKernel({"name": "q4k_dp4a",
+                    "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (int(N) + 63) // 64, "y": 1, "z": 1}})
+    return out
+
+
+# Q6_K keeps its 210-byte source block in place.  Six-bit values are assembled in registers
+# from ql/qh and consumed by the native packed signed-int8 dot instruction; only one
+# ephemeral activation row is requantised.  Sixteen-value activation scales match Q6_K's
+# sixteen source scales, so the phase-two approximation never crosses a stored scale group.
+_Q6K_DP4A_WGSL = """requires packed_4x8_integer_dot_product;
+@group(0) @binding(0) var<storage,read> x: array<f32>;
+@group(0) @binding(1) var<storage,read> w: array<u32>;
+@group(0) @binding(2) var<storage,read_write> outp: array<f32>;
+struct QM { N:u32, K:u32, rowb:u32, pad:u32, }
+@group(0) @binding(3) var<storage,read> qm: QM;
+var<workgroup> xq: array<u32, 256>;
+var<workgroup> xsc: array<f32, 64>;
+var<workgroup> psum: array<f32, 256>;
+
+var<private> nrow: u32;
+fn W(wo:u32)->u32 { return w[wo * qm.N + nrow]; }
+fn B4(o:u32)->u32 {
+  let wo=o>>2u; let sh=(o&3u)*8u; let lo=W(wo);
+  if(sh==0u){return lo;} return (lo>>sh)|(W(wo+1u)<<(32u-sh));
+}
+fn B(o:u32)->u32 { return (W(o>>2u)>>((o&3u)*8u))&255u; }
+fn U16(o:u32)->u32 { return B4(o)&65535u; }
+fn HF(h:u32)->f32 {
+  let m=h&1023u; let e=(h>>10u)&31u; var v:f32;
+  if(e==0u){v=f32(m)*5.9604644775390625e-8;}
+  else if(e==31u){v=65504.0;}
+  else {v=exp2(f32(i32(e)-15))*(1.0+f32(m)*0.0009765625);}
+  return select(v,-v,(h&32768u)!=0u);
+}
+fn F16(o:u32)->f32 { return HF(U16(o)); }
+fn I8V(o:u32)->i32 { return i32(B(o)<<24u)>>24u; }
+fn Q6P(qs:u32,qh:u32,qshift:u32,hshift:u32)->u32 {
+  return pack4xI8(vec4<i32>(
+    i32(((qs>>qshift)&15u)|(((qh>>hshift)&3u)<<4u))-32,
+    i32(((qs>>(8u+qshift))&15u)|(((qh>>(8u+hshift))&3u)<<4u))-32,
+    i32(((qs>>(16u+qshift))&15u)|(((qh>>(16u+hshift))&3u)<<4u))-32,
+    i32(((qs>>(24u+qshift))&15u)|(((qh>>(24u+hshift))&3u)<<4u))-32));
+}
+
+@compute @workgroup_size(64,4)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>,
+        @builtin(local_invocation_id) lid:vec3<u32>) {
+  let n=gid.x; let lx=lid.x; let ly=lid.y; nrow=n;
+  let nb=qm.K/256u; let steps=(nb+3u)/4u; var acc:f32=0.0;
+  for(var st:u32=0u; st<steps; st=st+1u){
+    let b=st*4u+ly;
+    if(lx<16u){
+      let sb=lx; let si=ly*16u+sb; var mx:f32=0.0;
+      if(b<nb){
+        let xb=b*256u+sb*16u;
+        for(var j:u32=0u;j<16u;j=j+1u){mx=max(mx,abs(x[xb+j]));}
+      }
+      let sc=select(1.0,mx/127.0,mx>0.0);
+      for(var j:u32=0u;j<16u;j=j+4u){
+        var iv=vec4<i32>(0); if(b<nb){let xb=b*256u+sb*16u+j;
+          iv=vec4<i32>(round(vec4<f32>(x[xb],x[xb+1u],x[xb+2u],x[xb+3u])/sc));}
+        xq[si*4u+j/4u]=pack4xI8Clamp(iv);
+      }
+      xsc[si]=sc;
+    }
+    workgroupBarrier();
+    if(b<nb && n<qm.N){
+      let o=b*210u; let d=F16(o+208u);
+      for(var half:u32=0u;half<2u;half=half+1u){
+        let lo=o+half*64u; let ho=o+128u+half*32u; let so=o+192u+half*8u;
+        for(var region:u32=0u;region<4u;region=region+1u){
+          for(var ii:u32=0u;ii<2u;ii=ii+1u){
+            let sb=half*8u+region*2u+ii; let xi=ly*16u+sb; var di:i32=0;
+            for(var j:u32=0u;j<16u;j=j+4u){
+              let l=ii*16u+j; let a=B4(lo+l); let c=B4(lo+l+32u); let h=B4(ho+l);
+              var q:u32;
+              if(region==0u){q=Q6P(a,h,0u,0u);}
+              else if(region==1u){q=Q6P(c,h,0u,2u);}
+              else if(region==2u){q=Q6P(a,h,4u,4u);}
+              else {q=Q6P(c,h,4u,6u);}
+              di=di+dot4I8Packed(xq[xi*4u+j/4u],q);
+            }
+            acc=acc+xsc[xi]*d*f32(I8V(so+ii+2u*region))*f32(di);
+          }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+  psum[ly*64u+lx]=acc; workgroupBarrier();
+  if(ly==0u && n<qm.N){
+    outp[n]=psum[lx]+psum[64u+lx]+psum[128u+lx]+psum[192u+lx];
+  }
+}
+"""
+
+_q6k_dp4a_added = False
+
+
+def _q6k_dp4a_matmul(xf, packed, K, N):
+    """Approximate one-row Q6_K matmul using native packed INT8 dot products."""
+    global _q6k_dp4a_added
+    if int(xf.shape[0]) != 1:
+        raise RuntimeError("Q6_K DP4A is a one-row decode candidate")
+    plat = _adam_kernel["platform"]
+    if not _q6k_dp4a_added:
+        plat.addKernel("q6k_dp4a", {"source": _Q6K_DP4A_WGSL,
+            "bindingTypes": ["read-only-storage", "read-only-storage", "storage",
+                             "read-only-storage"]})
+        _q6k_dp4a_added = True
+    out = _empty((1, int(N)))
+    rowb = (int(K) // 256) * 210
+    meta = _adam_kernel["make_meta"]((int(N), int(K), rowb, 0), "u4,u4,u4,u4")
+    plat.runKernel({"name": "q6k_dp4a",
+                    "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (int(N) + 63) // 64, "y": 1, "z": 1}})
+    return out
 
 # Q5_K: 256 values / 176 bytes -- f16 d | f16 dmin | scales[12] | qh[32] | qs[128].
 # qh carries each value's fifth bit, one bit per sub-block index.
@@ -6625,6 +7584,13 @@ def _cfg_for(kind, vals):
     """The (WGX, KS) a kernel variant was built with. `kind` is what `_shape_kind` returned."""
     if kind == "narrow":
         return _small_cfg(vals)
+    # Same packed decoder and original bit width, redistributed across workgroups.  These
+    # are phase-two candidates, never fixed policy: self-checking and per-shape measurement
+    # below decide whether either is useful on this device.
+    if kind == "balanced":
+        return (32, 8)
+    if kind == "compact":
+        return (32, 4)
     if kind == "shortk":
         return _SHORT_K_CFG
     return None
@@ -6889,6 +7855,10 @@ def _selfcheck_shape(kind, vals):
     N is deliberately not a multiple of the group width, so the last group is partial and the
     `n < gm.N` guard is exercised rather than assumed."""
     n_wide = _SMALL_N + 64
+    if kind in ("balanced", "compact"):
+        # Explicit candidates do not come from `_shape_kind`; this still covers an output
+        # tail and three independently byte-aligned packed blocks.
+        return n_wide, 3
     if kind == "narrow":
         n, nb = 2, 3
     elif kind == "shortk":
@@ -7053,8 +8023,9 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None, gl_m=None):
 # There is deliberately no global row threshold here.  The crossover between stored-block
 # compute and materialize-then-matmul changed with format, shape and device in the complete
 # matrix benchmark (and even reversed around the old threshold).  `_weight_execution`
-# measures the actual operator, keeps a 5% margin for the lower-memory stored path, and puts
-# the device-specific answer in the reusable kernel profile.
+# measures the actual operator with paired samples, retains every repeatable positive win,
+# and puts the device-specific answer in the reusable kernel profile.  Inconclusive samples
+# keep the lower-memory stored representation; there is no minimum percentage cutoff.
 
 # Rows the fp32 matmul wants its input to be a multiple of. Its tiled kernel only runs when
 # they are, and missing it costs seven times -- at K=1024 N=3072, 1850 GFLOPS at M=2816
@@ -7192,7 +8163,7 @@ def ggml_dequant_ok(type_name):
 
 
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
-                xper=False, bias=None, execution="stored"):
+                xper=False, bias=None, execution="stored", shape_execution="auto"):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
 
     `packed` must be in the transposed (word, row) layout that `ggml_transpose` produces --
@@ -7208,8 +8179,10 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     expands a supported weight on the GPU.  ``"auto"`` is reserved for a measured routing
     policy; callers must opt into it rather than silently changing representations.
     """
-    if execution not in ("stored", "materialized", "auto"):
-        raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
+    if execution not in ("stored", "dp4a", "materialized", "auto"):
+        raise ValueError("execution must be 'stored', 'dp4a', 'materialized', or 'auto'")
+    if shape_execution not in ("auto", None, "narrow", "balanced", "compact", "shortk"):
+        raise ValueError("stored shape execution is not a known physical route")
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
     # batch of two, and it only pays if the second row rides along with the first.
     _gpu_stat_push()
@@ -7242,18 +8215,46 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     mode = m if m <= 2 else 0
     can_materialize = (eidx is None and not xper and _adam_backend_ready()
                        and ggml_dequant_ok(type_name))
+    can_dp4a = (eidx is None and not xper and _adam_backend_ready()
+                and type_name in ("Q4_K", "Q6_K") and m == 1)
+    if execution == "dp4a" and not can_dp4a:
+        raise RuntimeError("%s shape has no packed-dot comparison path" % type_name)
     if execution == "materialized" and not can_materialize:
         raise RuntimeError("%s has no verified materialized comparison path" % type_name)
     if execution == "auto":
-        if can_materialize:
+        if can_dp4a or can_materialize:
+            candidates = (("stored",) + (("dp4a",) if can_dp4a else ())
+                          + (("materialized",) if can_materialize else ()))
+            reference = [None]
+
+            def run(which):
+                return ggml_matmul(xf, packed, type_name, K, N, eidx=eidx,
+                                   eslot=eslot, estride=estride, xper=xper,
+                                   bias=bias, execution=which)
+
+            def correct(which):
+                if which == "stored":
+                    return True
+                if reference[0] is None:
+                    reference[0] = np.asarray(run("stored").get(), np.float32)
+                got = np.asarray(run(which).get(), np.float32)
+                if not np.all(np.isfinite(got)):
+                    return False
+                scale = max(1e-6, float(np.abs(reference[0]).max()))
+                # Activation INT8 is an explicit phase-two approximation.  The bound is on
+                # the operator output, measured against this weight and real activation;
+                # expanded-float remains a same-values comparison with the tighter bound.
+                limit = 0.03 if which == "dp4a" else 1e-3
+                return float(np.abs(got - reference[0]).max()) / scale < limit
+
             execution = _weight_execution(
-                "ggml", type_name, K, N, m,
-                lambda which: ggml_matmul(xf, packed, type_name, K, N, eidx=eidx,
-                                          eslot=eslot, estride=estride, xper=xper,
-                                          bias=bias, execution=which),
-            )
+                "ggml", type_name, K, N, m, run, candidates=candidates, check=correct)
         else:
             execution = "stored"
+    if execution == "dp4a":
+        of = (_q4k_dp4a_matmul(xf, packed, K, N) if type_name == "Q4_K"
+              else _q6k_dp4a_matmul(xf, packed, K, N))
+        return of if bias is None else of + bias
     if execution == "materialized":
         # The measured policy above has found enough rows to pay for unpacking once.
         # Bit-exact against the quantised kernel; the only difference is fp32 rounding in
@@ -7279,7 +8280,9 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         if pad:
             of = _contig(of[:m])            # the padded rows were arithmetic, not an answer
         return of if bias is None else of + bias
-    small = _ggml_shape_for(type_name, N, K, packed) if mode == 1 else None
+    small = ((_ggml_shape_for(type_name, N, K, packed)
+              if shape_execution == "auto" else shape_execution)
+             if mode == 1 else None)
     moe = eidx is not None
     # Rows per thread is chosen from the batch here, so a short prefill and a long one get
     # different kernels rather than one compromise that is wrong at both ends. It is part of
@@ -7295,6 +8298,300 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     of = _ggml_run(xf, packed, type_name, K, N, small=small,
                    eidx=eidx, eslot=eslot, estride=estride, xper=xper)
     return of if bias is None else of + bias
+
+
+# One activation feeding several independent projections is one operation at the transformer
+# layer even though a plain implementation launches one matmul per weight.  The WebGPU path
+# below binds the original packed buffers side by side and assigns output-row ranges to them
+# inside ONE stored-format kernel.  No weight is concatenated, copied, dequantized or changed
+# in width.  WebGL exposes the same parallel_linear contract and evaluates its projections
+# separately at the nearest efficient layer, because a fragment pass has exactly one output.
+_GGML_PARALLEL_ADDED = set()
+_GGML_PARALLEL_OK = {}
+
+
+def _ggml_parallel_src(type_name, count, kind=None):
+    if count not in (2, 3):
+        raise ValueError("parallel stored kernel supports two or three projections")
+    if _GGML_TYPES[type_name][4] is not None:
+        raise RuntimeError("parallel stored kernel has no spare binding for a codebook")
+    src = _ggml_src(type_name, 1, _cfg_for(kind, _GGML_TYPES[type_name][2]))
+    base = _GGML_BIND.replace("MOEVARS", "").replace("WOFS", "")
+    if not src.startswith(base):
+        raise RuntimeError("ggml source binding prefix changed")
+    marker = "// Byte addressing"
+    helpers = base[base.index(marker):]
+    old_w = "fn W(wo: u32) -> u32 { return w[wo * gm.N + nrow]; }"
+    limits = ["gm.estride", "gm.eslot", "gm.xper"]
+    reads = []
+    stores = []
+    off = "0u"
+    for i in range(count):
+        ni = limits[i]
+        reads.append("  if (nrow < (%s) + %s) { return w%d[wo * %s + nrow - (%s)]; }"
+                     % (off, ni, i, ni, off))
+        stores.append("  if (row < (%s) + %s) { out%d[row - (%s)] = v; return; }"
+                      % (off, ni, i, off))
+        off = "%s + %s" % (off, ni)
+    new_w = "fn W(wo: u32) -> u32 {\n%s\n  return 0u;\n}" % "\n".join(reads)
+    store = "fn STORE(row: u32, v: f32) {\n%s\n}" % "\n".join(stores)
+    helpers = helpers.replace(old_w, new_w + "\n" + store)
+    binds = ["@group(0) @binding(0)\nvar<storage,read> x: array<f32>;"]
+    for i in range(count):
+        binds.append("@group(0) @binding(%d)\nvar<storage,read> w%d: array<u32>;"
+                     % (1 + i, i))
+    for i in range(count):
+        binds.append("@group(0) @binding(%d)\nvar<storage,read_write> out%d: array<f32>;"
+                     % (1 + count + i, i))
+    meta_binding = 1 + 2 * count
+    binds.append("struct GM { M: u32, N: u32, K: u32, rowb: u32, estride: u32, "
+                 "eslot: u32, xper: u32, pad: u32, }\n"
+                 "@group(0) @binding(%d)\nvar<storage,read> gm: GM;" % meta_binding)
+    custom = "\n".join(binds) + "\n" + helpers
+    src = custom + src[len(base):]
+    if "outp[nn] = tot;" not in src:
+        raise RuntimeError("ggml stored output statement changed")
+    return src.replace("outp[nn] = tot;", "STORE(nn, tot);")
+
+
+def _ggml_parallel_fused(xd, linears, kind=None):
+    count = len(linears)
+    type_name = linears[0].type_name
+    K = int(linears[0].Kt)
+    ns = tuple(int(l.Nt) for l in linears)
+    key = (type_name, count, kind)
+    plat = _adam_kernel["platform"]
+    name = "ggml_parallel%d_%s%s" % (
+        count, type_name.lower(), "" if kind is None else "_" + str(kind))
+    if key not in _GGML_PARALLEL_ADDED:
+        ro, rw = "read-only-storage", "storage"
+        plat.addKernel(name, {"source": _ggml_parallel_src(type_name, count, kind),
+                              "bindingTypes": [ro] + [ro] * count + [rw] * count + [ro]})
+        _GGML_PARALLEL_ADDED.add(key)
+    outs = [_empty((1, n)) for n in ns]
+    padded = ns + (0,) * (3 - count)
+    meta = _adam_kernel["make_meta"]((1, sum(ns), K, 0, padded[0], padded[1], padded[2], 0),
+                                     "u4,u4,u4,u4,u4,u4,u4,u4")
+    tensors = ([xd.buffer.buffer_id]
+               + [l.packed.buffer.buffer_id for l in linears]
+               + [o.buffer.buffer_id for o in outs] + [meta.buffer_id])
+    vals = _GGML_TYPES[type_name][2]
+    plat.runKernel({"name": name, "tensors": tensors,
+                    "workGroups": {"x": _gemv_groups(sum(ns), 1, vals, kind),
+                                   "y": 1, "z": 1}})
+    return tuple(Tensor(o) for o in outs)
+
+
+def parallel_linear(linears, x, execution="auto"):
+    """Run independent projections from one activation, returning one Tensor per weight.
+
+    ``auto`` is the best route at this layer.  A containing transformer may pass
+    ``separate`` or ``fused`` when its complete-layer or complete-API combination measures
+    faster.  Unsupported formats/backends keep the same interface and use the separate
+    equivalent; no model name or model category participates in the decision.
+    """
+    linears = tuple(linears)
+    fused_modes = ("fused:default", "fused:balanced", "fused:compact", "fused:narrow")
+    if execution not in ("auto", "separate", "fused") + fused_modes:
+        raise ValueError("execution must be auto, separate, fused, or a fused:<shape> route")
+    separate = lambda: tuple(layer(x) for layer in linears)
+    xd = x.data
+    rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
+    capable = (2 <= len(linears) <= 3 and rows == 1 and _adam_backend_ready()
+               and all(isinstance(l, GGMLLinear) for l in linears)
+               and len({l.type_name for l in linears}) == 1
+               and len({int(l.Kt) for l in linears}) == 1
+               and all(l.bias is None for l in linears)
+               and _GGML_TYPES[linears[0].type_name][4] is None)
+    if not capable:
+        # This is the nearest common interface level.  WebGL has one output per fragment
+        # pass, and mixed storage formats need different decode fragments, so neither can
+        # share the physical dispatch.  They still implement the same parallel-projection
+        # operation here with separate passes; callers do not lose the layer capability.
+        return separate()
+    xd = _contig(xd.reshape(1, int(linears[0].Kt)))
+    ns = tuple(int(l.Nt) for l in linears)
+    kinds = (None, "balanced", "compact", "narrow")
+    reference = [None]
+
+    def fused_kind(kind):
+        return _ggml_parallel_fused(xd, linears, kind=kind)
+
+    def correct_fused(kind):
+        ckey = ("parallel_correct", linears[0].type_name, int(linears[0].Kt), ns, kind)
+        if ckey in _GGML_PARALLEL_OK:
+            return _GGML_PARALLEL_OK[ckey]
+        if reference[0] is None:
+            reference[0] = tuple(ggml_matmul(
+                xd, l.packed, l.type_name, l.Kt, l.Nt, execution="stored")
+                                 for l in linears)
+            reference[0] = tuple(np.asarray(v.get(), np.float32) for v in reference[0])
+        got = fused_kind(kind); ok = True
+        for av, b in zip(reference[0], got):
+            bv = np.asarray(b.numpy(), np.float32)
+            scale = max(1e-6, float(np.abs(av).max()))
+            ok = ok and bool(np.all(np.isfinite(bv))
+                             and float(np.abs(av - bv).max()) / scale < 2e-5)
+        _GGML_PARALLEL_OK[ckey] = ok
+        return ok
+
+    def best_fused_kind():
+        key = ("parallel_fused_kind", linears[0].type_name,
+               int(linears[0].Kt), ns)
+        if key in _TUNED:
+            return _TUNED[key]
+        valid = [kind for kind in kinds if correct_fused(kind)]
+        if not valid:
+            raise RuntimeError("no fused stored-format projection passed validation")
+        samples = {kind: [] for kind in valid}
+
+        def bench(kind):
+            out = None; t0 = time.perf_counter()
+            for _ in range(4):
+                out = fused_kind(kind)
+            out[-1].numpy()
+            return (time.perf_counter() - t0) / 4.0
+
+        for kind in valid:
+            bench(kind)
+        for r in range(9):
+            order = valid if not (r & 1) else list(reversed(valid))
+            for kind in order:
+                samples[kind].append(bench(kind))
+        chosen = _measured_choice(samples, valid, default=None)
+        _TUNED[key] = chosen
+        return chosen
+
+    def fused():
+        return fused_kind(best_fused_kind())
+
+    if execution.startswith("fused:"):
+        kind = None if execution == "fused:default" else execution.split(":", 1)[1]
+        if not correct_fused(kind):
+            raise RuntimeError("fused stored-format projection shape failed validation")
+        return fused_kind(kind)
+    if execution == "fused":
+        return fused()
+    if execution == "separate":
+        return separate()
+
+    key = ("parallel_linear", linears[0].type_name, int(linears[0].Kt),
+           tuple(int(l.Nt) for l in linears))
+    chosen = _TUNED.get(key)
+    if chosen is None:
+        candidates = ["separate"] + (["fused"] if any(correct_fused(k) for k in kinds)
+                                      else [])
+        samples = {c: [] for c in candidates}
+
+        def bench(which):
+            out = None; t0 = time.perf_counter()
+            for _ in range(4):
+                out = fused() if which == "fused" else separate()
+            out[-1].numpy()                # queue order completes every sibling projection
+            return (time.perf_counter() - t0) / 4.0
+
+        for c in candidates:
+            bench(c)
+        for r in range(9):
+            order = candidates if not (r & 1) else list(reversed(candidates))
+            for c in order:
+                samples[c].append(bench(c))
+        chosen = _measured_choice(samples, candidates, default="separate")
+        _TUNED[key] = chosen
+    return fused() if chosen == "fused" else separate()
+
+
+def parallel_swiglu(linears, x, execution="auto"):
+    """Two parallel projections followed by SwiGLU, optimised at the MLP layer.
+
+    ``parallel_linear`` remains independently callable and returns ordinary tensors.  This
+    next layer may use a different combination: on WebGL, same-format gate/up weights can
+    render one combined projection texture and :func:`swiglu` consumes its two halves in
+    place, avoiding both a second projection draw and materialised slices.  WebGPU uses its
+    own shared-dispatch projection.  Unsupported or mixed formats take the equivalent
+    separate path at this nearest common layer.
+    """
+    linears = tuple(linears)
+    if len(linears) != 2:
+        raise ValueError("parallel_swiglu needs exactly gate and up projections")
+    fused_modes = ("fused:default", "fused:balanced", "fused:compact", "fused:narrow")
+    if execution not in ("auto", "separate", "fused") + fused_modes:
+        raise ValueError("execution must be auto, separate, fused, or a fused:<shape> route")
+
+    def separate():
+        gate, up = parallel_linear(linears, x, execution="separate")
+        out = swiglu(gate, up)
+        return out if out is not None else (gate / (1.0 + (-gate).exp())) * up
+
+    xd = x.data
+    rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
+    capable = (rows == 1 and all(isinstance(l, GGMLLinear) for l in linears)
+               and len({l.type_name for l in linears}) == 1
+               and len({int(l.Kt) for l in linears}) == 1
+               and len({int(l.Nt) for l in linears}) == 1
+               and all(l.bias is None for l in linears)
+               and _GGML_TYPES[linears[0].type_name][4] is None
+               and (_adam_backend_ready() or _webgl_ready()))
+    if not capable:
+        return separate()
+    xd = _contig(xd.reshape(1, int(linears[0].Kt)))
+
+    def fused(route="fused"):
+        if _webgl_ready() and not _adam_backend_ready():
+            combined = _ggml_parallel_fused_gl(xd, linears)
+            return swiglu(combined)
+        gate, up = parallel_linear(linears, Tensor(xd), execution=route)
+        return swiglu(gate, up)
+
+    if execution == "separate":
+        return separate()
+    # ``fused`` is an upper-layer request, not permission to skip the numerical gate.  The
+    # first call compares the complete activation, then the result is remembered per backend
+    # and operator shape.
+    backend_name = "webgpu" if _adam_backend_ready() else "webgl"
+    def correct_fused(route="fused"):
+        ckey = ("parallel_swiglu_correct", backend_name, linears[0].type_name,
+                int(linears[0].Kt), int(linears[0].Nt), route)
+        if ckey in _TUNED:
+            return bool(_TUNED[ckey])
+        a = np.asarray(separate().numpy(), np.float32)
+        b = np.asarray(fused(route).numpy(), np.float32)
+        scale = max(1e-6, float(np.abs(a).max()))
+        ok = bool(np.all(np.isfinite(b))
+                  and float(np.abs(a - b).max()) / scale < 2e-5)
+        _TUNED[ckey] = ok
+        return ok
+
+    if execution.startswith("fused:"):
+        # WebGL has no workgroup decomposition at this physical layer; its nearest-layer
+        # fused equivalent is nevertheless the same SwiGLU operation and is validated here.
+        return fused(execution) if correct_fused(execution) else separate()
+    if execution == "fused":
+        return fused() if correct_fused() else separate()
+
+    key = ("parallel_swiglu", backend_name, linears[0].type_name,
+           int(linears[0].Kt), int(linears[0].Nt))
+    chosen = _TUNED.get(key)
+    if chosen is None:
+        candidates = ["separate"] + (["fused"] if correct_fused() else [])
+        samples = {c: [] for c in candidates}
+
+        def bench(which):
+            out = None; t0 = time.perf_counter()
+            for _ in range(4):
+                out = fused() if which == "fused" else separate()
+            out.numpy()
+            return (time.perf_counter() - t0) / 4.0
+
+        for c in candidates:
+            bench(c)
+        for r in range(9):
+            order = candidates if not (r & 1) else list(reversed(candidates))
+            for c in order:
+                samples[c].append(bench(c))
+        chosen = _measured_choice(samples, candidates, default="separate")
+        _TUNED[key] = chosen
+    return fused() if chosen == "fused" else separate()
 
 
 def _ggml_grid(type_name):
@@ -7391,6 +8688,195 @@ def _gl_run(name, source, inputs, out, uniforms):
     return out
 
 
+# Greedy language-model decoding needs one integer, not a 150k-float vocabulary copied to
+# WASM every token.  One workgroup scans the row and reduces it deterministically (ties use
+# the first index, matching numpy.argmax).  Keeping the reduction on-device removes both the
+# full readback and the CPU argmax from the common no-sampling path.
+_VOCAB_ARGMAX_WGSL = """
+@group(0) @binding(0) var<storage,read> x: array<f32>;
+@group(0) @binding(1) var<storage,read_write> out_idx: array<i32>;
+struct AM { n: u32, offset: u32, pad1: u32, pad2: u32, }
+@group(0) @binding(2) var<storage,read> am: AM;
+var<workgroup> best_v: array<f32, 256>;
+var<workgroup> best_i: array<u32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = lid.x;
+  var v = -3.402823466e+38;
+  var bi = 0u;
+  for (var i = t; i < am.n; i = i + 256u) {
+    let q = x[i];
+    if (q > v || (q == v && i < bi)) { v = q; bi = i; }
+  }
+  best_v[t] = v; best_i[t] = bi;
+  workgroupBarrier();
+  var width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (t < width) {
+      let ov = best_v[t + width]; let oi = best_i[t + width];
+      if (ov > best_v[t] || (ov == best_v[t] && oi < best_i[t])) {
+        best_v[t] = ov; best_i[t] = oi;
+      }
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (t == 0u) { out_idx[am.offset] = i32(best_i[0]); }
+}
+"""
+
+_VOCAB_ARGMAX_GLSL = """#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+uniform int _ka_tex_output_texture_w; uniform sampler2D tex_x; uniform int u_n;
+out int fragColor;
+float Xf(int i) { ivec2 s = textureSize(tex_x, 0); int y = i / s.x;
+  return texelFetch(tex_x, ivec2(i - y * s.x, y), 0).r; }
+void main() {
+  float best = -3.402823466e+38; int bi = 0;
+  for (int i = 0; i < u_n; i = i + 1) {
+    float v = Xf(i); if (v > best) { best = v; bi = i; }
+  }
+  fragColor = bi;
+}
+"""
+
+_vocab_argmax_k = {"gpu": False}
+def vocab_argmax(x, out=None, offset=0):
+    """Return a device-resident int32[1] containing the first argmax of one flat row.
+
+    WebGPU uses a workgroup reduction and WebGL provides the same interface with a single
+    fragment scan.  CPU remains the reference fallback.  The caller decides when greedy
+    argmax is semantically valid; sampling, penalties and constraints still use full logits.
+    """
+    xd = _contig(x.data if isinstance(x, Tensor) else x).reshape(-1)
+    n = int(xd.size)
+    if _adam_backend_ready():
+        plat = _adam_kernel["platform"]
+        if not _vocab_argmax_k["gpu"]:
+            plat.addKernel("vocab_argmax", {"source": _VOCAB_ARGMAX_WGSL,
+                "bindingTypes": ["read-only-storage", "storage", "read-only-storage"]})
+            _vocab_argmax_k["gpu"] = True
+        out = xp.empty((1,), np.int32) if out is None else out
+        if int(offset) < 0 or int(offset) >= int(out.size):
+            raise ValueError("vocab_argmax output offset is outside its buffer")
+        meta = _adam_kernel["make_meta"]((n, int(offset), 0, 0), "u4,u4,u4,u4")
+        plat.runKernel({"name": "vocab_argmax",
+                        "tensors": [xd.buffer.buffer_id, out.buffer.buffer_id,
+                                    meta.buffer_id],
+                        "workGroups": {"x": 1, "y": 1, "z": 1}})
+        return out
+    if _webgl_ready():
+        if out is not None or int(offset):
+            raise RuntimeError("WebGL vocab_argmax writes its complete one-value output")
+        out = xp.empty((1,), np.int32)
+        return _gl_run("vocab_argmax_gl", _VOCAB_ARGMAX_GLSL,
+                       [("tex_x", xd)], out, [("u_n", n)])
+    return np.asarray([int(np.asarray(xd).argmax())], np.int32)
+
+
+# Device-side input preparation for a tied Q6_K embedding/head.  It is deliberately an
+# original-format operation: one selected source row is reconstructed directly from the
+# transposed 210-byte blocks already used by the vocabulary head.  The packed weight is not
+# widened or duplicated.  A containing greedy decoder can place several of these between
+# captured decode steps and cross the JS/WASM/GPU boundary once for the whole chunk.
+_Q6K_DECODE_INPUT_WGSL = """
+@group(0) @binding(0) var<storage,read> tokens: array<i32>;
+@group(0) @binding(1) var<storage,read> w: array<u32>;
+@group(0) @binding(2) var<storage,read> cos_table: array<f32>;
+@group(0) @binding(3) var<storage,read> sin_table: array<f32>;
+@group(0) @binding(4) var<storage,read_write> h_out: array<f32>;
+@group(0) @binding(5) var<storage,read_write> cos_out: array<f32>;
+@group(0) @binding(6) var<storage,read_write> sin_out: array<f32>;
+@group(0) @binding(7) var<storage,read_write> ctl: array<i32>;
+struct IM { K:u32, N:u32, HD:u32, step:u32, inc:u32, pad0:u32, pad1:u32, pad2:u32, }
+@group(0) @binding(8) var<storage,read> im: IM;
+var<private> nrow:u32;
+fn W(wo:u32)->u32 { return w[wo*im.N+nrow]; }
+fn B4(o:u32)->u32 { let wo=o>>2u; let sh=(o&3u)*8u; let lo=W(wo);
+  if(sh==0u){return lo;} return (lo>>sh)|(W(wo+1u)<<(32u-sh)); }
+fn B(o:u32)->u32 { return (W(o>>2u)>>((o&3u)*8u))&255u; }
+fn U16(o:u32)->u32 { return B4(o)&65535u; }
+fn HF(h:u32)->f32 { let m=h&1023u; let e=(h>>10u)&31u; var v:f32;
+  if(e==0u){v=f32(m)*5.9604644775390625e-8;} else if(e==31u){v=65504.0;}
+  else {v=exp2(f32(i32(e)-15))*(1.0+f32(m)*0.0009765625);}
+  return select(v,-v,(h&32768u)!=0u); }
+fn I8(o:u32)->f32 { return f32(i32(B(o)<<24u)>>24u); }
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let k=gid.x; nrow=u32(tokens[im.step]);
+  if(k<im.K){
+    let b=k/256u; let p=k-b*256u; let half=p/128u; let r=(p-half*128u)/32u;
+    let l=p&31u; let ii=l>>4u; let o=b*210u;
+    let lo=o+half*64u; let ho=o+128u+half*32u; let so=o+192u+half*8u;
+    let a=B(lo+l); let c=B(lo+l+32u); let hh=B(ho+l); var q:u32;
+    if(r==0u){q=(a&15u)|(((hh>>0u)&3u)<<4u);}
+    else if(r==1u){q=(c&15u)|(((hh>>2u)&3u)<<4u);}
+    else if(r==2u){q=(a>>4u)|(((hh>>4u)&3u)<<4u);}
+    else {q=(c>>4u)|(((hh>>6u)&3u)<<4u);}
+    h_out[k]=HF(U16(o+208u))*I8(so+ii+2u*r)*(f32(q)-32.0);
+  }
+  if(k<im.HD){
+    cos_out[k]=cos_table[im.step*im.HD+k];
+    sin_out[k]=sin_table[im.step*im.HD+k];
+  }
+  if(k==0u && im.inc!=0u){ ctl[0]=ctl[0]+1; }
+}
+"""
+
+# The same exact Q6_K decoder over the file's compact row-major bytes.  The vocabulary
+# projection transposes those bytes once for coalesced matrix multiplication; selecting one
+# embedding row has the opposite access pattern, so keeping the already-present compact
+# table on the device can be much faster at the cost of one compressed-size duplicate.
+# Derive the shader so the quant arithmetic cannot drift between the two candidates.
+_Q6K_DECODE_ROW_INPUT_WGSL = _Q6K_DECODE_INPUT_WGSL.replace(
+    "fn W(wo:u32)->u32 { return w[wo*im.N+nrow]; }",
+    "fn W(wo:u32)->u32 { return w[nrow*im.N+wo]; }")
+if _Q6K_DECODE_ROW_INPUT_WGSL == _Q6K_DECODE_INPUT_WGSL:
+    raise RuntimeError("Q6_K compact-row shader derivation did not match")
+
+_q6k_decode_input_added = {"transposed": False, "compact": False}
+
+
+def q6k_decode_input(tokens, packed, K, N, cos_table, sin_table,
+                     h_out, cos_out, sin_out, ctl, step=0, increment=False,
+                     layout="transposed"):
+    """Prepare one captured decode input from a device token and original Q6_K row."""
+    if layout not in ("transposed", "compact"):
+        raise ValueError("Q6_K row layout must be transposed or compact")
+    if not _adam_backend_ready():
+        raise RuntimeError("device Q6_K decode input requires WebGPU")
+    plat = _adam_kernel["platform"]
+    name = "q6k_decode_input" if layout == "transposed" else "q6k_decode_input_compact"
+    if not _q6k_decode_input_added[layout]:
+        plat.addKernel(name, {"source": (_Q6K_DECODE_INPUT_WGSL
+                                          if layout == "transposed"
+                                          else _Q6K_DECODE_ROW_INPUT_WGSL),
+            "bindingTypes": ["read-only-storage"] * 4 + ["storage"] * 4
+                            + ["read-only-storage"]})
+        _q6k_decode_input_added[layout] = True
+    td = tokens.data if isinstance(tokens, Tensor) else tokens
+    wd = packed.data if isinstance(packed, Tensor) else packed
+    cd = cos_table.data if isinstance(cos_table, Tensor) else cos_table
+    sd = sin_table.data if isinstance(sin_table, Tensor) else sin_table
+    hd = h_out.data if isinstance(h_out, Tensor) else h_out
+    co = cos_out.data if isinstance(cos_out, Tensor) else cos_out
+    so = sin_out.data if isinstance(sin_out, Tensor) else sin_out
+    ct = ctl.data if isinstance(ctl, Tensor) else ctl
+    HDr = int(co.size)
+    meta = _adam_kernel["make_meta"](
+        (int(K), int(N), HDr, int(step), 1 if increment else 0, 0, 0, 0),
+        "u4,u4,u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+                    "tensors": [td.buffer.buffer_id, wd.buffer.buffer_id,
+                                cd.buffer.buffer_id, sd.buffer.buffer_id,
+                                hd.buffer.buffer_id, co.buffer.buffer_id,
+                                so.buffer.buffer_id, ct.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": {"x": (int(K) + 255) // 256, "y": 1, "z": 1}})
+    return h_out
+
+
 _SWIGLU_GLSL = _gl_head([("tex_g", "Gf"), ("tex_u", "Uf")],
                         ("u_half", "u_gstride", "u_ustride", "u_uoff", "u_n")) + """
 void main() {
@@ -7468,6 +8954,116 @@ void main() {
                          : Bf((p * u_n2 + (w - u_n1)) * u_post + t);
 }
 """
+
+
+def _webgl_prepare_growing_cache():
+    """Compile the common KV append before a large model occupies GPU memory.
+
+    Registration is a one-time scheduling request; shader compilation and all GPU work
+    stay in the JavaScript backend. The normal first use sees the same kernel and skips
+    registration. This is format- and model-independent for WebGL growing-cache decode.
+    """
+    if _webgl_ready() and "cat2_gl" not in _gl_kernels:
+        _copy_kernel["plat"].addKernel("cat2_gl", {"source": _CAT2_GLSL})
+        _gl_kernels.add("cat2_gl")
+
+
+# A batched MoE routes each token to k experts.  Its activation must appear k times,
+# but advanced ndarray indexing reads the entire activation back to Python before
+# uploading the repeated rows.  The router has a device implementation too; using
+# both device operations lets the *containing layer* submit all its work without a
+# per-layer CPU/GPU synchronization.  Neither backend changes weight precision.
+_REPEAT_ROWS_GLSL = _gl_head([("tex_x", "Xf")], ("u_H", "u_k", "u_n")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_n) { fragColor = 0.0; return; }
+  int r = i / u_H;
+  fragColor = Xf((r / u_k) * u_H + i - r * u_H);
+}
+"""
+
+_REPEAT_ROWS_WGSL = """
+@group(0) @binding(0) var<storage,read> x: array<f32>;
+@group(0) @binding(1) var<storage,read_write> y: array<f32>;
+struct RM { h: u32, k: u32, n: u32, pad: u32, }
+@group(0) @binding(2) var<storage,read> rm: RM;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i < rm.n) {
+    let row = i / rm.h;
+    y[i] = x[(row / rm.k) * rm.h + i - row * rm.h];
+  }
+}
+"""
+_repeat_rows_k = {"gpu": False}
+
+
+def repeat_rows(x, repeats, execution="auto"):
+    """Repeat each row of a 2-D FP32 activation, without changing its values.
+
+    ``auto`` benchmarks the operation on this backend and shape.  A containing
+    layer may explicitly request ``device``: its own best composition can differ
+    from this isolated operator's winner because a host readback also serializes
+    every earlier dispatch in that layer.
+    """
+    if execution not in ("auto", "host", "device"):
+        raise ValueError("repeat_rows execution must be auto, host, or device")
+    xd = x.data if isinstance(x, Tensor) else x
+    if len(xd.shape) != 2:
+        raise ValueError("repeat_rows requires a 2-D activation")
+    k = int(repeats)
+    if k < 1 or k != repeats:
+        raise ValueError("repeat_rows requires a positive integer repeat count")
+    if k == 1:
+        return xd
+    rows, h = (int(v) for v in xd.shape)
+    backend = "webgpu" if _adam_backend_ready() else "webgl" if _webgl_ready() else "cpu"
+    device_ok = backend != "cpu" and np.dtype(xd.dtype) == np.dtype(np.float32)
+
+    def host_array(a):
+        return np.asarray(a.get() if hasattr(a, "get") else a)
+
+    def run(which):
+        if which == "host" or not device_ok:
+            return xp.asarray(np.repeat(host_array(xd), k, axis=0))
+        source = _contig(xd)
+        out = _empty((rows * k, h))
+        n = rows * k * h
+        if backend == "webgl":
+            return _gl_run("repeat_rows_gl", _REPEAT_ROWS_GLSL,
+                           [("tex_x", source)], out,
+                           [("u_H", h), ("u_k", k), ("u_n", n)])
+        plat = _adam_kernel["platform"]
+        if not _repeat_rows_k["gpu"]:
+            plat.addKernel("repeat_rows", {
+                "source": _REPEAT_ROWS_WGSL,
+                "bindingTypes": ["read-only-storage", "storage", "read-only-storage"]})
+            _repeat_rows_k["gpu"] = True
+        meta = _adam_kernel["make_meta"]((h, k, n, 0), "u4,u4,u4,u4")
+        plat.runKernel({"name": "repeat_rows",
+                        "tensors": [source.buffer.buffer_id, out.buffer.buffer_id,
+                                    meta.buffer_id],
+                        "workGroups": {"x": (n + 255) // 256, "y": 1, "z": 1}})
+        return out
+
+    if execution == "device" and not device_ok:
+        raise TypeError("device repeat_rows requires a GPU-backed FP32 activation")
+    if execution == "auto" and device_ok:
+        reference = [None]
+
+        def correct(which):
+            if which == "host":
+                return True
+            if reference[0] is None:
+                reference[0] = np.repeat(host_array(xd), k, axis=0)
+            got = host_array(run(which))
+            return bool(np.array_equal(got, reference[0]))
+
+        execution = _weight_execution("repeat_rows", backend, h, k, rows, run,
+                                     candidates=("host", "device"), check=correct,
+                                     rounds=5, repeat=2)
+    return run("host" if execution == "auto" else execution)
 
 
 def _webgl_cat2(a, b, axis):
@@ -7675,21 +9271,24 @@ _MOE_IDX_GL = """#version 300 es
 precision highp float; precision highp int; precision highp sampler2D;
 uniform int _ka_tex_output_texture_w;
 uniform sampler2D tex_lg;
-uniform int u_ne; uniform int u_k;
+uniform int u_ne; uniform int u_k; uniform int u_T;
 out int fragColor;
 float Lf(int i) { ivec2 t = textureSize(tex_lg, 0);
   if (t.y == 1) { return texelFetch(tex_lg, ivec2(i, 0), 0).r; }
   int y = i / t.x; return texelFetch(tex_lg, ivec2(i - y * t.x, y), 0).r; }
 void main() {
-  int s = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
-  if (s >= u_k) { fragColor = 0; return; }
+  int out_i = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (out_i >= u_T * u_k) { fragColor = 0; return; }
+  int row = out_i / u_k;
+  int s = out_i - row * u_k;
+  int base = row * u_ne;
   int chosen[%d];
   for (int t = 0; t <= s; t = t + 1) {
     float best = -1e30; int bi = 0;
     for (int e = 0; e < u_ne; e = e + 1) {
       bool taken = false;
       for (int j = 0; j < t; j = j + 1) { if (chosen[j] == e) { taken = true; } }
-      float v = Lf(e);
+      float v = Lf(base + e);
       if (!taken && v > best) { best = v; bi = e; }
     }
     chosen[t] = bi;
@@ -7704,7 +9303,7 @@ precision highp sampler2D; precision highp isampler2D;
 uniform int _ka_tex_output_texture_w;
 uniform sampler2D tex_lg;
 uniform isampler2D tex_idx;
-uniform int u_ne; uniform int u_k; uniform int u_norm;
+uniform int u_ne; uniform int u_k; uniform int u_norm; uniform int u_T;
 out float fragColor;
 float Lf(int i) { ivec2 t = textureSize(tex_lg, 0);
   if (t.y == 1) { return texelFetch(tex_lg, ivec2(i, 0), 0).r; }
@@ -7713,21 +9312,30 @@ int If(int i) { ivec2 t = textureSize(tex_idx, 0);
   if (t.y == 1) { return texelFetch(tex_idx, ivec2(i, 0), 0).r; }
   int y = i / t.x; return texelFetch(tex_idx, ivec2(i - y * t.x, y), 0).r; }
 void main() {
-  int s = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
-  if (s >= u_k) { fragColor = 0.0; return; }
-  // softmax over ALL experts, then renormalised across the chosen ones (the Qwen
-  // convention); with u_norm == 0 the raw softmax weights are kept.
-  float mx = -1e30;
-  for (int e = 0; e < u_ne; e = e + 1) { mx = max(mx, Lf(e)); }
-  float den = 0.0;
-  for (int e = 0; e < u_ne; e = e + 1) { den += exp(Lf(e) - mx); }
-  float p = exp(Lf(If(s)) - mx) / den;
+  int out_i = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (out_i >= u_T * u_k) { fragColor = 0.0; return; }
+  int row = out_i / u_k;
+  int s = out_i - row * u_k;
+  int base = row * u_ne;
+  // Normalised top-k cancels the full softmax denominator. Retain it only when
+  // the caller asks for unnormalised full-expert probabilities.
   if (u_norm == 1) {
-    float tot = 0.0;
-    for (int j = 0; j < u_k; j = j + 1) { tot += exp(Lf(If(j)) - mx) / den; }
-    if (tot > 0.0) { p = p / tot; }
+    float mx_sel = -1e30;
+    for (int j = 0; j < u_k; j = j + 1) {
+      mx_sel = max(mx_sel, Lf(base + If(row * u_k + j)));
+    }
+    float den_sel = 0.0;
+    for (int j = 0; j < u_k; j = j + 1) {
+      den_sel += exp(Lf(base + If(row * u_k + j)) - mx_sel);
+    }
+    fragColor = exp(Lf(base + If(out_i)) - mx_sel) / den_sel;
+    return;
   }
-  fragColor = p;
+  float mx = -1e30;
+  for (int e = 0; e < u_ne; e = e + 1) { mx = max(mx, Lf(base + e)); }
+  float den = 0.0;
+  for (int e = 0; e < u_ne; e = e + 1) { den += exp(Lf(base + e) - mx); }
+  fragColor = exp(Lf(base + If(out_i)) - mx) / den;
 }
 """
 
@@ -7738,10 +9346,37 @@ def _webgl_moe_route(logits, eidx, ew, ne, k, norm):
     if int(k) > _MOE_TOPK:
         raise RuntimeError("WebGL MoE routing is built for up to %d experts per token, "
                            "not %d -- raise _MOE_TOPK" % (_MOE_TOPK, int(k)))
+    rows = int(logits.shape[0]) if len(logits.shape) == 2 else 1
     _gl_run("moe_idx_gl", _MOE_IDX_GL, [("tex_lg", logits)], eidx,
-            [("u_ne", int(ne)), ("u_k", int(k))])
+            [("u_ne", int(ne)), ("u_k", int(k)), ("u_T", rows)])
     _gl_run("moe_w_gl", _MOE_W_GL, [("tex_lg", logits), ("tex_idx", eidx)], ew,
-            [("u_ne", int(ne)), ("u_k", int(k)), ("u_norm", 1 if norm else 0)])
+            [("u_ne", int(ne)), ("u_k", int(k)), ("u_norm", 1 if norm else 0),
+             ("u_T", rows)])
+
+
+_MOE_REDUCE_GL = _gl_head([("tex_y", "Yf"), ("tex_w", "Wf")],
+                          ("u_rows", "u_k", "u_h")) + """
+void main() {
+  int i = _idx();
+  if (i >= u_rows * u_h) { fragColor = 0.0; return; }
+  int row = i / u_h;
+  int col = i - row * u_h;
+  float acc = 0.0;
+  for (int slot = 0; slot < u_k; slot = slot + 1) {
+    int p = row * u_k + slot;
+    acc += Yf(p * u_h + col) * Wf(p);
+  }
+  fragColor = acc;
+}
+"""
+
+
+def _webgl_moe_weighted_sum(yd, wd, rows, k, h):
+    out = _empty((rows, h))
+    _gl_run("moe_weighted_sum_gl", _MOE_REDUCE_GL,
+            [("tex_y", yd), ("tex_w", wd)], out,
+            [("u_rows", rows), ("u_k", k), ("u_h", h)])
+    return Tensor(out)
 
 
 # Fused single-position attention, on WebGL.
@@ -8037,7 +9672,7 @@ int Ef(int i) { int y = i / _ew; return texelFetch(tex_e, ivec2(i - y * _ew, y),
 """
 
 
-def _ggml_src_gl(type_name, moe, moedec, bias=False, mode=1):
+def _ggml_src_gl(type_name, moe, moedec, bias=False, mode=1, exact_route="selected"):
     """GLSL ES 3.00 for one (format, routing, bias) combination.
 
     The bias is a compile-time variant rather than a second dispatch. It is one fetch at the
@@ -8045,10 +9680,15 @@ def _ggml_src_gl(type_name, moe, moedec, bias=False, mode=1):
     launches per layer on the backend where a launch is worth the most -- a 36-layer model
     was spending more than a hundred of them a token on `out = out + bias`."""
     from . import _wgsl2glsl as w2g
+    if exact_route not in ("selected", "base", "alternate"):
+        raise ValueError("WebGL exact route must be 'selected', 'base', or 'alternate'")
     dec, helpers, vals, _, _ = _GGML_TYPES[type_name]
     override = _GGML_GL_MODE_DECODERS.get(type_name, {}).get(mode)
-    if override is not None:
+    if exact_route in ("selected", "alternate") and override is not None:
         dec, helpers = override
+    elif exact_route == "alternate":
+        raise ValueError("%s mode %s has no alternate exact WebGL decoder" %
+                         (type_name, mode))
     ng = _grid_u32(type_name)
     # Substitutions that inject WGSL text run BEFORE translation, for the same reason they
     # run first on the WebGPU side: what they expand to contains further placeholders.
@@ -8116,25 +9756,28 @@ def _gl_rowinit(moe, moedec):
 _ggml_gl = {"added": set()}
 
 
-def _ggml_name_gl(type_name, moe, moedec, bias=False, mode=1):
-    return "ggml_gl_%s_%s_m%d%s" % (type_name.lower().replace("-", "_"),
-                                    "md" if moedec else ("mb" if moe else "d"), mode,
-                                    "_b" if bias else "")
+def _ggml_name_gl(type_name, moe, moedec, bias=False, mode=1, exact_route="base"):
+    return "ggml_gl_%s_%s_m%d_%s%s" % (type_name.lower().replace("-", "_"),
+                                       "md" if moedec else ("mb" if moe else "d"), mode,
+                                       "xa" if exact_route == "alternate" else "xb",
+                                       "_b" if bias else "")
 
 
-def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False, mode=1):
-    key = (type_name, moe, moedec, bias, mode)
+def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False, mode=1,
+                 exact_route="base"):
+    key = (type_name, moe, moedec, bias, mode, exact_route)
     if key in _ggml_gl["added"]:
         return
     plat = _copy_kernel["plat"]
-    plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias, mode),
-                   {"source": _ggml_src_gl(type_name, moe, moedec, bias, mode)})
+    plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias, mode, exact_route),
+                   {"source": _ggml_src_gl(type_name, moe, moedec, bias, mode,
+                                            exact_route)})
     _ggml_gl["added"].add(key)
 
 
-def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xper=False,
-                 bias=None):
-    """The WebGL dispatch. One fragment per output element; no workgroup shape to choose."""
+def _ggml_run_gl_exact(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
+                       xper=False, bias=None, exact_route="base"):
+    """One exact stored-width WebGL dispatch for an explicitly selected decoder."""
     _, _, vals, blk, _ = _GGML_TYPES[type_name]
     moe = eidx is not None
     M = 1 if (moe and xper) else int(xf.shape[0])
@@ -8142,7 +9785,7 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
     mode = M if M <= 2 else (3 if M <= 32 else 0)
     slots = int(eidx.size) if moedec else 1
     rows = slots * M
-    _ggml_add_gl(type_name, moe, moedec, bias is not None, mode)
+    _ggml_add_gl(type_name, moe, moedec, bias is not None, mode, exact_route)
     of = _empty((rows, N))
     grid = _ggml_grid(type_name)
     inputs = [{"name": "tex_x", "id": _contig(xf).buffer.buffer_id},
@@ -8155,7 +9798,8 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
         inputs.append({"name": "tex_bias", "id": _contig(bias).buffer.buffer_id})
     U = lambda n, v: {"name": n, "value": int(v), "type": "int"}
     plat = _copy_kernel["plat"]
-    plat.runKernel({"name": _ggml_name_gl(type_name, moe, moedec, bias is not None, mode),
+    plat.runKernel({"name": _ggml_name_gl(type_name, moe, moedec, bias is not None, mode,
+                                           exact_route),
                     "inputs": inputs, "output": of.buffer.buffer_id,
                     "uniforms": [U("_ka_tex_output_texture_w", of.buffer.texture_shape.width),
                                  U("u_M", M), U("u_N", N), U("u_K", K),
@@ -8163,6 +9807,151 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
                                  U("u_eslot", eslot), U("u_xper", 1 if xper else 0),
                                  U("u_ROWS", rows)]})
     return of
+
+
+_GGML_GL_PARALLEL_ADDED = set()
+
+
+def _ggml_parallel_src_gl(type_name, count, exact_route="base"):
+    """Turn the dense exact decoder into one combined-output WebGL projection."""
+    if count not in (2, 3):
+        raise ValueError("WebGL combined projection supports two or three weights")
+    src = _ggml_src_gl(type_name, False, False, False, 1, exact_route)
+    old_sampler = "uniform isampler2D tex_w;"
+    samplers = "\n".join("uniform isampler2D tex_w%d;" % i for i in range(count))
+    if old_sampler not in src:
+        raise RuntimeError("WebGL GGML weight sampler declaration changed")
+    src = src.replace(old_sampler, samplers)
+    old_width = "  _ww = textureSize(tex_w, 0).x;"
+    widths = "\n".join("  _ww%d = textureSize(tex_w%d, 0).x;" % (i, i)
+                       for i in range(count))
+    if old_width not in src:
+        raise RuntimeError("WebGL GGML weight width setup changed")
+    src = src.replace(old_width, widths)
+    src = src.replace("int _xw; int _ww; int _gw; int _ew; int _xh;",
+                      "int _xw; int _ww; int _gw; int _ew; int _xh; "
+                      + " ".join("int _ww%d;" % i for i in range(count)))
+    old_w = ("uint  W(uint wo) { int i = int(woff) + int(wo) * int(gm.N) + int(nrow);\n"
+             "                   int y = i / _ww; return uint(texelFetch(tex_w, ivec2(i - y * _ww, y), 0).r); }")
+    branches = []
+    offset = "0"
+    for i in range(count):
+        ni = "u_N%d" % i
+        branches.append(
+            "  if (int(nrow) < (%s) + %s) { int r = int(nrow) - (%s); "
+            "int z = int(wo) * %s + r; int y = z / _ww%d; "
+            "return uint(texelFetch(tex_w%d, ivec2(z - y * _ww%d, y), 0).r); }"
+            % (offset, ni, offset, ni, i, i, i))
+        offset = "(%s) + %s" % (offset, ni)
+    new_w = "uint W(uint wo) {\n%s\n  return 0u;\n}" % "\n".join(branches)
+    if old_w not in src:
+        raise RuntimeError("WebGL GGML W() helper changed")
+    src = src.replace(old_w, new_w)
+    decl = "uniform int u_ROWS;"
+    extra = decl + " " + " ".join("uniform int u_N%d;" % i for i in range(count))
+    if decl not in src:
+        raise RuntimeError("WebGL GGML row uniform changed")
+    return src.replace(decl, extra)
+
+
+def _ggml_parallel_run_gl_exact(xd, linears, exact_route="base"):
+    count = len(linears); type_name = linears[0].type_name
+    K = int(linears[0].Kt); ns = tuple(int(l.Nt) for l in linears)
+    key = (type_name, count, exact_route)
+    name = "ggml_gl_parallel%d_%s_%s" % (
+        count, type_name.lower().replace("-", "_"), exact_route)
+    plat = _copy_kernel["plat"]
+    if key not in _GGML_GL_PARALLEL_ADDED:
+        plat.addKernel(name, {"source": _ggml_parallel_src_gl(type_name, count,
+                                                               exact_route)})
+        _GGML_GL_PARALLEL_ADDED.add(key)
+    out = _empty((1, sum(ns)))
+    inputs = [{"name": "tex_x", "id": _contig(xd).buffer.buffer_id}]
+    inputs += [{"name": "tex_w%d" % i, "id": l.packed.buffer.buffer_id}
+               for i, l in enumerate(linears)]
+    _, _, vals, blk, _ = _GGML_TYPES[type_name]
+    U = lambda n, v: {"name": n, "value": int(v), "type": "int"}
+    uniforms = [U("_ka_tex_output_texture_w", out.buffer.texture_shape.width),
+                U("u_M", 1), U("u_N", sum(ns)), U("u_K", K),
+                U("u_rowb", (K // vals) * blk), U("u_estride", 0),
+                U("u_eslot", 0), U("u_xper", 0), U("u_ROWS", 1)]
+    uniforms += [U("u_N%d" % i, n) for i, n in enumerate(ns)]
+    plat.runKernel({"name": name, "inputs": inputs,
+                    "output": out.buffer.buffer_id, "uniforms": uniforms})
+    return Tensor(out)
+
+
+def _ggml_parallel_fused_gl(xd, linears):
+    """Measured same-width combined projection used by WebGL's MLP layer."""
+    linears = tuple(linears); type_name = linears[0].type_name
+    mode = 1
+    alternate = _GGML_GL_MODE_DECODERS.get(type_name, {}).get(mode)
+
+    def run(route):
+        return _ggml_parallel_run_gl_exact(xd, linears, route).data
+
+    if alternate is None:
+        return _ggml_parallel_run_gl_exact(xd, linears, "base")
+    reference = [None]
+
+    def correct(route):
+        if route == "base":
+            return True
+        if reference[0] is None:
+            reference[0] = np.asarray(run("base").get(), np.float32)
+        got = np.asarray(run(route).get(), np.float32)
+        scale = max(1e-6, float(np.abs(reference[0]).max()))
+        return bool(np.all(np.isfinite(got))
+                    and float(np.abs(got - reference[0]).max()) / scale < 1e-4)
+
+    route = _weight_execution("ggml_gl_parallel", type_name, linears[0].Kt,
+                              sum(int(l.Nt) for l in linears), 1, run,
+                              candidates=("base", "alternate"), check=correct,
+                              rounds=9, repeat=2)
+    return _ggml_parallel_run_gl_exact(xd, linears, route)
+
+
+def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xper=False,
+                 bias=None):
+    """Measured exact-width WebGL dispatch, independently selected on this device.
+
+    The base and alternate shaders decode the same original packed bytes into FP32
+    accumulators; only their scalar/``vec4`` register schedule differs.  When a format has
+    both, correctness is checked first and paired measurements select by format, routing
+    mode, shape and row bucket.  WebGPU's result is never consulted.
+    """
+    moe = eidx is not None
+    M = 1 if (moe and xper) else int(xf.shape[0])
+    mode = M if M <= 2 else (3 if M <= 32 else 0)
+    override = _GGML_GL_MODE_DECODERS.get(type_name, {}).get(mode)
+
+    def run(route):
+        return _ggml_run_gl_exact(xf, packed, type_name, K, N, eidx=eidx,
+                                  eslot=eslot, estride=estride, xper=xper, bias=bias,
+                                  exact_route=route)
+
+    if override is None:
+        return run("base")
+    reference = [None]
+
+    def correct(route):
+        if route == "base":
+            return True
+        if reference[0] is None:
+            reference[0] = np.asarray(run("base").get(), np.float32)
+        got = np.asarray(run(route).get(), np.float32)
+        scale = max(1e-6, float(np.abs(reference[0]).max()))
+        return bool(np.all(np.isfinite(got))
+                    and float(np.abs(got - reference[0]).max()) / scale < 1e-4)
+
+    storage = "%s:m%d:%s:%s:%s" % (type_name, mode,
+                                     "moe" if moe else "dense",
+                                     "slot" if moe and M <= 2 else "batch",
+                                     "bias" if bias is not None else "nobias")
+    route = _weight_execution("ggml_gl_exact", storage, K, N, M, run,
+                              candidates=("base", "alternate"), check=correct,
+                              rounds=9, repeat=2)
+    return run(route)
 
 
 def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
@@ -8458,13 +10247,13 @@ DP4ACC
 
 _dp4a_k = {"pack": False, "gptq": set()}
 
-# Phase-two cross-width audit.  DP4A was numerically acceptable on WebGPU but slower for
-# every measured GPTQ int4/int8 shape once activation packing was included.  WebGL exposes
-# neither compute packing nor packed integer dot products, so both backends explicitly keep
-# the exact stored path.  This metadata is intentionally model-agnostic and test-visible.
+# Phase-two cross-width routing.  WebGPU can measure activation-INT8 DP4A, including its
+# packing cost, per format/shape/device.  WebGL exposes neither compute packing nor packed
+# integer dot products, so its equivalent QuantizedLinear implementation converges at the
+# public operator result and keeps the exact stored GLSL path.  This is model-agnostic.
 _PHASE2_CROSS_WIDTH = {
     "gptq_activation_int8_dp4a": {
-        "webgpu": "measured_negative_keep_stored",
+        "webgpu": "measured_per_format_shape_device",
         "webgl": "primitive_unavailable_keep_stored",
     },
 }
@@ -9399,7 +11188,20 @@ def _ggml_transpose_gl(src, n, rowb):
     return dst
 
 
-def ggml_transpose(src, n, rowb, dst=None, dstoff=0):
+# A bounded number of in-flight expert sources: 32 replaces 32 per-expert readback
+# synchronisations with one while keeping transient upload buffers to tens of MB.
+# The limit is transport memory hygiene; the stored weight bits and order do not change.
+_MOE_TRANSPOSE_WINDOW = 32
+
+
+def _ggml_transpose_drain(pending):
+    """Finish queued sliced writes before their source/meta buffers can be recycled."""
+    if pending:
+        cp.asnumpy(pending[-1][2])
+        pending.clear()
+
+
+def ggml_transpose(src, n, rowb, dst=None, dstoff=0, pending=None):
     """(n, rowb bytes) -> (words, n) u32, so a matmul's threads read adjacent words.
 
     `dst`/`dstoff` write into an existing buffer instead of a fresh one, which is how a
@@ -9432,15 +11234,17 @@ def ggml_transpose(src, n, rowb, dst=None, dstoff=0):
                     "tensors": [src.buffer.buffer_id, dst.buffer.buffer_id, meta.buffer_id,
                                 flag.buffer.buffer_id],
                     "workGroups": {"x": gx, "y": gy, "z": 1}})
-    # The dispatch is queued, not done. The caller drops the source right after this, and
-    # freeing a buffer a pending command still reads leaves the destination zeroed -- which
-    # showed up as a loaded model of all-zero weights while the same tensor transposed on
-    # its own was fine, because using it immediately forced the queue to drain.
+    # The dispatch is queued, not done. Keep every source, metadata and flag alive until
+    # a readback drains the queue. A standalone transpose still synchronises here; a
+    # stacked MoE weight may batch bounded slices and synchronise once per window.
     #
     # Read the flag, not the tensor: a read-back is sized to the whole buffer, and asking
     # for a 210 MB head block back exceeds what the backend will stage ("buffer size
     # insufficient"). Four bytes drain the queue just as well.
-    cp.asnumpy(flag)
+    if pending is None:
+        cp.asnumpy(flag)
+    else:
+        pending.append((src, meta, flag))
     return dst
 
 
@@ -9555,9 +11359,14 @@ def _gpu_stat_push(force=False):
         if hook is None:
             _stat_why = "no hook installed"
             return
-        from wgpy_backends.webgpu.platform import get_platform as _gp
-        held, peak, n = _gp().gpuBytes()
-        hook(held, peak, n)
+        if _webgl_ready() and not _adam_backend_ready():
+            # The WebGL JS backend writes live texture bytes directly to the shared
+            # resource array; Python merely signals the worker to refresh WASM size.
+            hook(None, None, None)
+        else:
+            from wgpy_backends.webgpu.platform import get_platform as _gp
+            held, peak, n = _gp().gpuBytes()
+            hook(held, peak, n)
         _stat_why = None
     except Exception as e:
         # Kept, not swallowed. This path is best-effort, so it must not raise -- but a
@@ -9654,8 +11463,8 @@ class GGMLLinear(Module):
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
     def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
-        if execution not in ("stored", "materialized", "auto"):
-            raise ValueError("execution must be 'stored', 'materialized', or 'auto'")
+        if execution not in ("stored", "dp4a", "materialized", "auto"):
+            raise ValueError("execution must be 'stored', 'dp4a', 'materialized', or 'auto'")
         b = np.frombuffer(raw, np.uint8)
         pad = (-b.size) % 4
         if pad:
@@ -9669,15 +11478,23 @@ class GGMLLinear(Module):
         self.type_name = type_name
         self.storage_format = type_name
         self.execution = execution
+        # A containing decoder may override only its one-row composition without changing
+        # this Linear's own auto route or forcing that choice onto multi-row prefill.
+        self.decode_execution = None
+        self.decode_shape = "auto"
         self.Kt = int(K); self.Nt = int(N)
         self.bias = None if bias is None else xp.asarray(np.asarray(bias, np.float32))
 
     def forward(self, x):
         xd = x.data
         lead = xd.shape[:-1]
+        rows = int(xd.reshape(-1, self.Kt).shape[0])
+        execution = (self.decode_execution
+                     if rows == 1 and self.decode_execution is not None else self.execution)
         of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed,
                          self.type_name, self.Kt, self.Nt, bias=self.bias,
-                         execution=self.execution)
+                         execution=execution,
+                         shape_execution=(self.decode_shape if rows == 1 else "auto"))
         return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
 
 
@@ -9691,28 +11508,34 @@ class GGMLMoELinear(Module):
     keeps the command identical: the shader offsets into this buffer by `estride` words.
     This is the same shape as llama.cpp's ggml_mul_mat_id.
 
-    Experts are transposed one at a time into the destination, so the peak stays at a single
-    expert rather than the whole stack.
+    Experts are transposed in bounded windows into the destination. Only one window of
+    source buffers stays live while GPU work is in flight, not the whole stack.
     """
 
-    def __init__(self, chunks, type_name, K, N):
+    def __init__(self, chunks, type_name, K, N, also_chunks=None):
         vals, blk_b = _GGML_TYPES[type_name][2], _GGML_TYPES[type_name][3]
         rowb = (int(K) // vals) * blk_b
         words = (rowb + 3) // 4
         self.estride = words * int(N)
         ne = len(chunks)
+        if also_chunks is not None and len(also_chunks) != ne:
+            raise ValueError("joined expert projections must have the same expert count")
         if _webgl_ready() and not _adam_backend_ready():
             # One upload and one pass. Per-expert transposes into slices of a shared
             # destination have no fragment-shader form (see `_ggml_transpose_gl_stack`), and
             # the alternative -- one buffer per expert -- costs the routed kernel and, with
             # it, the device-side router: the host would have to read the router's scores
             # back to decide which expert's buffer to bind, once per layer per token.
-            nb = max(len(c) for c in chunks)
+            nb = max(len(c) + (len(also_chunks[e]) if also_chunks is not None else 0)
+                     for e, c in enumerate(chunks))
             perb = nb + (-nb) % 4
             buf = np.zeros(perb * ne, np.uint8)
             for e, raw in enumerate(chunks):
-                b = np.frombuffer(raw, np.uint8)
-                buf[e * perb:e * perb + b.size] = b
+                offset = e * perb
+                for part in ((raw, also_chunks[e]) if also_chunks is not None else (raw,)):
+                    b = np.frombuffer(part, np.uint8)
+                    buf[offset:offset + b.size] = b
+                    offset += b.size
             up = xp.asarray(buf.view(np.int32))
             del buf
             self.packed = _ggml_transpose_gl_stack(up, int(N), rowb, ne, perb // 4)
@@ -9721,14 +11544,27 @@ class GGMLMoELinear(Module):
             self.Kt = int(K); self.Nt = int(N); self.n_experts = ne
             return
         dst = _empty((self.estride * ne,))
-        for e, raw in enumerate(chunks):
-            b = np.frombuffer(raw, np.uint8)
-            pad = (-b.size) % 4
-            if pad:
-                b = np.concatenate([b, np.zeros(pad, np.uint8)])
-            up = xp.asarray(b.view(np.int32))
-            ggml_transpose(up, int(N), rowb, dst=dst, dstoff=e * self.estride)
-            del up
+        pending = []
+        try:
+            for e, raw in enumerate(chunks):
+                b = np.frombuffer(raw, np.uint8)
+                if also_chunks is not None:
+                    # Only one expert is joined at a time.  The WebGPU transpose
+                    # already drains in bounded windows; a whole-layer joined list
+                    # defeats that bound before the first upload starts.
+                    b = np.concatenate((b, np.frombuffer(also_chunks[e], np.uint8)))
+                pad = (-b.size) % 4
+                if pad:
+                    b = np.concatenate([b, np.zeros(pad, np.uint8)])
+                up = xp.asarray(b.view(np.int32))
+                ggml_transpose(up, int(N), rowb, dst=dst, dstoff=e * self.estride,
+                               pending=pending)
+                # A 32-expert window bounds transient GPU uploads even for hundreds of
+                # experts. Queue order makes one four-byte flag read wait for all slices.
+                if len(pending) >= _MOE_TRANSPOSE_WINDOW:
+                    _ggml_transpose_drain(pending)
+        finally:
+            _ggml_transpose_drain(pending)
         self.packed = dst
         self.type_name = type_name
         self.Kt = int(K); self.Nt = int(N); self.n_experts = ne
@@ -9802,6 +11638,10 @@ class QuantizedLinear(Module):
                 return _gptq_matmul(xf, self.qweight, self.qzeros, self.scales,
                                     self.Kp, self.Np, self.gs, self.bits,
                                     zoff=self.zero_offset)
+            if which == "dp4a":
+                return _gptq_dp4a_matmul(xf, self.qweight, self.qzeros, self.scales,
+                                         self.Kp, self.Np, self.gs, self.bits,
+                                         zoff=self.zero_offset)
             full = _dequant_full(self.qweight, self.qzeros, self.scales, self.Kp,
                                  self.Np, self.gs, self.bits, self.zero_offset)
             return xf @ full
@@ -9811,8 +11651,24 @@ class QuantizedLinear(Module):
         # original packed GLSL path; do not enter a WebGPU-only tuner and rely on an
         # exception as backend routing.
         if execution == "auto" and _adam_backend_ready():
+            candidates = ("stored", "dp4a", "materialized")
+            reference = [None]
+
+            def correct(which):
+                if which == "stored":
+                    return True
+                if reference[0] is None:
+                    reference[0] = np.asarray(run("stored").get(), np.float32)
+                got = np.asarray(run(which).get(), np.float32)
+                if not np.all(np.isfinite(got)):
+                    return False
+                scale = max(1e-6, float(np.abs(reference[0]).max()))
+                limit = 0.03 if which == "dp4a" else 1e-3
+                return float(np.abs(got - reference[0]).max()) / scale < limit
+
             execution = _weight_execution("gptq", self.storage_format, self.Kp, self.Np,
-                                          int(xf.shape[0]), run)
+                                          int(xf.shape[0]), run, candidates=candidates,
+                                          check=correct)
         elif execution == "auto":
             execution = "stored"
         of = run(execution)

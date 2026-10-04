@@ -492,6 +492,50 @@ class DecisionModel(wt.Module):
         f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
         return x + f
 
+    @staticmethod
+    def _select_rows(x, rows):
+        """Select arbitrary device rows through the common Tensor contract.
+
+        WebGPU and WebGL expose different low-level indexing primitives.  A small one-hot
+        matmul is the nearest efficient shared layer and, unlike host indexing, keeps the
+        hidden states on the device on both backends.
+        """
+        rows = [int(r) for r in rows]
+        pick = np.zeros((len(rows), int(x.shape[0])), dtype=np.float32)
+        pick[np.arange(len(rows)), rows] = 1.0
+        return Tensor(pick).matmul(x)
+
+    def _last_head_selected(self, x, i, rows, queries_only=False):
+        """Compute only required output rows of the final transformer head layer.
+
+        This is topology-based, not tied to a checkpoint or model name: when no later layer
+        consumes the other rows, their output projection and MLP work is dead.  K/V still
+        cover the whole bidirectional sequence.  ``queries_only`` additionally selects the
+        required Q rows before attention; both variants preserve the original dtype.
+        """
+        p = "head.layers.%d." % i
+        h, hd, T = self.heads, self.head_dim, x.shape[0]
+        a = self._ln(x, p + "norm1")
+        qkv = self._lin(a, p + "self_attn.in_proj")
+        d = h * hd
+        q0 = wt._slice_last(qkv, 0, d)
+        k = wt._slice_last(qkv, d, 2 * d).reshape(T, h, hd).permute(1, 0, 2)
+        v = wt._slice_last(qkv, 2 * d, 3 * d).reshape(T, h, hd).permute(1, 0, 2)
+        if queries_only:
+            q0 = self._select_rows(q0, rows)
+            q = q0.reshape(len(rows), h, hd).permute(1, 0, 2)
+            o = bmm(softmax(bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))), v)
+            o = o.permute(1, 0, 2).reshape(len(rows), d)
+        else:
+            q = q0.reshape(T, h, hd).permute(1, 0, 2)
+            o = bmm(softmax(bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))), v)
+            o = o.permute(1, 0, 2).reshape(T, d)
+            o = self._select_rows(o, rows)
+        y = self._select_rows(x, rows) + self._lin(o, p + "self_attn.out_proj")
+        f = self._ln(y, p + "norm2")
+        f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
+        return y + f
+
     # Where one pass over several questions beats one pass each.
     #
     # Measured, four matmuls per layer over 28 layers, separate against batched:
@@ -519,37 +563,58 @@ class DecisionModel(wt.Module):
     def _run_one(self, ids, markers, qtype_idx):
         return self._score(self.enc.encode(ids), markers, qtype_idx)
 
-    def _score(self, h, markers, qtype_idx):
-        h = h + wt.embedding(self._t("type_emb.weight"),
-                             np.full((h.shape[0],), qtype_idx, dtype=np.int64))
-        for i in range(self.n_head_layers):
-            h = self._head_layer(h, i)
-        # Pick out the rows that matter -- one per option marker, plus position 0 for the
-        # action head -- as a matmul with a selector, not by indexing. Two reasons. Indexing
-        # a GPU array does not come back as numpy, so a slice of it is a GPU slice and the
-        # backend read `[1:]` as the index 1 (it raised "index 3 out of range for shape
-        # (3, 1024)"), which is a whole class of bug this sidesteps. And a selector keeps the
-        # work where the weights already are: k is a handful of rows against (T, D).
-        #
-        # Two selectors rather than one and a slice, for the same reason.
+    def _packed_score(self, h, markers):
+        """Scorer/action result as one device tensor and one eventual readback."""
         T = h.shape[0]
-        pm = np.zeros((len(markers), T), dtype=np.float32)
-        for r, mpos in enumerate(markers):
-            pm[r, mpos] = 1.0
-        m = Tensor(pm).matmul(h)                             # (k, D)
-        pp = np.zeros((1, T), dtype=np.float32)
-        pp[0, 0] = 1.0
-        pooled_t = Tensor(pp).matmul(h)                      # (1, D)
+        m = self._select_rows(h, markers)
+        pooled_t = self._select_rows(h, [0])
         s = self._ln(m, "scorer.0")
         s = self._lin(gelu(self._lin(s, "scorer.1")), "scorer.3")
-        # Keep the scorer/action boundary on the device.  Reading `s` and `pooled_t` here
-        # used to insert two queue synchronizations and a GPU -> CPU -> GPU round-trip for
-        # four scalar features.  The reduction and concatenate are capture-safe GPU kernels;
-        # logits and the final action are packed into the one readback the caller needs.
         feats = wt.decision_features(s.reshape(1, -1), len(markers))
         a = wt.cat([pooled_t, feats], axis=1)
         a = self._lin(gelu(self._lin(a, "act_head.0")), "act_head.2")
-        packed = wt.cat([s.reshape(-1), a.reshape(-1)], axis=0).numpy().reshape(-1)
+        return wt.cat([s.reshape(-1), a.reshape(-1)], axis=0)
+
+    def _score(self, h, markers, qtype_idx):
+        h = h + wt.embedding(self._t("type_emb.weight"),
+                             np.full((h.shape[0],), qtype_idx, dtype=np.int64))
+        for i in range(max(0, self.n_head_layers - 1)):
+            h = self._head_layer(h, i)
+        last = self.n_head_layers - 1
+        rows = [0] + [int(m) for m in markers]
+
+        def run(which):
+            if which == "full" or last < 0:
+                out = self._head_layer(h, last) if last >= 0 else h
+                return self._packed_score(out, markers).data
+            out = self._last_head_selected(h, last, rows, queries_only=(which == "selected_q"))
+            # Selected rows are ordered [pooled, marker0, marker1, ...].
+            return self._packed_score(out, range(1, len(rows))).data
+
+        mode = "full"
+        if last >= 0 and (wt._adam_backend_ready() or wt._webgl_ready()):
+            reference = [None]
+
+            def correct(which):
+                if which == "full":
+                    return True
+                if reference[0] is None:
+                    reference[0] = np.asarray(run("full").get(), np.float32)
+                got = np.asarray(run(which).get(), np.float32)
+                if not np.all(np.isfinite(got)):
+                    return False
+                scale = max(1e-6, float(np.abs(reference[0]).max()))
+                return float(np.abs(got - reference[0]).max()) / scale < 1e-3
+
+            backend = "webgpu" if wt._adam_backend_ready() else "webgl"
+            token_bucket = ((int(h.shape[0]) + 31) // 32) * 32
+            row_bucket = 1 << (len(rows) - 1).bit_length()
+            mode = wt._weight_execution("decision_head_" + backend, "selected_rows",
+                                        token_bucket, row_bucket, 1, run,
+                                        candidates=("full", "selected_full", "selected_q"),
+                                        check=correct, repeat=1)
+        self._head_execution = mode
+        packed = np.asarray(run(mode).get()).reshape(-1)
         logits = packed[:len(markers)]
         act = packed[len(markers):]
         act = np.exp(act - act.max()); act = act / act.sum()
@@ -624,6 +689,8 @@ class DecisionModel(wt.Module):
             execution.update({"encoder_tokens": encoder_tokens,
                               "encoder_passes": encoder_passes,
                               "batched": device_batch is not None or hs is not None})
+            if hasattr(self, "_head_execution"):
+                execution["head_execution"] = self._head_execution
         return scored
 
     def decide(self, state, questions):

@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Optional
+from time import perf_counter
 import numpy as np
 from wgpy_backends.webgl.texture import (
     WebGL2RenderingContext,
@@ -12,6 +13,33 @@ from wgpy_backends.webgl.shader_util import (
 )
 from wgpy_backends.webgl.platform import get_platform
 import wgpy_backends.webgl.webgl_config as webgl_config
+
+
+_upload_profiles = {}
+
+
+def _upload_auto(key, staged, direct):
+    """Measure repeated physical shapes and use the faster upload path.
+
+    Natural calls alternate paths with one upload per call, so calibration
+    never makes an extra copy. The faster median wins without a benefit gate.
+    """
+    profile = _upload_profiles.setdefault(key, {"seen": 0, "staged": [],
+                                                 "direct": [], "choice": None})
+    if profile["choice"] is not None:
+        (direct if profile["choice"] == "direct" else staged)()
+        return
+    mode = "staged" if profile["seen"] % 2 == 0 else "direct"
+    start = perf_counter()
+    (staged if mode == "staged" else direct)()
+    profile[mode].append(perf_counter() - start)
+    profile["seen"] += 1
+    byte_length = key.element_count * texture_type_to_element_itemsize[key.type]
+    trials = 7 if byte_length < 1024 * 1024 else 3
+    if len(profile["direct"]) >= trials and len(profile["staged"]) >= trials:
+        profile["choice"] = (
+            "direct" if sorted(profile["direct"])[trials // 2]
+            < sorted(profile["staged"])[trials // 2] else "staged")
 
 performance_metrics = {
     "webgl.buffer.create": 0,
@@ -56,10 +84,31 @@ added_kernels = set()
 # straight.
 _capture_depth = 0
 _pinned_ids = {}
+_capture_name = None
+_pins = {}
+_orphaned = {}
+_POOL_PER_SHAPE = 4
+_POOL_MAX_BYTES = 512 * 1024 * 1024
+_pool_bytes = 0
 
 
-def begin_capture_pin():
-    global _capture_depth
+def begin_capture_pin(name=None):
+    global _capture_depth, _capture_name
+    if _capture_depth == 0:
+        key = name if name is not None else "?"
+        old = _pins.pop(key, None)
+        if old:
+            plat = get_platform()
+            for bid in old:
+                _pinned_ids.pop(bid, None)
+                shape = _orphaned.pop(bid, None)
+                if shape is not None:
+                    plat.disposeBuffer(bid)
+                    performance_metrics["webgl.buffer.delete"] += 1
+                    performance_metrics["webgl.buffer.buffer_count"] -= 1
+                    performance_metrics["webgl.buffer.buffer_size"] -= _texture_shape_byte_size(shape)
+        _pins[key] = {}
+        _capture_name = key
     _capture_depth += 1
 
 
@@ -74,21 +123,38 @@ def reset_capture_pins():
     Does NOT dispose anything — the ids still need to be read off first."""
     global _capture_depth
     _capture_depth = 0
+    _pins.clear()
+    _orphaned.clear()
 
 
 def _maybe_pin(buffer_id: int, byte_size: int):
     if _capture_depth > 0:
         _pinned_ids[buffer_id] = byte_size
+        if _capture_name is not None:
+            _pins.setdefault(_capture_name, {})[buffer_id] = byte_size
 
 
 def _pool_put(texture_shape: WebGLArrayTextureShape, buffer_id: int):
+    global _pool_bytes
     if buffer_id in _pinned_ids:
+        _orphaned[buffer_id] = texture_shape
         return  # pinned by a capture — never recycle
-    _pool[texture_shape].append(buffer_id)
+    ids = _pool[texture_shape]
+    byte_size = _texture_shape_byte_size(texture_shape)
+    if len(ids) >= _POOL_PER_SHAPE or _pool_bytes + byte_size > _POOL_MAX_BYTES:
+        get_platform().disposeBuffer(buffer_id)
+        performance_metrics["webgl.buffer.delete"] += 1
+        performance_metrics["webgl.buffer.buffer_count"] -= 1
+        performance_metrics["webgl.buffer.buffer_size"] -= byte_size
+        return
+    ids.append(buffer_id)
+    _pool_bytes += byte_size
 
 
 def _pool_get(texture_shape: WebGLArrayTextureShape) -> Optional[int]:
+    global _pool_bytes
     if len(_pool[texture_shape]) > 0:
+        _pool_bytes -= _texture_shape_byte_size(texture_shape)
         return _pool[texture_shape].pop()
     return None
 
@@ -134,6 +200,14 @@ def release_pooled_buffers():
             performance_metrics["webgl.buffer.buffer_count"] -= 1
             performance_metrics["webgl.buffer.buffer_size"] -= byte_size
     _pool.clear()
+    global _pool_bytes
+    _pool_bytes = 0
+
+
+def release_comm_buffer():
+    """Drop the Python and JS views of the largest host staging array."""
+    WebGLBuffer._comm_buf = None
+    get_platform().releaseCommBuf()
 
 
 class WebGLBuffer:
@@ -184,8 +258,10 @@ class WebGLBuffer:
         )
 
     def __del__(self):
-        # TODO: limit pooled size
-        _pool_put(self.texture_shape, self.buffer_id)
+        texture_shape = getattr(self, "texture_shape", None)
+        buffer_id = getattr(self, "buffer_id", None)
+        if texture_shape is not None and buffer_id is not None:
+            _pool_put(texture_shape, buffer_id)
         # get_platform().disposeBuffer(self.buffer_id)
 
     def _get_comm_buf(self, byte_size: int) -> np.ndarray:
@@ -198,27 +274,64 @@ class WebGLBuffer:
 
     def set_data(self, array: np.ndarray):
         if self.texture_shape.type == WebGL2RenderingContext.HALF_FLOAT:
-            array_f16 = array.astype(np.float16).ravel()
-            buf = self._get_comm_buf(
-                np.dtype(np.uint16).itemsize * self.texture_shape.element_count
-            )
-            packed = buf.view(np.float16)
-            packed[: array.size] = array_f16
+            array_f16 = array.astype(np.float16, copy=False).ravel()
             size = self.texture_shape.element_count
             dtype = np.uint16
+            eligible = array_f16.size == size
+            choice = (_upload_profiles.get(self.texture_shape, {}).get("choice")
+                      if eligible else "staged")
+            if choice == "direct":
+                get_platform().setDataFromArray(
+                    self.buffer_id, array_f16.view(np.uint16),
+                    get_dtype_js_ctor_type(dtype), size * np.dtype(dtype).itemsize)
+            elif choice == "staged":
+                buf = self._get_comm_buf(np.dtype(dtype).itemsize * size)
+                packed = buf.view(np.float16)
+                packed[: array.size] = array_f16
+                get_platform().setData(self.buffer_id, get_dtype_js_ctor_type(dtype), size)
+            else:
+                # The float16 conversion is needed for this WebGL storage format;
+                # do not copy its result once more into the reusable WASM arena.
+                def staged_upload():
+                    buf = self._get_comm_buf(np.dtype(dtype).itemsize * size)
+                    packed = buf.view(np.float16)
+                    packed[: array.size] = array_f16
+                    get_platform().setData(self.buffer_id, get_dtype_js_ctor_type(dtype), size)
+                _upload_auto(self.texture_shape, staged_upload,
+                             lambda: get_platform().setDataFromArray(
+                                 self.buffer_id, array_f16.view(np.uint16),
+                                 get_dtype_js_ctor_type(dtype),
+                                 size * np.dtype(dtype).itemsize))
         else:
             dtype = {
                 WebGL2RenderingContext.FLOAT: np.float32,
                 WebGL2RenderingContext.INT: np.int32,
                 WebGL2RenderingContext.UNSIGNED_BYTE: np.uint8,
             }[self.texture_shape.type]
-            buf = self._get_comm_buf(
-                np.dtype(dtype).itemsize * self.texture_shape.element_count
-            )
-            packed = buf.view(dtype)
-            packed[: array.size] = array.ravel()
             size = self.texture_shape.element_count
-        get_platform().setData(self.buffer_id, get_dtype_js_ctor_type(dtype), size)
+            eligible = (array.dtype == np.dtype(dtype) and array.flags.c_contiguous
+                        and array.size == size)
+            choice = (_upload_profiles.get(self.texture_shape, {}).get("choice")
+                      if eligible else "staged")
+            if choice == "direct":
+                get_platform().setDataFromArray(
+                    self.buffer_id, array, get_dtype_js_ctor_type(dtype),
+                    size * np.dtype(dtype).itemsize)
+            elif choice == "staged":
+                buf = self._get_comm_buf(np.dtype(dtype).itemsize * size)
+                packed = buf.view(dtype)
+                packed[: array.size] = array.ravel()
+                get_platform().setData(self.buffer_id, get_dtype_js_ctor_type(dtype), size)
+            else:
+                def staged_upload():
+                    buf = self._get_comm_buf(np.dtype(dtype).itemsize * size)
+                    packed = buf.view(dtype)
+                    packed[: array.size] = array.ravel()
+                    get_platform().setData(self.buffer_id, get_dtype_js_ctor_type(dtype), size)
+                _upload_auto(self.texture_shape, staged_upload,
+                             lambda: get_platform().setDataFromArray(
+                                 self.buffer_id, array, get_dtype_js_ctor_type(dtype),
+                                 size * np.dtype(dtype).itemsize))
         performance_metrics["webgl.buffer.write_count"] += 1
         # physical size
         performance_metrics["webgl.buffer.write_size"] += (

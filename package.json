@@ -9,10 +9,10 @@
     "build": "npm run build:js && npm run build:python && npm run build:test",
     "build:js": "webpack",
     "build:js:watch": "webpack --watch",
-    "build:python:webgl": "rimraf build && python setup_webgl.py bdist_wheel",
-    "build:python:webgpu": "rimraf build && python setup_webgpu.py bdist_wheel",
+    "build:python:webgl": "rimraf build && python3 setup_webgl.py bdist_wheel",
+    "build:python:webgpu": "rimraf build && python3 setup_webgpu.py bdist_wheel",
     "build:python": "npm run build:python:webgl && npm run build:python:webgpu",
-    "build:test": "rimraf build && python setup_test.py bdist_wheel"
+    "build:test": "rimraf build && python3 setup_test.py bdist_wheel"
   },
   "repository": {
     "type": "git",

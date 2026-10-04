@@ -359,21 +359,172 @@ def moe_mlp(lm, lay, x):
     k = int(m["top_k"])
     st = m.get("stacked")
     norm = bool(m.get("norm_topk_prob", m.get("norm_topk", True)))
+    reduce_execution = m.get("reduce_execution",
+                             getattr(lm, "_moe_reduce_execution", "auto"))
     rlog = m["gate"](x)                                   # (T, n_experts), on device
-    if T == 1 and st is not None and getattr(wt, "moe_route", None) is not None:
-        # Everything on the device: the router's scores go straight into the index and weight
-        # buffers the expert matmuls read, so a decode step makes no round-trip at all. On a
-        # 48-layer model, reading the router back once per layer WAS most of the step.
+    if st is not None and getattr(wt, "moe_route", None) is not None:
+        # The device route avoids a router readback on every MoE layer.  It is not
+        # unconditionally best: on the measured 30B, a cold prefill benefited greatly but
+        # a settled one preferred the host route.  Auto uses a device+shape+phase profile
+        # established by whole-model paired tests. Unknown buckets retain the exact host
+        # baseline; the containing model or layer can override a lower route explicitly.
         ne = int(m.get("n_experts") or st["gate"].n_experts)
-        buf = m.get("_gpu_route")
-        if buf is None:
-            buf = {"eidx": wt._empty_i32((k,)), "ew": wt.Tensor(np.zeros((k,), np.float32))}
-            m["_gpu_route"] = buf
-        wt.moe_route(rlog.data, buf["eidx"], buf["ew"].data, ne, k, norm)
-        eidx = buf["eidx"]
-        gu = st["gate_up"].forward(x, eidx)               # (k, 2*inter): gate then up
-        y = st["down"].forward(_swiglu(gu), eidx)
-        out = (y * buf["ew"].reshape(k, 1)).sum(axis=0).reshape(1, -1)
+        if T == 1:
+            # Persistent outputs are required by the captured decode graph.
+            buf = m.get("_gpu_route")
+            if buf is None:
+                buf = {"eidx": wt._empty_i32((k,)),
+                       # moe_route writes every selected index and weight before either
+                       # is read. A host-backed zero upload here submitted the pending
+                       # decoder work once per MoE layer on the first step (48 times on
+                       # the local 30B), turning a single pass into a long serial chain.
+                       # Device-native empty storage is safe on WebGPU and WebGL alike.
+                       "ew": wt.Tensor(wt._empty((k,)))}
+                m["_gpu_route"] = buf
+            wt.moe_route(rlog.data, buf["eidx"], buf["ew"].data, ne, k, norm)
+            eidx = buf["eidx"]
+            gu = st["gate_up"].forward(x, eidx)           # (k, 2*inter)
+            y = st["down"].forward(_swiglu(gu), eidx)
+            out = wt.moe_weighted_sum(y, buf["ew"], k,
+                                      execution=reduce_execution)
+
+            if m.get("shared"):
+                sh = m["shared"]
+                ys = sh["down"](_swiglu(sh["gate"](x), sh["up"](x)))
+                if m.get("shared_gate") is not None:
+                    ys = ys * m["shared_gate"](x).sigmoid()
+                out = out + ys
+            return out
+
+        def device_batch():
+            # Router and repeated activations must BOTH stay on the device.
+            # Keeping only one there still forces a readback at every MoE layer;
+            # the containing full-model path measured no positive gain until
+            # both transfers were removed together.
+            xg = wt.Tensor(wt.repeat_rows(x.data, k, execution="device"))
+            eidx = wt._empty_i32((T * k,))
+            ew = wt.Tensor(wt._empty((T * k,)))
+            wt.moe_route(rlog.data, eidx, ew.data, ne, k, norm)
+            gu = st["gate_up"].forward(xg, eidx)
+            y = st["down"].forward(_swiglu(gu), eidx)
+            return wt.moe_weighted_sum(y, ew, k,
+                                       execution=reduce_execution)
+
+        def host_batch():
+            # JS owns the host-side arithmetic and both small result uploads.
+            # Python schedules only opaque GPU buffers and the expert kernels.
+            buffer = getattr(getattr(rlog, "data", None), "buffer", None)
+            module = type(buffer).__module__ if buffer is not None else ""
+            if module in ("wgpy_backends.webgl.webgl_buffer",
+                          "wgpy_backends.webgpu.webgpu_buffer"):
+                xg = wt.Tensor(wt.repeat_rows(x.data, k, execution="device"))
+                eidx = wt._empty_i32((T * k,))
+                weights = wt.Tensor(wt._empty((T * k,)))
+                if module == "wgpy_backends.webgl.webgl_buffer":
+                    from wgpy_backends.webgl.platform import get_platform
+                    get_platform().routeHost(buffer.buffer_id, eidx.buffer.buffer_id,
+                                             weights.data.buffer.buffer_id,
+                                             T, ne, k, norm)
+                else:
+                    from wgpy_backends.webgpu.platform import get_platform
+                    get_platform().routeHost(buffer.buffer_id,
+                                             buffer.texture_shape.byte_length,
+                                             eidx.buffer.buffer_id,
+                                             weights.data.buffer.buffer_id,
+                                             T, ne, k, norm)
+                gu = st["gate_up"].forward(xg, eidx)
+                y = st["down"].forward(_swiglu(gu), eidx)
+                return wt.moe_weighted_sum(y, weights, k,
+                                           execution=reduce_execution)
+            # CPU-only fallback while the standalone NumPy runtime remains supported.
+            router_logits = rlog.numpy()
+            probs = _softmax_rows(router_logits)
+            topk_idx = np.argpartition(-probs, k - 1, axis=1)[:, :k]
+            topk_w = np.take_along_axis(probs, topk_idx, axis=1)
+            if norm:
+                topk_w = topk_w / topk_w.sum(1, keepdims=True)
+            rows = np.repeat(np.arange(T, dtype=np.int64), k)
+            xg = wt.Tensor(wt._contig(x.data[rows]))
+            eidx = wt._empty_i32((T * k,))
+            eidx.buffer.set_data(np.ascontiguousarray(topk_idx.reshape(-1).astype(np.int32)))
+            gu = st["gate_up"].forward(xg, eidx)
+            y = st["down"].forward(_swiglu(gu), eidx)
+            weights = wt.Tensor(np.ascontiguousarray(topk_w.reshape(-1).astype(np.float32)))
+            return wt.moe_weighted_sum(y, weights, k,
+                                       execution=reduce_execution)
+
+        mode = m.get("prefill_execution", getattr(lm, "_moe_prefill_execution", "auto"))
+        if mode not in ("auto", "host", "device"):
+            raise ValueError("MoE prefill execution must be auto, host, or device")
+        if mode == "auto":
+            # A containing prefill can have a different winner from an isolated
+            # MoE layer: one host readback serializes *all* earlier layers. Let
+            # the containing API use its measured composition when available;
+            # direct callers of this layer retain their own auto profile.
+            upper = getattr(lm, "_moe_prefill_api_choice", None)
+            if callable(upper):
+                mode = upper(T)
+                if mode not in ("auto", "host", "device"):
+                    raise ValueError("MoE prefill API choice must be auto, host, or device")
+        if mode == "auto":
+            backend = ("webgpu" if wt._adam_backend_ready() else
+                       "webgl" if wt._webgl_ready() else "cpu")
+            bucket = 1 << (int(T).bit_length() - 1)
+            base = (backend, ne, k, bucket,
+                    str(getattr(st["gate_up"], "type_name", "?")),
+                    str(getattr(st["down"], "type_name", "?")))
+            pending = getattr(lm, "_moe_prefill_pending", None)
+            if pending is not None:
+                pending.add(base)
+            phase = ("warm" if base in getattr(lm, "_moe_prefill_seen", ())
+                     else "cold")
+            key = ("moe_prefill_route_js_v3",) + base + (phase,)
+            mode = wt._TUNED.get(key)
+            if mode is None:
+                # The single-layer choice measures router and row repetition
+                # together, but does not claim to be the whole-model winner.
+                # That decision belongs to the containing prefill API above.
+                # The key uses backend/format/shape, never a model name.
+                import time
+                import warnings
+
+                def timed(which):
+                    t0 = time.perf_counter()
+                    y = device_batch() if which == "device" else host_batch()
+                    arr = np.asarray(y.numpy(), np.float32)
+                    return time.perf_counter() - t0, arr
+
+                _, reference = timed("host")
+                if not np.all(np.isfinite(reference)):
+                    raise RuntimeError("MoE host prefill produced non-finite values")
+                if backend == "cpu":
+                    mode = "host"
+                else:
+                    try:
+                        _, candidate = timed("device")
+                        scale = max(1e-6, float(np.abs(reference).max()))
+                        error = float(np.abs(candidate - reference).max()) / scale
+                        if not (np.all(np.isfinite(candidate)) and error < 1e-4):
+                            warnings.warn("MoE device prefill disagrees with host for "
+                                          "%s shape %s (relative error %.3g); using host"
+                                          % (backend, base, error))
+                            mode = "host"
+                        else:
+                            samples = {"host": [], "device": []}
+                            for round_index in range(5):
+                                order = (("host", "device") if not round_index % 2
+                                         else ("device", "host"))
+                                for which in order:
+                                    elapsed, _ = timed(which)
+                                    samples[which].append(elapsed)
+                            mode = wt._measured_choice(samples, ("host", "device"),
+                                                       default="host")
+                    except Exception as exc:
+                        warnings.warn("MoE device prefill unavailable for %s shape %s: %s; "
+                                      "using host" % (backend, base, exc))
+                        mode = "host"
+                wt._TUNED[key] = mode
+        out = device_batch() if mode == "device" else host_batch()
         if m.get("shared"):
             sh = m["shared"]
             ys = sh["down"](_swiglu(sh["gate"](x), sh["up"](x)))

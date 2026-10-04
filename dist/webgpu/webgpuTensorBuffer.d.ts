@@ -9,7 +9,8 @@ export declare class WebGPUTensorBuffer {
     gpuBuffer: GPUBuffer;
     constructor(bufferShape: WebGPUBufferShape, forMetaBuffer: boolean);
     setMetaBufferContent(data: Uint8Array): void;
-    setDataRaw(data: Uint8Array): void;
+    setDataRaw(data: Uint8Array): void | Promise<void>;
     getDataRaw(): Promise<Uint8Array>;
+    getDataInto(data: Uint8Array): Promise<void>;
     dispose(): void;
 }

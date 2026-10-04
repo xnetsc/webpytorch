@@ -1525,7 +1525,10 @@ def forget_model_file(name):
 
 async def _read_local_file(handle, offset, length):
     """A byte range of a picked file, read where it lies."""
-    f = await handle.getFile()
+    # FileSystemFileHandle.getFile() and an <input>-supplied File converge here. File is a
+    # Blob already and structured-clones without first becoming one giant ArrayBuffer.
+    get_file = getattr(handle, "getFile", None)
+    f = await get_file() if callable(get_file) else handle
     total = int(f.size)
     end = total if length is None else min(offset + length, total)
     if end <= offset:

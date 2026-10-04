@@ -33,6 +33,8 @@ from . import _core as wt
 xp = wt.xp
 
 
+
+
 # ----------------------------- tokenizer ------------------------------------
 def _bytes_to_unicode():
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -987,6 +989,16 @@ class CausalLM:
     def __init__(self, base):
         self.base = (base.rstrip("/") + "/") if base else ""
         self.capture_ready = False
+        self._greedy_chunk_capture_ready = False
+        # Each layer-level API owns an independently usable auto route.  The complete
+        # decoder tuner may override either one when a combination that is not locally
+        # fastest wins at the higher layer.
+        self._qkv_execution = "auto"
+        self._gate_up_execution = "auto"
+        self._qk_norm_rope_execution = "auto"
+        self._kv_write_execution = "auto"
+        self._embedding_row_execution = "auto"
+        self._head_shape_execution = "auto"
         # Sampling state, so a forward called outside generate() still works.
         self.mtp = None             # multi-token-prediction head, when the file has one
         self._seen = []
@@ -1398,7 +1410,11 @@ class CausalLM:
         nb = G.tensor_nbytes(t["type"], per)
         off = self._gds + t["offset"]
         raw = await self._grng(off, off + nb * ne - 1)
-        chunks = [raw[e * nb:(e + 1) * nb] for e in range(ne)]
+        # Keep views of the file bytes.  Copying every expert here, then copying the
+        # joined gate/up bytes again, kept several whole-layer copies in the WASM heap
+        # while the GPU upload also needed its own bounded staging window.
+        chunks = [memoryview(raw)[e * nb:(e + 1) * nb] for e in range(ne)]
+        also_chunks = None
         if also is not None:
             t2 = self._ginfo.get(also)
             if t2 is None or t2["type"] != t["type"]:
@@ -1411,9 +1427,11 @@ class CausalLM:
             raw2 = await self._grng(off2, off2 + nb2 * ne - 1)
             # One weight per expert holding both: the first out_d rows are this tensor's, the
             # rest the other's, so a single matmul produces both halves at once.
-            chunks = [chunks[e] + raw2[e * nb2:(e + 1) * nb2] for e in range(ne)]
+            also_chunks = [memoryview(raw2)[e * nb2:(e + 1) * nb2]
+                           for e in range(ne)]
             out_d = out_d + out2
-        return wt.GGMLMoELinear(chunks, nm, in_d, out_d)
+        return wt.GGMLMoELinear(chunks, nm, in_d, out_d,
+                               also_chunks=also_chunks)
 
     async def _gexperts(self, name):
         """Yield each expert of a stacked MoE tensor as a ready Linear, one at a time.
@@ -1722,6 +1740,12 @@ class CausalLM:
                 "(supported: %s). Use a supported quant (Q4_K/Q6_K/Q8_0/Q4_0/Q4_1/F16/F32)."
                 % (", ".join(bad), ", ".join(sorted(G.SUPPORTED_NAMES))))
 
+        # WebGL's growing KV cache uses this append kernel on every token. Compiling it
+        # after 13+ GB of weights have been uploaded can synchronise the driver at the
+        # load-time proof; compile while memory is still free instead. The same generic
+        # kernel serves any model whose execution uses this cache, not a model-name case.
+        wt._webgl_prepare_growing_cache()
+
         t0 = time.perf_counter()
         # token_embd -> host f16 (streamed in row-blocks so the full 1.2GB fp32
         # never materializes); if tied, build the int4 head from the same blocks.
@@ -1733,6 +1757,7 @@ class CausalLM:
         # more than 32-bit WASM will hand out for a single array.
         ebuf = np.empty(V * erow, np.uint8)
         tied = "output.weight" not in self._ginfo
+        self._tied_embed_head = bool(tied)
         self.head = [] if tied else None
         # Read in big spans, not row counts: the IO layer splits a request into 16 MB
         # pieces and runs several at once, so one large read keeps every fetch slot busy
@@ -1766,6 +1791,18 @@ class CausalLM:
                     b1 = min(v1, b0 + hb)
                     self.head.append(self._head_block(
                         ot["type"], raw[(b0 - v0) * orow:(b1 - v0) * orow], b1 - b0, H))
+        # A single tied native head means the complete compressed embedding table is already
+        # bounded by `_HEAD_BYTES_NATIVE`.  Preserve its original compact row layout on
+        # WebGPU as a second-stage candidate: the projection's transposed layout is ideal for
+        # scanning every vocabulary row, while embedding lookup wants one contiguous row.
+        # This is format/shape capability detection, never a repository or model-name rule.
+        self._embed_packed_rows = None
+        self._embed_row_words = 0
+        if (tied and wt._adam_backend_ready() and len(self.head) == 1
+                and isinstance(self.head[0], wt.GGMLLinear)
+                and self.head[0].type_name == "Q6_K" and erow % 4 == 0):
+            self._embed_packed_rows = xp.asarray(ebuf.view(np.int32))
+            self._embed_row_words = erow // 4
         self.layers = []
         from . import webio as _wio
         for i in range(self.L):
@@ -1861,6 +1898,11 @@ class CausalLM:
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
         # Reading is done; everything from here reads nothing, so the byte meter has stopped
         # and only these say the load is still alive. On a 13GB model they are minutes.
+        # The largest CPU/JS transfer window belongs to weight upload, not inference.
+        # Releasing it here (rather than only in the host's load-finally block) leaves
+        # more physical memory for the first whole-model GPU step. The following small
+        # input/readback buffers may allocate a fresh bounded window as needed.
+        wt._release_transfer_memory()
         _load_stage("warming")
         self._init_state()          # kernel shapes measured for this model
         _load_stage("checking")
@@ -2021,6 +2063,17 @@ class CausalLM:
                 return r
         return (x / ((x * x).mean(axis=-1, keepdims=True) + self.eps).sqrt()) * w
 
+    def _add_rms(self, residual, update, w):
+        """One layer-boundary contract on both GPU backends.
+
+        WebGPU can write the residual sum and its RMS-normalised view in one compute
+        dispatch. WebGL reaches the same pair through its fastest portable two-pass path.
+        Keeping that difference below this layer avoids either backend changing the model
+        graph merely because its atomic primitive set differs.
+        """
+        return wt.add_rmsnorm(residual, update, w, self.eps,
+                              execution=getattr(self, "_add_rms_execution", "auto"))
+
     def _audit(self):
         """Refuse a model whose weights do not agree with what its own file declares.
 
@@ -2097,11 +2150,17 @@ class CausalLM:
         ask it anything, and that answer has to be finite and to distinguish between tokens
         at all -- the two things every real forward pass does and a kernel that never ran
         does not."""
-        ids = [1, 2, 3, 4]
+        capturable = self._capturable()
+        # WebGL's growing-cache decoder is the public one-row execution path.
+        # Prove a complete decode there without forcing a four-row prefill and
+        # its layer-by-layer tuning onto the load critical path. Batched MoE
+        # correctness is covered separately and must still pass product prefill
+        # regression; this is a load-time smoke test, not that regression.
+        ids = [1, 2, 3, 4] if capturable else [1]
         vsz = int(getattr(self.tok, "vocab_size", 0) or 0)
         if vsz:
             ids = [i % vsz for i in ids]
-        if self._capturable():
+        if capturable:
             self._prefill(ids)
             hidden = self._last_prefill_hidden
         else:
@@ -2234,10 +2293,143 @@ class CausalLM:
         return cos, sin
 
     def _logits(self, hlast):
-        return wt.cat([blk(hlast) for blk in self.head], axis=-1).numpy()[0]
+        return self._logits_tensor(hlast).numpy()[0]
+
+    def _logits_tensor(self, hlast):
+        parts = [blk(hlast) for blk in self.head]
+        # A one-block head is already the requested vocabulary tensor.  Sending it through
+        # cat copied the entire vocabulary once per token (about 600KB on Qwen3-0.6B) for
+        # an operation whose input and output are identical.
+        return parts[0] if len(parts) == 1 else wt.cat(parts, axis=-1)
+
+    @staticmethod
+    def _token_from_device(value):
+        value = value.get() if hasattr(value, "get") else value
+        return int(np.asarray(value).reshape(-1)[0])
+
+    def _prepare_device_greedy(self, logits):
+        """Build/read device argmax and correctness-gate it against full logits once."""
+        if self.__dict__.get("_device_argmax_ok") is False:
+            return None, None
+        try:
+            token_buf = wt.vocab_argmax(logits.data)
+            token = self._token_from_device(token_buf)
+            if "_device_argmax_ok" not in self.__dict__:
+                want = int(logits.numpy()[0].argmax())
+                self._device_argmax_ok = token == want
+                if not self._device_argmax_ok:
+                    return None, None
+            return token_buf, token
+        except Exception:
+            self._device_argmax_ok = False
+            return None, None
+
+    def _device_greedy_ok(self):
+        """Whether argmax may stay on-device without changing generation semantics."""
+        sp = getattr(self, "_sampling", None) or {}
+        if sp.get("do_sample") or sp.get("constraint") is not None:
+            return False
+        if float(sp.get("repetition_penalty", 1.0) or 1.0) != 1.0:
+            return False
+        if float(sp.get("presence_penalty", 0.0) or 0.0):
+            return False
+        if float(sp.get("frequency_penalty", 0.0) or 0.0):
+            return False
+        mn = int(sp.get("min_new_tokens", 0) or 0)
+        eos = getattr(getattr(self, "tok", None), "eos_ids", ())
+        return (getattr(self, "_greedy_execution", "device") != "full"
+                and not (mn and len(self._seen) - self._gen_start < mn and eos))
+
+    def _accept_token(self, tok, con=None, sp=None):
+        """Record a selected token and apply the constraint's state transition."""
+        sp = sp if sp is not None else (getattr(self, "_sampling", None) or {})
+        self._seen.append(int(tok))
+        if con is not None:
+            self._con_text += self._con_dec.push([int(tok)])
+            from . import constrain
+            v = self.__dict__.pop("_con_after", None)
+            if v == constrain.THEN_END:
+                self._con_end = True
+            if v == constrain.THEN_FREE or self.__dict__.pop("_con_release", False):
+                sp["constraint"] = None
+                self._sampling["constraint"] = None
+        return int(tok)
 
     def _head_argmax(self, hlast):
-        return self._pick(self._logits(hlast))
+        logits = self._logits_tensor(hlast)
+        if self._device_greedy_ok():
+            _token_buf, token = self._prepare_device_greedy(logits)
+            if _token_buf is not None:
+                return self._accept_token(token)
+        return CausalLM._pick_tensor(self, logits)
+
+    def _pick_tensor(self, logits):
+        """Keep full-vocabulary data in JS for a supported unconstrained GPU readback.
+
+        Python owns only tensor/buffer IDs, generation options and the selected
+        scalar. The JS worker reads the GPU result, applies penalties and samples
+        in-place in shared memory; the vector never enters a NumPy array.
+        """
+        sp = getattr(self, "_sampling", None) or {}
+        data = getattr(logits, "data", None)
+        buffer = getattr(data, "buffer", None)
+        shape = getattr(data, "shape", ())
+        module = type(buffer).__module__ if buffer is not None else ""
+        direct = (sp.get("constraint") is None and buffer is not None
+                  and len(shape) == 2 and int(shape[0]) == 1
+                  and int(getattr(data, "offset", 0)) == 0
+                  and np.dtype(getattr(data, "dtype", np.float32)) == np.dtype(np.float32)
+                  and int(getattr(buffer, "size", -1)) >= int(shape[1]))
+        if direct and module == "wgpy_backends.webgl.webgl_buffer":
+            texture = buffer.texture_shape
+            direct = (texture.type == 5126 and texture.elements_per_pixel == 1)
+        if not direct or module not in ("wgpy_backends.webgl.webgl_buffer",
+                                       "wgpy_backends.webgpu.webgpu_buffer"):
+            return self._pick(logits.numpy()[0])
+
+        sampling = bool(sp.get("do_sample"))
+        rng = sp.get("rng")
+        options = {
+            "doSample": sampling,
+            "temperature": float(sp.get("temperature", 1.0) or 1.0),
+            "topP": float(sp.get("top_p", 1.0) or 1.0),
+            "topK": int(sp.get("top_k", 0) or 0),
+            "minP": float(sp.get("min_p", 0.0) or 0.0),
+            "random": float(rng.random() if rng is not None else np.random.random())
+                      if sampling else 0.0,
+            "repetitionPenalty": float(sp.get("repetition_penalty", 1.0) or 1.0),
+            "presencePenalty": float(sp.get("presence_penalty", 0.0) or 0.0),
+            "frequencyPenalty": float(sp.get("frequency_penalty", 0.0) or 0.0),
+            "blockEos": bool(int(sp.get("min_new_tokens", 0) or 0)
+                             > len(self._seen) - self._gen_start),
+            "eosIds": list(self.tok.eos_ids) if self.tok.eos_ids else [],
+        }
+        # Candidate for the unconstrained full-softmax case only.  The source
+        # format, model name and task are irrelevant; a different top-k/p,
+        # history penalty or EOS mask keeps the established JS sampler.  `auto`
+        # selects the per-device/vocabulary result only after it was measured
+        # and placed in the kernel profile; an unmeasured device stays on JS.
+        sample_key = ("vocab_sample_full", int(shape[1]), "webgpu")
+        sample_route = getattr(self, "_sample_execution", "auto")
+        if sample_route == "auto":
+            sample_route = wt._TUNED.get(sample_key, "js")
+        if sample_route == "gpu" and module == "wgpy_backends.webgpu.webgpu_buffer":
+            # Python schedules a scalar route only. The JS worker validates the
+            # sampling mode, and the main-thread JS/GPU own metadata, dispatch,
+            # reduction and four-byte readback. Unsupported modes use JS sampling.
+            options["execution"] = "gpu"
+        if not getattr(self, "_js_sampler_initialized", False):
+            options["seen"] = list(self._seen)
+        if module == "wgpy_backends.webgl.webgl_buffer":
+            from wgpy_backends.webgl.platform import get_platform
+            token = get_platform().sampleLogits(buffer.buffer_id, int(shape[1]), options)
+        else:
+            from wgpy_backends.webgpu.platform import get_platform
+            token = get_platform().sampleLogits(
+                buffer.buffer_id, buffer.texture_shape.byte_length,
+                int(shape[1]), options)
+        self._js_sampler_initialized = True
+        return self._accept_token(token)
 
     def _pick(self, logits):
         """Turn logits into a token id using the current sampling parameters.
@@ -2247,6 +2439,7 @@ class CausalLM:
         an optional output constraint. Parameters come from `generate(...)`, from the
         model's own generation_config.json, or from `load(...)`."""
         sp = getattr(self, "_sampling", None) or {}
+        self._js_sampler_initialized = False
         lg = np.asarray(logits, np.float32)
         rp = float(sp.get("repetition_penalty", 1.0) or 1.0)
         if rp != 1.0 and self._seen:
@@ -2313,20 +2506,7 @@ class CausalLM:
             tok = self._pick_constrained(lg, con, sp)
         else:
             tok = self._sample(lg, sp) if sp.get("do_sample") else int(lg.argmax())
-        self._seen.append(tok)
-        if con is not None:
-            self._con_text += self._con_dec.push([tok])
-            from . import constrain
-            v = self.__dict__.pop("_con_after", None)
-            if v == constrain.THEN_END:
-                # Emitted, and the last one: the loops check `_stop_now` immediately after
-                # yielding a token, so saying so here ends the reply WITH this token in it.
-                self._con_end = True
-            if v == constrain.THEN_FREE or self.__dict__.pop("_con_release", False):
-                # Steering a prefix should not cost anything after the prefix.
-                sp["constraint"] = None
-                self._sampling["constraint"] = None
-        return tok
+        return self._accept_token(tok, con, sp)
 
     def _sample(self, lg, sp):
         from . import lm_engine
@@ -2814,6 +2994,7 @@ class CausalLM:
             con.reset()
         base["constraint"] = con
         self._sampling = base
+        self._js_sampler_initialized = False
         # Repetition penalty counts the prompt too, as it does elsewhere; the constraint
         # sees only what this generation produced.
         self._seen = list(prompt_ids or [])
@@ -2847,7 +3028,12 @@ class CausalLM:
         # generation and shows there: measured, the first reply ran at 9.6 tok/s against the
         # 109 every reply after it. A cost paid where someone is already waiting is not the
         # same cost as one paid where they are reading.
+        # A first load must not spend minutes searching a combinatorial decode space.
+        # The same full tuner remains callable explicitly with no deadline for offline
+        # benchmarking; the interactive path has a wall-clock budget across all stages.
+        self._warm_deadline = time.perf_counter() + 8.0
         self._warm_shapes()
+        _load_stage("warm-state")
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
@@ -2887,7 +3073,1126 @@ class CausalLM:
                 probe = wt.gqa_decode(wt.Tensor(np.zeros((NH, 1, HD), np.float32)),
                                       self.Kc[0], self.Vc[0], self.mask_b, 1.0, ctl=self.ctl)
                 self._fused_attn = probe is not None
+            _load_stage("warm-oracle")
+            self._tune_decode_composition()
+            _load_stage("warm-step")
+            wt._gpu_release_idle_pool()
             self._warm_decode_step()
+            _load_stage("warm-greedy")
+            if time.perf_counter() + 3.0 < self._warm_deadline:
+                self._tune_greedy_chunks()
+            else:
+                self._greedy_chunk_size = 0
+                self._greedy_chunk_capture_ready = False
+                self.decode_plan["greedy_chunk"] = 0
+                self.decode_plan["greedy_chunk_budget_skipped"] = True
+        elif wt._webgl_ready():
+            # WebGL has no command capture, but it still owns an independent complete-API
+            # choice (most visibly full-vocabulary readback versus its fragment argmax).
+            # Do not inherit the WebGPU plan: this backend has different primitives and a
+            # different cost balance.
+            wt._gpu_release_idle_pool()
+            self._tune_webgl_decode_composition()
+
+    def _stored_linears(self):
+        """All encoded Linear leaves reachable from this model, without naming a format."""
+        seen = set(); found = []
+
+        def walk(value):
+            oid = id(value)
+            if oid in seen:
+                return
+            seen.add(oid)
+            if isinstance(value, wt.GGMLLinear):
+                found.append(value); return
+            if isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item)
+            elif isinstance(value, wt.Module):
+                for item in vars(value).values():
+                    walk(item)
+
+        walk(self.layers); walk(self.head)
+        return found
+
+    def _decode_pick_mode(self):
+        """The selection path the next call will actually execute.
+
+        Load-time tuning runs before ``_set_sampling``.  In that case derive the same
+        default that ``_set_sampling`` will install, rather than benchmarking a device
+        argmax for a model whose normal API call samples the full vocabulary.
+        """
+        if getattr(self, "_sampling", None) is not None:
+            return "device" if CausalLM._device_greedy_ok(self) else "full"
+        defaults = getattr(self, "gen_defaults", None) or {}
+        temperature = float(defaults.get("temperature", CausalLM._DEFAULT_TEMPERATURE) or 0)
+        sample = defaults.get("do_sample")
+        sample = False if temperature <= 0 else (True if sample is None else bool(sample))
+        if (sample or defaults.get("constraint") is not None
+                or float(defaults.get("repetition_penalty", 1.0) or 1.0) != 1.0
+                or float(defaults.get("presence_penalty", 0.0) or 0.0)
+                or float(defaults.get("frequency_penalty", 0.0) or 0.0)
+                or int(defaults.get("min_new_tokens", 0) or 0)):
+            return "full"
+        return "device"
+
+    def _decode_sampler_route(self, pick_mode=None):
+        """The token-selection implementation actually reached by this decoder.
+
+        Full-vocabulary JS readback and GPU sampling have different queue,
+        storage and synchronization costs.  A complete-decoder profile measured
+        with one cannot justify reusing the same upper-level plan with the other.
+        Unsupported sampling options always fall back to JS in the worker, even
+        when the requested execution override says GPU.
+        """
+        mode = pick_mode or CausalLM._decode_pick_mode(self)
+        if mode != "full" or not getattr(self, "_gpu", False):
+            return "none"
+        sp = getattr(self, "_sampling", None) or getattr(self, "gen_defaults", None) or {}
+        temperature = float(sp.get("temperature", CausalLM._DEFAULT_TEMPERATURE) or 0)
+        sampling = sp.get("do_sample")
+        sampling = temperature > 0 if sampling is None else bool(sampling)
+        eligible = (sampling and temperature > 0 and sp.get("constraint") is None
+                    and float(sp.get("top_p", 1) or 1) >= 1
+                    and int(sp.get("top_k", 0) or 0) <= 0
+                    and float(sp.get("min_p", 0) or 0) <= 0
+                    and float(sp.get("repetition_penalty", 1) or 1) == 1
+                    and not float(sp.get("presence_penalty", 0) or 0)
+                    and not float(sp.get("frequency_penalty", 0) or 0)
+                    and not int(sp.get("min_new_tokens", 0) or 0))
+        if not eligible:
+            return "js"
+        route = getattr(self, "_sample_execution", "auto")
+        if route == "auto":
+            route = wt._TUNED.get(("vocab_sample_full", int(getattr(self, "VOCAB", 0)),
+                                   "webgpu"), "js")
+        return "gpu" if route == "gpu" else "js"
+
+    def _decode_composition_key(self, linears, qshapes, pick_mode=None,
+                                backend="webgpu"):
+        """Name a measured whole-decoder plan by source content identity and topology.
+
+        The browser keeps profiles under its backend/device key; this additional key
+        prevents one model's upper-layer choice from leaking to another model with a
+        different graph. It is derived from the source identifier and tensor *shapes*,
+        never from a recognised model-name or task category.
+        """
+        source = getattr(self, "_gguf", None) or getattr(self, "base", None)
+        if not source:
+            return None
+        import hashlib
+        topology = {
+            "source": str(source),
+            "pick_mode": pick_mode or CausalLM._decode_pick_mode(self),
+            "geometry": [int(getattr(self, name, 0) or 0) for name in
+                         ("L", "H", "NH", "NKV", "HD", "VOCAB", "n_experts",
+                          "top_k", "bits", "gs")],
+            "layers": list(getattr(self, "layer_types", ()) or ()),
+            "weights": sorted((str(m.type_name), int(m.Kt), int(m.Nt))
+                              for m in linears),
+            "q4_shapes": sorted((int(k), int(n)) for k, n in qshapes),
+        }
+        if backend == "webgpu":
+            topology["sampler_route"] = CausalLM._decode_sampler_route(
+                self, pick_mode or CausalLM._decode_pick_mode(self))
+        digest = hashlib.sha256(json.dumps(topology, sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()[:24]
+        # WebGPU v2 measured the actual sampling path but did not distinguish JS
+        # from GPU sampling. A profile from one is not evidence for the other's
+        # upper-level composition. WebGL still uses its unchanged v1 topology.
+        version = "decode_plan_v3" if backend == "webgpu" else "decode_plan_v1"
+        return (version, backend, digest)
+
+    def _activate_decode_profile_for_call(self):
+        """Switch complete-API plans when a call changes the token-selection path.
+
+        A greedy profile is not evidence for a full-logit sampling call, or vice versa.
+        Reuse only a measured matching plan. If one is absent, the existing correct
+        arithmetic stays in place and its missing performance validation is explicit.
+        """
+        if (not getattr(self, "_gpu", False)
+                or not getattr(self, "decode_plan", None)
+                or not self._capturable()):
+            return
+        mode = CausalLM._decode_pick_mode(self)
+        if mode != "device" and getattr(self, "_greedy_chunk_capture_ready", False):
+            CausalLM._release_idle_greedy_capture(
+                self, wt._adam_kernel["platform"], mode)
+        sampler_route = CausalLM._decode_sampler_route(self, mode)
+        if (self.decode_plan.get("pick_mode") == mode
+                and self.decode_plan.get("sampler_route") == sampler_route):
+            # A preceding call may have requested an unprofiled mode.  The
+            # measured plan is active again now; do not leave its diagnostic
+            # status claiming that the missing mode is still in use.
+            self.decode_plan["active_pick_mode"] = mode
+            self.decode_plan["active_sampler_route"] = sampler_route
+            self.decode_plan.pop("mode_profile_missing", None)
+            return
+        linears = self._stored_linears()
+        qshapes = sorted({(m.Kt, m.Nt) for m in linears
+                          if m.type_name == "Q4_K" and m.execution == "auto"})
+        key = CausalLM._decode_composition_key(self, linears, qshapes, mode)
+        saved = wt._TUNED.get(key) if key is not None else None
+        plan = saved.get("plan") if isinstance(saved, dict) else None
+        if (isinstance(plan, (tuple, list)) and len(plan) in (8, 9)
+                and isinstance(plan[1], (tuple, list))
+                and len(plan[1]) == len(qshapes)):
+            CausalLM._tune_decode_composition(self, interactive=True)
+        else:
+            self.decode_plan["active_pick_mode"] = mode
+            self.decode_plan["active_sampler_route"] = sampler_route
+            self.decode_plan["mode_profile_missing"] = True
+
+    def _tune_decode_composition(self, *, interactive=None):
+        """Choose the fastest correct complete decode composition for this model instance.
+
+        Lower APIs retain their own ``auto`` routes.  This layer is allowed to override
+        them because candidates that win alone can lose when adjacent commands share GPU
+        occupancy or enter a captured graph.  Timing therefore replays the entire captured
+        trunk+head and the winning plan is exposed as ``decode_plan``.
+        """
+        pick_mode = CausalLM._decode_pick_mode(self)
+        sampler_route = CausalLM._decode_sampler_route(self, pick_mode)
+        _missing = object()
+        _pick_fields = ("_sampling", "_seen", "_gen_start", "_con_text", "_con_dec",
+                        "_js_sampler_initialized", "_con_end", "_con_after",
+                        "_con_release")
+        _saved_pick = {name: self.__dict__.get(name, _missing) for name in _pick_fields}
+
+        def reset_probe_sampling():
+            """Give each plan the same real sampling semantics and random stream."""
+            import copy
+            old = _saved_pick["_sampling"]
+            settings = (old if old is not _missing and old is not None
+                        else (getattr(self, "gen_defaults", None) or {}))
+            names = ("temperature", "top_p", "top_k", "do_sample", "min_p",
+                     "repetition_penalty", "presence_penalty", "frequency_penalty",
+                     "min_new_tokens", "constraint", "stop")
+            options = {name: (copy.deepcopy(settings[name]) if name in ("constraint", "stop")
+                              else settings[name]) for name in names if name in settings}
+            CausalLM._set_sampling(self, seed=1729, prompt_ids=[], **options)
+
+        incumbent = getattr(self, "decode_plan", None)
+        self.capture_ready = False
+        self._decode_graph_signature = None
+        self._decode_graph_logits = None
+        self._decode_graph_token = None
+        if interactive is None:
+            interactive = hasattr(self, "_warm_deadline")
+        deadline = (getattr(self, "_warm_deadline", float("inf"))
+                    if interactive else float("inf"))
+        self._add_rms_execution = "auto"
+        self._greedy_execution = "device"
+        self.decode_plan = {"add_rmsnorm": "auto", "q4_decode": "auto",
+                            "qkv": "auto", "gate_up": "auto",
+                            "qk_norm_rope": "auto",
+                            "kv_write": "auto",
+                            "head_shape": "auto",
+                            "projection_shapes": {"o": "auto", "down": "auto"},
+                            "greedy_pick": "device", "pick_mode": pick_mode,
+                            "sampler_route": sampler_route}
+        if not self._gpu or not self._capturable():
+            return self.decode_plan
+        class _WarmLimit(Exception):
+            pass
+        try:
+            import itertools as _it
+            import statistics as _stats
+            plat = wt._adam_kernel["platform"]
+            stored_linears = self._stored_linears()
+            q4 = [m for m in stored_linears
+                  if m.type_name == "Q4_K" and m.execution == "auto"]
+            qshapes = sorted({(m.Kt, m.Nt) for m in q4})
+            qindex = {shape: i for i, shape in enumerate(qshapes)}
+            profile_key = CausalLM._decode_composition_key(
+                self, stored_linears, qshapes, pick_mode)
+            # Exhaust every per-shape combination while it is tractable.  More shapes use
+            # the lower layer's own auto vector plus the two uniform overrides; this keeps
+            # load time bounded without collapsing all shapes into one global vote.
+            if not qshapes:
+                qroutes = [()]
+            elif len(qshapes) <= 6:
+                qroutes = [("auto",) * len(qshapes)]
+                qroutes += list(_it.product(("stored", "dp4a"), repeat=len(qshapes)))
+            else:
+                qroutes = [("auto",) * len(qshapes), ("stored",) * len(qshapes),
+                           ("dp4a",) * len(qshapes)]
+            qroutes = list(dict.fromkeys(qroutes))
+            pick_routes = (("device", "full") if pick_mode == "device"
+                           else ("full",))
+            plans = [(a, q, p) for q in qroutes for a in ("fused", "composed")
+                     for p in pick_routes]
+
+            # A plan that won for greedy selection may still be the best plan when a
+            # caller samples. Keep it as a candidate, but require a comparison using
+            # this call's actual full-logit or device-pick path before reusing it.
+            prior_plan = None
+            if isinstance(incumbent, dict):
+                routes = incumbent.get("q4_decode")
+                if isinstance(routes, dict):
+                    routes = tuple(routes.get("%dx%d" % shape, "auto")
+                                   for shape in qshapes)
+                elif routes == "auto":
+                    routes = ("auto",) * len(qshapes)
+                elif isinstance(routes, (tuple, list)):
+                    routes = tuple(routes)
+                if isinstance(routes, tuple) and len(routes) == len(qshapes):
+                    prior_plan = (incumbent.get("add_rmsnorm"), routes,
+                                  incumbent.get("greedy_pick"), incumbent.get("qkv"),
+                                  incumbent.get("gate_up"), incumbent.get("qk_norm_rope"),
+                                  incumbent.get("kv_write"), incumbent.get("head_shape"))
+                    shapes = incumbent.get("projection_shapes")
+                    if isinstance(shapes, dict):
+                        prior_plan += ((shapes.get("o", "auto"),
+                                        shapes.get("down", "auto")),)
+                    if (prior_plan[0] not in ("fused", "composed")
+                            or any(x not in ("auto", "stored", "dp4a") for x in routes)
+                            or prior_plan[2] not in ("device", "full")):
+                        prior_plan = None
+
+            def select(plan, original_width=False):
+                self._add_rms_execution = plan[0]
+                self._greedy_execution = plan[2]
+                self._qkv_execution = plan[3] if len(plan) > 3 else "auto"
+                self._gate_up_execution = plan[4] if len(plan) > 4 else "auto"
+                self._qk_norm_rope_execution = plan[5] if len(plan) > 5 else "auto"
+                self._kv_write_execution = plan[6] if len(plan) > 6 else "auto"
+                self._head_shape_execution = plan[7] if len(plan) > 7 else "auto"
+                for block in self.head:
+                    if isinstance(block, wt.GGMLLinear):
+                        block.decode_shape = self._head_shape_execution
+                # Physical leaf shapes are independently usable through GGMLLinear, but
+                # the containing decode API may prefer a different combination.  Reset
+                # both groups for every candidate so a previous probe cannot leak into
+                # the next capture or into the original-width correctness oracle.
+                projection_shapes = plan[8] if len(plan) > 8 else ("auto", "auto")
+                for lay in self.layers:
+                    for key, route in zip(("o", "down"), projection_shapes):
+                        block = lay.get(key)
+                        if isinstance(block, wt.GGMLLinear):
+                            block.decode_shape = route
+                # `decode_execution` is an override for this containing API only.  Reset
+                # every encoded leaf first so an exact-oracle run cannot leak its forced
+                # stored route into the candidate that follows it.  The oracle forces ALL
+                # formats to their original-width path, not only the Q4_K leaves which have
+                # a DP4A phase-two candidate today.
+                for lin in stored_linears:
+                    lin.decode_execution = "stored" if original_width else None
+                if not original_width:
+                    for lin in q4:
+                        lin.decode_execution = plan[1][qindex[(lin.Kt, lin.Nt)]]
+
+            def captured_sample(plan, steps):
+                """Time the real upper API route, including its active sampler."""
+                reset_probe_sampling()
+                select(plan); self._reset_linear_state(); self._set_inputs(0, 0)
+                plat.beginCapture("decode")
+                logits = self._decode_fwd()
+                token = (wt.vocab_argmax(logits.data)
+                         if plan[2] == "device" and pick_mode == "device" else None)
+                (token.get() if token is not None else logits.numpy())
+                plat.endCapture()
+                nxt = (self._accept_token(self._token_from_device(token))
+                       if token is not None else CausalLM._pick_tensor(self, logits))
+                t0 = time.perf_counter()
+                for pos in range(1, steps + 1):
+                    self._set_inputs(nxt, pos); plat.replay("decode")
+                    nxt = (self._accept_token(self._token_from_device(token))
+                           if token is not None else CausalLM._pick_tensor(self, logits))
+                return (time.perf_counter() - t0) / steps
+
+            # Correctness is judged against the exact original-width composition, never
+            # against whichever candidate happens to be enumerated first.  In particular,
+            # a lower-level ``auto`` is allowed to select DP4A in phase two, so it is not a
+            # suitable numerical oracle for the other upper-layer combinations.
+            reference_plan = ("composed", ("stored",) * len(qshapes), "full",
+                              "separate", "separate", "composed", "separate", None)
+            if interactive and profile_key is not None:
+                cached = wt._TUNED.get(profile_key)
+                if isinstance(cached, dict):
+                    saved = cached.get("plan")
+                    if (isinstance(saved, (list, tuple)) and len(saved) in (8, 9)
+                            and isinstance(saved[1], (list, tuple))
+                            and len(saved[1]) == len(qshapes)):
+                        chosen = (saved[0], tuple(saved[1]), *saved[2:])
+                        select(chosen)
+                        projection_shapes = (chosen[8] if len(chosen) > 8
+                                             else ("auto", "auto"))
+                        self.decode_plan = {
+                            "add_rmsnorm": chosen[0],
+                            "q4_decode": {"%dx%d" % shape: chosen[1][i]
+                                          for i, shape in enumerate(qshapes)},
+                            "greedy_pick": chosen[2], "qkv": chosen[3],
+                            "gate_up": chosen[4], "qk_norm_rope": chosen[5],
+                            "kv_write": chosen[6], "head_shape": chosen[7],
+                            "projection_shapes": dict(zip(("o", "down"),
+                                                           projection_shapes)),
+                            "median_ms": cached.get("median_ms"),
+                            "pick_mode": pick_mode,
+                            "sampler_route": sampler_route,
+                            "profile_reused": True,
+                        }
+                        return self.decode_plan
+            # Semantic correctness is sequential.  A candidate that agrees only on the
+            # first token can diverge on the very next state, so it is not eligible for
+            # timing.  Four steps cover the state transition, KV write/read and reuse of a
+            # generated token while keeping load-time tuning bounded on 30B-class models.
+            semantic_steps = 4
+            def semantic_trace(plan, original_width=False):
+                """Read sequential logits and select with the real fixed-seed sampler.
+
+                Four eager forwards on a large MoE paid Python/JS dispatch and shader
+                setup four times (20.2 s on the local 30B). A replay changes the input
+                token and position but retains the exact same arithmetic and KV writes.
+                Keep the whole-logit check; only remove repeated host dispatch overhead.
+                """
+                reset_probe_sampling()
+                select(plan, original_width=original_width)
+                self._reset_linear_state()
+                trace = []
+                token = 0
+                self._set_inputs(token, 0)
+                try:
+                    if original_width:
+                        _load_stage("warm-record")
+                    plat.beginCapture("decode_semantic")
+                    try:
+                        logits = self._decode_fwd()
+                        picked_gpu = (wt.vocab_argmax(logits.data)
+                                      if plan[2] == "device" and pick_mode == "device"
+                                      else None)
+                        logits.numpy()
+                    finally:
+                        plat.endCapture()
+                    if original_width:
+                        _load_stage("warm-replay")
+                    for pos in range(semantic_steps):
+                        if pos:
+                            self._set_inputs(token, pos)
+                            plat.replay("decode_semantic")
+                        got = np.asarray(logits.numpy()[0], np.float32).copy()
+                        picked = (self._accept_token(self._token_from_device(picked_gpu))
+                                  if picked_gpu is not None
+                                  else CausalLM._pick_tensor(self, logits))
+                        trace.append((got, picked))
+                        token = picked
+                    return trace
+                finally:
+                    # This temporary graph must not pin its scratch buffers for the
+                    # lifetime of the loaded model. Same-name recapture releases them.
+                    plat.beginCapture("decode_semantic")
+                    plat.endCapture()
+
+            # A full-model record is indivisible and can exceed the entire interactive
+            # budget (16.6 s on the local 30B), even when 3 s remain at entry.  The
+            # loader cannot measure its cost in advance. Interactive load therefore
+            # selects the original-width exact composition without starting an oracle;
+            # explicit offline tuning remains available with interactive=False.
+            if interactive:
+                raise _WarmLimit()
+            reference_trace = semantic_trace(reference_plan, original_width=True)
+            if any(not np.all(np.isfinite(logits)) for logits, _ in reference_trace):
+                raise RuntimeError("exact stored decode produced non-finite logits")
+            _load_stage("warm-search")
+
+            last_good = reference_plan
+            tested_candidates = 0
+
+            def check_budget():
+                if time.perf_counter() >= deadline:
+                    raise _WarmLimit()
+
+            semantic_cache = {}
+
+            def correct(plan):
+                """Full logits and token sequence against the original-width oracle."""
+                nonlocal tested_candidates
+                if plan in semantic_cache:
+                    return semantic_cache[plan]
+                try:
+                    check_budget()
+                    approximate = any(route in ("auto", "dp4a") for route in plan[1])
+                    limit = 0.03 if approximate else 2e-5
+                    for (reference, reference_pick), (got, picked) in zip(
+                            reference_trace, semantic_trace(plan)):
+                        if not np.all(np.isfinite(got)):
+                            semantic_cache[plan] = False
+                            return False
+                        scale = max(1e-6, float(np.abs(reference).max()))
+                        if (float(np.abs(got - reference).max()) / scale > limit
+                                or picked != reference_pick):
+                            semantic_cache[plan] = False
+                            return False
+                    semantic_cache[plan] = True
+                    tested_candidates += 1
+                    return True
+                except _WarmLimit:
+                    raise
+                except Exception:
+                    semantic_cache[plan] = False
+                    return False
+
+            def tournament(candidates):
+                """Screen all combinations, then require paired evidence for replacement."""
+                nonlocal last_good
+                valid = []
+                for plan in candidates:
+                    check_budget()
+                    if correct(plan):
+                        valid.append(plan)
+                    # The interactive pass compares an orthogonal slice of the same
+                    # addressable routes.  An explicit offline call without a deadline
+                    # still examines the entire candidate set.
+                    if interactive and len(valid) >= 4:
+                        break
+                if not valid:
+                    raise RuntimeError("no correct full-decode composition survived validation")
+                samples = {}
+                for plan in valid:
+                    check_budget()
+                    samples[plan] = []
+                baseline = valid[0]
+                # Correctness-screening is not performance-screening. The old offline
+                # search timed only the first four valid plans, silently excluding
+                # later physical combinations from the claimed upper-layer optimum.
+                finalists = valid if not interactive else valid[:4]
+                if baseline not in finalists:
+                    finalists.append(baseline)
+                # Five paired rounds are the minimum for the exact sign test to accept a
+                # repeatable positive result (5/5 wins -> p=1/32). No fixed gain cutoff.
+                for r in range(5):
+                    order = finalists if not (r & 1) else list(reversed(finalists))
+                    for plan in order:
+                        check_budget()
+                        samples[plan].append(captured_sample(plan, 2))
+                chosen = baseline
+                for plan in sorted(finalists, key=lambda p: _stats.median(samples[p])):
+                    if plan != chosen and wt._paired_faster(samples, plan, chosen):
+                        chosen = plan
+                last_good = chosen
+                return chosen, samples
+
+            # First settle the lower auto routes plus residual/pick/Q4 interaction.  Then
+            # measure the layer-level parallel projection overrides at that whole-decode
+            # point, and finally re-run every first-stage candidate under the winning
+            # projection pair.  This is the upward pass the API needs: local winners remain
+            # callable, while a peer combination can replace them only at this layer.
+            _load_stage("tuning", done=0, total=8)
+            initial, _ = tournament(plans)
+            _load_stage("tuning", done=1, total=8)
+            # The fused projection layer has its own locally measured workgroup shape, but
+            # the complete decoder may prefer another one once QKV, MLP and head commands
+            # share a graph.  Keep those physical routes addressable so this upper layer can
+            # override the local `auto` rather than being trapped by it.
+            group_modes = ("auto", "fused", "separate", "fused:default",
+                           "fused:balanced", "fused:compact", "fused:narrow")
+            def parallel_capable(parts):
+                parts = tuple(parts)
+                return bool(parts and all(isinstance(x, wt.GGMLLinear) for x in parts)
+                            and len({x.type_name for x in parts}) == 1
+                            and wt._GGML_TYPES[parts[0].type_name][4] is None)
+
+            attention_layers = [lay for i, lay in enumerate(self.layers)
+                                if not self._is_linear_layer(i)]
+            qkv_modes = (group_modes if any(parallel_capable(
+                (lay.get("q"), lay.get("k"), lay.get("v")))
+                for lay in attention_layers) else ("auto",))
+            # Routed MoE never calls the dense gate/up pair.  Enumerating seven values for
+            # a variable that cannot reach the graph measured the identical 30B plan seven
+            # times and turned load-time tuning into a 20+ minute apparent hang.
+            dense_layers = [lay for lay in self.layers if not lay.get("experts")]
+            gate_modes = (group_modes if any(parallel_capable(
+                (lay.get("gate"), lay.get("up"))) for lay in dense_layers)
+                else ("auto",))
+            qk_modes = (("auto", "composed", "fused")
+                        if attention_layers and all(lay.get("qn") is not None
+                                                    and lay.get("kn") is not None
+                                                    for lay in attention_layers)
+                        else ("composed",))
+            kv_modes = (("auto", "separate", "fused")
+                        if attention_layers else ("separate",))
+            group_plans = [initial + (q, g, r, "auto")
+                           for q in qkv_modes for g in gate_modes for r in qk_modes]
+            grouped, _ = tournament(group_plans)
+            _load_stage("tuning", done=2, total=8)
+            # K/V has a locally addressable auto choice, then participates in a full upward
+            # pass.  Re-run the peer projection/QK combinations under its winner: a fused
+            # scatter that wins alone is not assumed to win beside a different fused QKV,
+            # and a projection choice made beside separate writes is likewise not frozen.
+            kv_grouped, _ = tournament([
+                grouped[:6] + (route,) for route in kv_modes])
+            _load_stage("tuning", done=3, total=8)
+            regrouped, _ = tournament([
+                initial + (q, g, r, kv_grouped[6])
+                for q in qkv_modes for g in gate_modes for r in qk_modes])
+            composed, _ = tournament([
+                regrouped[:6] + (route,) for route in kv_modes])
+            _load_stage("tuning", done=4, total=8)
+            head_modes = (("auto", None, "balanced", "compact", "narrow", "shortk")
+                          if self.head and all(isinstance(x, wt.GGMLLinear)
+                                               for x in self.head) else ("auto",))
+            headed, _ = tournament([composed + (route,) for route in head_modes])
+            _load_stage("tuning", done=5, total=8)
+            # The vocabulary projection is adjacent to every candidate above in the
+            # captured graph.  Re-run the peer layer choices under its winner, then give
+            # KV and the head one final replacement opportunity before the outer Q4/
+            # residual/pick pass.  This prevents a head-local winner from being treated as
+            # automatically optimal in the containing decoder.
+            regrouped_head, _ = tournament([
+                initial + (q, g, r, composed[6], headed[7])
+                for q in qkv_modes for g in gate_modes for r in qk_modes])
+            rekv, _ = tournament([
+                regrouped_head[:6] + (route, regrouped_head[7])
+                for route in kv_modes])
+            _load_stage("tuning", done=6, total=8)
+            final_group, _ = tournament([
+                rekv[:7] + (route,) for route in head_modes])
+            _load_stage("tuning", done=7, total=8)
+            refined = [plan + (final_group[3], final_group[4], final_group[5],
+                               final_group[6], final_group[7])
+                       for plan in plans]
+            # Keep the previously proven fully fused composition in the *whole-API*
+            # tournament.  A sequence of one-axis tournaments can prune it before all
+            # of its peers are present, even though the combination wins end to end.
+            # Its physical QKV shapes are separate candidates: the locally fastest
+            # fused workgroup need not be the fastest after capture and sampling.
+            # These are capability candidates, never model-name defaults; every one
+            # still faces the sequential semantic oracle and paired device timings.
+            restored = []
+            if ("fused" in qkv_modes and self.head
+                    and all(isinstance(block, wt.GGMLLinear) for block in self.head)):
+                restored = [
+                    ("fused", ("stored",) * len(qshapes), "full", qroute,
+                     "separate", "fused", "fused", "compact")
+                    for qroute in ("fused", "fused:balanced", "fused:compact")]
+            chosen, samples = tournament(list(dict.fromkeys(
+                ([prior_plan] if prior_plan is not None else []) + restored + refined)))
+            # A lower matvec may select its own fastest shape, while the attention-output
+            # and MLP-down peers can interact through graph scheduling and cache pressure.
+            # Compare the complete decode API with both groups independently and together,
+            # then revisit the adjacent residual/QKV composition under the winning pair.
+            # No model identity or fixed percentage threshold enters this choice.
+            o_modes = (("auto", "balanced", "compact", "narrow")
+                       if any(isinstance(lay.get("o"), wt.GGMLLinear)
+                              for lay in self.layers) else ("auto",))
+            down_modes = (("auto", "balanced", "compact", "narrow")
+                          if any(isinstance(lay.get("down"), wt.GGMLLinear)
+                                 for lay in self.layers) else ("auto",))
+            shape_pairs = list(_it.product(o_modes, down_modes))
+            base = chosen[:8]
+            shaped, _ = tournament([base + (pair,) for pair in shape_pairs])
+            recomposed, _ = tournament([
+                (add, *shaped[1:3], qkv, *shaped[4:8], shaped[8])
+                for add in ("composed", "fused") for qkv in qkv_modes])
+            chosen, samples = tournament([
+                recomposed[:8] + (pair,) for pair in shape_pairs])
+            _load_stage("tuning", done=8, total=8)
+            select(chosen)
+            qchosen = ({"%dx%d" % shape: chosen[1][i]
+                        for i, shape in enumerate(qshapes)} if qshapes else {})
+            self.decode_plan = {"add_rmsnorm": chosen[0], "q4_decode": qchosen,
+                                "qkv": chosen[3],
+                                "gate_up": chosen[4],
+                                "qk_norm_rope": chosen[5],
+                                "kv_write": chosen[6],
+                                "head_shape": chosen[7],
+                                "projection_shapes": dict(zip(("o", "down"), chosen[8])),
+                                "greedy_pick": chosen[2],
+                                "pick_mode": pick_mode,
+                                "sampler_route": sampler_route,
+                                "median_ms": round(_stats.median(samples[chosen]) * 1000, 4)
+                                if chosen in samples and samples[chosen] else None}
+            if profile_key is not None:
+                wt._TUNED[profile_key] = {
+                    "plan": [chosen[0], list(chosen[1]), *chosen[2:]],
+                    "median_ms": self.decode_plan["median_ms"],
+                }
+            return self.decode_plan
+        except _WarmLimit:
+            # A candidate is never selected merely because the budget ran out: use the
+            # last fully checked and measured composition, or the exact original-width
+            # oracle if the search never completed a tournament.
+            chosen = locals().get("last_good", locals().get("reference_plan"))
+            if chosen is not None:
+                select(chosen, original_width=chosen == reference_plan)
+                self.decode_plan = {
+                    "add_rmsnorm": chosen[0], "q4_decode": chosen[1],
+                    "greedy_pick": chosen[2],
+                    "qkv": chosen[3] if len(chosen) > 3 else "auto",
+                    "gate_up": chosen[4] if len(chosen) > 4 else "auto",
+                    "qk_norm_rope": chosen[5] if len(chosen) > 5 else "auto",
+                    "kv_write": chosen[6] if len(chosen) > 6 else "auto",
+                    "head_shape": chosen[7] if len(chosen) > 7 else "auto",
+                    "projection_shapes": dict(zip(("o", "down"),
+                                                   chosen[8] if len(chosen) > 8
+                                                   else ("auto", "auto"))),
+                    "pick_mode": pick_mode,
+                    "sampler_route": sampler_route,
+                    "budget_limited": True,
+                    "tested_candidates": locals().get("tested_candidates", 0),
+                }
+            return self.decode_plan
+        except Exception as exc:
+            self._add_rms_execution = "auto"
+            self._greedy_execution = "device"
+            self._qkv_execution = "auto"
+            self._gate_up_execution = "auto"
+            self._qk_norm_rope_execution = "auto"
+            self._kv_write_execution = "auto"
+            self._head_shape_execution = "auto"
+            for block in getattr(self, "head", ()):
+                if isinstance(block, wt.GGMLLinear):
+                    block.decode_shape = "auto"
+            for lay in getattr(self, "layers", ()):
+                for key in ("o", "down"):
+                    block = lay.get(key)
+                    if isinstance(block, wt.GGMLLinear):
+                        block.decode_shape = "auto"
+            for lin in locals().get("stored_linears", ()):
+                lin.decode_execution = None
+            self.decode_plan["error"] = "%s: %s" % (type(exc).__name__, exc)
+            raise RuntimeError("decode composition tuning failed: %s" % exc) from exc
+        finally:
+            # Semantic traces and candidate timing write synthetic token rows into the
+            # live KV buffers.  A later chat must not treat the pre-tuning `_kv_ids` as
+            # evidence that those rows still hold its prefix.
+            try:
+                CausalLM._kv_drop(self)
+                self._reset_linear_state()
+            finally:
+                for name, value in _saved_pick.items():
+                    if value is _missing:
+                        self.__dict__.pop(name, None)
+                    else:
+                        self.__dict__[name] = value
+
+    def _tune_webgl_decode_composition(self, *, interactive=True):
+        """Choose WebGL's complete decode API route from WebGL measurements.
+
+        Exact packed scalar/vec4 choices are made independently inside each weight
+        operation.  At this top layer the remaining real alternative is whether greedy
+        selection stays in a fragment shader and returns four bytes, or reads the complete
+        vocabulary back.  Both execute the same eager growing-cache decoder and are gated
+        on a sequential token trace selected by the full-logit reference.
+        """
+        pick_mode = CausalLM._decode_pick_mode(self)
+        self._add_rms_execution = "auto"
+        self._qkv_execution = "auto"
+        self._gate_up_execution = "auto"
+        self._greedy_execution = "full"
+        self.decode_plan = {"backend": "webgl", "add_rmsnorm": "composed",
+                            "packed_exact": "device-measured",
+                            "qkv": "auto", "gate_up": "auto",
+                            "qk_norm_rope": "composed",
+                            "kv_write": "composed",
+                            "head_shape": "device-measured",
+                            "greedy_pick": "full", "pick_mode": pick_mode}
+        if self._gpu or not wt._webgl_ready():
+            return self.decode_plan
+        # A complete WebGL tournament runs hundreds of eager 30B forwards. Keep it
+        # available for explicit offline calibration, but never put that search on
+        # every interactive load. A matching device/model profile is the only
+        # evidence that lets the fast load claim an optimal measured route; when it
+        # is absent, expose the exact baseline as pending rather than silently
+        # claiming that the first candidate won.
+        linears = CausalLM._stored_linears(self)
+        profile_key = CausalLM._decode_composition_key(
+            self, linears, (), pick_mode, backend="webgl")
+        cached = wt._TUNED.get(profile_key) if profile_key is not None else None
+        saved = cached.get("plan") if isinstance(cached, dict) else None
+        if (interactive and isinstance(saved, (tuple, list)) and len(saved) == 2
+                and saved[0] in ("auto", "separate", "fused")
+                and saved[1] in (("full", "device") if pick_mode == "device"
+                                 else ("full",))):
+            self._gate_up_execution, self._greedy_execution = saved
+            self.decode_plan.update({"gate_up": saved[0], "greedy_pick": saved[1],
+                                     "median_ms": cached.get("median_ms"),
+                                     "profile_reused": True})
+            return self.decode_plan
+        if interactive:
+            self.decode_plan["profile_pending"] = True
+            return self.decode_plan
+        import statistics as _stats
+        saved_seen = list(getattr(self, "_seen", ()))
+        saved_sampling = self.__dict__.get("_sampling", None)
+        saved_gen_start = self.__dict__.get("_gen_start", None)
+        samples = {}
+
+        def run(plan):
+            gate_route, pick_route = plan
+            self._gate_up_execution = gate_route
+            self._greedy_execution = pick_route
+            self._seen = []
+            self._gen_start = 0
+            if pick_mode == "device":
+                self._sampling = {"do_sample": False, "temperature": 0.0}
+            else:
+                settings = dict(saved_sampling or getattr(self, "gen_defaults", None) or {})
+                temperature = float(settings.get("temperature", CausalLM._DEFAULT_TEMPERATURE)
+                                    or 0)
+                settings["temperature"] = temperature
+                settings["do_sample"] = (False if temperature <= 0 else
+                                         bool(settings.get("do_sample", True)))
+                settings["constraint"] = None
+                settings["rng"] = np.random.default_rng(1729)
+                self._sampling = settings
+            self._reset_linear_state()
+            cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+            t0 = time.perf_counter()
+            tokens = []
+            token = 0
+            for pos in range(4):
+                token = int(self._kv_forward([token], pos, cache))
+                tokens.append(token)
+            return (time.perf_counter() - t0) / len(tokens), tuple(tokens)
+
+        try:
+            # Compile and establish the semantic oracle before measuring either route.
+            reference_plan = ("separate", "full")
+            _, reference = run(reference_plan)
+            candidates = []
+            for gate_route in ("auto", "separate", "fused"):
+                for pick_route in (("full", "device") if pick_mode == "device"
+                                   else ("full",)):
+                    plan = (gate_route, pick_route)
+                    _, picked = run(plan)
+                    if (picked == reference
+                            and (pick_route != "device"
+                                 or self.__dict__.get("_device_argmax_ok", True))):
+                        candidates.append(plan)
+                        samples[plan] = []
+            if reference_plan not in candidates:
+                raise RuntimeError("the exact WebGL reference route did not reproduce")
+            for r in range(9):
+                order = candidates if not (r & 1) else list(reversed(candidates))
+                for plan in order:
+                    elapsed, picked = run(plan)
+                    if picked != reference:
+                        raise RuntimeError("%s WebGL route selected %r, expected %r" %
+                                           (plan, picked, reference))
+                    samples[plan].append(elapsed)
+            chosen = wt._measured_choice(samples, candidates, default=reference_plan)
+            self._gate_up_execution, self._greedy_execution = chosen
+            self.decode_plan["gate_up"] = chosen[0]
+            self.decode_plan["greedy_pick"] = chosen[1]
+            self.decode_plan["median_ms"] = round(_stats.median(samples[chosen]) * 1000, 4)
+            if profile_key is not None:
+                wt._TUNED[profile_key] = {
+                    "plan": list(chosen), "median_ms": self.decode_plan["median_ms"]}
+            return self.decode_plan
+        except Exception as exc:
+            self._greedy_execution = "full"
+            self._gate_up_execution = "auto"
+            self.decode_plan["error"] = "%s: %s" % (type(exc).__name__, exc)
+            return self.decode_plan
+        finally:
+            self._reset_linear_state()
+            self._seen = saved_seen
+            if saved_sampling is None:
+                self.__dict__.pop("_sampling", None)
+            else:
+                self._sampling = saved_sampling
+            if saved_gen_start is None:
+                self.__dict__.pop("_gen_start", None)
+            else:
+                self._gen_start = saved_gen_start
+
+    def _can_chunk_greedy(self):
+        """Whether this instance can feed a captured greedy step entirely on-device.
+
+        This is capability/shape driven.  A tied, single-block Q6_K table lets the output
+        head's original packed buffer serve as the embedding table too; split heads and
+        other stored formats keep the ordinary one-token API until they have their own
+        exact row decoder.  No model name or model category participates.
+        """
+        return bool(
+            self._gpu and self._capturable()
+            and getattr(self, "_tied_embed_head", False)
+            and len(getattr(self, "head", ())) == 1
+            and isinstance(self.head[0], wt.GGMLLinear)
+            and self.head[0].type_name == "Q6_K"
+            and int(self.head[0].Kt) == int(self.H)
+            and int(self.head[0].Nt) == int(self.embed.shape[0])
+            and not any(self._is_linear_layer(i) for i in range(self.L)))
+
+    def _ensure_chunk_buffers(self, count=4):
+        count = max(1, int(count))
+        if getattr(self, "_chunk_capacity", 0) >= count:
+            return
+        self._chunk_capacity = count
+        self._chunk_tokens = xp.empty((count + 1,), np.int32)
+        self._chunk_cos = wt._empty((count, self.HD))
+        self._chunk_sin = wt._empty((count, self.HD))
+
+    def _embedding_row_candidates(self):
+        candidates = ["transposed"]
+        if (getattr(self, "_embed_packed_rows", None) is not None
+                and int(getattr(self, "_embed_row_words", 0)) > 0):
+            candidates.append("compact")
+        return tuple(candidates)
+
+    def _embedding_row_key(self):
+        head = self.head[0]
+        return ("embedding_row", head.type_name, int(head.Kt), int(head.Nt),
+                int(getattr(self, "_embed_row_words", 0)))
+
+    def _decode_chunk_input(self, step=0, increment=False, execution=None):
+        """Decode one exact embedding row through an explicitly addressable layout."""
+        head = self.head[0]
+        route = self._embedding_row_execution if execution is None else execution
+        if route == "auto":
+            route = wt._TUNED.get(self._embedding_row_key(), "transposed")
+        if route not in self._embedding_row_candidates():
+            raise ValueError("embedding row execution is unavailable: %s" % route)
+        compact = route == "compact"
+        packed = self._embed_packed_rows if compact else head.packed
+        stride = self._embed_row_words if compact else head.Nt
+        return wt.q6k_decode_input(
+            self._chunk_tokens, packed, head.Kt, stride,
+            self._chunk_cos, self._chunk_sin,
+            self.h_in, self.cos_b, self.sin_b, self.ctl,
+            step=step, increment=increment, layout=route)
+
+    def _tune_embedding_row(self):
+        """Choose a bit-exact row layout locally, before whole-decoder composition."""
+        key = self._embedding_row_key()
+        if key in wt._TUNED:
+            return wt._TUNED[key]
+        candidates = self._embedding_row_candidates()
+        self._ensure_chunk_buffers(1)
+        probe = min(37, int(self.embed.shape[0]) - 1)
+        self._set_chunk_inputs(probe, 0, 1)
+        reference = None; valid = []
+        for route in candidates:
+            try:
+                self._decode_chunk_input(execution=route)
+                got = np.asarray(self.h_in.numpy()[0], np.float32).copy()
+                if reference is None:
+                    reference = got
+                if np.array_equal(got, reference):
+                    valid.append(route)
+            except Exception:
+                continue
+        if not valid:
+            raise RuntimeError("no exact Q6_K embedding-row route")
+        samples = {route: [] for route in valid}
+
+        def bench(route):
+            t0 = time.perf_counter()
+            for _ in range(16):
+                self._decode_chunk_input(execution=route)
+            self.h_in.numpy()
+            return (time.perf_counter() - t0) / 16.0
+
+        for route in valid:
+            bench(route)
+        for r in range(9):
+            order = valid if not (r & 1) else list(reversed(valid))
+            for route in order:
+                samples[route].append(bench(route))
+        chosen = wt._measured_choice(samples, valid, default=valid[0])
+        wt._TUNED[key] = chosen
+        return chosen
+
+    def _set_chunk_inputs(self, token, pos, count):
+        """One host crossing for a complete greedy chunk, not one crossing per token."""
+        self._ensure_chunk_buffers(count)
+        seed = np.zeros((self._chunk_capacity + 1,), np.int32)
+        seed[0] = int(token)
+        c, s = self._rope_np(int(pos), int(count))
+        cbuf = np.zeros((self._chunk_capacity, self.HD), np.float32)
+        sbuf = np.zeros_like(cbuf)
+        cbuf[:count] = np.asarray(c, np.float32).reshape(count, self.HD)
+        sbuf[:count] = np.asarray(s, np.float32).reshape(count, self.HD)
+        self._chunk_tokens.buffer.set_data(seed)
+        self._chunk_cos.buffer.set_data(cbuf.reshape(-1))
+        self._chunk_sin.buffer.set_data(sbuf.reshape(-1))
+        self.ctl.buffer.set_data(np.asarray(
+            [int(pos), 1, self.NKV, self.HD, self.kv_cap], np.int32))
+
+    def _capture_greedy_chunk(self, count, name="decode_chunk", row_execution=None):
+        """Record and execute `count` chained exact-input greedy steps."""
+        plat = wt._adam_kernel["platform"]
+        head = self.head[0]
+        plat.beginCapture(name)
+        try:
+            for i in range(int(count)):
+                self._decode_chunk_input(
+                    step=i, increment=(i > 0), execution=row_execution)
+                logits = self._decode_fwd()
+                wt.vocab_argmax(logits.data, self._chunk_tokens, i + 1)
+            values = np.asarray(self._chunk_tokens.get(), np.int32).copy()
+        finally:
+            plat.endCapture()
+        if name == "decode_chunk":
+            self._greedy_chunk_capture_ready = True
+        return values
+
+    def _replay_greedy_chunk(self, count, name="decode_chunk"):
+        wt._adam_kernel["platform"].replay(name)
+        return np.asarray(self._chunk_tokens.get(), np.int32)[:int(count) + 1].copy()
+
+    def _release_idle_greedy_capture(self, plat, active_pick_mode):
+        """Unpin a calibrated greedy graph until a greedy caller needs it."""
+        if active_pick_mode != "device" and self._greedy_chunk_capture_ready:
+            plat.beginCapture("decode_chunk")
+            plat.endCapture()
+            self._greedy_chunk_capture_ready = False
+
+    def _tune_greedy_chunks(self):
+        """Select the fastest correct complete greedy API batch on this WebGPU device.
+
+        Lower-layer `auto` choices remain untouched.  Counts 1/2/4 compete against the
+        ordinary host-fed one-token path using complete captured decode steps, including
+        uploads and the synchronising token readback.  The winner is therefore an API-level
+        composition, not a dispatch microbenchmark.
+        """
+        self._greedy_chunk_size = 0
+        self._greedy_chunk_capture_ready = False
+        if not self._can_chunk_greedy():
+            if getattr(self, "decode_plan", None) is not None:
+                self.decode_plan["greedy_chunk"] = 0
+            return 0
+        import statistics as _stats
+        plat = wt._adam_kernel["platform"]
+        active_pick_mode = CausalLM._decode_pick_mode(self)
+        saved_sampling = self.__dict__.get("_sampling", None)
+        saved_seen = list(getattr(self, "_seen", ()))
+        name = "decode_chunk_tune"
+        try:
+            self._set_sampling(temperature=0, do_sample=False, prompt_ids=[])
+            self._ensure_chunk_buffers(4)
+            local_row = self._tune_embedding_row()
+            self.decode_plan["embedding_row_auto"] = local_row
+            # Both physical layouts have already matched one another bit-for-bit.  Match the
+            # winning reconstruction against the independent host GGUF decoder as well.
+            probe = min(37, int(self.embed.shape[0]) - 1)
+            self._set_chunk_inputs(probe, 0, 1)
+            self._decode_chunk_input(execution=local_row)
+            got = np.asarray(self.h_in.numpy()[0], np.float32)
+            ref = np.asarray(self.embed[probe], np.float32)
+            if not np.array_equal(got, ref):
+                self.decode_plan["greedy_chunk_error"] = "Q6_K row reconstruction differs"
+                self.decode_plan["greedy_chunk"] = 0
+                return 0
+
+            def record(which, row_route="transposed", token=0, pos=0):
+                if which:
+                    self._set_chunk_inputs(token, pos, which)
+                    return self._capture_greedy_chunk(
+                        which, name, row_execution=row_route)
+                self._set_inputs(token, pos)
+                self._chunk_tokens.buffer.set_data(np.zeros((5,), np.int32))
+                plat.beginCapture(name)
+                try:
+                    logits = self._decode_fwd()
+                    wt.vocab_argmax(logits.data, self._chunk_tokens, 1)
+                    values = np.asarray(self._chunk_tokens.get(), np.int32).copy()
+                finally:
+                    plat.endCapture()
+                return values
+
+            # Token correctness is sequential: every candidate must reproduce the ordinary
+            # host-fed route, not merely choose the same first token.
+            ref_tokens = []
+            token = 0
+            for pos in range(4):
+                values = record(0, token=token, pos=pos)
+                token = int(values[1]); ref_tokens.append(token)
+            valid = [(0, "host")]
+            for row_route in self._embedding_row_candidates():
+                for count in (1, 2, 4):
+                    values = record(count, row_route, 0, 0)
+                    if values[1:count + 1].tolist() == ref_tokens[:count]:
+                        valid.append((count, row_route))
+
+            samples = {c: [] for c in valid}
+
+            def bench(candidate):
+                which, row_route = candidate
+                record(which, row_route, 0, 32)
+                token = 0; pos = 64
+                steps = 4 if hasattr(self, "_warm_deadline") else 16
+                t0 = time.perf_counter()
+                if which == 0:
+                    for _ in range(steps):
+                        self._set_inputs(token, pos)
+                        plat.replay(name)
+                        token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
+                        pos += 1
+                else:
+                    for _ in range(steps // which):
+                        self._set_chunk_inputs(token, pos, which)
+                        plat.replay(name)
+                        values = np.asarray(self._chunk_tokens.get(), np.int32)
+                        token = int(values[which]); pos += which
+                return (time.perf_counter() - t0) / steps
+
+            for r in range(5 if hasattr(self, "_warm_deadline") else 15):
+                order = valid if not (r & 1) else list(reversed(valid))
+                for candidate in order:
+                    if time.perf_counter() >= getattr(self, "_warm_deadline", float("inf")):
+                        self.decode_plan["greedy_chunk_budget_skipped"] = True
+                        self.decode_plan["greedy_chunk"] = 0
+                        return 0
+                    samples[candidate].append(bench(candidate))
+            # This is the highest generation API, so latency is primary and memory is the
+            # tie-breaker.  Walking candidates in allocation order can get stuck on a noisy
+            # intermediate route and never reach the actual fastest route.  Rank by measured
+            # latency, then still require paired evidence against the low-memory baseline;
+            # there is no percentage threshold, and an inconclusive comparison stays on the
+            # baseline.  Lower-layer `_measured_choice` deliberately keeps its memory-first
+            # policy because those APIs may be called outside generation.
+            baseline = (0, "host")
+            ranked = sorted(valid, key=lambda c: _stats.median(samples[c]))
+            chosen = baseline
+            for candidate in ranked:
+                if candidate != chosen and wt._paired_faster(samples, candidate, chosen):
+                    chosen = candidate
+            self._greedy_chunk_size = int(chosen[0])
+            self._embedding_row_execution = (chosen[1] if chosen[0] else "auto")
+            self.decode_plan["greedy_chunk"] = int(chosen[0])
+            self.decode_plan["embedding_row"] = self._embedding_row_execution
+            self.decode_plan["greedy_chunk_ms"] = round(
+                _stats.median(samples[chosen]) * 1000, 4)
+            self.decode_plan["greedy_chunk_candidates_ms"] = {
+                "%s/%s" % (candidate[0], candidate[1]): round(
+                    _stats.median(samples[candidate]) * 1000, 4)
+                for candidate in valid}
+            # This graph is independent of prompt position: inputs, rope rows and `ctl`
+            # are mutable buffers populated immediately before replay.  Keep one verified
+            # recording for the model lifetime instead of charging every API call for graph
+            # construction.  KV growth invalidates it below because that moves buffers.
+            if chosen[0]:
+                self._set_chunk_inputs(0, 0, chosen[0])
+                self._capture_greedy_chunk(
+                    chosen[0], row_execution=chosen[1])
+            return self._greedy_chunk_size
+        except Exception as exc:
+            self._greedy_chunk_size = 0
+            self.decode_plan["greedy_chunk"] = 0
+            self.decode_plan["greedy_chunk_error"] = "%s: %s" % (type(exc).__name__, exc)
+            return 0
+        finally:
+            # Overwrite the potentially four-step tuning graph so it pins no model buffers.
+            try:
+                plat.beginCapture(name); plat.endCapture()
+            except Exception:
+                pass
+            self._seen = saved_seen
+            if saved_sampling is None:
+                self.__dict__.pop("_sampling", None)
+            else:
+                self._sampling = saved_sampling
+            # The loader may calibrate the greedy route even when the model's
+            # normal call samples. The selected chunk size remains available,
+            # but its captured graph cannot be called by that sampling route.
+            # Replacing only this named graph releases its pins without touching
+            # the active decode graph. A later greedy call records it lazily.
+            CausalLM._release_idle_greedy_capture(self, plat, active_pick_mode)
 
     def _warm_decode_step(self):
         """Run one decode step here, where nothing is recording.
@@ -2929,9 +4234,30 @@ class CausalLM:
             # going three times slower for reasons no one can see.
             wt._count_dispatch_names(True)
             a = self._dispatch_names()
-            self._set_inputs(tok, 0); self._decode_fwd().numpy()
+            _t0 = time.perf_counter()
+            self._set_inputs(tok, 0)
+            _t1 = time.perf_counter()
+            first_logits = self._decode_fwd()
+            _t2 = time.perf_counter()
+            first_logits.numpy()
+            _t3 = time.perf_counter()
+            del first_logits
             b = self._dispatch_names()
-            self._set_inputs(tok, 0); self._decode_fwd().numpy()
+            self._set_inputs(tok, 0)
+            _t4 = time.perf_counter()
+            second_logits = self._decode_fwd()
+            _t5 = time.perf_counter()
+            second_logits.numpy()
+            _t6 = time.perf_counter()
+            del second_logits
+            self._warm_step_profile = {
+                "first_input_s": _t1 - _t0,
+                "first_dispatch_s": _t2 - _t1,
+                "first_sync_s": _t3 - _t2,
+                "second_input_s": _t4 - _t3,
+                "second_dispatch_s": _t5 - _t4,
+                "second_sync_s": _t6 - _t5,
+            }
             c = self._dispatch_names()
             first = {k: b.get(k, 0) - a.get(k, 0) for k in b}
             again = {k: c.get(k, 0) - b.get(k, 0) for k in c}
@@ -2997,10 +4323,11 @@ class CausalLM:
         if lay.get("moe"):
             from . import lm_engine
             return lm_engine.moe_mlp(self, lay, x)
-        from . import lm_engine
-        return lay["down"](lm_engine._swiglu(lay["gate"](x), lay["up"](x)))
+        activated = wt.parallel_swiglu((lay["gate"], lay["up"]), x,
+                                       execution=self._gate_up_execution)
+        return lay["down"](activated)
 
-    def _qkv(self, lay, x, T):
+    def _qkv(self, lay, x, T, apply_norm=True):
         """q,k,v projections -> (heads, T, HD). Applies per-head QK-norm (RMSNorm over head_dim,
         before rope) when `lay` carries `qn`/`kn` weights.
 
@@ -3008,7 +4335,8 @@ class CausalLM:
         2 * n_heads * head_dim, laid out per head as [q | gate]. That is detected from the
         projection's own width — not from a model name — and the gate is stashed on the layer
         for `_attn_out` to apply."""
-        qraw = lay["q"](x)
+        qraw, kraw, vraw = wt.parallel_linear((lay["q"], lay["k"], lay["v"]), x,
+                                              execution=self._qkv_execution)
         wide = int(np.prod(qraw.shape)) // max(T, 1) >= 2 * self.NH * self.HD
         if wide:                                        # fused [q | gate] per head
             qg = qraw.reshape(T, self.NH, 2 * self.HD)
@@ -3017,7 +4345,7 @@ class CausalLM:
         else:
             q = qraw.reshape(T, self.NH, self.HD)
             lay["_gate"] = None
-        k = lay["k"](x).reshape(T, self.NKV, self.HD)
+        k = kraw.reshape(T, self.NKV, self.HD)
         # QK-norm comes in two widths and the WEIGHT says which. One head_dim of weight is
         # the per-head form (Qwen3): each head is normalised over its own dims. A weight as
         # wide as the whole projection is the other form (OLMoE): the normalisation runs over
@@ -3025,10 +4353,76 @@ class CausalLM:
         # scale. Reading it off the weight is what keeps this generic -- applying the per-head
         # form to a full-width weight raises nothing, it silently divides by the wrong number,
         # and the model answers with fluent nonsense.
-        q = self._qk_norm(q, lay.get("qn"), T, self.NH)
-        k = self._qk_norm(k, lay.get("kn"), T, self.NKV)
-        v = lay["v"](x).reshape(T, self.NKV, self.HD).permute(1, 0, 2)
+        if apply_norm:
+            q = self._qk_norm(q, lay.get("qn"), T, self.NH)
+            k = self._qk_norm(k, lay.get("kn"), T, self.NKV)
+        v = vraw.reshape(T, self.NKV, self.HD).permute(1, 0, 2)
         return q.permute(1, 0, 2), k.permute(1, 0, 2), v
+
+    def _qk_norm_rope(self, lay, q, k):
+        """Decode-time Q/K norm+rope layer with an independently usable ``auto`` route.
+
+        WebGPU can combine both tensors into one dispatch.  WebGL and unsupported norm
+        shapes compose their existing primitives at this nearest equivalent layer.  A
+        containing full-decoder tuner may request either route explicitly.
+        """
+        route = getattr(self, "_qk_norm_rope_execution", "auto")
+
+        def composed():
+            return (self._rope1(self._qk_norm(q, lay.get("qn"), 1, self.NH)),
+                    self._rope1(self._qk_norm(k, lay.get("kn"), 1, self.NKV)))
+
+        def fused():
+            return wt.qk_norm_rope_decode(
+                q, k, lay.get("qn"), lay.get("kn"), self.cos_b, self.sin_b,
+                self.HD, getattr(self, "rope_dim", self.HD), self.eps)
+
+        key = ("qk_norm_rope", self.NH, self.NKV, self.HD,
+               getattr(self, "rope_dim", self.HD))
+        correct_key = key + ("correct",)
+        if route == "composed" or (route == "auto" and wt._TUNED.get(key) == "composed"):
+            return composed()
+        probe = fused()
+        if probe is None:
+            return composed()
+        if correct_key not in wt._TUNED:
+            rq, rk = composed(); fq, fk = probe
+            qa, ka = np.asarray(rq.numpy()), np.asarray(rk.numpy())
+            qb, kb = np.asarray(fq.numpy()), np.asarray(fk.numpy())
+            scale = max(1e-6, float(np.abs(qa).max()), float(np.abs(ka).max()))
+            wt._TUNED[correct_key] = bool(
+                np.all(np.isfinite(qb)) and np.all(np.isfinite(kb))
+                and max(float(np.abs(qa - qb).max()),
+                        float(np.abs(ka - kb).max())) / scale < 2e-5)
+        valid_fused = bool(wt._TUNED[correct_key])
+        if route == "composed":
+            return composed()
+        if route == "fused":
+            if not valid_fused:
+                raise RuntimeError("fused Q/K norm+rope failed numerical validation")
+            return probe
+        if route != "auto":
+            raise ValueError("Q/K norm+rope execution must be auto, composed, or fused")
+        if key not in wt._TUNED:
+            candidates = ["composed"] + (["fused"] if valid_fused else [])
+            samples = {name: [] for name in candidates}
+
+            def bench(name):
+                out = None; t0 = time.perf_counter()
+                for _ in range(8):
+                    out = fused() if name == "fused" else composed()
+                out[-1].numpy()
+                return (time.perf_counter() - t0) / 8.0
+
+            for name in candidates:
+                bench(name)
+            for r in range(9):
+                order = candidates if not (r & 1) else list(reversed(candidates))
+                for name in order:
+                    samples[name].append(bench(name))
+            wt._TUNED[key] = wt._measured_choice(samples, candidates,
+                                                  default="composed")
+        return probe if wt._TUNED[key] == "fused" else composed()
 
     def _attn_out(self, lay, o, T):
         """Attention output -> hidden. Applies the sigmoid output gate when the query projection
@@ -3161,27 +4555,62 @@ class CausalLM:
             # One readback here costs one wait instead of hundreds.
             wt.Tensor(np.zeros((1, 1), np.float32)).numpy()
             _t0 = time.perf_counter()
+            # Settle the independent one-row MoE reduction before any decoder graph is
+            # captured. Its auto tuner checks numerical equivalence and paired timing;
+            # doing that for the first time *inside* capture would replay all calibration
+            # dispatches on every generated token. This is keyed by operator shape, not
+            # model identity, and runs once per distinct (top-k, hidden width).
+            reductions = set()
+            for lay in getattr(self, "layers", ()):
+                moe = lay.get("moe")
+                if not moe or not moe.get("stacked"):
+                    continue
+                rk = (int(moe["top_k"]), int(self.H))
+                if rk in reductions:
+                    continue
+                reductions.add(rk)
+                rng = np.random.default_rng(rk[0] * 65537 + rk[1])
+                trial = wt.Tensor(rng.normal(0, 1, (rk[0], rk[1])).astype(np.float32))
+                weights = wt.Tensor(np.linspace(0.2, 1.0, rk[0], dtype=np.float32))
+                wt.moe_weighted_sum(trial, weights, rk[0]).numpy()
+                del trial, weights
+            if reductions:
+                wt.gpu_reap()
             seen = set()
             held = []
-            for lay in getattr(self, "layers", []) or []:
-                for v in lay.values():
-                    packed = getattr(v, "packed", None)
-                    if packed is None or not hasattr(v, "Kt"):
-                        continue
-                    key = (v.type_name, int(v.Nt), int(v.Kt))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    x = wt.Tensor(np.zeros((1, int(v.Kt)), np.float32))
-                    # Do NOT read each one back. `.numpy()` per shape is a full sync per
-                    # shape, and a sync waits for everything already queued -- which here is
-                    # the tail of however many gigabytes were just uploaded. Thirty-two of
-                    # those is thirty-two waits for the same backlog. The point of running
-                    # these is to register and tune the kernels, and that happens on the way
-                    # in; the values are not wanted. So the results are held (a dropped
-                    # reference can recycle the buffer under a kernel that has not run yet)
-                    # and one readback at the end drains the lot.
-                    held.append(v(x))
+            owners = {}
+            walked = set()
+            def walk(value):
+                oid = id(value)
+                if oid in walked:
+                    return
+                walked.add(oid)
+                if isinstance(value, (wt.GGMLLinear, wt.GGMLMoELinear)):
+                    moe = isinstance(value, wt.GGMLMoELinear)
+                    key = (value.type_name, int(value.Nt), int(value.Kt), moe)
+                    owners.setdefault(key, value)
+                    return
+                if isinstance(value, dict):
+                    for item in value.values():
+                        walk(item)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        walk(item)
+                elif isinstance(value, wt.Module):
+                    for item in vars(value).values():
+                        walk(item)
+            walk(getattr(self, "layers", [])); walk(getattr(self, "head", []))
+            eidx = wt._empty_i32((1,)) if any(k[3] for k in owners) else None
+            if eidx is not None:
+                eidx.buffer.set_data(np.zeros((1,), np.int32))
+            for key, v in owners.items():
+                seen.add(key)
+                x = wt.Tensor(np.zeros((1, int(v.Kt)), np.float32))
+                # Stacked MoE experts live under lay["moe"]["stacked"], not directly
+                # under a layer. Missing them made the four semantic forwards pay for
+                # their stored-kernel registration on every large-model load.
+                held.append(v(x, eidx) if key[3] else v(x))
+                # No per-shape readback: queue order and the final read settle them all.
             if held:
                 held[-1].numpy()
             held.clear()
@@ -3206,9 +4635,10 @@ class CausalLM:
             # a few dozen tensors rather than over the model.
             for m in (3,):
                 try:
-                    for tname, nt, kt in list(seen):
-                        lay = self._shape_owner_of(getattr(self, "layers", []),
-                                                   tname, nt, kt)
+                    for tname, nt, kt, moe in list(seen):
+                        if moe:
+                            continue  # the decode expert path has its own shape above
+                        lay = owners.get((tname, nt, kt, False))
                         if lay is None:
                             continue
                         old_execution = getattr(lay, "execution", None)
@@ -3230,8 +4660,11 @@ class CausalLM:
             # rather than an argument. Timing only; it changes nothing.
             try:
                 c = wt.tune_cost()
-                _load_stage("warming", done=int(c.get("shapes") or 0),
-                            total=int(c.get("variants") or 0))
+                # ``shapes`` and ``variants`` are different units: a shape evaluates
+                # several variants, while one compiled variant can serve several shapes.
+                # Reporting them as done/total produced impossible progress such as 9/6.
+                # The dispatched shape set is the actual finite work list for this pass.
+                _load_stage("warming", done=len(seen), total=len(seen))
                 import js
                 # The kernel build stamp goes on this line because this line is what gets
                 # quoted back. Three readings today could not be attributed to a version --
@@ -3299,6 +4732,10 @@ class CausalLM:
         self.kv_cap = new
         # Every kernel was captured against the old buffers and the old stride.
         self.capture_ready = False
+        self._greedy_chunk_capture_ready = False
+        self._decode_graph_signature = None
+        self._decode_graph_logits = None
+        self._decode_graph_token = None
 
     def _kv_commit(self, held, embeds=None, rope_pos=None):
         """Record what the cache rows actually hold. MUST run on every exit path.
@@ -3327,6 +4764,158 @@ class CausalLM:
         self.__dict__.pop("_kv_ids", None)
         self.__dict__.pop("_gcache", None)      # the growing cache is named by those ids too
 
+    def _moe_prefill_api_key(self, rows):
+        """Whole-prefill route identity, separate from a single MoE layer's choice.
+
+        The host keeps this build's profile under its physical-device key. The
+        source identity and actual layer geometry keep different model graphs
+        apart without recognising any model name or task category.
+        """
+        if rows <= 1:
+            return None
+        source = getattr(self, "_gguf", None) or getattr(self, "base", None)
+        if not source:
+            return None
+        digest = getattr(self, "_moe_prefill_api_digest", None)
+        if digest is None:
+            layout = []
+            for layer in getattr(self, "layers", ()):
+                moe = layer.get("moe") if isinstance(layer, dict) else None
+                stacked = moe.get("stacked") if moe else None
+                if stacked:
+                    layout.append((int(moe.get("n_experts") or stacked["gate"].n_experts),
+                                   int(moe["top_k"]),
+                                   str(getattr(stacked["gate_up"], "type_name", "?")),
+                                   str(getattr(stacked["down"], "type_name", "?"))))
+                else:
+                    layout.append(None)
+            if not any(entry is not None for entry in layout):
+                return None
+            import hashlib
+            topology = {"source": str(source), "geometry": [
+                int(getattr(self, name, 0) or 0) for name in
+                ("L", "H", "NH", "NKV", "HD", "VOCAB")],
+                "layers": layout}
+            digest = hashlib.sha256(json.dumps(topology, sort_keys=True,
+                                                separators=(",", ":")).encode()
+                                    ).hexdigest()[:24]
+            self._moe_prefill_api_digest = digest
+        backend = ("webgpu" if wt._adam_backend_ready() else
+                   "webgl" if wt._webgl_ready() else "cpu")
+        bucket = 1 << (int(rows).bit_length() - 1)
+        base = (backend, digest, bucket)
+        phase = ("warm" if base in getattr(self, "_moe_prefill_api_seen", ())
+                 else "cold")
+        return ("moe_prefill_api_v3", *base, phase)
+
+    def _moe_prefill_api_choice(self, rows):
+        key = CausalLM._moe_prefill_api_key(self, rows)
+        route = wt._TUNED.get(key) if key is not None else None
+        if route in ("host", "device"):
+            return route
+        if key is not None and key[1] in ("webgpu", "webgl"):
+            # No interactive multi-layer tournament: that made load/first
+            # response take tens to hundreds of seconds. Use the no-readback
+            # exact device route provisionally, and leave this bucket pending
+            # for an explicit paired full-API profile of the new JS host route.
+            self._moe_prefill_api_pending = getattr(
+                self, "_moe_prefill_api_pending", set())
+            self._moe_prefill_api_pending.add(key)
+            return "device"
+        return "auto"
+
+    def _moe_prefill_api_completed(self, rows):
+        key = CausalLM._moe_prefill_api_key(self, rows)
+        if key is not None:
+            self._moe_prefill_api_seen = getattr(self, "_moe_prefill_api_seen", set())
+            self._moe_prefill_api_seen.add(key[1:4])
+
+    def profile_moe_prefill_composition(self, ids=(1, 2, 3, 4), rounds=5):
+        """Explicit offline whole-model MoE route A/B; not part of interactive load.
+
+        This exercises the same prefill API as generation, checks the final
+        token and hidden state, then compares paired *warm* calls. A cold
+        winner cannot be inferred from repeated warm runs; it remains pending
+        until separately measured. Synthetic calls invalidate the live KV
+        prefix, so the next generation rebuilds that prefix from its text.
+        """
+        ids = tuple(int(token) for token in ids)
+        if len(ids) <= 1:
+            raise ValueError("whole-prefill profiling needs at least two rows")
+        if int(rounds) <= 0:
+            raise ValueError("rounds must be positive")
+        key = CausalLM._moe_prefill_api_key(self, len(ids))
+        if key is None or key[1] not in ("webgpu", "webgl"):
+            raise ValueError("no GPU stacked-MoE prefill route to profile")
+        import statistics as _stats
+        old_route = self.__dict__.get("_moe_prefill_execution")
+        had_route = "_moe_prefill_execution" in self.__dict__
+
+        def run(route):
+            self._moe_prefill_execution = route
+            self._reset_linear_state()
+            t0 = time.perf_counter()
+            try:
+                if self._capturable():
+                    picked = self._prefill(ids)
+                    hidden = self._last_prefill_hidden
+                else:
+                    cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+                    picked = self._kv_forward(ids, 0, cache)
+                    hidden = self._last_hidden
+                vector = np.asarray(hidden.numpy(), np.float32).copy()
+                elapsed = time.perf_counter() - t0
+                return elapsed, int(picked), vector
+            finally:
+                CausalLM._kv_drop(self)
+
+        try:
+            _, reference_token, reference = run("host")
+            _, candidate_token, candidate = run("device")
+            if not np.all(np.isfinite(reference)):
+                raise RuntimeError("host whole-prefill result is not finite")
+            if candidate.shape != reference.shape:
+                raise RuntimeError("device whole-prefill route changed hidden shape")
+            scale = max(1e-6, float(np.abs(reference).max()))
+            error = float(np.abs(candidate - reference).max()) / scale
+            if (candidate_token != reference_token
+                    or not np.all(np.isfinite(candidate)) or error >= 1e-4):
+                raise RuntimeError("device whole-prefill route failed the host numerical "
+                                   "gate (relative error %.3g)" % error)
+            # The two correctness passes have warmed both routes. They are not
+            # timing pairs, and must not be misreported as cold-path evidence.
+            key = CausalLM._moe_prefill_api_key(self, len(ids))
+            if key is None or key[-1] != "warm":
+                raise RuntimeError("whole-prefill route did not enter its warm phase")
+            samples = {"host": [], "device": []}
+            for index in range(int(rounds)):
+                order = (("host", "device") if index % 2 == 0
+                         else ("device", "host"))
+                for route in order:
+                    elapsed, picked, vector = run(route)
+                    if picked != reference_token or not np.all(np.isfinite(vector)):
+                        raise RuntimeError("whole-prefill route changed its result while "
+                                           "being measured")
+                    samples[route].append(elapsed)
+            choice = wt._measured_choice(samples, ("host", "device"), default="host")
+            wt._TUNED[key] = choice
+            return {"key": key, "choice": choice,
+                    "median_seconds": {route: _stats.median(times)
+                                       for route, times in samples.items()},
+                    "samples_seconds": samples, "relative_error": error,
+                    "evidence": wt._paired_evidence(samples, "device", "host"),
+                    "phase": "warm", "cold_profile_pending": True}
+        finally:
+            if had_route:
+                self._moe_prefill_execution = old_route
+            else:
+                self.__dict__.pop("_moe_prefill_execution", None)
+            CausalLM._kv_drop(self)
+            self._reset_linear_state()
+            import gc
+            gc.collect()
+            wt._gpu_release_idle_pool()
+
     def _prefill(self, ids, embeds=None, start=0):
         """Run `ids` through the model, writing their keys and values into the cache at
         `start`, and return the argmax of the last position's logits.
@@ -3335,6 +4924,11 @@ class CausalLM:
         `_kv_prefix`. The new tokens then carry rotary positions `start..start+T-1` and
         attend back over everything from 0, so the result is identical to prefilling the
         whole sequence; only the work already done is skipped."""
+        # A cold GPU working set and a settled one can prefer opposite MoE routes.
+        # Record which shape classes completed an entire prefill. An incomplete run must
+        # not turn its cold profile into a warm decision on the next attempt.
+        self._moe_prefill_seen = getattr(self, "_moe_prefill_seen", set())
+        self._moe_prefill_pending = set()
         H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
         LMAX = self.kv_cap                    # the rows on the device, not the context
         # The prompt is NOT padded. Row alignment is the fp32 matmul's requirement and it
@@ -3361,10 +4955,11 @@ class CausalLM:
         mask = wt.Tensor(m.reshape(1, T, end))
         h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
+        x = self._rms(h, self.layers[0]["in_ln"]) if self.layers else None
+        fin = self._rms(h, self.final_norm) if not self.layers else None
         for i, lay in enumerate(self.layers):
-            x = self._rms(h, lay["in_ln"])
             if self._is_linear_layer(i):                       # recurrent (fixed-state) layer
-                h = h + self._linear_mixer(i, lay, x, T)
+                mix = self._linear_mixer(i, lay, x, T)
             else:                                              # softmax attention layer
                 q, k, v = self._qkv(lay, x, T)
                 q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
@@ -3383,9 +4978,13 @@ class CausalLM:
                 # `causal_start` instead of the mask tensor: the shape is what the mask
                 # says, so the kernel derives it and nothing seq-squared is built or sent.
                 o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc, causal_start=start)
-                h = h + self._attn_out(lay, o, T)
-            x = self._rms(h, lay["post_ln"])
-            h = h + self._mlp(lay, x)
+                mix = self._attn_out(lay, o, T)
+            h, post = self._add_rms(h, mix, lay["post_ln"])
+            mlp = self._mlp(lay, post)
+            if i + 1 < len(self.layers):
+                h, x = self._add_rms(h, mlp, self.layers[i + 1]["in_ln"])
+            else:
+                h, fin = self._add_rms(h, mlp, self.final_norm)
             # Every eighth layer, hand back what the layers before it finished with. A
             # prompt's intermediates are ~100MB a layer here, and holding all of them to the
             # end of the prefill is several gigabytes on a machine that has none to spare --
@@ -3398,8 +4997,39 @@ class CausalLM:
         # and the tensor is built here either way.
         # The LAST REAL row, which is not the last row when the prompt was padded above.
         self._last_prefill_hidden = wt.Tensor(wt._contig(
-            self._rms(h, self.final_norm).data[T_real - 1:T_real]))
-        return self._head_argmax(self._last_prefill_hidden)
+            fin.data[T_real - 1:T_real]))
+        picked = self._head_argmax(self._last_prefill_hidden)
+        self._moe_prefill_seen.update(self._moe_prefill_pending)
+        CausalLM._moe_prefill_api_completed(self, T_real)
+        return picked
+
+    def _prefill_or_replay_one(self, ids, embeds=None, start=0):
+        """Use an already-validated decode graph for one new cached-prefix row.
+
+        A continued chat often has exactly one uncached template token.  Running that
+        row through the general prefill builds and submits a second, shape-specific
+        command list over the whole model.  The captured decode graph writes the same
+        KV row and produces its logits with the current token and position; reusing it
+        also avoids reintroducing a cold GPU working set just before the first token.
+        The graph key checks the physical plan and buffers, and excludes recurrent
+        state.  Embedding overrides and an absent cached prefix keep the general path.
+        """
+        if (start > 0 and len(ids) == 1 and embeds is None
+                and getattr(self, "_gpu", False)
+                and getattr(self, "capture_ready", False)):
+            split = wt.gqa_tune(self.NH, self.NKV, self.HD, start + 1)
+            key = CausalLM._decode_graph_key(self, split)
+            if (key is not None and key == getattr(self, "_decode_graph_signature", None)
+                    and getattr(self, "_decode_graph_logits", None) is not None):
+                self._set_inputs(int(ids[0]), start)
+                wt._adam_kernel["platform"].replay("decode")
+                self._last_prefill_route = "decode_replay"
+                token_buf = getattr(self, "_decode_graph_token", None)
+                if token_buf is not None:
+                    return self._accept_token(self._token_from_device(token_buf))
+                return CausalLM._pick_tensor(self, self._decode_graph_logits)
+        self._last_prefill_route = "general"
+        return self._prefill(ids, embeds=embeds, start=start)
 
     def _set_inputs(self, token, pos):
         NKV, HD, LMAX = self.NKV, self.HD, self.kv_cap
@@ -3411,38 +5041,323 @@ class CausalLM:
             self.mask_b.data.buffer.set_data(m)
         self.ctl.buffer.set_data(np.array([pos, 1, NKV, HD, LMAX], np.int32))
 
-    def _decode_fwd(self):
+    def _decode_graph_key(self, split):
+        """Only reuse a graph when its buffers and physical execution plan are stable.
+
+        A recurrent layer may replace its device state during prompt prefill, so its graph
+        is deliberately re-recorded.  This is a capability check, not a model-name rule.
+        WebGL has no command capture and keeps its equivalent eager API path.
+        """
+        if not getattr(self, "_gpu", False) or any(
+                isinstance(lay, dict) and lay.get("linear") is not None
+                for lay in getattr(self, "layers", ())):
+            return None
+        return (int(self.kv_cap), repr(split), bool(self._device_greedy_ok()),
+                bool(getattr(self, "_fused_attn", False)),
+                *(getattr(self, name, None) for name in (
+                    "_add_rms_execution", "_qkv_execution", "_gate_up_execution",
+                    "_qk_norm_rope_execution", "_kv_write_execution",
+                    "_head_shape_execution", "_greedy_execution",
+                    "_moe_reduce_execution")),
+                int(getattr(wt, "_WEIGHT_TUNE_CALLS", 0)))
+
+    def _capture_or_replay_decode(self, plat, split):
+        """Execute the first step once, retaining its output for the next compatible turn.
+
+        Recording executes a real step.  Replaying an existing graph also executes exactly
+        one real step; neither may be followed by an extra replay at that same position.
+        The output Tensor stays referenced while the graph is pinned so a later turn can
+        sample its new logits without recording 1,000+ identical dispatches again.
+        """
+        key = CausalLM._decode_graph_key(self, split)
+        if (key is not None and getattr(self, "capture_ready", False)
+                and getattr(self, "_decode_graph_signature", None) == key
+                and getattr(self, "_decode_graph_logits", None) is not None):
+            plat.replay("decode")
+            token = getattr(self, "_decode_graph_token", None)
+            # Replay submission is asynchronous. Synchronise before returning so the
+            # first-token timer includes the real GPU wait just as recording does.
+            if token is None:
+                self._decode_graph_logits.numpy()
+                picked = None
+            else:
+                picked = self._token_from_device(token)
+            return self._decode_graph_logits, token, picked
+
+        plat.beginCapture("decode")
+        try:
+            logits = self._decode_fwd()
+            token = picked = None
+            if self._device_greedy_ok():
+                token, picked = self._prepare_device_greedy(logits)
+            if token is None:
+                logits.numpy()
+        finally:
+            plat.endCapture()
+        self.capture_ready = True
+        key = CausalLM._decode_graph_key(self, split)
+        self._decode_graph_signature = key
+        self._decode_graph_logits = logits if key is not None else None
+        self._decode_graph_token = token if key is not None else None
+        return logits, token, picked
+
+    def _decode_fwd(self, profile=None):
         H, NH, NKV, HD, LMAX = self.H, self.NH, self.NKV, self.HD, self.kv_cap
         sc = 1.0 / math.sqrt(HD); h = self.h_in
+
+        # Profiling is completely absent from production.  A list requests the simple
+        # sync-after-stage trace; a dict requests one captured graph per stage so the
+        # profiler can replay exactly the command lists production uses.
+        _last_mark = [time.perf_counter()]
+        _active = [None]
+        def start(stage, layer=-1):
+            if profile is None:
+                return
+            _active[0] = (stage, int(layer))
+            if isinstance(profile, dict):
+                n = len(profile["segments"])
+                name = "decode_profile_%03d" % n
+                profile["active_name"] = name
+                wt._adam_kernel["platform"].beginCapture(name)
+
+        def mark(value):
+            if profile is None:
+                return
+            probe = value[-1] if isinstance(value, (tuple, list)) else value
+            stage, layer = _active[0]
+            if isinstance(profile, dict):
+                wt._adam_kernel["platform"].endCapture()
+                probe.numpy()                 # finish the recording before the next segment
+                profile["segments"].append({"layer": layer, "stage": stage,
+                                             "name": profile.pop("active_name"),
+                                             "probe": probe})
+                return
+            probe.numpy()
+            now = time.perf_counter()
+            profile.append({"layer": int(layer), "stage": stage,
+                            "raw_ms": (now - _last_mark[0]) * 1000.0})
+            _last_mark[0] = now
+
+        start("input_norm")
+        x = self._rms(h, self.layers[0]["in_ln"]) if self.layers else None
+        fin = self._rms(h, self.final_norm) if not self.layers else None
+        mark(x if self.layers else fin)
         for i, lay in enumerate(self.layers):
-            x = self._rms(h, lay["in_ln"])
             if self._is_linear_layer(i):
                 # A recurrent mixer is capturable once its step runs on the device: the
                 # commands are the same every token, and the state it reads and writes in
                 # place is a buffer like any other.
-                h = h + self._linear_mixer(i, lay, x, 1)
+                start("mixer", i); mix = self._linear_mixer(i, lay, x, 1)
+                mark(mix)
             else:
-                q, k, v = self._qkv(lay, x, 1)
-                q = self._rope1(q); k = self._rope1(k)
+                start("qkv", i); q, k, v = self._qkv(lay, x, 1, apply_norm=False)
+                mark((q, k, v))
+                start("rope", i)
+                q, k = self._qk_norm_rope(lay, q, k)
+                mark((q, k))
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
-                K.data = wt.kv_write(K.data, wt._contig(k).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
-                V.data = wt.kv_write(V.data, wt._contig(v).data, 0, 1, NKV, HD, LMAX, ctl=self.ctl)
+                start("kv_write", i)
+                K.data, V.data = wt.kv_write_pair(
+                    K.data, V.data, wt._contig(k).data, wt._contig(v).data,
+                    0, 1, NKV, HD, LMAX, ctl=self.ctl,
+                    execution=self._kv_write_execution)
+                mark(v)
                 # One dispatch for the single decode position; falls back for anything the
                 # fused kernel does not cover.
                 # `ctl` carries the position, so the fused kernel scans only what the
                 # conversation has actually filled -- decode speed follows the conversation,
                 # not the context the model was loaded with.
+                start("attention_out", i)
                 o = (wt.gqa_decode(q, K, V, self.mask_b, sc, ctl=self.ctl)
                      if wt._GQA_FUSED else None)
                 if o is None:
                     o = wt.gqa_attention(q, K, V, self.mask_b, scale=sc)
-                h = h + self._attn_out(lay, o, 1)
-            x = self._rms(h, lay["post_ln"])
-            h = h + self._mlp(lay, x)
-        return wt.cat([blk(self._rms(h, self.final_norm)) for blk in self.head], axis=-1)
+                mix = self._attn_out(lay, o, 1)
+                mark(mix)
+            start("post_add_norm", i)
+            h, post = self._add_rms(h, mix, lay["post_ln"])
+            mark(post)
+            start("mlp", i)
+            mlp = self._mlp(lay, post)
+            mark(mlp)
+            if i + 1 < len(self.layers):
+                start("next_add_norm", i)
+                h, x = self._add_rms(h, mlp, self.layers[i + 1]["in_ln"])
+                mark(x)
+            else:
+                start("final_add_norm", i)
+                h, fin = self._add_rms(h, mlp, self.final_norm)
+                mark(fin)
+        start("head")
+        logits = self._logits_tensor(fin)
+        mark(logits)
+        return logits
+
+    def profile_decode_layers(self, rounds=3, token=0, pos=0):
+        """Measure one-token decode by layer/stage plus the unsplit whole-step latency.
+
+        Each stage is captured separately, then those graphs are replayed in dependency
+        order.  The measured empty-replay/readback cost is subtracted as ``net_ms``.  The
+        complete decode is also captured as one graph; ``full_step_ms`` is therefore the
+        same path production uses and remains the number candidate selection must optimise.
+        """
+        if not self._gpu:
+            if wt._webgl_ready():
+                return self._profile_webgl_decode_layers(rounds, token, pos)
+            raise RuntimeError("layer decode profiling requires a GPU backend")
+        # Profiling writes synthetic token rows into the model's actual captured KV
+        # buffers. Invalidate the previous chat's prefix *before* the first write so
+        # even a failed/interrupted profile cannot make a later reply reuse stale rows.
+        self._kv_drop()
+        import statistics as _stats
+        rounds = max(1, int(rounds)); token = int(token); pos = int(pos)
+        self._reset_linear_state(); self._set_inputs(token, pos)
+        self._decode_fwd().numpy()                         # compile/warm outside the sample
+
+        plat = wt._adam_kernel["platform"]
+        cap = {"segments": []}
+        self._reset_linear_state(); self._set_inputs(token, pos)
+        self._decode_fwd(profile=cap)
+
+        # Same host/worker/readback fixed cost as a segment, but with no GPU dispatch.
+        # Replaying each graph several times before one readback amortises the map/copy cost
+        # that otherwise dwarfs a 20-80 microsecond layer fragment.
+        segment_repeat = 16
+        plat.beginCapture("decode_profile_empty"); plat.endCapture()
+        sync_ms = []
+        for _ in range(max(7, rounds)):
+            t0 = time.perf_counter()
+            for _r in range(segment_repeat):
+                plat.replay("decode_profile_empty")
+            self.h_in.numpy()
+            sync_ms.append((time.perf_counter() - t0) * 1000.0 / segment_repeat)
+        sync = _stats.median(sync_ms)
+
+        grouped = {(s["layer"], s["stage"]): [] for s in cap["segments"]}
+        for _ in range(rounds):
+            self._reset_linear_state(); self._set_inputs(token, pos)
+            for segment in cap["segments"]:
+                t0 = time.perf_counter()
+                for _r in range(segment_repeat):
+                    plat.replay(segment["name"])
+                segment["probe"].numpy()
+                grouped[(segment["layer"], segment["stage"])].append(
+                    (time.perf_counter() - t0) * 1000.0 / segment_repeat)
+
+        # Whole captured graph, including the active API token-selection route.
+        self._reset_linear_state(); self._set_inputs(token, pos)
+        plat.beginCapture("decode_profile_full")
+        logits = self._decode_fwd()
+        token_t = wt.vocab_argmax(logits.data) if self._device_greedy_ok() else None
+        (token_t.get() if token_t is not None else logits.numpy())
+        plat.endCapture()
+        whole = []
+        for _ in range(max(7, rounds)):
+            self._set_inputs(token, pos)
+            t0 = time.perf_counter(); plat.replay("decode_profile_full")
+            (token_t.get() if token_t is not None else logits.numpy())
+            whole.append((time.perf_counter() - t0) * 1000.0)
+        self._reset_linear_state()
+
+        stages = []
+        for (layer, stage), vals in grouped.items():
+            raw = _stats.median(vals)
+            stages.append({"layer": layer, "stage": stage,
+                           "raw_ms": round(raw, 4),
+                           "net_ms": round(max(0.0, raw - sync), 4)})
+        layer_totals = []
+        for layer in range(len(self.layers)):
+            vals = [s["net_ms"] for s in stages if s["layer"] == layer]
+            layer_totals.append({"layer": layer, "net_ms": round(sum(vals), 4)})
+        result = {"rounds": rounds, "segment_repeat": segment_repeat,
+                "segment_overhead_ms": round(sync, 4),
+                "full_step_ms": round(_stats.median(whole), 4),
+                "profiled_raw_ms": round(sum(s["raw_ms"] for s in stages), 4),
+                "profiled_net_ms": round(sum(s["net_ms"] for s in stages), 4),
+                "stages": stages, "layers": layer_totals,
+                "decode_plan": dict(getattr(self, "decode_plan", {}))}
+        # Profiling creates hundreds of short-lived captures.  Drop their pins; the next
+        # generation records its normal single graph again.
+        plat.resetCaptures(); self.capture_ready = False
+        self._greedy_chunk_capture_ready = False
+        self._decode_graph_signature = None
+        self._decode_graph_logits = None
+        self._decode_graph_token = None
+        return result
+
+    def _profile_webgl_decode_layers(self, rounds=3, token=0, pos=0):
+        """WebGL counterpart of :meth:`profile_decode_layers`.
+
+        WebGL cannot replay command captures, so its stages are measured on the eager
+        growing-cache path with a synchronization after each boundary.  A no-work readback
+        is measured separately and subtracted from every stage.  The unsplit whole-step
+        number is timed without instrumentation and is the production number; stage values
+        diagnose proportions rather than pretending WebGPU capture timings apply here.
+        """
+        import statistics as _stats
+        rounds = max(1, int(rounds)); token = int(token); pos = max(0, int(pos))
+        saved_seen = list(getattr(self, "_seen", ()))
+        saved_sampling = self.__dict__.get("_sampling", None)
+        self._sampling = {"do_sample": False, "temperature": 0.0}
+
+        def fresh_cache():
+            self._reset_linear_state()
+            cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+            if pos:
+                self._seen = []
+                self._kv_forward([token] * pos, 0, cache)
+            return cache
+
+        try:
+            # Compile every production shader before either the trace or whole-step sample.
+            self._seen = []; self._kv_forward([token], pos, fresh_cache())
+            probe = wt.Tensor(np.zeros((1,), np.float32)); probe.numpy()
+            overhead = []
+            for _ in range(max(7, rounds)):
+                t0 = time.perf_counter(); probe.numpy()
+                overhead.append((time.perf_counter() - t0) * 1000.0)
+            sync = _stats.median(overhead)
+
+            grouped = {}
+            for _ in range(rounds):
+                trace = []; self._seen = []
+                self._kv_forward([token], pos, fresh_cache(), profile=trace)
+                for row in trace:
+                    grouped.setdefault((row["layer"], row["stage"]), []).append(
+                        row["raw_ms"])
+
+            whole = []
+            for _ in range(max(7, rounds)):
+                self._seen = []; cache = fresh_cache()
+                t0 = time.perf_counter(); self._kv_forward([token], pos, cache)
+                whole.append((time.perf_counter() - t0) * 1000.0)
+
+            stages = []
+            for (layer, stage), vals in grouped.items():
+                raw = _stats.median(vals)
+                stages.append({"layer": layer, "stage": stage,
+                               "raw_ms": round(raw, 4),
+                               "net_ms": round(max(0.0, raw - sync), 4)})
+            layer_totals = []
+            for layer in range(len(self.layers)):
+                vals = [s["net_ms"] for s in stages if s["layer"] == layer]
+                layer_totals.append({"layer": layer, "net_ms": round(sum(vals), 4)})
+            return {"backend": "webgl", "rounds": rounds,
+                    "segment_overhead_ms": round(sync, 4),
+                    "full_step_ms": round(_stats.median(whole), 4),
+                    "profiled_raw_ms": round(sum(s["raw_ms"] for s in stages), 4),
+                    "profiled_net_ms": round(sum(s["net_ms"] for s in stages), 4),
+                    "stages": stages, "layers": layer_totals,
+                    "decode_plan": dict(getattr(self, "decode_plan", {}))}
+        finally:
+            self._reset_linear_state(); self._seen = saved_seen
+            if saved_sampling is None:
+                self.__dict__.pop("_sampling", None)
+            else:
+                self._sampling = saved_sampling
 
     # ---- WebGL path: growing KVCache, fresh forward (no in-place capture) ----
-    def _kv_forward(self, ids, pos, cache, embeds=None, rope_pos=None):
+    def _kv_forward(self, ids, pos, cache, embeds=None, rope_pos=None, profile=None):
         """`pos` is the cache position -- how many tokens are already stored -- and is what
         the attention mask is built from. `rope_pos`, when given, is the ROTARY position:
         with multi-axis rope the two are not the same number. An image of 4x4 patches is 16
@@ -3450,26 +5365,77 @@ class CausalLM:
         two dimensions rather than one after another. Conflating them puts the text after an
         image at the wrong distance from it."""
         T = len(ids); H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        if T > 1:
+            self._moe_prefill_seen = getattr(self, "_moe_prefill_seen", set())
+            self._moe_prefill_pending = set()  # WebGL/non-capturable peer of _prefill
+        _last_mark = [time.perf_counter()]
+        _active = [None]
+
+        def start(stage, layer=-1):
+            if profile is not None:
+                _active[0] = (stage, int(layer))
+
+        def mark(value):
+            if profile is None:
+                return
+            probe = value[-1] if isinstance(value, (tuple, list)) else value
+            if hasattr(probe, "numpy"):
+                probe.numpy()
+            elif hasattr(probe, "get"):
+                probe.get()
+            now = time.perf_counter(); stage, layer = _active[0]
+            profile.append({"layer": int(layer), "stage": stage,
+                            "raw_ms": (now - _last_mark[0]) * 1000.0})
+            _last_mark[0] = now
+
+        start("embed_norm")
         c, s = self._rope_np(pos if rope_pos is None else rope_pos, T)
         cos_t, sin_t = wt.Tensor(c), wt.Tensor(s)
         h = self._embed_ids(ids, embeds)
         sc = 1.0 / math.sqrt(HD)
+        x = self._rms(h, self.layers[0]["in_ln"]) if self.layers else None
+        fin = self._rms(h, self.final_norm) if not self.layers else None
+        mark(x if self.layers else fin)
         for i, lay in enumerate(self.layers):
-            x = self._rms(h, lay["in_ln"])
             if self._is_linear_layer(i):                       # recurrent (fixed-state) layer
-                h = h + self._linear_mixer(i, lay, x, T)
+                start("mixer", i)
+                mix = self._linear_mixer(i, lay, x, T)
+                mark(mix)
             else:
+                start("qkv", i)
                 q, k, v = self._qkv(lay, x, T)
+                mark((q, k, v))
+                start("rope", i)
                 q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
+                mark((q, k))
+                start("attention_out", i)
                 o = cache.attn(i, q, k, v, pos, scale=sc)
-                h = h + self._attn_out(lay, o, T)
-            x = self._rms(h, lay["post_ln"])
-            h = h + self._mlp(lay, x)
-        fin = self._rms(h, self.final_norm)
+                mix = self._attn_out(lay, o, T)
+                mark(mix)
+            start("post_add_norm", i)
+            h, post = self._add_rms(h, mix, lay["post_ln"])
+            mark(post)
+            start("mlp", i)
+            mlp = self._mlp(lay, post)
+            mark(mlp)
+            if i + 1 < len(self.layers):
+                start("next_add_norm", i)
+                h, x = self._add_rms(h, mlp, self.layers[i + 1]["in_ln"])
+                mark(x)
+            else:
+                start("final_add_norm", i)
+                h, fin = self._add_rms(h, mlp, self.final_norm)
+                mark(fin)
         # Keep the last position's hidden state: a multi-token-prediction head drafts from it,
         # and recomputing the trunk to get it back would defeat the point of drafting.
         self._last_hidden = wt.Tensor(wt._contig(fin.data[-1:]))
-        return self._head_argmax(self._last_hidden)
+        start("head")
+        picked = self._head_argmax(self._last_hidden)
+        mark(picked)
+        if T > 1:
+            self._moe_prefill_seen.update(self._moe_prefill_pending)
+            CausalLM._moe_prefill_api_completed(self, T)
+        return picked
 
     def stream(self, prompt=None, max_new=None, system="You are a helpful assistant.",
                messages=None, tools=None, ids=None, temperature=None, top_p=None,
@@ -3546,6 +5512,7 @@ class CausalLM:
                            min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
+        CausalLM._activate_decode_profile_for_call(self)
         t0 = time.perf_counter()
         # How many tokens this stream has produced so far, readable WHILE it runs. A reader
         # counting the pieces it receives is not counting tokens: a token that completes no
@@ -3571,6 +5538,14 @@ class CausalLM:
                    "context": int(P),
                    "gpu_ms": round(span["gpu"] * 1000 / max(1, steps), 2),
                    "pick_ms": round(span["pick"] * 1000 / max(1, steps), 2)}
+            if span.get("prefill_s") is not None:
+                out["prefill_s"] = round(float(span["prefill_s"]), 3)
+            if span.get("post_prefill_s") is not None:
+                out["post_prefill_s"] = round(float(span["post_prefill_s"]), 3)
+            if span.get("prefill_route") is not None:
+                out["prefill_route"] = span["prefill_route"]
+            if getattr(self, "decode_plan", None):
+                out["decode_plan"] = dict(self.decode_plan)
             # The mean hides the one shape that changes what to do about a slow reply: an
             # opening that is slower than the rest. A mean says "the model is slow"; a head
             # far above the tail says "it was slow until something warmed up", and those are
@@ -3602,6 +5577,8 @@ class CausalLM:
             if span.get("prefilled") is not None:
                 out["prefilled"] = int(span["prefilled"])
                 out["prefill_d"] = int(span.get("prefill_d") or 0)
+                out["prefill_tune_s"] = round(float(span.get("prefill_tune_s") or 0.0), 3)
+                out["prefill_tune_calls"] = int(span.get("prefill_tune_calls") or 0)
             self.last_stream = out
             return out
 
@@ -3621,8 +5598,8 @@ class CausalLM:
                     piece = dec.push([nxt]); n += 1; steps += 1; self.stream_n = n
                     if piece:
                         yield piece
-                    if self._stop_now():
-                        break                   # just-yielded text satisfies the constraint
+                    if self._stop_now() or n >= max_new:
+                        break                   # final token needs no extra forward
                     held.append(nxt)            # its row is written by the call below
                     _tg = time.perf_counter()
                     nxt = self._kv_forward([nxt], pos, cache); pos += 1
@@ -3644,17 +5621,90 @@ class CausalLM:
         # that re-uses its prefix computes a handful of rows and a first turn computes all of
         # them, and the same seconds mean opposite things in the two cases.
         _pd0 = _pin_stats()[3]
-        g0 = self._prefill(ids[keep:], start=keep); self._stream_ttft = time.perf_counter() - t0
+        _ts0 = wt._WEIGHT_TUNE_SECONDS
+        _tc0 = wt._WEIGHT_TUNE_CALLS
+        g0 = CausalLM._prefill_or_replay_one(self, ids[keep:], start=keep)
+        span["prefill_s"] = self._stream_ttft = time.perf_counter() - t0
+        span["prefill_route"] = self._last_prefill_route
         span["prefilled"] = int(P - keep)
         span["prefill_d"] = int(_pin_stats()[3] - _pd0)
+        span["prefill_tune_s"] = wt._WEIGHT_TUNE_SECONDS - _ts0
+        span["prefill_tune_calls"] = wt._WEIGHT_TUNE_CALLS - _tc0
         held = list(ids)
         plat = wt._adam_kernel["platform"]
+        chunk = (int(getattr(self, "_greedy_chunk_size", 0) or 0)
+                 if self._device_greedy_ok() else 0)
+        if chunk:
+            # The highest API's measured greedy route: one host submission/readback covers
+            # several autoregressive steps.  Every internal step still reads the original
+            # packed Q6_K row; only the synchronisation boundary moved.
+            span["path"] = "replay-chunk%d" % chunk
+            dec = self.tok.stream_decoder()
+            current = int(g0); pos = P; n = 0; steps = 0
+            captured = bool(getattr(self, "_greedy_chunk_capture_ready", False))
+            t_first = time.perf_counter()
+            try:
+                if current != eot and n < max_new:
+                    piece = dec.push([current]); n += 1; self.stream_n = n
+                    if piece:
+                        yield piece
+                while current != eot and n < max_new and not self._stop_now():
+                    if pos + chunk > self.kv_cap:
+                        span["recut"].append(n)
+                        self._kv_reserve(pos + chunk)
+                        captured = False
+                    _tg = time.perf_counter()
+                    self._set_chunk_inputs(current, pos, chunk)
+                    values = (self._replay_greedy_chunk(chunk) if captured
+                              else self._capture_greedy_chunk(chunk))
+                    captured = True; self.capture_ready = True
+                    elapsed = time.perf_counter() - _tg
+                    used = 0
+                    for token in values[1:chunk + 1]:
+                        held.append(current)       # this input's row was written by the step
+                        # Match the ordinary replay path exactly: a selected token always
+                        # crosses the generation-state transition, including EOS.  Plain
+                        # greedy decoding does not consult `_seen` while choosing this
+                        # chunk, but later API calls and diagnostics still observe it.
+                        current = self._accept_token(int(token))
+                        pos += 1; steps += 1; used += 1
+                        if current == eot:
+                            break
+                        piece = dec.push([current]); n += 1; self.stream_n = n
+                        if piece:
+                            yield piece
+                        if n >= max_new or self._stop_now():
+                            break
+                    if used:
+                        span["gpu"] += elapsed
+                        span["each"].extend([elapsed / used] * used)
+                    if current == eot or n >= max_new or self._stop_now():
+                        break
+            finally:
+                self._kv_commit(held)
+            tail = dec.flush()
+            if tail:
+                yield tail
+            # `_decode_rate` removes the already-available first token.  `steps` counts only
+            # the subsequent device steps here (unlike the scalar loop, whose counter also
+            # includes that first token), so include it explicitly before asking for rate.
+            _stats(n, n >= max_new and current != eot, steps + 1, t_first)
+            return
         self._set_inputs(g0, P)
-        wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
+        decode_split = wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1)
+        wt._set_split(decode_split)
         _d0 = _pin_stats()[3]
-        plat.beginCapture("decode"); logits_t = self._decode_fwd(); logits_t.numpy(); plat.endCapture()
+        logits_t, token_t, token0 = CausalLM._capture_or_replay_decode(
+            self, plat, decode_split)
+        # Recording OR reusing the graph executed the step once. Consume those logits
+        # instead of replaying the same position, which advances recurrent state twice.
+        captured_step_pending = True
+        # The first token waits for this decode execution, whether recorded or replayed.
+        # Reporting only prefill hid that wait from the UI's first-token figure.
+        self._stream_ttft = time.perf_counter() - t0
+        span["post_prefill_s"] = self._stream_ttft - span["prefill_s"]
         span["pins"].append(_pin_stats() + (_d0,))
-        self.capture_ready = True; nxt = g0; pos = P; n = 0; steps = 0
+        nxt = g0; pos = P; n = 0; steps = 0
         span["path"] = "replay"
         dec = self.tok.stream_decoder()
         t_first = time.perf_counter()
@@ -3663,29 +5713,39 @@ class CausalLM:
                 piece = dec.push([nxt]); n += 1; steps += 1; self.stream_n = n
                 if piece:
                     yield piece
-                if self._stop_now():
-                    break                       # just-yielded text satisfies the constraint
+                if self._stop_now() or n >= max_new:
+                    # Capture already wrote the first token's KV row. Later final
+                    # tokens have not been forwarded yet, just as in generate().
+                    if captured_step_pending:
+                        held.append(nxt)
+                        captured_step_pending = False
+                    break
                 _step = 0.0
-                if pos >= self.kv_cap:              # out of rows -- see `generate`
+                if captured_step_pending:
+                    captured_step_pending = False
+                elif pos >= self.kv_cap:            # out of rows -- see `generate`
                     span["recut"].append(n)
                     self._kv_reserve(pos + 1)
                     self._set_inputs(nxt, pos)
                     _d0 = _pin_stats()[3]
-                    plat.beginCapture("decode")
-                    logits_t = self._decode_fwd(); logits_t.numpy()
-                    plat.endCapture()
+                    logits_t, token_t, token0 = CausalLM._capture_or_replay_decode(
+                        self, plat, decode_split)
                     span["pins"].append(_pin_stats() + (_d0,))
                 else:
                     _tg = time.perf_counter()
                     self._set_inputs(nxt, pos); plat.replay("decode")
                     _step += time.perf_counter() - _tg
-                held.append(nxt)                # row `pos` holds it as of this replay
+                held.append(nxt)                # capture or replay wrote row `pos`
                 _tp = time.perf_counter()
-                _lg = logits_t.numpy()[0]
+                if token_t is not None:
+                    _token = self._token_from_device(token_t)
                 _step += time.perf_counter() - _tp    # the readback waits for the step
                 span["gpu"] += _step; span["each"].append(_step)
+                # Device argmax is part of the replay and its four-byte readback belongs to
+                # GPU time.  Token bookkeeping remains CPU pick time, just like sampling.
                 _tp = time.perf_counter()
-                nxt = self._pick(_lg); pos += 1
+                nxt = (CausalLM._pick_tensor(self, logits_t) if token_t is None
+                       else self._accept_token(_token)); pos += 1
                 span["pick"] += time.perf_counter() - _tp
         finally:
             self._kv_commit(held)
@@ -3702,6 +5762,10 @@ class CausalLM:
         `from_pretrained` dedup on the weights); this releases ONE handle, and the weights
         drop only when the last handle does."""
         from . import _sdk
+        self.capture_ready = False
+        self._decode_graph_signature = None
+        self._decode_graph_logits = None
+        self._decode_graph_token = None
         self._kv_drop()                 # the rows it named are about to stop existing
         _sdk._impl_release(self)
         return self
@@ -3791,6 +5855,7 @@ class CausalLM:
                            min_new_tokens, prompt_ids=ids,
                            presence_penalty=presence_penalty,
                            frequency_penalty=frequency_penalty, stop=stop)
+        CausalLM._activate_decode_profile_for_call(self)
         self._reset_linear_state()                     # fresh recurrent state per generation
 
         # A decode step can only be captured if it is the same sequence of GPU commands every
@@ -3821,7 +5886,7 @@ class CausalLM:
             finally:
                 self._kv_commit(held, embeds, rope_pos)
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
-                             round(ttft, 3), _decode_rate(t_first, steps))
+                             round(ttft, 3), _decode_rate(t_first, steps + 1))
 
         # WebGPU capture path.
         #
@@ -3832,23 +5897,54 @@ class CausalLM:
         # impossible, which is the far bigger saving: see `_kv_prefix`.
         self._kv_reserve(P + min(max_new, self._KV_HEADROOM))
         keep = self._kv_prefix(ids, embeds, rope_pos)
-        t0 = time.perf_counter(); g0 = self._prefill(ids[keep:], embeds=embeds, start=keep)
+        t0 = time.perf_counter(); g0 = CausalLM._prefill_or_replay_one(
+            self, ids[keep:], embeds=embeds, start=keep)
         ttft = time.perf_counter() - t0
         held = list(ids)                               # rows 0..P-1 hold these
         plat = wt._adam_kernel["platform"]
+        chunk = (int(getattr(self, "_greedy_chunk_size", 0) or 0)
+                 if self._device_greedy_ok() else 0)
+        if chunk:
+            # Complete-API phase-two route selected by `_tune_greedy_chunks`.  It is only
+            # entered for unconstrained greedy decoding; sampling/penalties/constraints keep
+            # the ordinary one-token path because they need the host between every step.
+            t_first = time.perf_counter()
+            gen = [g0]; current = int(g0); pos = P; steps = 0
+            captured = bool(getattr(self, "_greedy_chunk_capture_ready", False))
+            try:
+                while current != eot and len(gen) < max_new:
+                    if pos + chunk > self.kv_cap:
+                        self._kv_reserve(pos + chunk)
+                        captured = False
+                    self._set_chunk_inputs(current, pos, chunk)
+                    values = (self._replay_greedy_chunk(chunk) if captured
+                              else self._capture_greedy_chunk(chunk))
+                    captured = True; self.capture_ready = True
+                    for token in values[1:chunk + 1]:
+                        held.append(current)
+                        current = self._accept_token(int(token))
+                        pos += 1; steps += 1
+                        if current == eot:
+                            break
+                        gen.append(current)
+                        if len(gen) >= max_new:
+                            break
+            finally:
+                self._kv_commit(held, embeds, rope_pos)
+            return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,
+                             round(ttft, 3), _decode_rate(t_first, steps))
         self._set_inputs(g0, P)
-        wt._set_split(wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1))
-        plat.beginCapture("decode")
-        logits_t = self._decode_fwd(); logits_t.numpy()
-        plat.endCapture(); self.capture_ready = True
-        # The capture ran the step for real, so its logits belong to this position. Replaying
-        # it with the same inputs would be harmless for attention -- the KV write is
-        # idempotent -- but would advance a recurrent state a second time, so consume the
-        # captured result and start replaying from the next position.
+        decode_split = wt.gqa_tune(self.NH, self.NKV, self.HD, P + 1)
+        wt._set_split(decode_split)
+        logits_t, token_t, token0 = CausalLM._capture_or_replay_decode(
+            self, plat, decode_split)
+        # The capture or existing graph ran the step for real; consume its logits now.
+        # Replaying the same position would advance a recurrent state twice.
         t_first = time.perf_counter()          # the first token exists as of here
         gen = [g0]; steps = 1
         held.append(g0)                        # the captured step wrote row P
-        nxt = self._pick(logits_t.numpy()[0]); pos = P + 1
+        nxt = (CausalLM._pick_tensor(self, logits_t) if token_t is None
+               else self._accept_token(token0)); pos = P + 1
         # Only what was actually written is claimed: the reply usually ends on a token whose
         # own keys and values were never needed, and claiming it would corrupt the next turn.
         try:
@@ -3863,14 +5959,15 @@ class CausalLM:
                     # iteration.
                     self._kv_reserve(pos + 1)
                     self._set_inputs(nxt, pos)
-                    plat.beginCapture("decode")
-                    logits_t = self._decode_fwd(); logits_t.numpy()
-                    plat.endCapture()
+                    logits_t, token_t, token0 = CausalLM._capture_or_replay_decode(
+                        self, plat, decode_split)
                 else:
                     self._set_inputs(nxt, pos)
                     plat.replay("decode")
                 held.append(nxt)               # row `pos` holds it as of this replay
-                nxt = self._pick(logits_t.numpy()[0]); pos += 1; steps += 1
+                nxt = (CausalLM._pick_tensor(self, logits_t) if token_t is None
+                       else self._accept_token(self._token_from_device(token_t)))
+                pos += 1; steps += 1
         finally:
             self._kv_commit(held, embeds, rope_pos)
         return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,

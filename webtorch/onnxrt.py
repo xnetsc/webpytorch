@@ -1,4 +1,4 @@
-"""Generic ONNX runtime for webtorch — runs ANY ONNX model in the browser.
+"""Generic ONNX runtime for webtorch — runs supported ONNX graphs in the browser.
 
 Two independent, reusable pieces:
   1. A pure-Python ONNX protobuf reader (no `onnx`/protobuf dependency, works in
@@ -6,7 +6,7 @@ Two independent, reusable pieces:
   2. An interpreter that executes the graph on host numpy / webtorch GPU ops via
      a generic op registry (`@op("Conv")` etc.).
 
-This is model-agnostic: any ONNX graph whose ops are registered will run. It is
+This is model-agnostic: an ONNX graph whose ops are registered will run. It is
 the SDK's generic "run an ONNX model" capability, used by e.g. speaker-embedding
 and speech-tokenizer models for voice cloning, but not specific to them.
 """
@@ -227,6 +227,85 @@ def _(x, lo=None, hi=None, **k): return [np.clip(x, lo, hi)]
 
 @op("MatMul")
 def _(a, b, **k): return [np.matmul(a, b)]
+
+
+def _qparam(value, rank, axis, dtype):
+    """Broadcast a scalar/per-axis ONNX quantization parameter without changing bits."""
+    a = np.asarray(value, dtype=dtype)
+    if a.ndim == 0 or a.size == 1:
+        return a.reshape(())
+    shape = [1] * int(rank)
+    shape[int(axis) % int(rank)] = a.size
+    return a.reshape(shape)
+
+
+@op("DequantizeLinear")
+def _(x, x_scale, x_zero_point=None, axis=1, **k):
+    """ONNX affine dequantization, including per-axis INT8 parameters."""
+    a = np.asarray(x)
+    scale = _qparam(x_scale, a.ndim, axis, np.float32)
+    zero = (np.asarray(0, np.int32) if x_zero_point is None
+            else _qparam(x_zero_point, a.ndim, axis, np.int32))
+    return [((a.astype(np.int32) - zero) * scale).astype(np.float32)]
+
+
+@op("QuantizeLinear")
+def _(x, y_scale, y_zero_point=None, axis=1, **k):
+    """ONNX affine quantization with ties-to-even rounding and output-type saturation."""
+    a = np.asarray(x, np.float32)
+    zp = np.asarray(0, np.uint8) if y_zero_point is None else np.asarray(y_zero_point)
+    dtype = zp.dtype
+    if dtype not in (np.dtype(np.uint8), np.dtype(np.int8)):
+        raise TypeError("QuantizeLinear supports int8/uint8 output, got %s" % dtype)
+    scale = _qparam(y_scale, a.ndim, axis, np.float32)
+    zero = _qparam(zp, a.ndim, axis, np.float32)
+    info = np.iinfo(dtype)
+    out = np.clip(np.rint(a / scale) + zero, info.min, info.max).astype(dtype)
+    return [out]
+
+
+@op("DynamicQuantizeLinear")
+def _(x, **k):
+    """Dynamic uint8 quantization with the three outputs required by ONNX."""
+    a = np.asarray(x, np.float32)
+    lo = min(0.0, float(a.min()))
+    hi = max(0.0, float(a.max()))
+    scale = np.float32((hi - lo) / 255.0 if hi > lo else 1.0)
+    zero = np.uint8(np.clip(np.rint(-lo / float(scale)), 0, 255))
+    q = np.clip(np.rint(a / scale) + zero, 0, 255).astype(np.uint8)
+    return [q, np.asarray(scale), np.asarray(zero)]
+
+
+def _matmul_integer(a, b, a_zero_point=None, b_zero_point=None):
+    """Original INT8/UINT8 operands with the ONNX-required INT32 accumulator."""
+    av = np.asarray(a).astype(np.int32)
+    bv = np.asarray(b).astype(np.int32)
+    if a_zero_point is not None:
+        az = np.asarray(a_zero_point, np.int32)
+        if az.ndim == 1 and az.size > 1:
+            az = az.reshape([1] * (av.ndim - 2) + [az.size, 1])
+        av = av - az
+    if b_zero_point is not None:
+        bz = np.asarray(b_zero_point, np.int32)
+        if bz.ndim == 1 and bz.size > 1:
+            bz = bz.reshape([1] * (bv.ndim - 1) + [bz.size])
+        bv = bv - bz
+    return np.matmul(av, bv).astype(np.int32)
+
+
+@op("MatMulInteger")
+def _(a, b, a_zero_point=None, b_zero_point=None, **k):
+    return [_matmul_integer(a, b, a_zero_point, b_zero_point)]
+
+
+@op("QLinearMatMul")
+def _(a, a_scale, a_zero_point, b, b_scale, b_zero_point,
+      y_scale, y_zero_point, **k):
+    """Quantized ONNX matmul without expanding either operand to floating point."""
+    acc = _matmul_integer(a, b, a_zero_point, b_zero_point)
+    real = acc.astype(np.float32) * np.asarray(a_scale, np.float32) \
+        * np.asarray(b_scale, np.float32)
+    return _OPS["QuantizeLinear"](real, y_scale, y_zero_point)
 @op("Gemm")
 def _(a, b, c=None, alpha=1.0, beta=1.0, transA=0, transB=0, **k):
     A = a.T if transA else a; B = b.T if transB else b
@@ -351,7 +430,7 @@ def _(x, scale, B, epsilon=1e-5, **k):
     sh = [1, -1] + [1] * (x.ndim - 2)
     return [(x - mu) / np.sqrt(var + epsilon) * scale.reshape(sh) + B.reshape(sh)]
 
-def _conv_nd(x, w, b, strides, pads, dils, groups):
+def _conv_nd(x, w, b, strides, pads, dils, groups, out_dtype=np.float32):
     # x (N,C,*spatial); w (O,C/g,*k). Generic 1d/2d via im2col.
     N = x.shape[0]; C = x.shape[1]; O = w.shape[0]; sp = x.ndim - 2
     strides = strides or [1] * sp; dils = dils or [1] * sp
@@ -361,7 +440,7 @@ def _conv_nd(x, w, b, strides, pads, dils, groups):
     ksz = w.shape[2:]
     outsp = [ (xp.shape[2 + i] - (dils[i] * (ksz[i] - 1) + 1)) // strides[i] + 1 for i in range(sp) ]
     Cg = C // groups; Og = O // groups
-    out = np.empty((N, O) + tuple(outsp), np.float32)
+    out = np.empty((N, O) + tuple(outsp), out_dtype)
     # build index grids for im2col
     for g in range(groups):
         xg = xp[:, g * Cg:(g + 1) * Cg]
@@ -397,6 +476,58 @@ def _(x, w, b=None, strides=None, pads=None, dilations=None, group=1, kernel_sha
             a = tot // 2; lo.append(tot - a if auto_pad == "SAME_LOWER" else a); hi.append(a if auto_pad == "SAME_LOWER" else tot - a)
         pads = lo + hi
     return [_conv_nd(x, w, b, strides, pads, dilations, int(group))]
+
+
+def _conv_zero(value, rank, weight=False):
+    if value is None:
+        return np.asarray(0, np.int32)
+    z = np.asarray(value, np.int32)
+    if weight and z.ndim == 1 and z.size > 1:
+        z = z.reshape([z.size] + [1] * (rank - 1))
+    return z
+
+
+@op("ConvInteger")
+def _(x, w, x_zero_point=None, w_zero_point=None, strides=None, pads=None,
+      dilations=None, group=1, kernel_shape=None, auto_pad="NOTSET", **k):
+    xv = np.asarray(x).astype(np.int32) - _conv_zero(x_zero_point, np.asarray(x).ndim)
+    wv = np.asarray(w).astype(np.int32) - _conv_zero(
+        w_zero_point, np.asarray(w).ndim, weight=True)
+    sp = xv.ndim - 2
+    if auto_pad in ("SAME_UPPER", "SAME_LOWER") and pads is None:
+        st = strides or [1] * sp
+        dl = dilations or [1] * sp
+        ks = kernel_shape or list(wv.shape[2:])
+        lo, hi = [], []
+        for i in range(sp):
+            out = -(-xv.shape[2 + i] // st[i])
+            total = max(0, (out - 1) * st[i] + dl[i] * (ks[i] - 1) + 1
+                        - xv.shape[2 + i])
+            first = total // 2
+            lo.append(total - first if auto_pad == "SAME_LOWER" else first)
+            hi.append(first if auto_pad == "SAME_LOWER" else total - first)
+        pads = lo + hi
+    return [_conv_nd(xv, wv, None, strides, pads, dilations, int(group),
+                     out_dtype=np.int32)]
+
+
+@op("QLinearConv")
+def _(x, x_scale, x_zero_point, w, w_scale, w_zero_point,
+      y_scale, y_zero_point, B=None, strides=None, pads=None, dilations=None,
+      group=1, kernel_shape=None, auto_pad="NOTSET", **k):
+    acc = _OPS["ConvInteger"](
+        x, w, x_zero_point, w_zero_point, strides=strides, pads=pads,
+        dilations=dilations, group=group, kernel_shape=kernel_shape,
+        auto_pad=auto_pad,
+    )[0]
+    if B is not None:
+        acc = acc + np.asarray(B, np.int32).reshape(
+            [1, np.asarray(B).size] + [1] * (acc.ndim - 2))
+    ws = np.asarray(w_scale, np.float32)
+    if ws.ndim == 1 and ws.size > 1:
+        ws = ws.reshape([1, ws.size] + [1] * (acc.ndim - 2))
+    real = acc.astype(np.float32) * np.asarray(x_scale, np.float32) * ws
+    return _OPS["QuantizeLinear"](real, y_scale, y_zero_point, axis=1)
 
 @op("AveragePool")
 def _(x, kernel_shape=None, strides=None, pads=None, ceil_mode=0, count_include_pad=0, **k):
