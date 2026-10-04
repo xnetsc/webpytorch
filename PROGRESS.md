@@ -2181,3 +2181,25 @@ prior build to four displayed decimals. The measured win is not a general
 claim that WebGL batch parallelism, per-operator timing, CPU batching, or
 single-question latency is solved. The user explicitly requested a commit and
 remote push at this best-current-performance checkpoint before more tuning.
+
+## 2026-10-04 ▸ xDecision GGUF recursion on published Pages
+
+**Trigger:** Chrome's Pages tab loaded the Q8_0 GGUF, then showed
+`RecursionError` inside WebGPU allocation while validating a materialized
+candidate. The allocator's `__hash__` was only where the recursive stack ran
+out: `ggml_dequant_ok` called `ggml_matmul` as its stored reference, and that
+stored call unconditionally called `ggml_dequant_ok` again. ModelScope source
+probe failures appeared in the console but were not this inference failure.
+
+**Change:** Restrict alternate-candidate discovery to `auto` or the explicitly
+requested candidate. A stored-format reference now runs without probing an
+alternate route; this applies by execution mode and format capability, never
+by model identity. A focused regression was red before the change and green
+after it. Host tests: 212 passed, one skipped; JS tests: 100 passed.
+
+**Browser evidence and limit:** Chrome's local updated build loaded the
+existing disk-backed xDecision-Q8_0 GGUF, then answered three structured
+questions (page-reported 152 ms). No model download was used. This proves the
+recursion is removed on that route, not independent model accuracy or all
+backend and performance gates. Published Pages must still receive the commit
+and be checked after deployment.

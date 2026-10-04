@@ -8598,9 +8598,15 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         return _ggml_run_gl(xf, packed, type_name, K, N, eidx=eidx, eslot=eslot,
                             estride=estride, xper=xper, bias=bias)
     mode = m if m <= 2 else 0
-    can_materialize = (eidx is None and not xper and _adam_backend_ready()
+    # The numerical verifier for materialization calls this same entry point with
+    # execution="stored" as its reference. Only discover alternative candidates
+    # when the caller actually requested one; otherwise the verifier recursively
+    # invokes itself before the packed kernel can run.
+    can_materialize = (execution in ("auto", "materialized")
+                       and eidx is None and not xper and _adam_backend_ready()
                        and ggml_dequant_ok(type_name))
-    can_dp4a = (eidx is None and not xper and _adam_backend_ready()
+    can_dp4a = (execution in ("auto", "dp4a")
+                and eidx is None and not xper and _adam_backend_ready()
                 and type_name in ("Q4_K", "Q6_K") and m == 1)
     if execution == "dp4a" and not can_dp4a:
         raise RuntimeError("%s shape has no packed-dot comparison path" % type_name)

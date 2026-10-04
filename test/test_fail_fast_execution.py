@@ -80,3 +80,18 @@ def test_gguf_materialization_error_is_not_cached_as_stored_only(monkeypatch):
         wt.ggml_dequant_ok("Q8_0")
     assert "packed reference failed" in str(error.value.__cause__)
     assert "Q8_0" not in wt._DEQ_OK
+
+
+def test_gguf_stored_reference_does_not_probe_materialized_candidate(monkeypatch):
+    """The candidate verifier calls the stored path; it must not call itself."""
+    sentinel = object()
+    key = ("Q8_0", 1, "narrow", False, 0)
+    monkeypatch.setattr(wt, "_adam_backend_ready", lambda: True)
+    monkeypatch.setitem(wt._ggml_k, "added", {key})
+    monkeypatch.setattr(wt, "ggml_dequant_ok", lambda _name: pytest.fail(
+        "stored execution recursively probed materialization"))
+    monkeypatch.setattr(wt, "_ggml_run", lambda *_args, **_kwargs: sentinel)
+
+    x = np.zeros((1, 32), np.float32)
+    assert wt.ggml_matmul(x, object(), "Q8_0", 32, 256,
+                          execution="stored", shape_execution="narrow") is sentinel
