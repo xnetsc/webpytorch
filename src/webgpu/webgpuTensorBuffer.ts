@@ -114,6 +114,7 @@ export class WebGPUTensorBuffer {
 
   async getDataInto(data: Uint8Array): Promise<void> {
     const ctx = getNNWebGPUContext();
+    await ctx.assertPipelinesReady?.();
     ctx.assertAlive?.();
     ctx.flush();  // submit pending dispatches so this readback sees their results
 

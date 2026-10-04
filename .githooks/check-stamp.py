@@ -50,7 +50,7 @@ def blob(path):
 
 
 def sdk_hash(length):
-    fixed = ['dist/wgpy-main.js', 'dist/wgpy-worker.js',
+    fixed = ['dist/wgpy-main.js', 'dist/wgpy-worker.js', 'dist/wgpy-gl-worker.js',
              'dist/wgpy_webgpu-1.0.0-py3-none-any.whl',
              'dist/wgpy_webgl-1.0.0-py3-none-any.whl',
              'webtorch/js/webtorch-main.js', 'webtorch/js/webtorch-host.js',
@@ -82,7 +82,8 @@ def main():
             content = blob(target)
             if content is None:
                 continue                                  # not tracked; nothing to hash
-            if src == 'chat/index.html' and url == '../webtorch/js/webtorch-main.js':
+            if src == 'chat/index.html' and url in ('../webtorch/js/webtorch-main.js',
+                                                     '../dist/wgpy-main.js'):
                 want = sdk_hash(len(m.group('v')))
             else:
                 want = hashlib.sha1(content).hexdigest()[:len(m.group('v'))]

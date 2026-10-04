@@ -96,20 +96,30 @@ def begin_capture_pin(name=None):
     global _capture_depth, _capture_name
     if _capture_depth == 0:
         key = name if name is not None else "?"
-        old = _pins.pop(key, None)
-        if old:
-            plat = get_platform()
-            for bid in old:
-                _pinned_ids.pop(bid, None)
-                shape = _orphaned.pop(bid, None)
-                if shape is not None:
-                    plat.disposeBuffer(bid)
-                    performance_metrics["webgl.buffer.delete"] += 1
-                    performance_metrics["webgl.buffer.buffer_count"] -= 1
-                    performance_metrics["webgl.buffer.buffer_size"] -= _texture_shape_byte_size(shape)
+        if key in _pins:
+            release_capture_pin(key)
         _pins[key] = {}
         _capture_name = key
     _capture_depth += 1
+
+
+def release_capture_pin(name):
+    """Unpin one retired graph and free only its no-longer-owned buffers."""
+    if _capture_depth:
+        raise RuntimeError("cannot release capture pins while recording")
+    old = _pins.pop(name, None)
+    if old is None:
+        raise KeyError("capture %r has no pin record" % name)
+    for bid in old:
+        if any(bid in pins for pins in _pins.values()):
+            continue
+        _pinned_ids.pop(bid, None)
+        shape = _orphaned.pop(bid, None)
+        if shape is not None:
+            get_platform().disposeBuffer(bid)
+            performance_metrics["webgl.buffer.delete"] += 1
+            performance_metrics["webgl.buffer.buffer_count"] -= 1
+            performance_metrics["webgl.buffer.buffer_size"] -= _texture_shape_byte_size(shape)
 
 
 def end_capture_pin():

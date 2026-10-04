@@ -1,4 +1,9 @@
-importScripts('/lib/pyodide/pyodide.js');
+// Match the product worker's pinned Pyodide release. The old hard-coded local
+// path is absent in a normal checkout and made the browser test worker die
+// before it could report a test result.
+importScripts('/chat/pyodide-version.js');
+const PYODIDE_URL = self.PYODIDE_URL || self.PYODIDE_CDN;
+importScripts(PYODIDE_URL + 'pyodide.js');
 importScripts('/dist/wgpy-worker.js');
 
 let pyodide;
@@ -21,7 +26,7 @@ async function start(backend, testPath) {
 
   log(`Loading pyodide with wgpy (backend: ${backend})`);
   pyodide = await loadPyodide({
-    indexURL: '/lib/pyodide/',
+    indexURL: PYODIDE_URL,
     stdout: log,
     stderr: log,
   });

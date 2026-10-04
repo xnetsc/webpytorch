@@ -92,6 +92,12 @@ class WebGLPlatform:
         reset_capture_pins()
         return gl.resetCaptures()
 
+    def releaseCapture(self, name):
+        from wgpy_backends.webgl.webgl_buffer import release_capture_pin
+        result = gl.releaseCapture(name)
+        release_capture_pin(name)
+        return result
+
     def replay(self, name):
         return gl.replay(name)
 

@@ -11,7 +11,7 @@ test('opt-in GPU timestamp uses the browser compute-pass descriptor and releases
   }).outputText;
   const actions = [];
   const marker = { __wgpyProfileNextPass: true };
-  const ticks = new BigUint64Array([0n, 393216n]);
+  const ticks = new BigUint64Array([0n, 393216n, 0n, 393216n]);
   const query = { destroy() { actions.push('query destroyed'); } };
   const readback = {
     mapAsync: async () => {},
@@ -87,4 +87,27 @@ test('opt-in GPU timestamp uses the browser compute-pass descriptor and releases
     [item.index, item.dispatches, item.gpuMs]), [
     [2, 1, 0.393216], [3, 1, 0.393216],
   ]);
+
+  marker.__wgpyProfileAllPasses = false;
+  marker.__wgpyProfileKernelNames = ['probe'];
+  marker.__wgpySelectedKernelPasses = [];
+  const submittedBefore = actions.filter(action => action === 'submitted').length;
+  ctx.runKernel({ pipelineName: 'probe', tensorBuffers: [],
+                  workGroups: { x: 1, y: 1, z: 1 } });
+  ctx.runKernel({ pipelineName: 'probe', tensorBuffers: [],
+                  workGroups: { x: 1, y: 1, z: 1 } });
+  ctx.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(actions.filter(action => action === 'submitted').length, submittedBefore + 1);
+  assert.deepEqual(Array.from(marker.__wgpySelectedKernelPasses, item =>
+    [item.dispatches, item.byName.probe.count, item.byName.probe.gpuMs]),
+    [[2, 2, 0.786432]]);
+
+  marker.__wgpyProfileKernelWorkgroups = true;
+  marker.__wgpySelectedKernelPasses = [];
+  ctx.runKernel({ pipelineName: 'probe', tensorBuffers: [],
+                  workGroups: { x: 2, y: 3, z: 4 } });
+  ctx.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(marker.__wgpySelectedKernelPasses[0].byName['probe@2x3x4'].count, 1);
 });

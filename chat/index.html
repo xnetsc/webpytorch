@@ -153,6 +153,7 @@
         “custom” accepts another hub repository. “on this device” reads a file or folder
         from disk — nothing is copied or cached.</p>
       <input id="localModelInput" type="file" accept=".gguf,application/octet-stream" hidden />
+      <input id="localDirInput" type="file" webkitdirectory multiple hidden />
       <div class="row btns">
         <button id="loadBtn" class="primary">Load model</button>
         <button id="releaseBtn">Release</button>
@@ -349,8 +350,8 @@
 </dialog>
 
 <script src="pyodide-version.js"></script>
-<script src="../dist/wgpy-main.js?v=16c9ea97d3"></script>
-<script src="../webtorch/js/webtorch-main.js?v=9ef7514292"></script>
+<script src="../dist/wgpy-main.js?v=3330431b87"></script>
+<script src="../webtorch/js/webtorch-main.js?v=3330431b87"></script>
 <script src="../webtorch/js/decision-vision.js"></script>
 <!-- The SDK needs the document cross-origin isolated or the model runs on the CPU. On a
      static host that means a service worker, and a client has only one, so it is the SDK's.
@@ -368,6 +369,6 @@ webtorch.installServiceWorker({
 });
 </script>
 <script src="zip.js?v=eadad49463"></script>
-<script src="app.js?v=76dfea11a1"></script>
+<script src="app.js?v=62b3f72779"></script>
 </body>
 </html>

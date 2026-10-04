@@ -250,6 +250,13 @@ class WebGPUPlatform:
         reset_capture_pins()
         return result
 
+    def releaseCapture(self, name):
+        """Retire one cold graph without disabling recording for other shapes."""
+        from wgpy_backends.webgpu.webgpu_buffer import release_capture_pin
+        result = gpu.releaseCapture(name)
+        release_capture_pin(name)
+        return result
+
     def replay(self, name):
         return gpu.replay(name)
 

@@ -167,7 +167,7 @@ test('local multi-file model UI states that ZIP archives must be extracted first
 
 test('local GGUF selection passes a direct disk-backed File to the SDK', () => {
   assert.match(htmlSource, /id="localModelInput"[^>]*type="file"[^>]*accept="[^"]*\.gguf/);
-  assert.match(appSource, /input\.files && input\.files\[0\]/);
+  assert.match(appSource, /event\.target\.files && event\.target\.files\[0\]/);
   assert.match(appSource, /cache\.import\(handle, name\)/);
   assert.match(appSource, /localModelIds\.add\(id\)/);
   const localBranch = appSource.slice(appSource.indexOf('if (localModelIds.has(id))'),
@@ -179,9 +179,89 @@ test('local GGUF selection passes a direct disk-backed File to the SDK', () => {
 
 test('local GGUF picker has no duplicate visible Settings field', () => {
   assert.match(htmlSource, /id="localModelInput" type="file"[^>]*hidden/);
+  assert.match(htmlSource, /id="localDirInput" type="file" webkitdirectory multiple hidden/);
   assert.doesNotMatch(htmlSource, /<span>GGUF on this device<\/span>/);
   assert.match(appSource, /\['local-file', 'Load a GGUF file from this device/);
-  assert.match(appSource, /localPick\('local-file', \(\) => \{\}, event\.target\.files\[0\]\)/);
+  assert.match(appSource, /localPick\('local-file', event\.target\.files\[0\]\)/);
+  assert.doesNotMatch(htmlSource, /id="localPickerHint"/);
+  assert.match(appSource, /const which = sel\.value;\s*sel\.value = lastGoodModelPreset;\s*openLocalPicker\(which\)/);
+});
+
+test('local model folder reads each disk-backed file without a network source', () => {
+  assert.match(appSource, /files = selectedFiles \|\| \[\]/);
+  assert.match(appSource, /localPick\('local-dir', null, Array\.from\(event\.target\.files\)\)/);
+  assert.match(appSource, /runner\.cache\.import\(file, name \+ '\/' \+ relative\)/);
+});
+
+test('Load cannot use a stale remote ID when a local picker option is selected', () => {
+  const start = appSource.indexOf("$('#loadBtn').onclick = async () => {");
+  const localGuard = appSource.indexOf("localChoice === 'local-file' || localChoice === 'local-dir'", start);
+  const modelId = appSource.indexOf("const id = $('#modelId').value.trim()", start);
+  assert.ok(start >= 0 && localGuard > start && modelId > localGuard);
+  assert.match(appSource.slice(localGuard, modelId), /\$\('#preset'\)\.value = lastGoodModelPreset/);
+  assert.match(appSource.slice(localGuard, modelId), /openLocalPicker\(localChoice\)/);
+  assert.match(appSource.slice(localGuard, modelId), /return;/);
+});
+
+test('a loaded model cannot silently latch a disabled local picker', () => {
+  assert.match(appSource, /\$\('#preset'\)\.disabled = boot \|\| modelLoaded/);
+  assert.match(appSource.slice(appSource.indexOf('function afterRelease()'),
+                               appSource.indexOf('function showStatus(')), /modelLoaded = false[\s\S]*syncButtons\(\)/);
+  assert.match(appSource.slice(appSource.indexOf('function afterLoad(m)'),
+                               appSource.indexOf('function onToken(')), /modelLoaded = true[\s\S]*syncButtons\(\)/);
+  assert.match(appSource, /\$\('#localDirInput'\)\.disabled = boot \|\| modelLoaded/);
+  assert.match(appSource, /if \(modelLoaded \|\| loading\) \{/);
+  const localPickBlock = appSource.slice(appSource.indexOf('async function localPick('),
+                                         appSource.indexOf("$('#localModelInput').addEventListener('change'"));
+  assert.doesNotMatch(localPickBlock, /localPickWaiting|new Promise\(\(resolve, reject\)/);
+  assert.match(appSource, /function openLocalPicker\(which\) \{/);
+  assert.match(appSource, /input\.click\(\)/);
+});
+
+test('model selector and native inputs disable on load, then re-enable on release', () => {
+  const start = appSource.indexOf('function syncButtons() {');
+  const end = appSource.indexOf('\n}', start);
+  const nodes = new Map();
+  const context = vm.createContext({
+    envReady: true, modelLoaded: false, modelImage: false, streaming: null,
+    $: selector => {
+      if (!nodes.has(selector)) nodes.set(selector, { classList: { toggle() {} } });
+      return nodes.get(selector);
+    },
+  });
+  vm.runInContext(`${appSource.slice(start, end + 2)}\nthis.sync = syncButtons;`, context);
+  const check = (expected) => {
+    context.sync();
+    for (const selector of ['#preset', '#localModelInput', '#localDirInput']) {
+      assert.equal(nodes.get(selector).disabled, expected, selector);
+    }
+    assert.equal(nodes.get('#releaseBtn').disabled, !expected);
+  };
+  check(false);
+  context.modelLoaded = true;
+  check(true);
+  context.modelLoaded = false;
+  check(false);
+});
+
+test('cancelling a local directory action leaves the same option selectable again', async () => {
+  const fill = appSource.indexOf('function fillPresets()');
+  const start = appSource.indexOf('sel.onchange = async () => {', fill);
+  const end = appSource.indexOf('\n  };', start);
+  const opened = [];
+  const context = vm.createContext({
+    sel: { value: 'local-dir' },
+    PRESETS: [{ repo: 'existing/model' }],
+    lastGoodModelPreset: '0',
+    openLocalPicker: which => opened.push(which),
+  });
+  vm.runInContext(appSource.slice(start, end + 5), context);
+  await context.sel.onchange();
+  assert.equal(context.sel.value, '0');
+  context.sel.value = 'local-dir';
+  await context.sel.onchange();
+  assert.equal(context.sel.value, '0');
+  assert.deepEqual(opened, ['local-dir', 'local-dir']);
 });
 
 test('local model status never claims a browser cache copy', () => {

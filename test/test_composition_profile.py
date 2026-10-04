@@ -18,7 +18,11 @@ def test_recorded_device_profile_is_build_bound_and_importable(monkeypatch):
     path = (Path(__file__).resolve().parents[1] / "profiles"
             / "webgpu_apple_metal3_2026-10-04.json")
     profile = json.loads(path.read_text())
-    assert profile["build"] == wt._kernel_build()
+    # A new kernel build must reject the historical device measurement. Test
+    # the old profile's import schema only under its recorded build stamp.
+    if profile["build"] != wt._kernel_build():
+        assert wt.use_kernel_profile(profile) == 0
+        monkeypatch.setattr(wt, "_kernel_build", lambda: profile["build"])
     assert profile["provenance"]["page_tok_s_range"][1] < 140
     key = profile["provenance"]["decode_profile_key"]
     assert profile["tuned"][key]["plan"] == [
@@ -81,6 +85,7 @@ def test_whole_prefill_calibration_checks_result_before_saving(monkeypatch,
     monkeypatch.setattr(wt, "_webgl_ready", lambda: True)
     monkeypatch.setattr(wt, "KVCache", lambda *args: object())
     monkeypatch.setattr(wt, "_measured_choice", lambda *args, **kw: "device")
+    monkeypatch.setattr(wt, "_gpu_release_idle_pool", lambda: None)
     stacked = {"gate": SimpleNamespace(n_experts=8),
                "gate_up": SimpleNamespace(type_name="Q3_K"),
                "down": SimpleNamespace(type_name="Q3_K")}

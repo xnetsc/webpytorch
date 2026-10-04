@@ -7,6 +7,7 @@ const webgl = await readFile(new URL('../src/webgl/webglContext.ts', import.meta
 const webgpu = await readFile(new URL('../src/webgpu/webgpuContext.ts', import.meta.url), 'utf8');
 const gpuBuffer = await readFile(new URL('../src/webgpu/webgpuTensorBuffer.ts', import.meta.url), 'utf8');
 const glCompute = await readFile(new URL('../src/webgl/webglComputeContext.ts', import.meta.url), 'utf8');
+const glWorker = await readFile(new URL('../src/webgl/webglWorker.ts', import.meta.url), 'utf8');
 const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8');
 const glPlatform = await readFile(new URL('../webgl/wgpy_backends/webgl/platform.py', import.meta.url), 'utf8');
 const chat = await readFile(new URL('../chat/app.js', import.meta.url), 'utf8');
@@ -36,7 +37,8 @@ test('a failed WebGL readback wakes the worker and Python refuses stale data', (
 });
 
 test('WebGL accounts live texture bytes in JS shared memory without a Python GPU query', () => {
-  assert.match(main, /contextGL\?\.setResourceStats\(e\.data\.channels\?\.stat \|\| null\)/);
+  assert.match(main, /glWorker\?\.postMessage\(\{ __webtorch: 'channels', stat: e\.data\.channels\?\.stat \|\| null \}\)/);
+  assert.match(glWorker, /context\.setResourceStats\(message\.stat \|\| null\)/);
   assert.match(glCompute, /setResourceStats\(memory: SharedArrayBuffer \| null\)/);
   assert.match(glCompute, /this\.heldTextureBytes \+= bytes/);
   assert.match(glCompute, /this\.heldTextureBytes -= this\.textureBytes\.get\(id\) \|\| 0/);

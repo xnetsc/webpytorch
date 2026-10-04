@@ -59,3 +59,56 @@ assert ("dispose", 12) not in events
     result = subprocess.run([sys.executable, "-c", script], cwd=root, env=env,
                             capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_release_one_capture_keeps_shared_pins_and_frees_only_its_orphans():
+    script = r'''
+import sys, types
+
+events = []
+class GPU:
+    def releaseCapture(self, name):
+        events.append(("release", name))
+    def disposeBuffer(self, bid):
+        events.append(("dispose", bid))
+
+sys.modules["js"] = types.SimpleNamespace(gpu=GPU())
+from wgpy_backends.webgpu import webgpu_buffer as wb
+from wgpy_backends.webgpu.platform import WebGPUPlatform
+from wgpy_backends.webgpu.texture import WebGPUArrayTextureShape
+
+plat = WebGPUPlatform()
+wb.get_platform = lambda: plat
+shape = WebGPUArrayTextureShape(64, "f32", "f32")
+for bid in (11, 12, 13):
+    plat._gpu_note(bid, 64)
+wb.performance_metrics["webgpu.buffer.buffer_count"] = 3
+wb.performance_metrics["webgpu.buffer.buffer_size"] = 192
+
+wb.begin_capture_pin("cold")
+wb._maybe_pin(11, 64)
+wb._maybe_pin(12, 64)
+wb.end_capture_pin()
+wb.begin_capture_pin("hot")
+wb._maybe_pin(12, 64)
+wb._maybe_pin(13, 64)
+wb.end_capture_pin()
+wb._pool_put(shape, 11)
+wb._pool_put(shape, 12)
+
+plat.releaseCapture("cold")
+assert events == [("release", "cold"), ("dispose", 11)]
+assert 12 in wb._pinned_ids and 12 in wb._orphaned
+assert 13 in wb._pinned_ids
+plat.releaseCapture("hot")
+assert events == [("release", "cold"), ("dispose", 11),
+                  ("release", "hot"), ("dispose", 12)]
+assert not wb._pinned_ids and not wb._orphaned
+assert plat.gpuBytes()[0] == 64  # live 13 is still owned by Python
+'''
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root / "webgpu")
+    result = subprocess.run([sys.executable, "-c", script], cwd=root, env=env,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -477,12 +477,59 @@ def batched_matmul_impl(
     B, m, k = lhs.shape
     B2, k2, n = rhs.shape
     assert B == B2 and k == k2, f"batched_matmul shape mismatch: {lhs.shape} @ {rhs.shape}"
-    kernel_name = "batched_matmul"
+    # An attention matrix has many output rows and columns but a short head
+    # dimension. The scalar kernel rereads each K/V lane for every output cell;
+    # a workgroup tile shares those reads across 16 rows and columns. Keep the
+    # scalar path for small query counts, where barriers cost more than reuse.
+    tiled = B >= 2 and m >= 32 and n >= 32 and 32 <= k <= 256
+    kernel_name = "batched_matmul_tiled16" if tiled else "batched_matmul"
     if kernel_name not in added_kernels:
         get_platform().addKernel(
             kernel_name,
             {
-                "source": """@group(0) @binding(0)
+                "source": ("""@group(0) @binding(0)
+var<storage,read> array_a: array<f32>;
+@group(0) @binding(1) var<storage,read> array_b: array<f32>;
+@group(0) @binding(2) var<storage,read_write> array_c: array<f32>;
+struct CMeta {
+B:u32, M:u32, N:u32, K:u32,
+A_OFF:u32, A_SB:u32, A_SM:u32, A_SK:u32,
+B_OFF:u32, B_SB:u32, B_SK:u32, B_SN:u32, alpha:f32,
+}
+@group(0) @binding(3) var<storage,read> cmeta: CMeta;
+var<workgroup> tile_a: array<array<f32, 16>, 16>;
+var<workgroup> tile_b: array<array<f32, 16>, 16>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) group:vec3<u32>,
+        @builtin(local_invocation_id) lane:vec3<u32>) {
+  let row = group.y * 16u + lane.y;
+  let col = group.x * 16u + lane.x;
+  let batch = group.z;
+  var sum = 0.0;
+  for (var base:u32 = 0u; base < cmeta.K; base = base + 16u) {
+    let ak = base + lane.x;
+    let bk = base + lane.y;
+    var av = 0.0;
+    var bv = 0.0;
+    if (row < cmeta.M && ak < cmeta.K) {
+      av = array_a[cmeta.A_OFF + batch*cmeta.A_SB + row*cmeta.A_SM + ak*cmeta.A_SK];
+    }
+    if (bk < cmeta.K && col < cmeta.N) {
+      bv = array_b[cmeta.B_OFF + batch*cmeta.B_SB + bk*cmeta.B_SK + col*cmeta.B_SN];
+    }
+    tile_a[lane.y][lane.x] = av;
+    tile_b[lane.y][lane.x] = bv;
+    workgroupBarrier();
+    for (var t:u32 = 0u; t < 16u; t = t + 1u) {
+      sum = sum + tile_a[lane.y][t] * tile_b[t][lane.x];
+    }
+    workgroupBarrier();
+  }
+  if (row < cmeta.M && col < cmeta.N) {
+    array_c[batch*cmeta.M*cmeta.N + row*cmeta.N + col] = sum*cmeta.alpha;
+  }
+}
+""" if tiled else """@group(0) @binding(0)
 var<storage,read> array_a: array<f32>;
 
 @group(0) @binding(1)
@@ -526,7 +573,7 @@ sum = array_a[cmeta.A_OFF + z * cmeta.A_SB + y * cmeta.A_SM + k * cmeta.A_SK] * 
 }
 array_c[z * cmeta.M * cmeta.N + y * cmeta.N + x] = sum * cmeta.alpha;
 }
-""",
+"""),
                 "bindingTypes": [
                     "read-only-storage",
                     "read-only-storage",
@@ -569,8 +616,8 @@ array_c[z * cmeta.M * cmeta.N + y * cmeta.N + x] = sum * cmeta.alpha;
                 meta.buffer_id,
             ],
             "workGroups": {
-                "x": int(math.ceil(n / 8)),
-                "y": int(math.ceil(m / 8)),
+                "x": int(math.ceil(n / (16 if tiled else 8))),
+                "y": int(math.ceil(m / (16 if tiled else 8))),
                 "z": int(B),
             },
         }

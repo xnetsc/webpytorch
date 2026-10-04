@@ -23,7 +23,7 @@ h() { shasum -a 1 "$1" | cut -c1-10; }
 # by webtorch.start(): both worker bootstraps, the module manifest, and all Python modules.
 sdk_hash() {
   {
-    for f in dist/wgpy-main.js dist/wgpy-worker.js \
+    for f in dist/wgpy-main.js dist/wgpy-worker.js dist/wgpy-gl-worker.js \
              dist/wgpy_webgpu-1.0.0-py3-none-any.whl \
              dist/wgpy_webgl-1.0.0-py3-none-any.whl \
              webtorch/js/webtorch-main.js webtorch/js/webtorch-host.js \
@@ -55,7 +55,7 @@ stamp_href() {                     # file, path-as-written, real-path
 }
 
 stamp_href chat/index.html "style.css"                     chat/style.css
-stamp_html chat/index.html "../dist/wgpy-main.js"          dist/wgpy-main.js
+stamp_html_version chat/index.html "../dist/wgpy-main.js" "$(sdk_hash)"
 stamp_html_version chat/index.html "../webtorch/js/webtorch-main.js" "$(sdk_hash)"
 stamp_html chat/index.html "zip.js"                        chat/zip.js
 stamp_html chat/index.html "app.js"                        chat/app.js

@@ -54,6 +54,7 @@ export interface ComputeContextGPUMessageGetData {
     id: number;
     data: SharedArrayBuffer;
     notify: SharedArrayBuffer;
+    error?: SharedArrayBuffer;
 }
 export interface ComputeContextGPUMessageSampleLogitsDevice {
     method: 'gpu.sampleLogitsDevice';
@@ -63,6 +64,7 @@ export interface ComputeContextGPUMessageSampleLogitsDevice {
     random: number;
     data?: SharedArrayBuffer;
     notify?: SharedArrayBuffer;
+    error?: SharedArrayBuffer;
 }
 export interface ComputeContextGPUMessageAddKernel {
     method: 'gpu.addKernel';
@@ -90,7 +92,11 @@ export interface ComputeContextGPUMessageReplay {
 export interface ComputeContextGPUMessageResetCaptures {
     method: 'gpu.resetCaptures';
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures;
+export interface ComputeContextGPUMessageReleaseCapture {
+    method: 'gpu.releaseCapture';
+    name: string;
+}
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;
@@ -106,6 +112,7 @@ export declare class ComputeContextGPU {
     disposeBuffer(id: number): void;
     beginCapture(name: string): void;
     endCapture(): void;
+    releaseCapture(name: string): void;
     resetCaptures(): void;
     replay(name: string): void;
     setData(id: number, data: Uint8Array): void | Promise<void>;
@@ -119,6 +126,7 @@ export declare class ComputeContextGPU {
     runKernel(descriptor: GPUKernelRunDescriptor): void;
     mdata: SharedArrayBuffer | null;
     mnotify: Int32Array | null;
+    merror: SharedArrayBuffer | null;
     uploadMemory: SharedArrayBuffer | null;
     uploadNotify: Int32Array | null;
     handleMessage(message: ComputeContextGPUMessage, worker: Worker): void;

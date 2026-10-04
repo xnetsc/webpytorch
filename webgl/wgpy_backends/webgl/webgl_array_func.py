@@ -181,7 +181,18 @@ void main() {{
             for in_array in [lhs, rhs]:
                 assert out.buffer.buffer_id != in_array.buffer.buffer_id
             assert out.shape == (m, n)
-        kernel_name = f"matmul_{m}_{n}_{k}"
+        # A complete KxN matrix stored as an N-wide texture has its logical
+        # (k, n) coordinates directly in the texture.  This removes the
+        # per-multiply integer division/modulo on the weight side without
+        # changing the stored values or the accumulation order.  Views and
+        # general flat textures continue through the original addressing path.
+        row_rhs = (
+            rhs.flags.c_contiguous_full
+            and rhs.buffer.texture_shape.width == n
+            and rhs.buffer.texture_shape.height == k
+            and rhs.strides == (n * rhs.itemsize, rhs.itemsize)
+        )
+        kernel_name = f"matmul_{m}_{n}_{k}" + ("_rowrhs" if row_rhs else "")
         if kernel_name not in added_kernels:
             get_platform().addKernel(
                 kernel_name,
@@ -199,6 +210,15 @@ precision highp usampler2DArray;
 #define M {m}
 #define N {n}
 #define K {k}
+#define ROW_RHS {int(row_rhs)}
+
+#if ROW_RHS
+#define RHS_Y(flat, row) (row)
+#define RHS_X(flat, row) (oj)
+#else
+#define RHS_Y(flat, row) ((flat) / rw)
+#define RHS_X(flat, row) ((flat) - (row) * rw)
+#endif
 
 uniform int _ka_tex_output_texture_w;
 uniform int LHS_STRIDE_0;
@@ -244,27 +264,27 @@ void main() {{
     float s = 0.0;
     int k = 0;
     for (; k + 4 <= K; k += 4) {{
-        int ly0 = lf / lw; int ry0 = rf / rw;
+        int ly0 = lf / lw; int ry0 = RHS_Y(rf, k);
         s += texelFetch(tex_lhs, ivec2(lf - ly0 * lw, ly0), 0).r
-           * texelFetch(tex_rhs, ivec2(rf - ry0 * rw, ry0), 0).r;
+           * texelFetch(tex_rhs, ivec2(RHS_X(rf, ry0), ry0), 0).r;
         lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
-        int ly1 = lf / lw; int ry1 = rf / rw;
+        int ly1 = lf / lw; int ry1 = RHS_Y(rf, k + 1);
         s += texelFetch(tex_lhs, ivec2(lf - ly1 * lw, ly1), 0).r
-           * texelFetch(tex_rhs, ivec2(rf - ry1 * rw, ry1), 0).r;
+           * texelFetch(tex_rhs, ivec2(RHS_X(rf, ry1), ry1), 0).r;
         lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
-        int ly2 = lf / lw; int ry2 = rf / rw;
+        int ly2 = lf / lw; int ry2 = RHS_Y(rf, k + 2);
         s += texelFetch(tex_lhs, ivec2(lf - ly2 * lw, ly2), 0).r
-           * texelFetch(tex_rhs, ivec2(rf - ry2 * rw, ry2), 0).r;
+           * texelFetch(tex_rhs, ivec2(RHS_X(rf, ry2), ry2), 0).r;
         lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
-        int ly3 = lf / lw; int ry3 = rf / rw;
+        int ly3 = lf / lw; int ry3 = RHS_Y(rf, k + 3);
         s += texelFetch(tex_lhs, ivec2(lf - ly3 * lw, ly3), 0).r
-           * texelFetch(tex_rhs, ivec2(rf - ry3 * rw, ry3), 0).r;
+           * texelFetch(tex_rhs, ivec2(RHS_X(rf, ry3), ry3), 0).r;
         lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
     }}
     for (; k < K; k++) {{
-        int ly = lf / lw; int ry = rf / rw;
+        int ly = lf / lw; int ry = RHS_Y(rf, k);
         s += texelFetch(tex_lhs, ivec2(lf - ly * lw, ly), 0).r
-           * texelFetch(tex_rhs, ivec2(rf - ry * rw, ry), 0).r;
+           * texelFetch(tex_rhs, ivec2(RHS_X(rf, ry), ry), 0).r;
         lf += LHS_STRIDE_1; rf += RHS_STRIDE_0;
     }}
     fragColor = s;

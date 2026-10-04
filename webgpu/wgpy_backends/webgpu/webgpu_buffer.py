@@ -104,19 +104,30 @@ def begin_capture_pin(name=None):
     global _capture_depth, _capture_name
     if _capture_depth == 0:
         key = name if name is not None else "?"
-        old = _pins.pop(key, None)
-        if old:
-            for bid in old:
-                _pinned_ids.pop(bid, None)
-                shape = _orphaned.pop(bid, None)
-                if shape is not None:
-                    get_platform().disposeBuffer(bid)
-                    performance_metrics["webgpu.buffer.delete"] += 1
-                    performance_metrics["webgpu.buffer.buffer_count"] -= 1
-                    performance_metrics["webgpu.buffer.buffer_size"] -= shape.byte_length
+        if key in _pins:
+            release_capture_pin(key)
         _pins[key] = {}
         _capture_name = key
     _capture_depth += 1
+
+
+def release_capture_pin(name):
+    """Unpin one retired graph; retain IDs still used by any other recording."""
+    if _capture_depth:
+        raise RuntimeError("cannot release capture pins while recording")
+    old = _pins.pop(name, None)
+    if old is None:
+        raise KeyError("capture %r has no pin record" % name)
+    for bid in old:
+        if any(bid in pins for pins in _pins.values()):
+            continue
+        _pinned_ids.pop(bid, None)
+        shape = _orphaned.pop(bid, None)
+        if shape is not None:
+            get_platform().disposeBuffer(bid)
+            performance_metrics["webgpu.buffer.delete"] += 1
+            performance_metrics["webgpu.buffer.buffer_count"] -= 1
+            performance_metrics["webgpu.buffer.buffer_size"] -= shape.byte_length
 
 
 def end_capture_pin():

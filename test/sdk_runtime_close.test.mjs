@@ -108,3 +108,56 @@ test('a shared resource snapshot reports zero GPU bytes after release', async ()
   assert.equal(api.resources().gpuPeak, 8192);
   api.close();
 });
+
+test('an unavailable or failing requested GPU backend never becomes CPU', async () => {
+  const messages = [];
+  const root = { navigator: { gpu: {} } };
+  vm.runInNewContext(source, {
+    self: root, navigator: root.navigator, document: {}, console, SharedArrayBuffer,
+  });
+  const worker = { postMessage: value => messages.push(value), addEventListener() {} };
+  await assert.rejects(root.webtorch.initMain(worker, { backendOrder: ['webgpu'] }),
+                       /wgpy-main.js/);
+  assert.equal(messages.length, 0);
+  root.wgpy = { initMain: async () => { throw new Error('device lost'); } };
+  await assert.rejects(root.webtorch.initMain(worker, { backendOrder: ['webgpu'] }),
+                       /device lost/);
+  assert.equal(messages.length, 0);
+  const cpu = await root.webtorch.initMain(worker, { backendOrder: [] });
+  assert.equal(cpu.backend, 'cpu');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].backend, 'cpu');
+});
+
+test('SDK rejects a worker backend mismatch and releases the runtime', async () => {
+  let worker, disposals = 0;
+  class FakeWorker {
+    listeners = new Map();
+    terminated = 0;
+    constructor() { worker = this; }
+    addEventListener(name, fn) {
+      const list = this.listeners.get(name) || [];
+      list.push(fn); this.listeners.set(name, list);
+    }
+    postMessage(message) {
+      if (message.method !== 'start') return;
+      queueMicrotask(() => {
+        for (const fn of this.listeners.get('message') || []) {
+          fn({ data: { __wt: 'reply', id: message.id, ok: true,
+                       value: { backend: 'cpu' } } });
+        }
+      });
+    }
+    terminate() { this.terminated++; }
+  }
+  const root = {};
+  vm.runInNewContext(source, {
+    self: root, location: { href: 'http://localhost/chat/' }, Worker: FakeWorker,
+    URL, URLSearchParams, console, navigator: {}, document: {}, queueMicrotask,
+  });
+  root.webtorch.initMain = async () => ({ backend: 'webgpu',
+    tasks: { cancel() {}, resources() {} }, dispose: () => { disposals++; } });
+  await assert.rejects(root.webtorch.start({ baseURL: '../' }), /backend mismatch/);
+  assert.equal(worker.terminated, 1);
+  assert.equal(disposals, 1);
+});

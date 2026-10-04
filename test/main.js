@@ -9,6 +9,12 @@ async function run() {
   const backend = document.querySelector('input[name="backend"]:checked').value;
   console.log(`backend: ${backend}`);
   const worker = new Worker('worker.js');
+  worker.addEventListener('error', (event) => {
+    log(`Worker error: ${event.message}`);
+  });
+  worker.addEventListener('messageerror', () => {
+    log('Worker message could not be decoded');
+  });
 
   log('Initializing wgpy main-thread-side javascript interface');
   try {

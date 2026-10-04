@@ -16,6 +16,8 @@ opinion about the model, it is arithmetic.
 What a caller gets is `encode(ids) -> (T, hidden)`. What it does with those vectors -- pool
 them, score some of them, classify them -- is not this module's business.
 """
+import time
+
 import numpy as np
 
 from . import _core as wt
@@ -168,7 +170,13 @@ class TextEncoder(wt.Module):
             if a is None:
                 raise KeyError(name)
             a = _f32(a)
-            got = Tensor(np.ascontiguousarray(a.T) if transposed else a)
+            if transposed:
+                matrix = np.ascontiguousarray(a.T)
+                got = wt.webgl_half_matrix(matrix)
+                if got is None:
+                    got = Tensor(matrix)
+            else:
+                got = Tensor(a)
             self._ten[key] = got
             if not (transposed and (name, False) in self._ten):
                 self._src.pop(name, None)          # the file's copy is no longer needed
@@ -272,6 +280,15 @@ class TextEncoder(wt.Module):
         than off the config field, because the field states the full width and the attention
         module and the mask builder disagree by one about what to do with it.
         """
+        return Tensor(self._mask_array(T, valid, kind, B))
+
+    def _mask_array(self, T, valid, kind, B=1):
+        """Build the mask once on the host when filling a captured input buffer.
+
+        A capture input must be uploaded, but creating a temporary device Tensor and
+        reading it straight back first adds two transfers with no arithmetic benefit.
+        The ordinary uncaptured path wraps the same values in a Tensor via ``_mask``.
+        """
         base = np.zeros((T, T), dtype=np.float32)
         if kind == "sliding_attention" and self.cfg.window:
             idx = np.arange(T)
@@ -281,7 +298,7 @@ class TextEncoder(wt.Module):
             if valid is not None:
                 m = base.copy()
                 m[:, np.asarray(valid[0] if np.ndim(valid) == 2 else valid) == 0] = -1e9
-            return Tensor(m)
+            return m
         # One mask per sequence, repeated for that sequence's heads, because what is padding
         # differs between them. The scores this is added to are (B*heads, T, T), so the rows
         # have to line up with that ordering: sequence outermost, head inside it.
@@ -292,7 +309,7 @@ class TextEncoder(wt.Module):
             if valid is not None:
                 mb[:, np.asarray(valid[b]) == 0] = -1e9
             out[b * h:(b + 1) * h] = mb
-        return Tensor(out)
+        return out
 
     def _attn(self, x, layer, kind, mask, B=1):
         h, hd = self.cfg.heads, self.cfg.head_dim
@@ -313,7 +330,7 @@ class TextEncoder(wt.Module):
                 q = qq
                 k = wt.qkv_take(qkv, 1, h, hd, T, cos, sin, B)
                 v = wt.qkv_take(qkv, 2, h, hd, T, B=B)
-                return self._out(q, k, v, mask, p, T, h, hd, B)
+                return self._out(q, k, v, mask, p, T, h, hd, B, kind)
             d = h * hd
             q = wt._slice_last(qkv, 0, d).reshape(B * T, h, hd)
             k = wt._slice_last(qkv, d, 2 * d).reshape(B * T, h, hd)
@@ -340,12 +357,27 @@ class TextEncoder(wt.Module):
         else:
             q, k = wt.apply_rope(q, cos, sin), wt.apply_rope(k, cos, sin)
         v = heads_first(v)
-        return self._out(q, k, v, mask, p, T, h, hd, B)
+        return self._out(q, k, v, mask, p, T, h, hd, B, kind)
 
-    def _out(self, q, k, v, mask, p, T, h, hd, B=1):
+    def _out(self, q, k, v, mask, p, T, h, hd, B=1, kind="full_attention"):
         """Attention over q, k, v laid out as (B*heads, T, head_dim)."""
-        scores = bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))
-        o = bmm(softmax(scores + mask), v)                     # (B*h, T, hd)
+        scale = 1.0 / (hd ** 0.5)
+        if wt._adam_backend_ready() and not (q.requires_grad or k.requires_grad
+                                            or mask.requires_grad):
+            scores = wt.banded_qk_scores(
+                q, k, mask, scale,
+                self.cfg.window if kind == "sliding_attention" else 0)
+            if scores is None:
+                raise RuntimeError("WebGPU fused QK does not support this attention layout")
+        else:
+            # WebGL/CPU and autograd have an explicit equivalent implementation;
+            # a selected WebGPU inference kernel is never silently replaced.
+            scores = bmm(q, transpose_last2(k)) * scale + mask
+        probabilities = softmax(scores)
+        # `banded_pv` remains available to lower-level callers. A standalone
+        # primitive win is insufficient to select it for this enclosing layer;
+        # its full-encoder route still needs a stable positive measurement.
+        o = bmm(probabilities, v)                              # (B*h, T, hd)
         if B == 1:
             o = o.permute(1, 0, 2).reshape(T, h * hd)
         else:
@@ -392,17 +424,25 @@ class TextEncoder(wt.Module):
     _EMB_DEVICE_MAX = 64 << 20          # in elements: 64M floats, 256 MB
 
     def _embed(self, ids):
+        rows = self._host_embedding_rows(ids)
+        if rows is not None:
+            return Tensor(rows)
+        name = self.p + "embeddings.tok_embeddings.weight"
+        return wt.embedding(self._t(name), ids)
+
+    def _host_embedding_rows(self, ids):
+        """Return gathered host rows when the vocabulary is kept off-device."""
         name = self.p + "embeddings.tok_embeddings.weight"
         if self._emb_host is None:
             rows, dim = self.shape_of[name]
             if rows * dim <= self._EMB_DEVICE_MAX:
-                return wt.embedding(self._t(name), ids)
+                return None
             src = self._src.pop(name, None)
             if src is None:
-                return wt.embedding(self._t(name), ids)
+                return None
             src = wt.materialize_weight(src)
             self._emb_host = np.ascontiguousarray(src)       # left at the file's own width
-        return Tensor(_f32(self._emb_host[ids]))
+        return _f32(self._emb_host[ids])
 
     def encode(self, ids, valid=None):
         """Token ids in, one vector per position out. `valid` is 1 for a real token and 0 for
@@ -472,7 +512,7 @@ class TextEncoder(wt.Module):
     _BUCKET = 32
 
     # Rounding is this method's own, so `_replayed` trims the answer back to the length it was
-    # asked about. It has to: padding changes NOTHING on the real positions -- measured on
+    # asked about on the device. It has to: padding changes NOTHING on the real positions -- measured on
     # this checkpoint at 105 to 225 tokens, padding to a multiple of 64 and trimming back
     # leaves the hidden states bit-identical, max absolute difference 0.0 at every length
     # against values of magnitude 42 -- but handing the padded ROWS on is a different thing
@@ -481,13 +521,16 @@ class TextEncoder(wt.Module):
     # were numerically unsound; it is the missing trim. `encode_many` never had the bug, for
     # the same reason: it cuts every sequence back to its own length on the way out.
 
-    # Each retained graph pins its own intermediate buffers, so their number is bounded rather
-    # than left to grow with however many lengths a session happens to see. Once full it stays
-    # full: the backend can drop ALL captures (`resetCaptures`, which release() sends) but not
-    # one of them, so there is no way to retire a cold slot in favour of a warm one. A session
-    # whose lengths drift far from its first few therefore stops benefiting -- visible as
-    # decisions settling back to the uncaptured time, not as anything going wrong.
+    # Each retained graph pins its intermediates, so the slot count is bounded. Retire the
+    # least recently used graph when a repeatedly seen new shape needs a slot; otherwise a
+    # session whose question lengths drift permanently falls back to uncaptured execution.
     _CAP_MAX = 4
+
+    @staticmethod
+    def _capture_platform():
+        if wt._adam_backend_ready():
+            return wt._adam_kernel["platform"]
+        return None
 
     def _replayed(self, ids, T, B, valid):
         """One encoder pass through a recorded command list, or None if that is not on.
@@ -497,86 +540,144 @@ class TextEncoder(wt.Module):
         idle almost the whole time. The arithmetic is not the cost; reaching the device 550
         times from Python inside wasm is. A captured pass issues one command instead.
 
-        Only where the shape can be held still: a single sequence, no autograd, and a backend
-        that records (WebGL does not). Everything else takes the ordinary path.
+        Only where the shape can be held still, with no autograd and a backend that records.
+        Independent question rows use a separate (batch, length) capture: the captured
+        masks preserve each row's own attention boundary and padding.
         """
-        if B != 1 or not self._capture_ok():
+        self._last_capture_timing = None
+        if not self._capture_ok():
             return None
         Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
         if self.cfg.max_positions and Tb > self.cfg.max_positions:
             return None
-        slot = self._cap.get(Tb)
+        # A large batch's B*heads*T*T mask would be pinned by recording. Bound that
+        # allocation; larger shapes keep the ordinary (uncaptured) implementation.
+        if B > 1 and B * self.cfg.heads * Tb * Tb * 4 * len(set(self.cfg.layer_types)) > (32 << 20):
+            return None
+        key = Tb if B == 1 else (B, Tb)
+        slot = self._cap.get(key)
         if slot is None:
-            if Tb not in self._cap_seen:
-                self._cap_seen.add(Tb)
+            if key not in self._cap_seen:
+                self._cap_seen.add(key)
                 return None
             if len(self._cap) >= self._CAP_MAX:
-                return None
-            slot = self._cap_make(Tb)
+                old_key = next(iter(self._cap))
+                old = self._cap[old_key]
+                plat = self._capture_platform()
+                if not hasattr(plat, "releaseCapture"):
+                    raise RuntimeError("WebGPU capture eviction is unavailable")
+                plat.releaseCapture(old["name"])
+                del self._cap[old_key]
+            slot = self._cap_make(Tb) if B == 1 else self._cap_make(Tb, B=B)
             if slot is None:
                 return None
-        self._cap_write(slot, ids, T, valid)
-        plat = wt._adam_kernel["platform"]
+        else:
+            # A repeated shape is hot; keep its recording when the next new shape arrives.
+            self._cap.pop(key)
+            self._cap[key] = slot
+        stage_start = time.perf_counter()
+        if B == 1:
+            self._cap_write(slot, ids, T, valid)
+        else:
+            self._cap_write(slot, ids, T, valid, B=B)
+        write_ms = (time.perf_counter() - stage_start) * 1000
+        plat = self._capture_platform()
+        stage_start = time.perf_counter()
         if slot["recorded"]:
             plat.replay(slot["name"])
         else:
             plat.beginCapture(slot["name"])
-            out = self._layers(slot["x"], slot["masks"], 1)
-            out.numpy()                      # the capture has to include the read it replays
+            out = self._layers(slot["x"], slot["masks"], B)
+            # Kernel dispatches are enqueued eagerly in FIFO order. Reading all hidden rows
+            # here only to upload them again for the decision head costs more than the
+            # replay itself; the head's final small readback synchronises the whole graph.
             plat.endCapture()
             slot["out"] = out
             slot["recorded"] = True
-        # `encode` answers for the ids it was given: undo the rounding. Free, near enough --
-        # the read is already part of the recorded pass, so the rows are on the host anyway
-        # and this is a slice. See the note on _BUCKET for what skipping it costs.
+        submit_ms = (time.perf_counter() - stage_start) * 1000
+        # `encode` answers for the ids it was given: undo the rounding without bringing
+        # every hidden row to the host. See the note on _BUCKET for why trimming is required.
+        stage_start = time.perf_counter()
         if Tb == T:
+            self._last_capture_timing = {"write_ms": round(write_ms, 3),
+                                         "submit_ms": round(submit_ms, 3),
+                                         "trim_ms": 0.0}
             return slot["out"]
-        rows = np.asarray(slot["out"].numpy()).reshape(Tb, -1)[:T]
-        return Tensor(np.ascontiguousarray(rows))
+        rows = (slot["out"][:T] if B == 1 else
+                slot["out"].reshape(B, Tb, self.cfg.hidden)[:, :T]
+                .reshape(B * T, self.cfg.hidden))
+        self._last_capture_timing = {"write_ms": round(write_ms, 3),
+                                     "submit_ms": round(submit_ms, 3),
+                                     "trim_ms": round((time.perf_counter() - stage_start) * 1000, 3)}
+        return rows
 
     def _capture_ok(self):
         if self._cap_off:
             return False
-        try:
-            plat = wt._adam_kernel["platform"]
-            self._cap_off = not (hasattr(plat, "beginCapture") and hasattr(plat, "replay"))
-        except Exception:
-            self._cap_off = True
+        plat = self._capture_platform()
+        self._cap_off = not (hasattr(plat, "beginCapture") and hasattr(plat, "replay"))
+        if wt._adam_backend_ready() and self._cap_off:
+            raise RuntimeError("WebGPU encoder capture is unavailable after backend initialization")
         return not self._cap_off
 
-    def _cap_make(self, Tb):
+    def _cap_make(self, Tb, B=1):
         """Buffers this length's recorded pass reads from. Written before every replay, never
         reallocated -- a capture binds the buffer it saw, so a fresh one would be invisible
         to it and the pass would answer with whatever the first call happened to contain."""
-        try:
-            x = Tensor(np.zeros((Tb, self.cfg.hidden), np.float32))
-            masks = {k: Tensor(np.zeros((Tb, Tb), np.float32))
-                     for k in set(self.cfg.layer_types)}
-        except Exception:
-            self._cap_off = True
-            return None
+        compact_masks = (B > 1 and wt._adam_backend_ready()
+                         and self._emb_host is not None
+                         and self._emb_host.dtype in (np.float16, np.float32))
+        mask_heads = 1 if compact_masks else self.cfg.heads
+        x = Tensor(np.zeros((B * Tb, self.cfg.hidden), np.float32))
+        masks = {k: Tensor(np.zeros((B * mask_heads, Tb, Tb), np.float32)
+                           if B > 1 else np.zeros((Tb, Tb), np.float32))
+                 for k in set(self.cfg.layer_types)}
         slot = {"x": x, "masks": masks, "out": None, "recorded": False,
-                "name": "enc%d_%d" % (id(self) & 0xffff, Tb), "T": Tb}
-        self._cap[Tb] = slot
+                "name": "enc%d_%d_%d" % (id(self) & 0xffff, B, Tb), "T": Tb,
+                "B": B, "mask_heads": mask_heads}
+        self._cap[Tb if B == 1 else (B, Tb)] = slot
         return slot
 
-    def _cap_write(self, slot, ids, T, valid):
+    def _cap_write(self, slot, ids, T, valid, B=1):
         Tb = slot["T"]
+        # The hot batched replay stages every mutable input in the worker's JS shared
+        # arena.  Python supplies references and shape metadata only; JS gathers the
+        # embedding rows, builds every per-question mask, and uploads in one call.
+        if B > 1 and wt._adam_backend_ready() and self._emb_host is not None:
+            dtype = self._emb_host.dtype
+            if dtype == np.float16 or dtype == np.float32:
+                import js
+                mask_ids = {kind: int(mask.data.buffer.buffer_id)
+                            for kind, mask in slot["masks"].items()}
+                js.gpu.stageDecisionCapture(
+                    int(slot["x"].data.buffer.buffer_id), mask_ids,
+                    np.asarray(ids, dtype=np.int64).view(np.uint8),
+                    np.asarray(valid, dtype=np.int64).view(np.uint8),
+                    # Pyodide cannot expose a NumPy float16 buffer as Float16Array in
+                    # browsers without native Float16 JS support. A uint8 *view* is the
+                    # same memory, with no conversion/copy; JS decodes f16 from its bytes.
+                    self._emb_host.view(np.uint8), "f16" if dtype == np.float16 else "f32",
+                    B, T, Tb, self.cfg.hidden, self.cfg.vocab, self.cfg.pad_id or 0,
+                    slot.get("mask_heads", self.cfg.heads), self.cfg.window or 0)
+                return
         pad = self.cfg.pad_id or 0
-        full = np.full(Tb, pad, dtype=np.int64)
-        full[:T] = np.asarray(ids, dtype=np.int64)[:T]
-        live = np.zeros(Tb, dtype=np.int64)
-        live[:T] = 1 if valid is None else np.asarray(
-            valid[0] if np.ndim(valid) == 2 else valid, dtype=np.int64)[:T]
-        emb = self._embed_rows(full)
+        full = np.full((B, Tb), pad, dtype=np.int64)
+        full[:, :T] = np.asarray(ids, dtype=np.int64).reshape(B, T)
+        live = np.zeros((B, Tb), dtype=np.int64)
+        live[:, :T] = (1 if valid is None else
+                       np.asarray(valid, dtype=np.int64).reshape(B, T))
+        emb = self._embed_rows(full.reshape(-1))
         slot["x"].data.buffer.set_data(np.ascontiguousarray(emb, dtype=np.float32).reshape(-1))
         for kind, m in slot["masks"].items():
-            built = self._mask(Tb, [live], kind, 1)
+            built = self._mask_array(Tb, live, kind, B)
             m.data.buffer.set_data(
-                np.ascontiguousarray(np.asarray(built.numpy()), np.float32).reshape(-1))
+                np.ascontiguousarray(built, dtype=np.float32).reshape(-1))
 
     def _embed_rows(self, ids):
         """The embedding rows for `ids`, as a host array."""
+        gathered = self._host_embedding_rows(ids)
+        if gathered is not None:
+            return gathered
         t = self._embed(ids)
         return np.asarray(t.numpy()) if hasattr(t, "numpy") else np.asarray(t.data)
 

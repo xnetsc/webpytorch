@@ -41,31 +41,32 @@
 
   /**
    * Initialise the main-thread half and tell the worker which backend to set up.
-   * Resolves to {backend}: 'webgpu' | 'webgl' | 'cpu'. Never rejects unless
-   * `requireGpu` is set — a CPU fallback is reported, not thrown, so a caller can
-   * decide whether it is acceptable.
+   * Resolves to the requested backend. An empty order explicitly requests CPU;
+   * a failed GPU request is an error, never an implicit CPU downgrade.
    */
   wt.initMain = async function (worker, opts) {
     opts = opts || {};
-    const order = opts.backendOrder || ['webgpu', 'webgl'];
-    let backend = null;
-    let disposeBackend = null;
-    if (typeof root.wgpy === 'undefined') {
-      if (opts.requireGpu) throw new Error('load dist/wgpy-main.js before webtorch-main.js');
-      console.warn('webtorch: wgpy-main.js not loaded, running on CPU');
-    } else if ((backend = pick(order))) {
-      try {
-        const started = await root.wgpy.initMain(worker, { backendOrder: [backend] });
-        disposeBackend = started && started.dispose;
-      } catch (e) {
-        if (opts.requireGpu) throw e;
-        console.warn('webtorch: GPU backend init failed, running on CPU:', e);
-        backend = null;
-      }
-    } else if (opts.requireGpu) {
-      throw new Error('no GPU backend available (tried: ' + order.join(', ') + ')');
+    const order = opts.backendOrder == null ? ['webgpu', 'webgl'] : opts.backendOrder;
+    if (!Array.isArray(order) || order.some(b => b !== 'webgpu' && b !== 'webgl')) {
+      throw new Error('backendOrder must contain only webgpu and webgl; [] requests CPU');
     }
-    backend = backend || 'cpu';
+    let backend = order.length ? pick(order) : 'cpu';
+    let disposeBackend = null;
+    if (order.length) {
+      if (typeof root.wgpy === 'undefined') {
+        throw new Error('load dist/wgpy-main.js before webtorch-main.js');
+      }
+      if (!backend) {
+        throw new Error('no GPU backend available (tried: ' + order.join(', ') + ')');
+      }
+      const started = await root.wgpy.initMain(worker, { backendOrder: [backend] });
+      if (!started || started.backend !== backend) {
+        started?.dispose?.();
+        throw new Error('GPU backend mismatch: requested ' + backend
+                        + ', initialized ' + (started?.backend || 'none'));
+      }
+      disposeBackend = started.dispose;
+    }
     // The worker cannot detect this for itself: it has no device and no Python yet.
     worker.postMessage({ __webtorch: 'backend', backend: backend });
     return { backend: backend, tasks: tasksFor(worker), dispose: disposeBackend };
@@ -350,7 +351,14 @@
       d.ok ? p.resolve(d.value) : p.reject(new Error(d.value));
     });
 
-    const { backend, tasks, dispose } = await wt.initMain(worker, opts);
+    let initial;
+    try {
+      initial = await wt.initMain(worker, opts);
+    } catch (error) {
+      worker.terminate();
+      throw error;
+    }
+    const { backend, tasks, dispose } = initial;
     let closed = false;
 
     function call(method, args, on) {
@@ -451,7 +459,10 @@
         return call('generate', { prompt: prompt, options: rest, images: images }, on);
       },
       /** Score structured questions against a structured state, for a model that decides. */
-      decide: function (state, questions) { return call('decide', { state: state, questions: questions }); },
+      decide: function (state, questions, options) {
+        return call('decide', { state: state, questions: questions,
+                                profile: !!(options && options.profile) });
+      },
       /** Fit decision probabilities on separate labelled held-out examples. */
       calibrate: function (examples, o) {
         o = o || {};
@@ -495,8 +506,18 @@
 
     // Boot now, so `backend` and `reason` are answers rather than promises by the time this
     // returns -- a caller that has to ask twice will forget once.
-    const started = await call('start', { pyodideIndexURL: opts.pyodideIndexURL,
-                                          rememberTuning: !!opts.rememberTuning });
+    let started;
+    try {
+      started = await call('start', { pyodideIndexURL: opts.pyodideIndexURL,
+                                      rememberTuning: !!opts.rememberTuning });
+      if (started.backend !== backend) {
+        throw new Error('backend mismatch: requested ' + backend
+                        + ', worker initialized ' + (started.backend || 'none'));
+      }
+    } catch (error) {
+      try { api.close(); } catch (_) { /* preserve the startup error */ }
+      throw error;
+    }
     api.backend = started.backend;
     api.reason = started.reason || null;
     return api;

@@ -273,13 +273,10 @@ webtorch.set_load_progress(
     lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total"),
                               i.get("after"), i.get("elapsed")))
 # What this device worked out last time.
-try:
-    _kp = js.self.__kp
-    if _kp is not None:
-        _n = webtorch.use_kernel_profile(_kp.to_py() if hasattr(_kp, "to_py") else _kp)
-        js.console.log("kernel profile: reused %d entries" % _n)
-except Exception as _e:
-    pass
+_kp = js.self.__kp
+if _kp is not None:
+    _n = webtorch.use_kernel_profile(_kp.to_py() if hasattr(_kp, "to_py") else _kp)
+    js.console.log("kernel profile: reused %d entries" % _n)
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
@@ -503,7 +500,8 @@ except ImportError:
 
     async decide(a) {
       if (!ready) throw new Error('no runtime');
-      root.__decide_in = JSON.stringify({ state: a.state, questions: a.questions });
+      root.__decide_in = JSON.stringify({ state: a.state, questions: a.questions,
+                                         profile: !!a.profile });
       return await pyJSON(`
 import js, json
 _req = json.loads(js.self.__decide_in)
@@ -512,7 +510,9 @@ if _m is None:
     raise RuntimeError("load a model first")
 if not hasattr(_m, "decide"):
     raise RuntimeError("this model answers by writing text, not by scoring questions")
-json.dumps(_m.decide(_req["state"], _req["questions"]))
+_out = (_m.decide(_req["state"], _req["questions"], profile=True)
+        if _req.get("profile") else _m.decide(_req["state"], _req["questions"]))
+json.dumps(_out)
 `);
     },
 

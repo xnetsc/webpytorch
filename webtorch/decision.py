@@ -20,6 +20,8 @@ gets the numbers to make it with.
 """
 import json
 import math
+import sys
+import time
 import warnings
 
 import numpy as np
@@ -205,11 +207,33 @@ def render_options(shape, criteria):
     return list(crit.keys()), [k if not v else "%s: %s" % (k, v) for k, v in crit.items()]
 
 
+def _question_layout(config, weight_names=()):
+    """Resolve the input contract from the checkpoint, never its repository/model name.
+
+    Weight shapes alone cannot reveal whether questions interacted during training.  An
+    explicit layout declaration is authoritative.  Older per-question-row checkpoints did
+    not write one, so recognize their *complete* config/tensor schema; an unknown schema
+    stays unknown rather than silently receiving independent-question semantics.
+    """
+    declared = config.get("question_layout")
+    if declared is not None:
+        if declared not in ("per_question", "joint"):
+            raise ValueError("unsupported decision question_layout %r" % declared)
+        return declared, "checkpoint_metadata"
+    names = set(weight_names or ())
+    legacy_config = {"max_len", "head_max_len", "head_layers", "max_prefixes"} <= set(config)
+    legacy_head = {"type_emb.weight", "scorer.0.weight", "scorer.3.weight",
+                   "act_head.0.weight", "act_head.2.weight"} <= names
+    if legacy_config and legacy_head and any(n.startswith("head.layers.0.") for n in names):
+        return "per_question", "checkpoint_structure"
+    return None, "undetermined"
+
+
 class DecisionConfig(object):
     """The decision half of the model's own config: how long a sequence may be, how the
     answer distribution is scaled, and which question types exist."""
 
-    def __init__(self, cfg, qtypes=None, type_count=None):
+    def __init__(self, cfg, qtypes=None, type_count=None, weight_names=()):
         c = dict(cfg or {})
         self.type_count = type_count
         self.raw = c
@@ -218,6 +242,7 @@ class DecisionConfig(object):
         self.head_layers = int(c.get("head_layers", 0))
         self.max_questions = int(c.get("max_prefixes", 0) or 0)
         self.option_tokens = int(c.get("option_tokens", 48))
+        self.question_layout, self.question_layout_source = _question_layout(c, weight_names)
         # Post-hoc calibration, fitted by whoever trained the model. Two levels: a
         # temperature per question type, and a finer one per type AND option count, because
         # a two-way question and a twenty-way one do not need the same scaling.
@@ -362,6 +387,12 @@ class DecisionModel(wt.Module):
     """
 
     def __init__(self, enc_cfg, dec_cfg, weights, tokenizer, mask_id, cls_id, sep_id, pad_id):
+        if dec_cfg.question_layout is None:
+            raise ValueError("decision checkpoint does not declare question_layout and its "
+                             "structure does not identify a supported question contract")
+        if dec_cfg.question_layout != "per_question":
+            raise NotImplementedError("decision checkpoint question_layout %r needs a matching "
+                                      "sequence and head adapter" % dec_cfg.question_layout)
         self.cfg = dec_cfg
         self.enc = TextEncoder(enc_cfg, {k: v for k, v in weights.items()
                                          if k.startswith("encoder.")})
@@ -436,13 +467,13 @@ class DecisionModel(wt.Module):
         return self._ten["__zero__"]
 
     # ---- the sequence ----------------------------------------------------------------
-    def build_sequence(self, state, qtype, instructions, criteria):
+    def build_sequence(self, state, qtype, instructions, criteria, *, state_ids=None):
         """`[CLS] <type> question: <instructions> [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]`
 
-        The budget matters as much as the order. Options are written first and in full, and
-        the state gets what is left, because an option that did not fit has no marker and
-        therefore no answer -- while a state that was cut short still answers, just with less
-        to go on.
+        Options are placed ahead of state; if the checkpoint's own head budget overflows,
+        each option is shortened evenly, matching the checkpoint's training/runtime
+        contract. A larger head budget needs an explicit model-side calibration decision,
+        not an implicit change to the scores users already interpret.
         """
         mask_str = self.tok.dec.get(self.mask_id, "")
 
@@ -454,7 +485,7 @@ class DecisionModel(wt.Module):
         opt_ids = [[self.mask_id] + self.tok.encode(" " + clean(o))[:self.cfg.option_tokens]
                    for o in opts]
         budget = self.cfg.head_max_len - sum(len(o) for o in opt_ids)
-        if budget < 16:                       # too many, or too long: shorten all of them evenly
+        if budget < 16:
             per = max(4, (self.cfg.head_max_len - 16) // max(1, len(opt_ids)))
             opt_ids = [o[:per] for o in opt_ids]
             budget = self.cfg.head_max_len - sum(len(o) for o in opt_ids)
@@ -466,11 +497,13 @@ class DecisionModel(wt.Module):
             ids.extend(o)
         ids.append(self.sep_id)
         room = max(0, self.cfg.max_len - len(ids) - 1)
-        ids = ids + self.tok.encode(clean(serialize_state(state)))[:room] + [self.sep_id]
+        if state_ids is None:
+            state_ids = self.tok.encode(clean(serialize_state(state)))
+        ids = ids + state_ids[:room] + [self.sep_id]
         return ids[:self.cfg.max_len], [m for m in markers if m < self.cfg.max_len], labels
 
     # ---- the head --------------------------------------------------------------------
-    def _head_layer(self, x, i):
+    def _head_layer(self, x, i, B=1, mask=None):
         """One pre-norm transformer block, in the layout the checkpoint was saved in.
 
         The activation is ReLU, not GELU: this head is a stock `TransformerEncoderLayer` and
@@ -478,29 +511,64 @@ class DecisionModel(wt.Module):
         an activation has no parameters -- so it is read off the reference implementation.
         """
         p = "head.layers.%d." % i
-        h, hd, T = self.heads, self.head_dim, x.shape[0]
+        h, hd, T = self.heads, self.head_dim, x.shape[0] // B
+        profile = getattr(self, "_head_profile", False)
+        marks = []
+        def mark(label):
+            if profile:
+                marks.append((label, time.perf_counter()))
+        mark("start")
         a = self._ln(x, p + "norm1")
+        mark("norm1")
         qkv = self._lin(a, p + "self_attn.in_proj")
+        mark("qkv")
         d = h * hd
-        q = wt._slice_last(qkv, 0, d).reshape(T, h, hd).permute(1, 0, 2)
-        k = wt._slice_last(qkv, d, 2 * d).reshape(T, h, hd).permute(1, 0, 2)
-        v = wt._slice_last(qkv, 2 * d, 3 * d).reshape(T, h, hd).permute(1, 0, 2)
-        o = bmm(softmax(bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))), v)
-        o = o.permute(1, 0, 2).reshape(T, d)
+        q = None if qkv.requires_grad else wt.qkv_take(qkv, 0, h, hd, T, B=B)
+        if q is not None:
+            k = wt.qkv_take(qkv, 1, h, hd, T, B=B)
+            v = wt.qkv_take(qkv, 2, h, hd, T, B=B)
+        else:
+            def heads_first(start, end):
+                return (wt._slice_last(qkv, start, end).reshape(B, T, h, hd)
+                        .permute(0, 2, 1, 3).reshape(B * h, T, hd))
+            q, k, v = heads_first(0, d), heads_first(d, 2 * d), heads_first(2 * d, 3 * d)
+        mark("qkv_layout")
+        scores = bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5))
+        mark("qk")
+        if mask is not None:
+            scores = scores + mask
+        mark("mask")
+        probs = softmax(scores)
+        mark("softmax")
+        o = bmm(probs, v)
+        mark("value")
+        o = o.reshape(B, h, T, hd).permute(0, 2, 1, 3).reshape(B * T, d)
         x = x + self._lin(o, p + "self_attn.out_proj")
+        mark("out_proj")
         f = self._ln(x, p + "norm2")
         f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
+        mark("mlp")
+        if profile:
+            self._full_head_timing = {
+                marks[j][0]: round((marks[j][1] - marks[j - 1][1]) * 1000, 3)
+                for j in range(1, len(marks))
+            }
         return x + f
 
     @staticmethod
     def _select_rows(x, rows):
         """Select arbitrary device rows through the common Tensor contract.
 
-        WebGPU and WebGL expose different low-level indexing primitives.  A small one-hot
-        matmul is the nearest efficient shared layer and, unlike host indexing, keeps the
-        hidden states on the device on both backends.
+        On CPU, selecting rows directly avoids constructing a dense one-hot matrix and
+        multiplying every row. Keep the measured device route for WebGPU and WebGL,
+        and the differentiable matmul route for autograd.
         """
         rows = [int(r) for r in rows]
+        if not x.requires_grad and not wt.GPU:
+            return x[rows]
+        direct = wt.gather_rows(x, rows)
+        if direct is not None:
+            return direct
         pick = np.zeros((len(rows), int(x.shape[0])), dtype=np.float32)
         pick[np.arange(len(rows)), rows] = 1.0
         return Tensor(pick).matmul(x)
@@ -519,8 +587,12 @@ class DecisionModel(wt.Module):
         qkv = self._lin(a, p + "self_attn.in_proj")
         d = h * hd
         q0 = wt._slice_last(qkv, 0, d)
-        k = wt._slice_last(qkv, d, 2 * d).reshape(T, h, hd).permute(1, 0, 2)
-        v = wt._slice_last(qkv, 2 * d, 3 * d).reshape(T, h, hd).permute(1, 0, 2)
+        k = None if qkv.requires_grad else wt.qkv_take(qkv, 1, h, hd, T)
+        if k is not None:
+            v = wt.qkv_take(qkv, 2, h, hd, T)
+        else:
+            k = wt._slice_last(qkv, d, 2 * d).reshape(T, h, hd).permute(1, 0, 2)
+            v = wt._slice_last(qkv, 2 * d, 3 * d).reshape(T, h, hd).permute(1, 0, 2)
         if queries_only:
             q0 = self._select_rows(q0, rows)
             q = q0.reshape(len(rows), h, hd).permute(1, 0, 2)
@@ -536,29 +608,90 @@ class DecisionModel(wt.Module):
         f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
         return y + f
 
-    # Where one pass over several questions beats one pass each.
-    #
-    # Measured, four matmuls per layer over 28 layers, separate against batched:
-    #
-    #     tokens each     x2      x3      x6
-    #        32          1.63    2.00    2.28
-    #        48          1.49    1.56    1.71
-    #        64          1.36    1.32    1.47
-    #        96          1.10    1.24    1.24
-    #       128          1.05    1.09    1.13
-    #       160+         1.04    1.04    1.04
-    #
-    # It is the same occupancy story as everywhere else here: a short sequence does not give
-    # the device enough rows to work on, and putting several together does. By 128 there are
-    # already enough and batching is noise when the encoder output crosses the host boundary.
-    # Decision heads now consume the padded result on-device; measured at 115--138 tokens,
-    # four questions fell from 370.2 ms to 347.5 ms without changing an answer. Keep the
-    # boundary at 160: above it padding and the larger attention squares erase that gain.
-    _BATCH_MAX_TOKENS = 160
+    def _last_head_selected_many(self, x, i, lengths, padded, markers, mask):
+        """Final bidirectional head layer for only the rows consumed by each scorer.
 
-    @classmethod
-    def batch_pays(cls, longest, count):
-        return count >= 2 and longest <= cls._BATCH_MAX_TOKENS
+        K/V still span every real token of each independent question.  Query and
+        following projection/MLP rows are limited to CLS and option markers, padded
+        only to a common *row* count so one batched matrix path serves every question.
+        """
+        B = len(lengths)
+        R = max(len(ms) + 1 for ms in markers)
+        h, hd, d = self.heads, self.head_dim, self.heads * self.head_dim
+        p = "head.layers.%d." % i
+        rows = []
+        for b, ms in enumerate(markers):
+            own = [0] + [int(m) for m in ms]
+            if any(r < 0 or r >= lengths[b] for r in own):
+                raise ValueError("decision option marker lies outside its question")
+            rows.extend(b * padded + r for r in own + [0] * (R - len(own)))
+        profile = getattr(self, "_head_profile", False)
+        marks = []
+        def mark(label):
+            if profile:
+                marks.append((label, time.perf_counter()))
+        mark("rows")
+        a = self._ln(x, p + "norm1")
+        mark("norm1")
+        qkv = self._lin(a, p + "self_attn.in_proj")
+        mark("qkv")
+        q0 = self._select_rows(wt._slice_last(qkv, 0, d), rows)
+        mark("select_q")
+        k = None if qkv.requires_grad else wt.qkv_take(qkv, 1, h, hd, padded, B=B)
+        if k is not None:
+            v = wt.qkv_take(qkv, 2, h, hd, padded, B=B)
+        else:
+            def heads_first(start, end):
+                return (wt._slice_last(qkv, start, end).reshape(B, padded, h, hd)
+                        .permute(0, 2, 1, 3).reshape(B * h, padded, hd))
+            k, v = heads_first(d, 2 * d), heads_first(2 * d, 3 * d)
+        mark("kv")
+        q = q0.reshape(B, R, h, hd).permute(0, 2, 1, 3).reshape(B * h, R, hd)
+        scores = bmm(q, transpose_last2(k)) * (1.0 / (hd ** 0.5)) + mask
+        o = bmm(softmax(scores), v)
+        o = o.reshape(B, h, R, hd).permute(0, 2, 1, 3).reshape(B * R, d)
+        mark("attention")
+        y = self._select_rows(x, rows) + self._lin(o, p + "self_attn.out_proj")
+        mark("out_proj")
+        f = self._ln(y, p + "norm2")
+        f = self._lin(wt.ReLU()(self._lin(f, p + "linear1")), p + "linear2")
+        mark("mlp")
+        if profile:
+            self._selected_head_timing = {
+                marks[i][0]: round((marks[i][1] - marks[i - 1][1]) * 1000, 3)
+                for i in range(1, len(marks))
+            }
+        return y + f, R
+
+    @staticmethod
+    def batch_pays(longest, count):
+        # Batching is *eligible* whenever rows are independent; a fixed token cutoff made
+        # a three-question request of 162 tokens run three full encoder/head passes. Which
+        # route wins is instead learned for this backend and physical shape below.
+        return count >= 2
+
+    def _batch_route(self, longest, count, option_counts):
+        """Use the measured winner, defaulting to batch until both routes are measured.
+
+        Product requests must not be used as an alternating scalar/batch experiment: that
+        makes every other multi-question request linear again. Separate calibration may
+        supply distinct-question measurements for both routes; absent that evidence, the
+        one-forward batch path is the safe default. The profile is per model instance,
+        hence scoped to its device, backend and weight representation.
+        """
+        backend = ("webgpu" if wt._adam_backend_ready() else
+                   "webgl" if wt._webgl_ready() else "cpu")
+        key = (backend, count, (longest + 31) // 32, max(option_counts or (0,)))
+        plans = self.__dict__.setdefault("_batch_profiles", {})
+        profile = plans.setdefault(key, {"batch": [], "scalar": []})
+        if len(profile["batch"]) >= 3 and len(profile["scalar"]) >= 3:
+            return ("batch" if np.median(profile["batch"][2:])
+                    < np.median(profile["scalar"][2:]) else "scalar"), key
+        return "batch", key
+
+    def _batch_observed(self, key, route, elapsed_ms):
+        profile = self._batch_profiles[key]
+        profile[route].append(float(elapsed_ms))
 
     def _run_one(self, ids, markers, qtype_idx):
         return self._score(self.enc.encode(ids), markers, qtype_idx)
@@ -574,6 +707,32 @@ class DecisionModel(wt.Module):
         a = wt.cat([pooled_t, feats], axis=1)
         a = self._lin(gelu(self._lin(a, "act_head.0")), "act_head.2")
         return wt.cat([s.reshape(-1), a.reshape(-1)], axis=0)
+
+    def _packed_score_many(self, h, padded, markers, selected_rows=0):
+        """Score every question's options and action in batched device operations.
+
+        The checkpoint's batch axis has one sequence per question. Variable option
+        counts are padded only in the scorer input; the feature reduction ignores those
+        lanes. Neither scorer nor action head runs a Python loop over questions.
+        """
+        B = len(markers)
+        width = max(map(len, markers))
+        stride = selected_rows or padded
+        pooled_rows = [b * stride for b in range(B)]
+        option_rows = []
+        for b, ms in enumerate(markers):
+            own = ([b * stride + j + 1 for j in range(len(ms))] if selected_rows else
+                   [b * stride + int(pos) for pos in ms])
+            option_rows.extend(own + [own[0]] * (width - len(own)))
+        pooled = self._select_rows(h, pooled_rows)
+        selected = self._select_rows(h, option_rows)
+        scores = self._ln(selected, "scorer.0")
+        scores = self._lin(gelu(self._lin(scores, "scorer.1")), "scorer.3")
+        logits = scores.reshape(B, width)
+        features = wt.decision_features_many(logits, [len(ms) for ms in markers])
+        action_input = wt.cat([pooled, features], axis=1)
+        action = self._lin(gelu(self._lin(action_input, "act_head.0")), "act_head.2")
+        return wt.cat([logits.reshape(-1), action.reshape(-1)], axis=0), width
 
     def _score(self, h, markers, qtype_idx):
         h = h + wt.embedding(self._t("type_emb.weight"),
@@ -592,21 +751,26 @@ class DecisionModel(wt.Module):
             return self._packed_score(out, range(1, len(rows))).data
 
         mode = "full"
-        if last >= 0 and (wt._adam_backend_ready() or wt._webgl_ready()):
+        if last >= 0:
             reference = [None]
+
+            def host(which):
+                raw = run(which)
+                return np.asarray(raw.get() if hasattr(raw, "get") else raw, np.float32)
 
             def correct(which):
                 if which == "full":
                     return True
                 if reference[0] is None:
-                    reference[0] = np.asarray(run("full").get(), np.float32)
-                got = np.asarray(run(which).get(), np.float32)
+                    reference[0] = host("full")
+                got = host(which)
                 if not np.all(np.isfinite(got)):
                     return False
                 scale = max(1e-6, float(np.abs(reference[0]).max()))
                 return float(np.abs(got - reference[0]).max()) / scale < 1e-3
 
-            backend = "webgpu" if wt._adam_backend_ready() else "webgl"
+            backend = ("webgpu" if wt._adam_backend_ready() else
+                       "webgl" if wt._webgl_ready() else "cpu")
             token_bucket = ((int(h.shape[0]) + 31) // 32) * 32
             row_bucket = 1 << (len(rows) - 1).bit_length()
             mode = wt._weight_execution("decision_head_" + backend, "selected_rows",
@@ -614,11 +778,105 @@ class DecisionModel(wt.Module):
                                         candidates=("full", "selected_full", "selected_q"),
                                         check=correct, repeat=1)
         self._head_execution = mode
-        packed = np.asarray(run(mode).get()).reshape(-1)
+        raw = run(mode)
+        packed = np.asarray(raw.get() if hasattr(raw, "get") else raw).reshape(-1)
         logits = packed[:len(markers)]
         act = packed[len(markers):]
         act = np.exp(act - act.max()); act = act / act.sum()
         return logits, float(act[0])
+
+    def _decision_key_mask(self, lengths, padded):
+        """Stage one broadcast key-validity row per head, without Python-side data work.
+
+        Browser GPU paths fill the shared upload arena in JS; browser CPU fills a
+        borrowed NumPy byte view in JS. Native non-Pyodide CPU tests retain NumPy
+        because no JavaScript worker exists there.
+        """
+        B, heads = len(lengths), self.heads
+        shape = (B * heads, 1, padded)
+        length_bytes = np.asarray(lengths, dtype=np.int32).view(np.uint8)
+        if wt._adam_backend_ready() or wt._webgl_ready():
+            import js
+            target = wt._empty(shape)
+            backend = js.gpu if wt._adam_backend_ready() else js.gl
+            backend.stageDecisionKeyMask(int(target.buffer.buffer_id), length_bytes,
+                                         B, heads, padded)
+            return Tensor(target)
+        target = np.empty(shape, dtype=np.float32)
+        if sys.platform == "emscripten":
+            import js
+            js.decision.fillKeyMask(target.view(np.uint8), length_bytes,
+                                    B, heads, padded)
+        else:
+            target.fill(0)
+            for b, length in enumerate(lengths):
+                if length < padded:
+                    target[b * heads:(b + 1) * heads, :, length:] = -1e9
+        return Tensor(target)
+
+    def _score_many(self, hidden, lengths, padded, markers, qtype_indices):
+        """Run independent question rows through the whole transformer head in one batch.
+
+        This is a layout capability of the per-question-row checkpoint contract, not a
+        claim that every decision model's questions are independent.  Mask each row's
+        padding before softmax; otherwise a shorter question changes when batched beside
+        a longer one.  The scorer still reads that question's own option markers.
+        """
+        B = len(lengths)
+        if B < 2 or len(markers) != B or len(qtype_indices) != B:
+            raise ValueError("parallel decision head needs one row of metadata per question")
+        profile = getattr(self, "_head_profile", False)
+        started = time.perf_counter() if profile else 0
+        types = np.repeat(np.asarray(qtype_indices, dtype=np.int64), padded)
+        h = hidden + wt.embedding(self._t("type_emb.weight"), types)
+        selected_final = self.n_head_layers > 0 and callable(
+            getattr(self, "_last_head_selected_many", None))
+        full_layers = self.n_head_layers - (1 if selected_final else 0)
+        mask = self._decision_key_mask(lengths, padded) if self.n_head_layers else None
+        prepared = time.perf_counter() if profile else 0
+        layer_times = []
+        for i in range(full_layers):
+            layer_started = time.perf_counter() if profile else 0
+            h = self._head_layer(h, i, B=B, mask=mask)
+            if profile:
+                layer_times.append(round((time.perf_counter() - layer_started) * 1000, 3))
+        selected_rows = 0
+        if selected_final:
+            selected_started = time.perf_counter() if profile else 0
+            h, selected_rows = self._last_head_selected_many(
+                h, self.n_head_layers - 1, lengths, padded, markers, mask)
+            if profile:
+                layer_times.append(round((time.perf_counter() - selected_started) * 1000, 3))
+        layers_queued = time.perf_counter() if profile else 0
+        packed, option_width = self._packed_score_many(
+            h, padded, markers, selected_rows)
+        raw = packed.data
+        scores_queued = time.perf_counter() if profile else 0
+        combined = np.asarray(raw.get() if hasattr(raw, "get") else raw).reshape(-1)
+        read_back = time.perf_counter() if profile else 0
+        outputs = []
+        action_start = B * option_width
+        for row, ms in enumerate(markers):
+            logits = combined[row * option_width:row * option_width + len(ms)]
+            act = combined[action_start + row * 2:action_start + row * 2 + 2]
+            act = np.exp(act - act.max()); act = act / act.sum()
+            outputs.append((logits, float(act[0])))
+        self._head_execution = "batched_selected_q" if selected_final else "batched_full"
+        if profile:
+            finished = time.perf_counter()
+            # The readback is the first fence after encoder replay. Its wait includes
+            # outstanding encoder AND head GPU work; it is not head-only GPU time.
+            self._head_timing = {
+                "prepare_ms": round((prepared - started) * 1000, 3),
+                "layers_queue_ms": round((layers_queued - prepared) * 1000, 3),
+                "scores_queue_ms": round((scores_queued - layers_queued) * 1000, 3),
+                "gpu_wait_readback_ms": round((read_back - scores_queued) * 1000, 3),
+                "result_ms": round((finished - read_back) * 1000, 3),
+                "layer_ms": layer_times,
+                "selected_ms": getattr(self, "_selected_head_timing", None),
+                "full_ms": getattr(self, "_full_head_timing", None),
+            }
+        return outputs
 
     # ---- the API ---------------------------------------------------------------------
     def _prepare_questions(self, state, questions):
@@ -626,6 +884,13 @@ class DecisionModel(wt.Module):
         # Every sequence is built first, because whether to run them together depends on how
         # long the longest one turned out to be.
         built = []
+        state_ids = None
+        if questions:
+            mask_str = self.tok.dec.get(self.mask_id, "")
+            state_text = str(serialize_state(state))
+            if mask_str:
+                state_text = state_text.replace(mask_str, " ")
+            state_ids = self.tok.encode(state_text)
         for qid, q in (questions or {}).items():
             qtype = q["type"]
             if qtype not in self.cfg.qtypes:
@@ -633,7 +898,8 @@ class DecisionModel(wt.Module):
                                  % (qtype, ", ".join(self.cfg.qtypes)))
             ins = q.get("instructions")
             ins = ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False)
-            ids, markers, labels = self.build_sequence(state, qtype, ins, q.get("criteria"))
+            ids, markers, labels = self.build_sequence(state, qtype, ins, q.get("criteria"),
+                                                       state_ids=state_ids)
             if len(markers) != len(labels):
                 raise ValueError("question %r: its options need more than %d tokens, so %d of "
                                  "them have no place in the sequence to be scored at"
@@ -643,57 +909,107 @@ class DecisionModel(wt.Module):
         return built, total
 
     def _raw_questions(self, built, execution=None):
-        hs = None
+        request_start = time.perf_counter()
+        profile = execution is not None and execution.get("_profile", False)
+        self._head_profile = profile
+        self._head_timing = None
+        encoder_ms = 0.0
+        head_ms = 0.0
         device_batch = None
-        if built and self.batch_pays(max(len(b[3]) for b in built), len(built)):
-            try:
-                device_batch = self.enc._encode_many_device([b[3] for b in built])
-            except Exception:
-                try:
-                    hs = self.enc.encode_many([b[3] for b in built])
-                except Exception:
-                    hs = None        # a batched pass is an optimisation, not a step
+        # Repeated identical jobs share one result. Different question metadata can have
+        # identical encoder ids but different head answers; give those jobs separate batch
+        # rows rather than silently switching the whole request to scalar execution.
+        jobs = {}
+        for row in built:
+            job = (tuple(row[3]), tuple(row[4]), row[2])
+            jobs.setdefault(job, row)
+        sequences = [row[3] for row in jobs.values()]
+        route, route_key = "scalar", None
+        if sequences and self.batch_pays(max(map(len, sequences)), len(sequences)):
+            chooser = getattr(self, "_batch_route", None)
+            if callable(chooser):
+                route, route_key = chooser(max(map(len, sequences)), len(sequences),
+                                           [len(row[4]) for row in jobs.values()])
+            else:
+                route = "batch"
+        if route == "batch":
+            stage_start = time.perf_counter()
+            device_batch = self.enc._encode_many_device(sequences)
+            encoder_ms += (time.perf_counter() - stage_start) * 1000
 
         encoded = {}
+        scored_cache = {}
         encoder_tokens = 0
         encoder_passes = 0
+        head_passes = 0
+        head_batched = False
         scored = []
-        for idx, (qid, q, qtype, ids, markers, labels) in enumerate(built):
+        if device_batch is not None:
+            if len(sequences) < 2:
+                raise RuntimeError("batch route selected without multiple head jobs")
+            batch_h, lengths, padded = device_batch
+            stage_start = time.perf_counter()
+            outputs = self._score_many(
+                batch_h, lengths, padded,
+                [job[1] for job in jobs],
+                [self.cfg.qtypes.index(job[2]) for job in jobs])
+            if len(outputs) != len(jobs):
+                raise RuntimeError("batched decision head returned the wrong number of rows")
+            head_passes = 1
+            head_batched = True
+            head_ms += (time.perf_counter() - stage_start) * 1000
+            scored_cache.update(zip(jobs, outputs))
+        for qid, q, qtype, ids, markers, labels in built:
+            key = tuple(ids)
+            score_key = (key, tuple(markers), qtype)
+            if score_key in scored_cache:
+                logits, act = scored_cache[score_key]
+                scored.append((qid, q, qtype, markers, labels, logits, act))
+                continue
             if device_batch is not None:
-                batch_h, lengths, padded = device_batch
-                # Select this sequence's valid rows while they are still on the device.
-                # A tiny one-hot matmul is cheaper than reading B*L*D values to the host and
-                # uploading each question again for its decision head.
-                selector = np.zeros((lengths[idx], len(lengths) * padded), dtype=np.float32)
-                rows = idx * padded + np.arange(lengths[idx])
-                selector[np.arange(lengths[idx]), rows] = 1.0
-                h = Tensor(selector).matmul(batch_h)
-                logits, act = self._score(h, markers, self.cfg.qtypes.index(qtype))
-            elif hs is not None:
-                logits, act = self._score(hs[idx], markers, self.cfg.qtypes.index(qtype))
+                raise RuntimeError("batched decision head did not score a requested job")
             else:
                 # Questions can collapse to the exact same encoder input (for example two
                 # identical boolean statements under different caller ids). Encoding that
                 # sequence twice cannot change the answer, so share it within this call.
-                key = tuple(ids)
                 if key not in encoded:
+                    stage_start = time.perf_counter()
                     encoded[key] = self.enc.encode(ids)
+                    encoder_ms += (time.perf_counter() - stage_start) * 1000
                     encoder_tokens += len(ids)
                     encoder_passes += 1
+                stage_start = time.perf_counter()
                 logits, act = self._score(encoded[key], markers, self.cfg.qtypes.index(qtype))
+                head_ms += (time.perf_counter() - stage_start) * 1000
+            scored_cache[score_key] = (logits, act)
+            head_passes += 1
             scored.append((qid, q, qtype, markers, labels, logits, act))
-        if device_batch is not None or hs is not None:
-            encoder_passes = 1 if built else 0
-            encoder_tokens = len(built) * max(len(b[3]) for b in built) if built else 0
+        if device_batch is not None:
+            encoder_passes = 1 if sequences else 0
+            encoder_tokens = len(sequences) * max(map(len, sequences)) if sequences else 0
+        actual_route = "batch" if head_batched else "scalar"
+        if route_key is not None and actual_route in ("batch", "scalar"):
+            self._batch_observed(route_key, actual_route,
+                                 (time.perf_counter() - request_start) * 1000)
         if execution is not None:
             execution.update({"encoder_tokens": encoder_tokens,
                               "encoder_passes": encoder_passes,
-                              "batched": device_batch is not None or hs is not None})
+                              "head_passes": head_passes,
+                              "batched": actual_route == "batch"})
+            if profile:
+                execution.update({"batch_route": actual_route,
+                                  "encoder_ms": round(encoder_ms, 3),
+                                  "head_ms": round(head_ms, 3)})
+                capture = getattr(self.enc, "_last_capture_timing", None)
+                if capture:
+                    execution["encoder_capture"] = capture
+                if head_batched and self._head_timing:
+                    execution["head_timing"] = self._head_timing
             if hasattr(self, "_head_execution"):
                 execution["head_execution"] = self._head_execution
         return scored
 
-    def decide(self, state, questions):
+    def decide(self, state, questions, *, profile=False):
         """Answer every question about this state.
 
         `questions` is `{id: {"type", "instructions", "criteria"}}`, and the answers come back
@@ -701,8 +1017,11 @@ class DecisionModel(wt.Module):
         a caller that wants to act on "0.51 versus 0.49" has to be able to see it.
         """
         out = {}
+        stage_start = time.perf_counter()
         built, total = self._prepare_questions(state, questions)
-        execution = {}
+        prepare_ms = (time.perf_counter() - stage_start) * 1000
+        execution = {"_profile": True} if profile else {}
+        stage_start = time.perf_counter()
         for qid, q, qtype, markers, labels, logits, act in self._raw_questions(built, execution):
             z = logits / self.cfg.temp_for(qtype, len(markers))
             p = np.exp(z - z.max()); p = p / p.sum()
@@ -725,10 +1044,16 @@ class DecisionModel(wt.Module):
             else:
                 ans["choice"] = labels[int(p.argmax())]
             out[qid] = ans
+        answer_ms = (time.perf_counter() - stage_start) * 1000 - (
+            execution.get("encoder_ms", 0) + execution.get("head_ms", 0))
         usage = {"input_tokens": total, "output_tokens": 0,
                  "questions": len(built),
                  "sequence_tokens": {str(b[0]): len(b[3]) for b in built}}
+        execution.pop("_profile", None)
         usage.update(execution)
+        if profile:
+            usage.update({"prepare_ms": round(prepare_ms, 3),
+                          "answer_ms": round(max(0.0, answer_ms), 3)})
         return {"answers": out, "usage": usage}
 
     @staticmethod
@@ -870,6 +1195,8 @@ class DecisionModel(wt.Module):
                                     "max": self.cfg.max_questions or None}},
             "returns": {"per_question": ["probabilities", "answer_confidence", "confidence",
                                            "act_probability"]},
+            "question_layout": self.cfg.question_layout,
+            "question_layout_source": self.cfg.question_layout_source,
             "calibration": self.cfg.calibration(),
             "limits": {"sequence_tokens": self.cfg.max_len,
                        "question_tokens": self.cfg.head_max_len,
@@ -1073,17 +1400,10 @@ def _tokenizer_from_json(tj):
 
 
 def _warm_decision(model, dec_cfg, webio):
-    try:
-        webio.load_stage("warm")
-        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
-                                           "instructions": "warm up",
-                                           "criteria": ["a", "b"]}})
-    except Exception as e:                    # a warm-up is an optimisation, not a step
-        try:
-            import js
-            js.console.warn("webtorch: decision warm-up skipped: " + str(e))
-        except Exception:
-            pass                              # no browser to tell; the model is still fine
+    webio.load_stage("warm")
+    model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
+                                       "instructions": "warm up",
+                                       "criteria": ["a", "b"]}})
 
 
 async def _from_gguf(src, **kw):
@@ -1138,7 +1458,7 @@ async def _from_gguf(src, **kw):
         dec_raw = dict(dec_raw)
         dec_raw["temperature"] = [float(x) for x in
                                   np.asarray(weights["temperature"]).reshape(-1)]
-    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights))
+    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights), weight_names=weights)
     model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
                           mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
                           pad_id=enc_cfg.pad_id)
@@ -1265,7 +1585,7 @@ async def _from_directory(src, **kw):
         dec_raw["temperature"] = [float(x) for x in
                                   np.asarray(weights["temperature"]).reshape(-1)]
 
-    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights))
+    dec_cfg = DecisionConfig(dec_raw, type_count=type_rows(weights), weight_names=weights)
     model = DecisionModel(enc_cfg, dec_cfg, weights, tok,
                           mask_id=mask_id, cls_id=enc_cfg.cls_id, sep_id=enc_cfg.sep_id,
                           pad_id=enc_cfg.pad_id)

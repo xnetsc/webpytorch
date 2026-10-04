@@ -1698,3 +1698,486 @@ operator performance. The browser also reported 527.9 MB loaded for a 402.5 MB G
   same local 0.6B. All outputs remained correct, but settled throughput was
   135.4–137.0 tok/s, no better than the default build. The candidate URL was
   removed and the same local model restored on the original WebGPU URL.
+
+## 2026-10-04 ▸ Decision-model layout detection and batched capture experiment
+
+**Trigger:** The user clarified that question dependence must be determined by the
+checkpoint's own contract, not by a Laya/model-name branch; independent questions must
+batch, recording must work on that batch, and real-use tests must ask new questions.
+The later requirement further restricts numerical work, control, and data movement to
+JS/GPU (including pure CPU), with Python used only for orchestration.
+
+### Changes and evidence
+
+- Decision layout now prefers explicit `question_layout` metadata. For a legacy checkpoint
+  without it, the complete config-plus-tensor schema identifies the per-question-row
+  contract; otherwise loading fails rather than assuming independence. The local
+  `convaiinnovations/laya-multilingual` configuration and its 170 safetensors names resolve
+  to `per_question / checkpoint_structure`. The repository/model name is unused.
+- A WebGPU encoder experiment records independent-row batches under a `(batch, length)`
+  key, keeps per-row masks, bounds pinned mask memory, rewrites inputs on replay, and trims
+  each row back to its actual length. Unit tests cover changed token IDs and masks.
+- One local model was resident at a time. WebGL two-question browser output remained
+  billing/yes, 764 ms hot for a 75-token request. WebGPU on the same short request was
+  61 ms for a hot single question and 167 ms for a hot two-question uncaptured batch;
+  this exposed the former single-only recording gate. On the new batch-capture build,
+  three *different* two-question requests measured 184 ms, 156 ms (record), and 73 ms
+  (replay); all returned billing/yes. No model was downloaded.
+- Current automated checks after layout changes: 186 Python, 81 JavaScript and the
+  TypeScript compiler passed. The capture changes have focused tests but still need
+  complete-suite rerun and further browser correctness/performance coverage.
+
+### Explicit limits
+
+- Weights alone cannot prove cross-question training semantics. An explicit `joint`
+  declaration currently fails with an adapter-needed error; no joint model is claimed
+  supported by the per-question head.
+- The 73 ms result remains above the 20 ms aspiration and does not prove fastest auto
+  routing across shape/backends. WebGL's longer three-question batch took 2579 ms hot;
+  batching must not be enabled merely because it is semantically valid.
+- Python still performs numeric input staging, mask construction, operator calls and CPU
+  NumPy execution. This fails the user's latest JS/GPU-only architecture requirement.
+  The experiment is uncommitted; the JS CPU/WebGL/WebGPU execution migration is open.
+
+### Unchanged
+
+- LLM decode paths and model-list policy were not changed by the layout detector.
+- The local decision model files were neither edited nor network-fetched.
+
+## 2026-10-04 — decision batch routing and local-picker root cause
+
+- Measured an already-loaded local Laya WebGPU request at 248 ms for 486 tokens:
+  119.785 ms encoder and 121.08 ms head. The three sequences exceeded the old
+  160-token batch eligibility gate, explaining the serial three-pass scaling.
+- Removed that gate; a three-distinct-question 162–164-token regression proves
+  one encoder and one head pass. Added pass/fallback diagnostics. Do not use
+  alternate real user requests to calibrate scalar: auto defaults to batch
+  until separately measured shape/backend evidence exists.
+- Batched decision scores now cross GPU→host once rather than once per question;
+  JS worker stages captured encoder embeddings/masks in shared memory, with
+  release tests. This is not yet a complete JS/GPU-only decision pipeline.
+- Diagnosed the local file chooser latch: the dropdown stayed selectable while
+  its file input was disabled for a resident model; a suppressed `input.click()`
+  left the awaited change/cancel Promise unresolved and `localPickActive` stuck.
+  The dropdown and both native inputs now disable when a model is loaded and
+  re-enable on release. The same dropdown and Load button are retained; no
+  extra visible file chooser control was added. The chooser itself no longer
+  holds a Promise/lock, so a suppressed picker can be retried.
+- Verified the repaired single-dropdown UI in the in-app browser and ran
+  190 Python / 86 JavaScript tests, TypeScript typecheck and JS syntax check.
+  A local-disk CPU Laya three-question request reported one encoder/head pass,
+  61 ms and 144 input tokens. The current WebGPU/WebGL real-model batch latency
+  remains unverified because the browser automation did not open a native
+  directory picker. No network model download was attempted and no model was
+  co-loaded. No commit or push was made in this round.
+
+## 2026-10-04 — live three-question fallback isolated
+
+- User loaded the local Laya checkpoint in the in-app WebGPU page, without a
+  network fetch. The 486-token, three-question hot response was 189 ms; the
+  newly exposed diagnostic showed **encoder/head passes 3/3, route scalar**.
+  The batch path failed before inference with `Javascript has no Float16
+  support` when Pyodide tried to expose a NumPy float16 embedding table.
+- Changed only the staging reference to a NumPy uint8 view sharing the exact
+  same bytes; JS already decodes FP16 values through DataView into Number.
+  This avoids a Float16Array bridge requirement without copying/requantizing
+  the stored embeddings. A new regression proves the uint8 view shares memory.
+- Full automated result after this fix: 191 Python, 87 JavaScript tests and
+  `git diff --check` pass. The loaded browser instance is still on the prior
+  worker, so no new 1/1-pass or latency claim is made yet. Model is kept
+  resident until a deliberate rebuild/reload and native local re-selection.
+
+## 2026-10-04 — byte-view bridge and cancelled-picker retry
+
+- Standardized captured decision input references as zero-copy uint8 views for
+  FP16 embedding bytes, int64 token IDs and int64 validity flags. JavaScript
+  reads the original bytes with DataView and interprets them as Number; the
+  typed views share their original NumPy memory. The JS test now passes only
+  Uint8Array proxies, including a binary16 table and int64 ids.
+- The directory-pick cancellation bug had a second independent cause: the
+  select remained on its action option, so choosing the same option again did
+  not dispatch `change`. The select now returns to its previous valid model
+  before launching the native chooser, including the Load-button fallback.
+  A separate in-app tab confirmed that choosing the directory action twice
+  returned to the previous option both times, without another visible picker
+  control. Native OS chooser automation itself is not available, so this is
+  state-machine evidence, not a complete manual-dialog pass.
+- Current source version stamps: SDK `9655bff4ef`, app `2eac7e3524`.
+  The user's existing loaded-model tab remains on its older worker and has
+  deliberately not been reloaded or network-refetched; real-model timing for
+  this fix remains pending.
+
+## 2026-10-04 — live one-pass evidence; batch final-head candidate
+
+- User-loaded local WebGPU Laya run confirmed the byte-view bridge reaches
+  `encoder/head 1/1, route batch` for three 486-token questions. Warm runs
+  were 187 and 208 ms; a 160-token single question was 87 and 90 ms. Batch
+  dispatch count fell but total latency still grows materially with the
+  amount of question work. Cold/record runs ranged 240–389 ms and are kept
+  separate from steady-state measurements.
+- Found that scalar inference uses the correctness-gated `selected_q` final
+  bidirectional head layer while batch always used `batched_full`. Added a
+  batched selected-query final layer: every real K/V token remains available;
+  only CLS and option marker Q/projection/MLP rows are computed. Distinct
+  question lengths and option counts match the full head numerically on CPU.
+  This is a candidate, not yet a WebGPU/WebGL speed conclusion. The user's
+  loaded tab was not reloaded, and no second model was loaded.
+- Profiled batch heads now expose prepare, layer queue, score queue, combined
+  pending-GPU wait plus readback, and result times. The previous `head_ms`
+  includes the first synchronization of outstanding encoder GPU work, so it
+  cannot alone identify head arithmetic as the bottleneck.
+- Replaced per-value FP16 exponent decode in the JS capture stage with a
+  worker-local 65,536-value lookup over the same zero-copy byte view. A
+  3x162x768 Node embedding-stage benchmark changed from ~2.7 to ~0.35 ms
+  median; finite, subnormal, infinity and NaN regression values pass.
+- The cancellation/reselect dropdown regression passes. Native OS-dialog
+  reopening and end-to-end latency for this build still need browser evidence.
+- Current source stamps are SDK `beb05a053a` and app `f8943b3fb2`.
+  Automated checks: 192 Python / 89 JavaScript, TypeScript typecheck, JS
+  syntax, version-stamp regression and clean diff. No commit or push yet.
+# 2026-10-04 — multi-question scaling continuation
+
+- User clarified the immediate gate: after batching, increasing question count must not
+  leave roughly linear request growth. Absolute latency is secondary at this stage.
+  The later gate is single-question performance; no 20–30 ms claim is established.
+- Inspected the disk-backed Laya model in the existing in-app WebGPU tab. Browser native
+  picker automation needed a CDP `Runtime.evaluate` user gesture on the *existing hidden
+  input*, then the supported filechooser `setFiles` pointed at the existing local model
+  directory. No network model read and no concurrent model load.
+- Moved the decision-head padding-key mask construction out of Python and into worker JS.
+  GPU paths stage one broadcast row per head through the shared upload arena; browser CPU
+  writes the borrowed WASM byte view in place. Python supplies only short length metadata
+  and buffer references. Unit regression checks mask semantics and proxy release.
+- Real browser after this change: three distinct questions, 486 tokens, one encoder and
+  one head pass, 174 ms warm. The previous ~120 ms `head prepare` appeared as ~140 ms
+  `head layers queue`; mask staging by itself did not fix scaling.
+- Added diagnostic per-layer/per-operator profile. In a warm 489-token three-question
+  request, the first full head layer took 130.58 ms, of which norm1 measured 125.22 ms.
+  Its generic WebGPU and WebGL fused LayerNorm used host-backed `_zeros` although each
+  output lane is overwritten. Changed forward and fully-overwritten backward buffers to
+  GPU-native `_empty` on both backends. Browser answers remained the same at displayed
+  precision. Head-layer queue dropped to about 2–3 ms, but the GPU completion wait was
+  ~125 ms and total three-question time ~155 ms.
+- The WebGPU 3D batched matmul was a one-output-cell-per-thread scalar K loop. Added a
+  16×16 workgroup-tiled kernel for B>=2, M/N>=32 and 32<=K<=256, retaining the scalar
+  route for smaller shapes. It preserves strided input addressing. Local three-question
+  browser answers remained unchanged at displayed precision, and changed-question warm
+  timings became 64 ms / 163 tokens (one), 97 ms / 314 tokens (two), 130 ms / 489 tokens
+  (three). These are positive absolute gains versus 71/112/155 ms on the prior kernel,
+  but the roughly +33 ms/question slope still fails the stated non-linear scaling gate.
+  WebGL performance and arbitrary-shape GPU numeric regression remain unverified.
+- 192 Python unit tests, 92 JavaScript tests, TypeScript no-emit, source syntax/diff check
+  pass. A `wgpy_test` batched strided/tail-shape test was added but browser harness did not
+  yet complete it. The WebGPU wheel and SDK stamp were rebuilt. No commit or push.
+- Extended the local single-model browser run to six distinct questions. Direct GPU
+  row gather replaced the dense one-hot/matmul selected-row path on WebGPU and WebGL;
+  the six-question selected-Q queue changed from 91/572 ms on first/record calls to
+  0.45/0.52 ms. Six-question warm total was 219 ms at 941 tokens, still scaling
+  roughly linearly with more distinct token rows.
+- Tested an eight-row packed-FP16 matrix-kernel candidate to increase weight reuse.
+  It made a three-question warm request slower (157 vs ~130 ms) and changed the
+  billing answer to account, violating semantic correctness. The candidate was
+  removed immediately; it is **not** an accepted optimisation. The browser still
+  needs to reload the restored kernel before more correctness/performance claims.
+
+## 2026-10-04 — corrected decision results and invalidated timings
+
+- Found the actual cause of the uniform decision results: WebGPU `gather_rows`
+  declared a WGSL binding named `meta`, a reserved identifier. The shader did
+  not produce valid rows; a small six-by-four matrix returned stale data and
+  the real model's marker logits were all zero. Renamed the binding and struct
+  to `gather_meta`/`GatherMeta`, then verified the small row gather exactly.
+  Earlier latency numbers using the broken shader are invalid and must not be
+  cited as a performance improvement.
+- Batched the scorer and action features for all decision rows in a single
+  GPU path, with variable option counts masked. Real Laya browser logits on
+  WebGPU are now nonzero and agree with scalar per-question inference within
+  a few e-6. WebGL row gather and the same batch-vs-scalar comparison also
+  pass. This proves internal numerical parity, not independent task accuracy.
+- Corrected WebGPU changed-question warm requests measured about 43/72/102/179
+  ms for 1/2/3/6 questions (163/319/495/954 tokens). The slope remains almost
+  linear; one batch pass does not imply arithmetic parallelism or GPU saturation.
+  WebGL one/two-question requests were roughly 1.5-1.9/3.75 s, so its speed
+  needs further work even though logits matched.
+- The existing model-structure inference for `question_layout` is not a
+  universal semantic proof; explicit checkpoint metadata or a verified
+  structural adapter is needed for any other architecture. It does not branch
+  on a model name. No claim that arbitrary questions are independent.
+- Automated source checks: 92 JS tests, TypeScript, and 194/195 host Python
+  tests pass. The one failure is the older build-bound Qwen device-profile
+  hash after common-kernel edits, not a numerical test failure. Do not change
+  that profile hash without device remeasurement. No commit/push.
+- Loaded the same local checkpoint on CPU only after releasing the WebGL
+  instance. CPU's three example answers matched WebGPU/WebGL at displayed
+  precision: `billing`, `true=0.9939`, `soon — today=0.5289`; the single batch
+  needed about 50 s. This cross-check strengthens backend numerical evidence,
+  but it does not supply independently labelled accuracy or satisfy CPU speed.
+  Released CPU and restored one local WebGPU instance. The actual chat page
+  displayed the same non-uniform answers in 115 ms for the first request after
+  that load. No network weight fetch or simultaneous model load.
+- With timestamp-query diagnostics enabled on the same WebGPU device, changed
+  single-question hot input (165 tokens) recorded 441 encoder dispatches in
+  one replayed pass at 42.27 ms GPU and about 72.4 ms end-to-end. A different
+  three-question hot input (491 tokens) recorded 397 encoder dispatches in
+  one replayed pass at 89.13 ms GPU and about 129.6 ms end-to-end; 17 passes
+  summed to 97.12 ms GPU. The larger batch has ~3x token work but ~2.1x
+  encoder GPU time, so there is some parallel benefit, yet the encoder remains
+  the dominant critical path and request growth remains unacceptable. GPU
+  timestamp mode adds query/readback overhead, so these are diagnostic ratios,
+  not normal-page latency benchmarks. Do not call GPU compute or bandwidth
+  saturation established from these counters alone.
+
+## 2026-10-04 — locate added cost before optimising multi-question parallelism
+
+- One disk-backed Laya model only; no weight download. Normal changed-input
+  warm WebGPU runs at 1/2/3/6 questions (roughly 167/327/507/1018 input
+  tokens) took ~43/72/103/193–205 ms. Each request used one encoder and one
+  head pass. JS preparation and capture writes rose by only several ms;
+  `head_ms` is not a pure head measurement because its first readback waits
+  for encoder GPU work.
+- Full-pass timestamp queries, with a known diagnostic overhead, measured the
+  hot encoder replay at about 50/57/81/160 ms GPU for 1/2/3/6 questions.
+  The head-related passes were much smaller. For B>=2 the encoder graph had
+  397 dispatches at every count. The incremental critical path is therefore
+  GPU work inside the batched encoder, not repeated encoder launches per
+  question.
+- Added an opt-in per-kernel timestamp mode and a small JS test. This mode
+  force-flushes every dispatch and is too intrusive for quantitative
+  cross-count comparisons: e.g. the six-question summed GPU time was lower
+  than the three-question sum even though full-pass and normal runs show the
+  opposite. It suggests packed-FP16 dense matmul (`mm_f16w`) and tiled
+  attention (`batched_matmul_tiled16`) are the relevant families, but this is
+  only candidate selection. No route has been enabled from these numbers.
+- Next work: measure those families with a less intrusive design, then test
+  shape/device-appropriate parallel and batch alternatives with output
+  equivalence and changed-question end-to-end timings. Only after the
+  multi-question slope is addressed may the single-question latency work
+  resume. Browser profiling flags must be disabled for product runs.
+
+## 2026-10-04 — lower-impact attribution and rejected shared-weight tile
+
+- Replaced the force-flush-every-kernel diagnostic with opt-in selected-kernel
+  timestamp passes inside one GPU command submission; the JavaScript test
+  confirms two selected dispatches still use one submit. With the same sole
+  local Laya model and changed state suffixes, B=2/3/6 encoder replays kept
+  397 dispatches. `mm_f16w` (88 calls) measured about 30/45/86 ms GPU,
+  `batched_matmul_tiled16` (44 calls) about 12/17/35 ms, and `ln_fwd`
+  (45 calls) about 6/6/7 ms. The 2→6 increments of ~56 and ~23 ms explain
+  most of the ~120 ms normal-page increase. Timestamp pass splitting still
+  perturbs the run somewhat; use these for attribution, not a production
+  throughput claim or proof of saturation.
+- Implemented a temporary workgroup-shared packed-FP16 weight tile and
+  validated its WGSL compiler diagnostics on the actual browser GPU. A
+  separate browser-only synthetic test compared both shaders at M=33/192/
+  384/576/1152, including G=1 and G=4. Outputs matched exactly, but the
+  shared tile was 1.4–1.6× slower for representative M=192–1152 dense
+  shapes. Removed the candidate, its switch, and the temporary test instead
+  of enabling a negative route. No model-specific rule was introduced.
+- The in-app browser's file chooser then stopped delivering any `change`
+  event or selected files for the same local directory, including in a fresh
+  isolated tab. No model was fetched from the network or co-loaded. This
+  blocks real-checkpoint A/B for the next candidate until local selection
+  works again; it does not invalidate the earlier attributions. No commit.
+
+## 2026-10-04 — question-count scaling and fail-fast execution audit
+
+- Selected-kernel GPU timestamps with one local Laya instance attribute the
+  2→6-question increase to 88 packed-FP16 dense matmuls growing ~30→86 ms
+  and 44 batched tiled-attention matmuls growing ~12→35 ms. LayerNorm's 45
+  calls remain ~6–7 ms. The encoder is already one batch graph with 397
+  dispatches for B≥2; each matrix dispatch covers all question rows. These
+  are diagnostic, not proof of GPU compute or memory-bandwidth saturation.
+- Audited the batch chain. `_bmm_raw` had a process-global exception latch:
+  any 3D matmul error permanently changed every later attention BMM into a
+  Python per-head loop. It now calls the backend's native 3D matmul directly
+  and propagates failure. Decision batch encoding and scoring no longer fall
+  back to host/scalar on exceptions or missing batch methods. Equal encoder
+  tokens with distinct head metadata use separate batch rows, preserving
+  answers without a scalar downgrade. The legacy per-question scorer loop in
+  `_score_many` was removed. Unit tests cover failures and duplicate jobs.
+- Made explicit WebGPU/WebGL boot fail rather than becoming CPU, checked the
+  worker's actual Python backend against the requested one, and closed the
+  runtime on mismatch. Direct `wgpy.initMain` also throws on an initialization
+  error rather than trying a later backend. Decision warm-up, encoder capture
+  allocation, missing SDK module manifest, stored-weight and shape-tuning
+  candidate errors now propagate instead of choosing a slower default.
+- The browser `/test/` worker was dying before pytest because it imported
+  nonexistent `/lib/pyodide/pyodide.js`; then an unconditional install of a
+  nonexistent Chainer wheel failed. It now uses the product's pinned Pyodide
+  release, reports worker errors, and installs Chainer only for its own test.
+  On the actual browser, focused native 3D BMM tests passed separately on
+  WebGL and WebGPU, including transposed RHS views (1 test each). These test
+  the low-level matrix primitive, not the full local decision model.
+- Host tests: 200 passed with one preexisting stale Qwen profile-build hash
+  failure; JavaScript tests: 94 passed. The profile cannot be stamped as
+  current without remeasuring that Qwen route. The Mac's locked state is the
+  concrete reason native file dialogs are not producing selection/change
+  events; an attempted normal chooser timed out, and raw CDP file injection
+  is unavailable in this browser. The new full-model slope, logits and WebGL
+  decision performance have not been revalidated. No network weight load and
+  no commit. Keep multi-question work open; do not start single-question work.
+
+## 2026-10-04 — capture shape-drift and explicit GPU errors
+
+- Found a distinct instability path: encoder capture retained four fixed shape
+  slots and silently used the uncaptured path forever for all later shapes.
+  Added per-name graph release and pin retirement on the WebGPU and WebGL
+  interfaces, then LRU replacement of cold encoder captures. Unit tests cover
+  slot replacement, recently used shapes, shared buffer pins and GPU release.
+  This removes a known downgrade, but its magnitude on local Laya still needs
+  a new-build browser A/B.
+- WebGPU now checks asynchronous WGSL compilation diagnostics and scoped
+  pipeline-validation errors before readback. A validation failure stays fatal
+  for that context; an invalid shader cannot be interpreted as a valid zero
+  output. WebGPU and WebGL readback failures carry the underlying error text
+  to the worker through a small shared-memory error field, not a delayed RPC.
+  Real-browser invalid-WGSL regression passed on WebGPU. The rebuilt WebGPU
+  and WebGL wheels also each passed the native 3D batched-matmul browser test.
+- The user has one local Laya model loaded in the existing WebGPU tab. That
+  already-running tab uses the old code; the new source and bundles were built
+  after it loaded. No second model was loaded and no model weights were fetched.
+  The user's 56 ms best single-question result is not evidence of stable
+  latency or a finished batch path. Host suite: 202 passed and one stale Qwen
+  build-bound profile failure; JS suite: 100 passed. Full changed-input Laya
+  correctness/slope/stability on the new build remains open. No commit.
+
+## 2026-10-04 — new-build local-Laya slope and further fail-fast coverage
+
+- Refreshed the existing in-app WebGPU page, releasing its old model, then the
+  user loaded the sole local Laya checkpoint again; no other model was loaded
+  or fetched over HTTP. The new build's first three-question UI run returned
+  non-uniform answers in 132 ms at 486 tokens, with encoder/head passes 1/1.
+  A second shorter input was 102 ms at 243 tokens and is **not** a comparable
+  speed gain because the token count halved.
+- Through the page's already-loaded SDK instance, sequentially ran distinct
+  state variants at the same 164/321/498-token 1/2/3-question shapes. Once
+  recorded, end-to-end results were about 47/75/101 ms with the batch route
+  for 2/3 and one encoder/head pass each. Six further changed three-question
+  states were 148/102/105/101/100/104 ms. The stable ~100 ms calls spent
+  81-88 ms in the combined GPU/readback wait; one separate 299 ms outlier
+  spent 274 ms there. A three-question result matched three separate calls
+  on all displayed answer fields, but both compute and latency scalability
+  remain open. No error-driven fallback was observed on those calls; this is
+  narrower than proving none remains elsewhere.
+- Additional candidate routes now propagate GQA, KV-pair, fused add-RMSNorm,
+  and GGUF materialization failures instead of silently choosing a slower
+  route. Selected GPU backend initialization and memory-release errors also
+  surface. New host regressions for the candidate failures: 5 passed. Full
+  host suite: 207 passed, one stale measured-profile hash failure that cannot
+  be relabeled without remeasuring Qwen. JavaScript suite: 100 passed.
+- Next: isolate and test positive dense/attention kernel or shape routes on
+  the actual device, explain the GPU-wait outliers, and continue fail-fast
+  audit. Only then revisit single-question latency. No commit.
+
+## 2026-10-04 — operator slope and two measured latency candidates
+
+- Repeated changed-input 2/3-question GPU timestamp profiles show the packed
+  FP16 dense family increasing from about 30–33 ms to 44–45 ms (88 calls),
+  with batched attention also increasing. The input grows by 183 tokens and
+  warm request time by about 29 ms; LayerNorm stays nearly flat. Separate
+  same-shader tests at 128/256/384/512/576/768 rows show approximately linear
+  arithmetic time once 144 workgroups are available (0.20/0.33/0.46/0.59/
+  0.66/0.92 ms for one representative dense operation). This is evidence that
+  merely batching more rows is not an additional parallel-speed solution.
+- A model-metadata-driven sliding-window QK kernel skips out-of-window tiles
+  while fusing scale and additive mask. Its independent GPU timestamp is
+  positive, and its full-model answers match the previous route. A similarly
+  banded P@V primitive wins standalone but did not show an enclosing encoder
+  gain, so the encoder continues using generic P@V. No model-name branch.
+- Reducing the capture length bucket from 32 to 16 tokens cut the same
+  two-question 327-token workload from roughly 71 to 66 ms. Enabling the
+  fused QK for full-attention layers as well cut it to roughly 63–65 ms; the
+  507-token three-question workload is still about 94–98 ms. The ten output
+  sets compared against the earlier build were all identical at product
+  precision; an independent GPU full/sliding QK numerical check gave maximum
+  absolute difference 9.4e-9 with no incorrect cells. This is a narrower
+  correctness claim than external-label model accuracy.
+- A changed shape crossing a new 16-token capture bucket took 139 ms first,
+  325 ms while recording on second use, then 132/112 ms. This cold-shape cost
+  must be weighed against the steady-state bucket improvement; it is not
+  closed. The large linear dense-math increment is also not closed. The sole
+  local Laya checkpoint was released between builds and reloaded from the
+  browser-native folder picker; no network model transfer or co-loading.
+- Subsequent check of the encoder's existing 24-input mixed-length benchmark
+  found the 16-token bucket's total latency (1345 ms) worse than 32 (1024 ms)
+  because it fills and churns the four capture slots. Restored 32 as the
+  general default; the 16-token local repeat win is not discarded as a
+  candidate for a future workload-scoped selection. Isolated full-attention
+  QK fusion at 32 tokens: 327-token two-question calls ~66–68 ms and
+  507-token three-question calls ~92–93 ms, again ten matching answer sets.
+- The captured WebGPU batch now stages one attention-mask plane per question,
+  not twelve identical copies per question. The fused QK shader maps each
+  head to its question's mask plane. At the same 32-token bucket, 2q calls
+  were ~62–66 ms and 3q ~87–94 ms; all ten product answers matched the
+  uncompressed-mask build. Independent GPU tests of compact masks across
+  two question rows and three heads each, for both full/sliding attention,
+  found no wrong cells and max absolute difference 9.4e-9. WebGL/CPU retain
+  their full-mask equivalent path. Relevant host Python tests: 50 passed;
+  JS capture/timestamp tests: 9 passed. This is a local latency reduction,
+  not a proof of solved parallel scaling or completed project acceptance.
+- An equal-input-token changed-state comparison measured three distinct
+  single-question calls at 119.9–121.6 ms total and the same three questions
+  in one batch at 88.4–90.3 ms (498 tokens in both cases), over five rounds.
+  Every batch answer matched its separate answer at product precision;
+  encoder/head passes were 1/1. This establishes actual ~1.34x batch speedup,
+  not a claim that the GPU is fully utilized or that near-linear additional
+  dense arithmetic is eliminated.
+# 2026-10-04 WebGL memory and batch diagnostic
+
+On the same local Laya WebGL checkpoint, repeated same-shape inference kept GPU
+buffer accounting at ~503–504 MB. A reused-capture two-question call took
+2342 ms at 376 MB GPU, while three questions took 3710 ms at 377 MB GPU.
+Explicit Release moved GPU accounting to 0 KB
+and WASM heap 994→50 MB; macOS reported 49% system memory free. The observed
+slowness is not presently supported as a per-call memory leak. A two-question
+visible-page request lasted 1822 ms and incurred a 1767-ms animation-frame
+gap, matching a 1773-ms WebGL final readback wait. The readback currently runs
+on the browser main thread, so this is proven UI blocking, separate from the
+model's GPU work.
+profile reported 234.8 ms encoder, 1786.1 ms head, with 1421.5 ms inside the
+last GPU/readback wait (which includes pending encoder work). R16F dense weights
+cut initial WebGL texture accounting ~479→269 MB and improved steady 2/3-question
+runtime ~3.5/5.6 s to ~2.3/3.7 s, preserving five distinct-state product
+answers to displayed precision. Batch was still slower than separate scalar
+requests for some WebGL cases, so WebGL batch optimization is not complete.
+An exploratory per-draw GPU timer-query instrument yielded a ~60 s aggregate
+for a 2.38 s request and could not serve as credible operator attribution; it
+was removed. Next: derive sound per-operator/shape costs or controlled ablations,
+then address WebGL batch and CPU batch before commit/push and single-question
+latency work. No model download and no commit.
+
+Follow-up: WebGL2 in an OffscreenCanvas worker is available on this browser.
+Moved context, commands and synchronous readback to a dedicated worker while
+keeping payloads in SharedArrayBuffer and command signals small. Local Laya
+loaded, inferred and released through the new path; after release the resource
+panel reported GPU 0 KB/WASM 50 MB. On the final unflushed build, two/three
+question answers matched the prior build and took 2353/3705 ms. Patching the
+main-thread `WebGL2RenderingContext.readPixels` observed zero calls during an
+inference, and the main-thread 10-ms interval had a max 11-ms gap, proving
+event-loop blocking was removed. The compositor still had a 1.4–1.7 s
+requestAnimationFrame gap, so GPU contention and model computation remain.
+An experimental `gl.flush()` every 64 draws left ~1.65-s frame gaps and was
+removed. The new worker/stamp code is not committed, and neither WebGL batch
+nor remaining backend gates are complete.
+As a separately isolated operator candidate, a scalar WebGL 334×768×2304
+multiply took ~14–15 ms after warmup, while a two-output fragment shader took
+~11–12 ms and produced the same 768 value in both output lanes on all-ones
+inputs. At 507×768×2304 the comparison was ~18–20 versus ~15 ms; at
+334×768×768 it was roughly tied. This has not passed full-matrix random-value
+parity, its required unpack pass or end-to-end model timing, so it is not an
+enabled optimization.
+
+## 2026-10-04 requested remote performance checkpoint
+
+WebGL now places eligible FP16 dense weights in row-aligned R16F textures, with
+direct `(output column, reduction index)` addressing for a full contiguous RHS.
+Wide or otherwise ineligible matrices keep the general layout/path. The
+isolated browser WebGL matmul suite passed 4/4, including the new row-aligned
+case. Host tests passed 211 with one skip; Node tests passed 100. On the sole
+local Laya checkpoint, three changed-state questions took about 2.39 s versus
+3.68 s before the row-aligned layout. The user observed 1.441–1.442 s on
+repeated two-question, 327-token calls. Checked product answers matched the
+prior build to four displayed decimals. The measured win is not a general
+claim that WebGL batch parallelism, per-operator timing, CPU batching, or
+single-question latency is solved. The user explicitly requested a commit and
+remote push at this best-current-performance checkpoint before more tuning.

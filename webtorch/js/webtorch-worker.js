@@ -27,21 +27,17 @@
   // chat/pyodide-version.js, which is the single place this project pins a release.
   wt.PYODIDE_URL = wt.PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/';
 
-  // The package's own inventory, read from a manifest generated with it, so adding a
-  // module never needs an edit here. The inline list is the fallback for a tree served
-  // without the manifest, and is only ever a floor.
-  const FALLBACK = ["__init__.py", "_core.py", "_sdk.py", "audiofe.py", "backend.py", "cosyvoice.py", "detection.py", "ggufload.py", "hfcompat.py", "iqtables.py", "linear_attn.py", "llm.py", "lm_engine.py", "multimodal.py", "onnxrt.py", "portable.py", "quantize.py", "torchshim.py", "tts.py", "vl.py", "webenv.py", "webio.py"];
-
+  // A missing/stale inventory cannot silently install an incomplete Python package.
   async function moduleList(base, version) {
-    try {
-      const r = await fetch(base + 'webtorch/modules.json'
-                            + (version ? '?v=' + encodeURIComponent(version) : ''));
-      if (r.ok) {
-        const m = (await r.json()).modules;
-        if (Array.isArray(m) && m.length) return m;
-      }
-    } catch (e) { /* fall through */ }
-    return FALLBACK;
+    const url = base + 'webtorch/modules.json'
+                + (version ? '?v=' + encodeURIComponent(version) : '');
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('webtorch module manifest failed: ' + r.status + ' ' + url);
+    const m = (await r.json()).modules;
+    if (!Array.isArray(m) || !m.length || !m.includes('__init__.py')) {
+      throw new Error('webtorch module manifest is incomplete: ' + url);
+    }
+    return m;
   }
 
   // Set by the main thread before it sends anything else (see webtorch-main.js).
@@ -292,11 +288,12 @@
     // Wait for the main thread's choice; it has the device, this context does not.
     const wanted = await announcedBackend;
 
-    if (wanted !== 'cpu' && typeof root.wgpy !== 'undefined') {
+    if (wanted !== 'cpu') {
+      if (typeof root.wgpy === 'undefined') {
+        throw new Error('the ' + wanted + ' worker backend script did not load');
+      }
       say('connecting to the GPU…');
-      try { await root.wgpy.initWorker(); }
-      catch (e) { warn('backend', 'the GPU backend would not start, so this runs on the '
-                        + 'CPU: ' + ((e && e.message) || e)); }
+      await root.wgpy.initWorker();
     }
 
     say('starting Python…');
@@ -310,12 +307,9 @@
 
     if (wanted !== 'cpu') {
       say('installing the ' + wanted + ' backend…');
-      try {
-        const mp = pyodide.pyimport('micropip');
-        await mp.install(base + 'dist/wgpy_' + wanted + '-1.0.0-py3-none-any.whl'
-                         + (opts.version ? '?v=' + encodeURIComponent(opts.version) : ''));
-      } catch (e) { warn('backend', 'the ' + wanted + ' backend could not be installed, so '
-                          + 'this runs on the CPU: ' + ((e && e.message) || e)); }
+      const mp = pyodide.pyimport('micropip');
+      await mp.install(base + 'dist/wgpy_' + wanted + '-1.0.0-py3-none-any.whl'
+                       + (opts.version ? '?v=' + encodeURIComponent(opts.version) : ''));
     }
 
     say('loading webtorch…');
@@ -361,11 +355,10 @@
     root.postMessage({ __webtorch: 'channels', channels: tasks._channels() });
 
     // What is actually live, not what was requested.
-    let backend = 'cpu';
-    try {
-      backend = await pyodide.runPythonAsync('import webtorch; webtorch.backend()');
-    } catch (e) { warn('backend', 'could not ask which backend came up: '
-                        + ((e && e.message) || e)); }
+    const backend = await pyodide.runPythonAsync('import webtorch; webtorch.backend()');
+    if (backend !== wanted) {
+      throw new Error('backend mismatch: requested ' + wanted + ', got ' + backend);
+    }
     say('ready (' + backend + ')');
     return { pyodide: pyodide, backend: backend, tasks: tasks };
   };

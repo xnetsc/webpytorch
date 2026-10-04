@@ -13,6 +13,7 @@ async function loadTypeScript(path, imports) {
   vm.runInNewContext(compiled, {
     module, exports: module.exports,
     require: name => {
+      if (name === '../sharedReadback') return { writeSharedReadbackError() {} };
       assert.ok(name in imports, `unexpected import ${name}`);
       return imports[name];
     },

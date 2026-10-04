@@ -21,6 +21,8 @@ export declare class NNWebGPUContext {
     device: GPUDevice;
     private deviceLostReason;
     private pipelines;
+    private pendingPipelineChecks;
+    private pipelineError;
     private commandEncoder;
     private passEncoder;
     private bindGroupCache;
@@ -29,10 +31,14 @@ export declare class NNWebGPUContext {
     private readbackPool;
     private diagnosticQuery;
     private diagnosticPassIndex;
+    private selectedQuery;
+    private selectedNames;
     private readonly flushThreshold;
     constructor();
     initialize(): Promise<void>;
     assertAlive(): void;
+    private trackPipelineCheck;
+    assertPipelinesReady(): Promise<void>;
     hasPipeline(name: string): boolean;
     createPipeline(name: string, source: string, bindingTypes: GPUBufferBindingType[]): void;
     private bufferIds;

@@ -490,8 +490,11 @@ export class WebGLTensorBuffer {
 // }
 
 function initWebGL() {
-  const canvas = document.createElement('canvas');
-  const gl = canvas.getContext('webgl2');
+  // A dedicated GPU worker keeps the synchronous WebGL readPixels fence off the
+  // UI thread. The same context class remains usable by browser-hosted tests.
+  const canvas = typeof document === 'undefined'
+    ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
+  const gl = canvas.getContext('webgl2') as WebGL2RenderingContext | null;
   if (!gl) {
     throw new Error('WebGL2 not supported');
   }
@@ -684,10 +687,10 @@ export class NNWebGLContext {
     this.gl.shaderSource(shader, source);
     this.gl.compileShader(shader);
     if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
+      const log = this.gl.getShaderInfoLog(shader);
+      this.gl.deleteShader(shader);
       throw Error(
-        `Shader Compile failed (name=${name}): ${this.gl.getShaderInfoLog(
-          shader
-        )}\n${source}`
+        `Shader Compile failed (name=${name}): ${log}\n${source}`
       );
     }
 
@@ -736,8 +739,14 @@ export class NNWebGLContext {
     this.gl.attachShader(program, this.vshader);
     this.gl.linkProgram(program);
     if (!this.gl.getProgramParameter(program, this.gl.LINK_STATUS)) {
-      throw new Error('ShaderProgram Initialization failed.');
+      const log = this.gl.getProgramInfoLog(program);
+      this.gl.deleteProgram(program);
+      this.gl.deleteShader(fshader);
+      throw new Error(`WebGL shader program ${name} failed to link: ${log}`);
     }
+
+    this.gl.detachShader(program, fshader);
+    this.gl.deleteShader(fshader);
 
     return program;
   }

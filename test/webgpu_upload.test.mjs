@@ -14,6 +14,7 @@ async function loadTypeScript(path, imports, globals = {}) {
     module,
     exports: module.exports,
     require: name => {
+      if (name === '../sharedReadback') return { writeSharedReadbackError() {} };
       assert.ok(name in imports, `unexpected import ${name}`);
       return imports[name];
     },
@@ -351,3 +352,40 @@ test('WebGL has the same graph replacement and release lifetime', async () => {
   context.disposeBuffer(2);
   assert.deepEqual(freed, [1, 2]);
 });
+
+for (const backend of ['WebGPU', 'WebGL']) {
+  test(`${backend} retires one captured shape without unpinning another`, async () => {
+    const gpu = backend === 'WebGPU';
+    const imports = gpu ? {
+      '../util': { nonNull: value => value },
+      './webgpuContext': { getNNWebGPUContext: () => ({ runKernel() {} }) },
+      './webgpuTensorBuffer': {},
+      './vocabSampler': { GPUVocabSampler: class {} },
+    } : {
+      '../util': { nonNull: value => value },
+      './webglContext': { getNNWebGLContext: () => ({ runKernel() {} }) },
+    };
+    const exports = await loadTypeScript(gpu
+      ? '../src/webgpu/webgpuComputeContext.ts'
+      : '../src/webgl/webglComputeContext.ts', imports);
+    const context = gpu ? new exports.ComputeContextGPU() : new exports.ComputeContextGL();
+    const freed = [];
+    for (const id of [1, 2, 3]) context.tensorBuffers.set(id, {
+      dispose() { freed.push(id); },
+    });
+    const run = ids => context.runKernel(gpu
+      ? { name: 'probe', tensors: ids, workGroups: { x: 1, y: 1, z: 1 } }
+      : { name: 'probe', inputs: ids.slice(0, -1).map(id => ({ name: 'x', id })),
+          output: ids.at(-1), uniforms: [] });
+    context.beginCapture('older'); run([1, 2]); context.endCapture();
+    context.beginCapture('hot'); run([2, 3]); context.endCapture();
+    context.releaseCapture('older');
+    for (const id of [1, 2, 3]) context.disposeBuffer(id);
+    assert.deepEqual(freed, [1]);
+    context.releaseCapture('hot');
+    context.disposeBuffer(2);
+    context.disposeBuffer(3);
+    assert.deepEqual(freed, [1, 2, 3]);
+    assert.throws(() => context.replay('older'), /not found/);
+  });
+}

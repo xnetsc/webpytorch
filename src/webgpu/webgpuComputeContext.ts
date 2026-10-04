@@ -4,6 +4,7 @@ import {
   WebGPUTensorBuffer,
 } from './webgpuTensorBuffer';
 import { GPUVocabSampler } from './vocabSampler';
+import { writeSharedReadbackError } from '../sharedReadback';
 
 export type WorkGroupDim = 'x' | 'y' | 'z';
 
@@ -67,6 +68,7 @@ export interface ComputeContextGPUMessageGetData {
   id: number;
   data: SharedArrayBuffer; // TypedArray of SharedArrayBuffer
   notify: SharedArrayBuffer; // Int32Array(1) of SharedArrayBuffer
+  error?: SharedArrayBuffer;
 }
 
 export interface ComputeContextGPUMessageSampleLogitsDevice {
@@ -77,6 +79,7 @@ export interface ComputeContextGPUMessageSampleLogitsDevice {
   random: number;
   data?: SharedArrayBuffer;
   notify?: SharedArrayBuffer;
+  error?: SharedArrayBuffer;
 }
 
 export interface ComputeContextGPUMessageAddKernel {
@@ -108,6 +111,11 @@ export interface ComputeContextGPUMessageResetCaptures {
   method: 'gpu.resetCaptures';
 }
 
+export interface ComputeContextGPUMessageReleaseCapture {
+  method: 'gpu.releaseCapture';
+  name: string;
+}
+
 export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageAddKernel
   | ComputeContextGPUMessageCreateBuffer
@@ -124,7 +132,8 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageBeginCapture
   | ComputeContextGPUMessageEndCapture
   | ComputeContextGPUMessageReplay
-  | ComputeContextGPUMessageResetCaptures;
+  | ComputeContextGPUMessageResetCaptures
+  | ComputeContextGPUMessageReleaseCapture;
 
 export class ComputeContextGPU {
   tensorBuffers: Map<number, WebGPUTensorBuffer> = new Map();
@@ -204,6 +213,13 @@ export class ComputeContextGPU {
     this.capturing = null;
   }
 
+  releaseCapture(name: string) {
+    if (this.capturing === name) throw new Error(`cannot release active capture '${name}'`);
+    if (!this.captures.delete(name)) throw new Error(`capture '${name}' not found`);
+    this.capturePins.delete(name);
+    this.pinned = new Set(Array.from(this.capturePins.values()).flatMap(ids => [...ids]));
+  }
+
   // Drop every recorded graph and unpin all of their buffers. Sent when a model is
   // released: without it the pins live forever, disposeBuffer keeps refusing every
   // buffer the captured decode ever touched, and the freed model's GPU memory is
@@ -241,7 +257,7 @@ export class ComputeContextGPU {
     if (this.commandError) return Promise.reject(this.commandError);
     const tb = this.tensorBuffers.get(id);
     if (!tb) {
-      return Promise.reject();
+      return Promise.reject(new Error(`WebGPU readback target ${id} was not created`));
     }
     return tb.getDataRaw() as Promise<Uint8Array>;
   }
@@ -293,6 +309,7 @@ export class ComputeContextGPU {
 
   mdata: SharedArrayBuffer | null = null;
   mnotify: Int32Array | null = null;
+  merror: SharedArrayBuffer | null = null;
   uploadMemory: SharedArrayBuffer | null = null;
   uploadNotify: Int32Array | null = null;
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -320,6 +337,7 @@ export class ComputeContextGPU {
         if (message.notify) {
           this.mnotify = new Int32Array(message.notify);
         }
+        if (message.error) this.merror = message.error;
         // A device loss or an invalid target can throw before getDataInto
         // returns a Promise.  Wake the blocked worker for both sync and async
         // failures, exactly as the WebGL readback path does.
@@ -330,6 +348,7 @@ export class ComputeContextGPU {
           })
           .catch((reason) => {
             console.error(reason);
+            writeSharedReadbackError(this.merror, reason);
             this.mnotify![0] = -1;
             Atomics.notify(this.mnotify!, 0);
           });
@@ -337,6 +356,7 @@ export class ComputeContextGPU {
       case 'gpu.sampleLogitsDevice': {
         if (message.data) this.mdata = message.data;
         if (message.notify) this.mnotify = new Int32Array(message.notify);
+        if (message.error) this.merror = message.error;
         const notify = this.mnotify!;
         void Promise.resolve().then(() => this.sampleLogitsDevice(
           message.id, message.count, message.temperature, message.random, this.mdata!))
@@ -346,6 +366,7 @@ export class ComputeContextGPU {
           })
           .catch(reason => {
             console.error(reason);
+            writeSharedReadbackError(this.merror, reason);
             notify[0] = -1;
             Atomics.notify(notify, 0);
           });
@@ -441,6 +462,9 @@ export class ComputeContextGPU {
         break;
       case 'gpu.resetCaptures':
         this.resetCaptures();
+        break;
+      case 'gpu.releaseCapture':
+        this.releaseCapture(message.name);
         break;
     }
   }

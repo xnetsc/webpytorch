@@ -1,6 +1,51 @@
 import { WgpyBackend } from './backend';
-import { ComputeContextGL } from './webgl/webglComputeContext';
 import { ComputeContextGPU } from './webgpu/webgpuComputeContext';
+
+// Capture the bundle URL while its script is executing. The GPU worker inherits
+// its cache-busting query, so a page never mixes two builds of the backend.
+const mainScriptUrl = typeof document === 'undefined' ? ''
+  : (document.currentScript as HTMLScriptElement | null)?.src
+    || Array.from(document.scripts).find(s => /wgpy-main\.js(?:\?|$)/.test(s.src))?.src || '';
+
+async function startGLWorker(): Promise<{ worker: Worker; deviceInfo: any }> {
+  if (!mainScriptUrl) throw new Error('wgpy-main.js script URL is unavailable');
+  const url = new URL('wgpy-gl-worker.js', mainScriptUrl);
+  url.search = new URL(mainScriptUrl).search;
+  const worker = new Worker(url.href);
+  try {
+    const deviceInfo = await new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error('WebGL worker initialization exceeded 10 seconds'));
+      }, 10_000);
+      const onMessage = (event: MessageEvent) => {
+        if (event.data?.method === 'ready') {
+          cleanup();
+          resolve(event.data.deviceInfo);
+        } else if (event.data?.method === 'error') {
+          cleanup();
+          reject(new Error(event.data.error));
+        }
+      };
+      const onError = (event: ErrorEvent) => {
+        cleanup();
+        reject(new Error(event.message || 'WebGL worker failed to start'));
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        worker.removeEventListener('message', onMessage);
+        worker.removeEventListener('error', onError);
+      };
+      worker.addEventListener('message', onMessage);
+      worker.addEventListener('error', onError);
+      worker.postMessage({ method: 'init' });
+    });
+    return { worker, deviceInfo };
+  } catch (error) {
+    worker.terminate();
+    throw error;
+  }
+}
 
 export interface WgpyInitOptions {
   // specify the order of backend to try. default: ['webgpu', 'webgl']
@@ -41,25 +86,23 @@ function releaseShared(queue: SharedQueue | null, slot: number): void {
 }
 
 export async function initMain(worker: Worker, options: WgpyInitOptions): Promise<WgpyInitResult> {
-  let contextGL: ComputeContextGL | null = null;
+  let glWorker: Worker | null = null;
+  let glDeviceInfo: any = null;
   let contextGPU: ComputeContextGPU | null = null;
   let initializedBackend: WgpyBackend | null = null;
-  let sharedGL: SharedQueue | null = null;
   let sharedGPU: SharedQueue | null = null;
   if (typeof SharedArrayBuffer === 'undefined') {
     throw new Error('wgpy: SharedArrayBuffer is not supported');
   }
   for (const backend of options.backendOrder ?? ['webgpu', 'webgl']) {
     if (backend === 'webgl') {
-      contextGL = new ComputeContextGL();
       try {
-        await contextGL.init();
+        const started = await startGLWorker();
+        glWorker = started.worker;
+        glDeviceInfo = started.deviceInfo;
         initializedBackend = backend;
       } catch (error) {
-        console.error(
-          `wgpy: failed to initialize WebGL context: ${(error as any)?.message}`
-        );
-        contextGL = null;
+        throw new Error(`wgpy: failed to initialize WebGL context: ${(error as any)?.message}`);
       }
     } else if (backend === 'webgpu') {
       contextGPU = new ComputeContextGPU();
@@ -67,10 +110,9 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
         await contextGPU.init();
         initializedBackend = backend;
       } catch (error) {
-        console.error(
-          `wgpy: failed to initialize WebGPU context: ${(error as any)?.message}`
-        );
+        try { contextGPU.dispose(); } catch (_) { /* preserve initialization failure */ }
         contextGPU = null;
+        throw new Error(`wgpy: failed to initialize WebGPU context: ${(error as any)?.message}`);
       }
     } else {
       throw new Error(`wgpy: unknown backend: ${backend}`);
@@ -82,7 +124,7 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
 
   const onMessage = (e: MessageEvent) => {
     if (e.data?.__webtorch === 'channels') {
-      contextGL?.setResourceStats(e.data.channels?.stat || null);
+      glWorker?.postMessage({ __webtorch: 'channels', stat: e.data.channels?.stat || null });
       return;
     }
     if (e.data?.namespace !== 'wgpy') {
@@ -93,28 +135,12 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
       worker.postMessage({
         namespace: 'wgpy',
         method: 'initComplete',
-        gl: contextGL ? contextGL.getDeviceInfo() : null, // TODO: send device features
+        gl: glWorker ? glDeviceInfo : null,
         gpu: contextGPU ? {} : null,
       });
     } else if (e.data.method.startsWith('gl.')) {
-      if (contextGL) {
-        if (e.data.method === 'gl.sharedQueue') {
-          sharedGL = e.data;
-        } else {
-          try {
-            const commands = e.data.method === 'gl.signal'
-              ? readShared(sharedGL, e.data.slot) : [e.data];
-            for (const command of commands) {
-              try { contextGL.handleMessage(command, worker); }
-              catch (error) { contextGL.commandError = error; console.error(error); }
-            }
-          } catch (error) {
-            contextGL.commandError = error;
-            console.error(error);
-          } finally {
-            if (e.data.method === 'gl.signal') releaseShared(sharedGL, e.data.slot);
-          }
-        }
+      if (glWorker) {
+        glWorker.postMessage(e.data);
       } else {
         console.error('WebGL context is not initialized. You may have loaded wrong wgpy python package.');
       }
@@ -156,7 +182,8 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
     try {
       contextGPU?.dispose();
     } finally {
-      contextGL?.dispose();
+      glWorker?.postMessage({ method: 'dispose' });
+      glWorker = null;
     }
   }};
 }

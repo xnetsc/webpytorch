@@ -7,6 +7,8 @@ import { sharedUploader } from './sharedUpload';
 import { sampleLogits, SamplingOptions } from './sampleLogits';
 import { routeTopKInto } from './routeTopK';
 import { sharedReadbackArena } from './sharedReadback';
+import { fillDecisionKeyMaskCpu, stageDecisionCapture,
+         stageDecisionKeyMask } from './decisionCapture';
 
 export interface WgpyInitWorkerResult {
   backend: WgpyBackend;
@@ -23,6 +25,12 @@ function dictToObj(dict: any) {
 function postToMain(obj: any, transfer: Transferable[] = []) {
   postMessage({ namespace: 'wgpy', ...obj }, transfer);
 }
+
+// Also present when the SDK selects CPU: the NumPy destination is a borrowed WASM
+// byte view and JavaScript writes it in place, without a Python element loop.
+(globalThis as any).decision = {
+  fillKeyMask: fillDecisionKeyMaskCpu,
+};
 
 // Opt-in, worker-local diagnosis of the complete token-selection boundary. A Python
 // caller may set `js.self.__wgpyProfileSample = true` and read the aggregate JSON;
@@ -50,6 +58,24 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
   let commBuf: any = undefined;
   let commBufUint8Array: Uint8Array | undefined = undefined;
   (globalThis as any).gl = {
+    stageDecisionKeyMask: (maskId: number, lengths: any,
+                           batch: number, heads: number, padded: number) =>
+      stageDecisionKeyMask('gl', () => commands.flush(), uploader,
+                           maskId, lengths, batch, heads, padded),
+    stageDecisionCapture: (
+      xId: number, maskIds: any, ids: any, valid: any, table: any,
+      tableType: 'f16' | 'f32', batch: number, length: number, padded: number,
+      hidden: number, vocab: number, padId: number, heads: number, window: number,
+    ) => {
+      try {
+        stageDecisionCapture('gl', () => commands.flush(), uploader, xId,
+                             typeof maskIds.toJs === 'function' ? dictToObj(maskIds) : maskIds,
+                             ids, valid, table, tableType, batch, length, padded, hidden,
+                             vocab, padId, heads, window);
+      } finally {
+        if (typeof maskIds.destroy === 'function') maskIds.destroy();
+      }
+    },
     isAvailable: () => {
       return glAvailable;
     },
@@ -147,7 +173,7 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
       Atomics.wait(status, 0, 0);
 
       if (Atomics.load(status, 0) < 0) {
-        return -1;
+        throw new Error('WebGL readback failed: ' + (readback.errorMessage() || 'unknown GPU error'));
       }
 
       const placeholderData = new ctor(memory, 0, size);
@@ -222,6 +248,9 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
     resetCaptures: () => {
       commands.enqueue({ method: 'gl.resetCaptures' });
     },
+    releaseCapture: (name: string) => {
+      commands.enqueue({ method: 'gl.releaseCapture', name });
+    },
   };
 }
 
@@ -233,6 +262,24 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
   let commBuf: any = undefined;
   let commBufUint8Array: Uint8Array | undefined = undefined;
   (globalThis as any).gpu = {
+    stageDecisionKeyMask: (maskId: number, lengths: any,
+                           batch: number, heads: number, padded: number) =>
+      stageDecisionKeyMask('gpu', () => commands.flush(), uploader,
+                           maskId, lengths, batch, heads, padded),
+    stageDecisionCapture: (
+      xId: number, maskIds: any, ids: any, valid: any, table: any,
+      tableType: 'f16' | 'f32', batch: number, length: number, padded: number,
+      hidden: number, vocab: number, padId: number, heads: number, window: number,
+    ) => {
+      try {
+        stageDecisionCapture('gpu', () => commands.flush(), uploader, xId,
+                             typeof maskIds.toJs === 'function' ? dictToObj(maskIds) : maskIds,
+                             ids, valid, table, tableType, batch, length, padded, hidden,
+                             vocab, padId, heads, window);
+      } finally {
+        if (typeof maskIds.destroy === 'function') maskIds.destroy();
+      }
+    },
     isAvailable: () => {
       return gpuAvailable;
     },
@@ -337,7 +384,7 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
       Atomics.wait(status, 0, 0);
 
       if (Atomics.load(status, 0) < 0) {
-        return -1;
+        throw new Error('WebGPU readback failed: ' + (readback.errorMessage() || 'unknown GPU error'));
       }
 
       const placeholderData = new Uint8Array(memory, 0, byteLength);
@@ -361,7 +408,8 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
           temperature: opts.temperature ?? 1, random: opts.random ?? 0, ...binding });
         Atomics.wait(status, 0, 0);
         if (Atomics.load(status, 0) < 0)
-          throw new Error('WebGPU device sampling failed; release and reload the model');
+          throw new Error('WebGPU device sampling failed: '
+            + (readback.errorMessage() || 'unknown GPU error'));
         const token = new DataView(memory).getInt32(0, true);
         if (token < 0 || token >= count)
           throw new Error('WebGPU device sampler selected an invalid token');
@@ -437,6 +485,9 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     },
     resetCaptures: () => {
       commands.enqueue({ method: 'gpu.resetCaptures' });
+    },
+    releaseCapture: (name: string) => {
+      commands.enqueue({ method: 'gpu.releaseCapture', name });
     },
   };
 }

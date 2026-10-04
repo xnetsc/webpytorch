@@ -1,5 +1,6 @@
 import { nonNull } from '../util';
 import { WorkGroupDim } from '../webgpu/webgpuComputeContext';
+import { writeSharedReadbackError } from '../sharedReadback';
 import {
   getNNWebGLContext,
   initializeNNWebGLContext,
@@ -63,6 +64,7 @@ export interface ComputeContextGLMessageGetData {
   id: number;
   data: SharedArrayBuffer; // TypedArray of SharedArrayBuffer
   notify: SharedArrayBuffer; // Int32Array(1) of SharedArrayBuffer
+  error?: SharedArrayBuffer;
   ctorType: string;
 }
 
@@ -95,6 +97,11 @@ export interface ComputeContextGLMessageResetCaptures {
   method: 'gl.resetCaptures';
 }
 
+export interface ComputeContextGLMessageReleaseCapture {
+  method: 'gl.releaseCapture';
+  name: string;
+}
+
 export type ComputeContextGLMessage =
   | ComputeContextGLMessageAddKernel
   | ComputeContextGLMessageCreateBuffer
@@ -108,7 +115,8 @@ export type ComputeContextGLMessage =
   | ComputeContextGLMessageBeginCapture
   | ComputeContextGLMessageEndCapture
   | ComputeContextGLMessageReplay
-  | ComputeContextGLMessageResetCaptures;
+  | ComputeContextGLMessageResetCaptures
+  | ComputeContextGLMessageReleaseCapture;
 
 export class ComputeContextGL {
   tensorBuffers: Map<number, WebGLTensorBuffer> = new Map();
@@ -210,6 +218,13 @@ export class ComputeContextGL {
     this.capturing = null;
   }
 
+  releaseCapture(name: string) {
+    if (this.capturing === name) throw new Error(`cannot release active capture '${name}'`);
+    if (!this.captures.delete(name)) throw new Error(`capture '${name}' not found`);
+    this.capturePins.delete(name);
+    this.pinned = new Set(Array.from(this.capturePins.values()).flatMap(ids => [...ids]));
+  }
+
   // Drop every recorded graph and unpin all of their buffers. Sent when a model is
   // released: without it the pins live forever, disposeBuffer keeps refusing every
   // buffer the captured step ever touched, and the freed model's memory is never
@@ -248,7 +263,7 @@ export class ComputeContextGL {
     // not necessarily async, but matching WebGPU API
     const tb = this.tensorBuffers.get(id);
     if (!tb) {
-      return Promise.reject();
+      return Promise.reject(new Error(`WebGL readback target ${id} was not created`));
     }
     // TODO consider data format
     // const data = tb.getDataRawFloat32();
@@ -298,6 +313,7 @@ export class ComputeContextGL {
 
   mdata: SharedArrayBuffer | null = null;
   mnotify: Int32Array | null = null;
+  merror: SharedArrayBuffer | null = null;
   uploadMemory: SharedArrayBuffer | null = null;
   uploadNotify: Int32Array | null = null;
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -319,6 +335,7 @@ export class ComputeContextGL {
         if (message.notify) {
           this.mnotify = new Int32Array(message.notify);
         }
+        if (message.error) this.merror = message.error;
         // getData can throw synchronously (e.g. context loss in readPixels), so
         // enter the Promise chain before calling it.  Both sync and async errors
         // must wake the worker waiting in Atomics.wait.
@@ -331,6 +348,7 @@ export class ComputeContextGL {
           })
           .catch((reason) => {
             console.error(reason);
+            writeSharedReadbackError(this.merror, reason);
             if (String(reason).includes('WebGL context lost')) {
               console.error('WebGL texture ledger at loss:', this.tensorBuffers.size,
                 'textures,', (this.heldTextureBytes / 1073741824).toFixed(2),
@@ -396,6 +414,9 @@ export class ComputeContextGL {
         break;
       case 'gl.resetCaptures':
         this.resetCaptures();
+        break;
+      case 'gl.releaseCapture':
+        this.releaseCapture(message.name);
         break;
     }
   }

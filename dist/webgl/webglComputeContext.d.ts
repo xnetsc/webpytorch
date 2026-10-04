@@ -51,6 +51,7 @@ export interface ComputeContextGLMessageGetData {
     id: number;
     data: SharedArrayBuffer;
     notify: SharedArrayBuffer;
+    error?: SharedArrayBuffer;
     ctorType: string;
 }
 export interface ComputeContextGLMessageAddKernel {
@@ -78,7 +79,11 @@ export interface ComputeContextGLMessageReplay {
 export interface ComputeContextGLMessageResetCaptures {
     method: 'gl.resetCaptures';
 }
-export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageUploadMemory | ComputeContextGLMessageSharedUpload | ComputeContextGLMessageReleaseUploadMemory | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures;
+export interface ComputeContextGLMessageReleaseCapture {
+    method: 'gl.releaseCapture';
+    name: string;
+}
+export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageUploadMemory | ComputeContextGLMessageSharedUpload | ComputeContextGLMessageReleaseUploadMemory | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures | ComputeContextGLMessageReleaseCapture;
 export declare class ComputeContextGL {
     tensorBuffers: Map<number, WebGLTensorBuffer>;
     commandError: unknown;
@@ -106,6 +111,7 @@ export declare class ComputeContextGL {
     disposeBuffer(id: number): void;
     beginCapture(name: string): void;
     endCapture(): void;
+    releaseCapture(name: string): void;
     resetCaptures(): void;
     replay(name: string): void;
     setData(id: number, data: ArrayBufferView): void;
@@ -117,6 +123,7 @@ export declare class ComputeContextGL {
     runKernel(descriptor: GLKernelRunDescriptor): void;
     mdata: SharedArrayBuffer | null;
     mnotify: Int32Array | null;
+    merror: SharedArrayBuffer | null;
     uploadMemory: SharedArrayBuffer | null;
     uploadNotify: Int32Array | null;
     handleMessage(message: ComputeContextGLMessage, worker: Worker): void;

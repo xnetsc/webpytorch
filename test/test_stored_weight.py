@@ -1,6 +1,7 @@
 import inspect
 
 import numpy as np
+import pytest
 
 from webtorch import _core as wt
 from webtorch import ggufload
@@ -18,6 +19,22 @@ def test_original_width_decode_shape_candidates_cover_distinct_workgroup_splits(
 def test_every_decodable_gguf_type_has_a_native_compute_kernel():
     """A storage type may not be accepted and then silently converted for lack of a kernel."""
     assert set(ggufload.SUPPORTED_NAMES) == set(wt._GGML_TYPES)
+
+
+def test_webgl_row_aligned_half_weight_matmul_matches_flat_weight():
+    if not wt._webgl_ready():
+        pytest.skip("requires the WebGL browser backend")
+    import wgpy as cp
+
+    rng = np.random.default_rng(44)
+    lhs = rng.integers(-4, 5, size=(5, 71)).astype(np.float32) * 0.25
+    weight = rng.integers(-4, 5, size=(71, 17)).astype(np.float32) * 0.25
+    row_weight = wt.webgl_half_matrix(weight).data
+    assert row_weight.buffer.texture_shape.width == 17
+    assert row_weight.buffer.texture_shape.height == 71
+    actual = cp.asnumpy(cp.asarray(lhs) @ row_weight)
+    baseline = cp.asnumpy(cp.asarray(lhs) @ cp.asarray(weight))
+    np.testing.assert_array_equal(actual, baseline)
 
 
 def test_q8_native_path_vectorizes_the_original_block_without_requantizing_activations():
@@ -243,6 +260,21 @@ def test_execution_policy_is_shape_based_cached_and_profiled():
                                     "stored", "materialized"
                                 }
     assert calls
+
+
+def test_execution_candidate_failure_cannot_cache_a_silent_downgrade():
+    key = ("weight_exec", "failure_probe", "f32", 19, 23, 8)
+    wt._TUNED.pop(key, None)
+
+    def run(which):
+        if which == "new":
+            raise RuntimeError("shader compile failed")
+        return np.asarray([1.0], np.float32)
+
+    with pytest.raises(RuntimeError, match="execution candidate 'new' failed"):
+        wt._weight_execution("failure_probe", "f32", 19, 23, 5, run,
+                             candidates=("base", "new"), rounds=5, repeat=1)
+    assert key not in wt._TUNED
 
 
 def test_phase_two_dp4a_choice_round_trips_through_device_profile():

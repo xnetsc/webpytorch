@@ -1344,11 +1344,13 @@ let envReady = false;
 function syncButtons() {
   const boot = !envReady;
   $('#loadBtn').disabled = boot || modelLoaded;
+  $('#preset').disabled = boot || modelLoaded;
   $('#localModelInput').disabled = boot || modelLoaded;
+  $('#localDirInput').disabled = boot || modelLoaded;
   $('#releaseBtn').disabled = boot || !modelLoaded;
   $('#loadBtn').title = boot ? 'Waiting for the compute backend…'
     : modelLoaded ? 'Release the current model first' : '';
-  ['#preset', '#modelId', '#lmax', '#gpuMem', '#gpuMemClear',
+  ['#modelId', '#lmax', '#gpuMem', '#gpuMemClear',
    '#refreshCache', '#clearCache', '#exportBtn', '#importBtn'].forEach(sel => {
     const el = $(sel); if (el) el.disabled = boot;
   });
@@ -1438,19 +1440,26 @@ function wireGpuMem() {
   $('#gpuMemClear').onclick = () => { box.value = ''; apply(0); };
 }
 
+let lastGoodModelPreset = null;
 function fillPresets() {
   const sel = $('#preset'); sel.innerHTML = '';
   const custom = PRESETS[PRESETS.length - 1];
   const DEFAULT = PRESETS[0];                       // first registry entry is the default
   const models = PRESETS.slice(0, -1);
 
-  // The "from this device" entries are actions, not selectable models: choosing one opens
-  // a picker, and cancelling restores whatever was selected before.
-  let lastGood = null;
+  // The local entries remain actions in this one dropdown; no second visible picker.
+  // Restore the previous option *before* opening a chooser. A cancelled native picker
+  // need not emit a change/cancel event, and selecting the same <option> again otherwise
+  // fires no change event at all.
   sel.onchange = async () => {
     const p = PRESETS[sel.value];
-    if (!p) { localPick(sel.value, () => { sel.value = lastGood; }); return; }
-    lastGood = sel.value;
+    if (!p) {
+      const which = sel.value;
+      sel.value = lastGoodModelPreset;
+      openLocalPicker(which);
+      return;
+    }
+    lastGoodModelPreset = sel.value;
     // one box, shown only for a model that is not in the list
     $('#modelId').value = p.repo ? (p.file ? p.repo + '/' + p.file : p.repo) : (p.url || '');
     $('#customBox').hidden = !!(p.repo || p.url);
@@ -1499,7 +1508,7 @@ function fillPresets() {
     sel.appendChild(o);
   });
 
-  sel.value = PRESETS.indexOf(best); lastGood = sel.value; sel.onchange();
+  sel.value = PRESETS.indexOf(best); lastGoodModelPreset = sel.value; sel.onchange();
   // Said once, about the machine — not repeated on every row it happens to apply to.
   const cacheNote = ENV.quotaGB && best.gb > ENV.quotaGB
     ? ' Note: the cache quota is smaller than this model, so part of it re-downloads each session'
@@ -1762,6 +1771,16 @@ $('#loadBtn').onclick = async () => {
     askStop();                                  // shared memory, so a busy worker still sees it
     wt && wt.stopLoading();
     if (visionLoadAbort) visionLoadAbort.abort();
+    return;
+  }
+  // Some embedded native select controls update their value without dispatching change.
+  // Never interpret a local-picker action as the previous remote model id.
+  const localChoice = $('#preset').value;
+  if (localChoice === 'local-file' || localChoice === 'local-dir') {
+    // Embedded select controls can update value without dispatching change. Restore a
+    // real model before opening, so cancelling never strands the select on an action.
+    $('#preset').value = lastGoodModelPreset;
+    openLocalPicker(localChoice);
     return;
   }
   // a single identifier: "org/repo/file.gguf", or "org/repo" for a HF-format directory
@@ -2112,40 +2131,61 @@ async function localFileId(handle) {
 
 // Runs one of the "from this device" dropdown entries: open the picker, register the model
 // under its identity, start the load. The dropdown restores its previous pick on cancel.
-let localPickWaiting = false;
-async function localPick(which, onCancel, selectedFile = null) {
+let localPickActive = false;
+function openLocalPicker(which) {
+  if (modelLoaded || loading) {
+    note('Release the current model or finish its load before selecting another.');
+    return;
+  }
+  const input = which === 'local-dir' ? $('#localDirInput') : $('#localModelInput');
+  input.value = '';
+  // Do not await a chooser Promise here. A browser may suppress the native picker without
+  // dispatching change/cancel (especially after a disabled input was clicked). The next
+  // dropdown choice or the existing Load button must always be able to try again.
+  input.click();
+}
+async function localPick(which, selectedFile = null, selectedFiles = null) {
+  if (localPickActive) return;
+  if (modelLoaded || loading) {
+    note('Release the current model or finish its load before selecting another.');
+    return;
+  }
+  localPickActive = true;
   const dir = which === 'local-dir';
   try {
-    let handle;
+    let handle, files = null;
     if (dir) {
-      handle = await window.showDirectoryPicker({ mode: 'read' });
+      // The native directory input produced these File objects. The chooser itself never
+      // takes the processing lock; only an actual selection enters this function.
+      files = selectedFiles || [];
+      if (!files.length) throw new DOMException('cancelled', 'AbortError');
+      const root = String(files[0].webkitRelativePath || '').split('/')[0];
+      if (!root || files.some(file => {
+        const parts = String(file.webkitRelativePath || '').split('/');
+        return parts.length < 2 || parts[0] !== root
+          || parts.some(part => !part || part === '.' || part === '..');
+      })) throw new Error('The selected folder has invalid relative file paths');
+      handle = { name: root };
     } else {
       // Blob slices stay backed by the chosen disk file. Passing this File to the worker
       // does not upload, fetch, cache, or assemble a second copy of the model.
-      const input = $('#localModelInput');
-      if (selectedFile) handle = selectedFile;
-      else {
-        input.value = '';
-        localPickWaiting = true;
-        try {
-          handle = await new Promise((resolve, reject) => {
-            input.onchange = () => resolve(input.files && input.files[0]);
-            input.addEventListener('cancel', () => reject(new DOMException('cancelled', 'AbortError')),
-                                   { once: true });
-            input.click();
-          });
-        } finally {
-          localPickWaiting = false;
-          input.onchange = null;
-        }
-      }
+      handle = selectedFile;
       if (!handle) throw new DOMException('cancelled', 'AbortError');
     }
     const name = dir ? handle.name : await localFileId(handle);
-    const names = await (await sdk).cache.import(handle, name);
+    const runner = await sdk;
+    const names = [];
+    if (dir) {
+      for (const file of files) {
+        const relative = file.webkitRelativePath.slice(name.length + 1);
+        names.push(...await runner.cache.import(file, name + '/' + relative));
+      }
+    } else {
+      names.push(...await runner.cache.import(handle, name));
+    }
     if (!names.length) {
       note('No model files found in that ' + (dir ? 'folder' : 'file') + '.');
-      onCancel(); return;
+      return;
     }
     // A folder that ships an HF-format model loads BY THE FOLDER (config.json names the
     // rest), so its id is the folder; a GGUF loads by the file itself.
@@ -2166,17 +2206,20 @@ async function localPick(which, onCancel, selectedFile = null) {
     $('#loadBtn').click();
   } catch (e) {
     if (e.name !== 'AbortError') note('Import failed: ' + e.message);
-    onCancel();
   } finally {
+    localPickActive = false;
     $('#localModelInput').value = '';
+    $('#localDirInput').value = '';
   }
 }
 
-// A visible native file input remains usable when the dropdown's synthetic click is not
-// available (keyboard accessibility and some embedded-browser file chooser adapters).
 $('#localModelInput').addEventListener('change', event => {
-  if (!localPickWaiting && event.target.files && event.target.files[0])
-    localPick('local-file', () => {}, event.target.files[0]);
+  if (event.target.files && event.target.files[0])
+    localPick('local-file', event.target.files[0]);
+});
+$('#localDirInput').addEventListener('change', event => {
+  if (event.target.files && event.target.files.length)
+    localPick('local-dir', null, Array.from(event.target.files));
 });
 
 
@@ -5161,7 +5204,9 @@ $('#dRun').onclick = async () => {
   try {
     const res = visionDecision
       ? await visionDecision.decide(state, questions)
-      : await (await sdk).decide(state, questions);
+      : await (await sdk).decide(state, questions, {
+        profile: new URLSearchParams(location.search).has('profile_decision'),
+      });
     // Label each answer with the question that produced it: the ids are this page's own.
     Object.keys(res.answers || {}).forEach(k => {
       if (questions[k]) res.answers[k].instructions = questions[k].instructions;
@@ -5172,6 +5217,36 @@ $('#dRun').onclick = async () => {
     const head = usage.head_execution ? ' · head ' + usage.head_execution.replaceAll('_', ' ') : '';
     $('#dTiming').textContent = Math.round(performance.now() - t0) + ' ms · '
       + (usage.input_tokens || 0) + ' tokens read' + head + cache;
+    if (new URLSearchParams(location.search).has('profile_decision')) {
+      $('#dTiming').textContent += ' · prepare ' + (usage.prepare_ms ?? '?')
+        + ' ms · encoder ' + (usage.encoder_ms ?? '?')
+        + ' ms · head ' + (usage.head_ms ?? '?')
+        + ' ms · answer ' + (usage.answer_ms ?? '?') + ' ms';
+      if (usage.encoder_capture) {
+        const c = usage.encoder_capture;
+        $('#dTiming').textContent += ' · capture write/submit/trim '
+          + c.write_ms + '/' + c.submit_ms + '/' + c.trim_ms + ' ms';
+      }
+      if (usage.head_timing) {
+        const h = usage.head_timing;
+        $('#dTiming').textContent += ' · head prepare/queue layers/queue scores/wait all GPU + readback/result '
+          + h.prepare_ms + '/' + h.layers_queue_ms + '/' + h.scores_queue_ms
+          + '/' + h.gpu_wait_readback_ms + '/' + h.result_ms + ' ms';
+        if (h.layer_ms) $('#dTiming').textContent += ' · layers ' + h.layer_ms.join('/') + ' ms';
+        if (h.selected_ms) $('#dTiming').textContent += ' · selected '
+          + Object.entries(h.selected_ms).map(([k, v]) => k + ':' + v).join('/') + ' ms';
+        if (h.full_ms) $('#dTiming').textContent += ' · full '
+          + Object.entries(h.full_ms).map(([k, v]) => k + ':' + v).join('/') + ' ms';
+      }
+      if (usage.encoder_passes != null && usage.head_passes != null) {
+        $('#dTiming').textContent += ' · passes encoder/head '
+          + usage.encoder_passes + '/' + usage.head_passes
+          + ' · route ' + (usage.batch_route || 'scalar');
+      }
+      if (usage.batch_fallback) {
+        $('#dTiming').textContent += ' · fallback ' + usage.batch_fallback;
+      }
+    }
   } catch (e) {
     $('#dTiming').textContent = '';
     note('Error: ' + (e && e.message ? e.message : e));

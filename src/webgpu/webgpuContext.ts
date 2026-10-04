@@ -43,6 +43,12 @@ export class NNWebGPUContext {
 
   private pipelines: Map<string, WebGPURunnerPipeline>;
 
+  // WebGPU reports WGSL and pipeline validation errors asynchronously. A pipeline
+  // object is not proof that its shader compiled: without checking these results,
+  // an invalid kernel can yield zero/stale tensors and look like a model answer.
+  private pendingPipelineChecks: Promise<void>[] = [];
+  private pipelineError: Error | null = null;
+
   // Batched submission: accumulate many compute dispatches into ONE command
   // encoder and submit once (at flush), instead of one queue.submit per kernel.
   private commandEncoder: GPUCommandEncoder | null = null;
@@ -61,6 +67,11 @@ export class NNWebGPUContext {
   private readbackPool: Map<number, GPUBuffer> = new Map();
   private diagnosticQuery: GPUQuerySet | null = null;
   private diagnosticPassIndex = 0;
+  // Selected-kernel diagnosis keeps the entire graph in one queue submission.
+  // It splits only the selected dispatches into timestamped passes, avoiding
+  // the hundreds of submissions/readbacks of the per-kernel flush mode.
+  private selectedQuery: GPUQuerySet | null = null;
+  private selectedNames: string[] = [];
   private readonly flushThreshold: number;
 
   constructor() {
@@ -130,10 +141,26 @@ export class NNWebGPUContext {
   }
 
   assertAlive(): void {
+    if (this.pipelineError !== null) throw this.pipelineError;
     if (this.deviceLostReason !== null) {
       throw new Error('WebGPU device lost: ' + this.deviceLostReason
                       + '; release and reload the model');
     }
+  }
+
+  private trackPipelineCheck(name: string, check: Promise<void>): void {
+    this.pendingPipelineChecks.push(check.catch((reason) => {
+      if (this.pipelineError === null) {
+        this.pipelineError = new Error(`WebGPU pipeline ${name} failed: ${String((reason as any)?.message || reason)}`);
+      }
+    }));
+  }
+
+  async assertPipelinesReady(): Promise<void> {
+    this.assertAlive();
+    const checks = this.pendingPipelineChecks.splice(0);
+    if (checks.length) await Promise.all(checks);
+    this.assertAlive();
   }
 
   hasPipeline(name: string): boolean {
@@ -156,35 +183,49 @@ export class NNWebGPUContext {
         buffer: { type: bindingTypes[i] },
       });
     }
-    const bindGroupLayout = device.createBindGroupLayout({
+    device.pushErrorScope('validation');
+    let shaderModule: GPUShaderModule;
+    let bindGroupLayout: GPUBindGroupLayout;
+    let pipeline: GPUComputePipeline;
+    try {
+      bindGroupLayout = device.createBindGroupLayout({
         entries: bindings,
-      }),
-      pipelineLayout = device.createPipelineLayout({
+      });
+      const pipelineLayout = device.createPipelineLayout({
         bindGroupLayouts: [bindGroupLayout],
-      }),
+      });
       shaderModule = device.createShaderModule({ code: source });
-    const started = PROFILE_COMPILE ? performance.now() : 0;
-    const pipeline = device.createComputePipeline({
+      const started = PROFILE_COMPILE ? performance.now() : 0;
+      pipeline = device.createComputePipeline({
         layout: pipelineLayout,
         compute: {
           module: shaderModule,
           entryPoint: 'main',
         },
       });
-
-    if (PROFILE_COMPILE) {
-      const ms = performance.now() - started;
-      const stats = (globalThis as any).__wgpyCompile;
-      stats.count++;
-      stats.setupMs += performance.now() - setupStarted;
-      stats.pipelineMs += ms;
-      stats.maxPipelineMs = Math.max(stats.maxPipelineMs, ms);
-      stats.slowest.push({ name, ms });
-      stats.slowest.sort((a: { ms: number }, b: { ms: number }) => b.ms - a.ms);
-      if (stats.slowest.length > 10) stats.slowest.length = 10;
-      if (ms >= 100) console.info(`webgpu pipeline ${name}: ${ms.toFixed(1)} ms`);
+      if (PROFILE_COMPILE) {
+        const ms = performance.now() - started;
+        const stats = (globalThis as any).__wgpyCompile;
+        stats.count++;
+        stats.setupMs += performance.now() - setupStarted;
+        stats.pipelineMs += ms;
+        stats.maxPipelineMs = Math.max(stats.maxPipelineMs, ms);
+        stats.slowest.push({ name, ms });
+        stats.slowest.sort((a: { ms: number }, b: { ms: number }) => b.ms - a.ms);
+        if (stats.slowest.length > 10) stats.slowest.length = 10;
+        if (ms >= 100) console.info(`webgpu pipeline ${name}: ${ms.toFixed(1)} ms`);
+      }
+      const info = (shaderModule as any).getCompilationInfo?.();
+      if (!info) throw new Error('WebGPU shader compilation diagnostics are unavailable');
+      this.trackPipelineCheck(name, Promise.resolve(info).then((result: any) => {
+        const errors = result.messages?.filter((message: any) => message.type === 'error') || [];
+        if (errors.length) throw new Error(errors.map((message: any) => message.message).join('; '));
+      }));
+    } finally {
+      this.trackPipelineCheck(name, device.popErrorScope().then((error) => {
+        if (error) throw new Error(error.message || String(error));
+      }));
     }
-
     this.pipelines.set(name, { bindGroupLayout, pipeline });
   }
 
@@ -237,8 +278,31 @@ export class NNWebGPUContext {
     if (!this.commandEncoder) {
       this.commandEncoder = device.createCommandEncoder();
     }
+    const selected = PROFILE_GPU && device.features.has('timestamp-query')
+      && Array.isArray((globalThis as any).__wgpyProfileKernelNames)
+      && (globalThis as any).__wgpyProfileKernelNames.includes(request.pipelineName);
+    if (selected) {
+      // An existing non-timestamped pass must end before a selected dispatch
+      // can get its own timestamp interval. No submit or CPU wait happens here.
+      this.passEncoder?.end();
+      this.passEncoder = null;
+      if (!this.selectedQuery) {
+        this.selectedQuery = device.createQuerySet({ type: 'timestamp', count: 1024 });
+      }
+      if (this.selectedNames.length < 512) {
+        const q = this.selectedNames.length * 2;
+        this.passEncoder = this.commandEncoder.beginComputePass({ timestampWrites: {
+          querySet: this.selectedQuery, beginningOfPassWriteIndex: q,
+          endOfPassWriteIndex: q + 1,
+        } } as any);
+        const byShape = (globalThis as any).__wgpyProfileKernelWorkgroups === true;
+        this.selectedNames.push(byShape
+          ? `${request.pipelineName}@${request.workGroups.x}x${request.workGroups.y}x${request.workGroups.z}`
+          : request.pipelineName);
+      }
+    }
     if (!this.passEncoder) {
-      if (PROFILE_GPU && ((globalThis as any).__wgpyProfileNextPass === true
+      if (!selected && PROFILE_GPU && ((globalThis as any).__wgpyProfileNextPass === true
           || (globalThis as any).__wgpyProfileAllPasses === true)
           && device.features.has('timestamp-query')) {
         const skip = (globalThis as any).__wgpyProfileAllPasses === true ? 0
@@ -276,6 +340,10 @@ export class NNWebGPUContext {
       request.workGroups.z
     );
     this.pendingCount++;
+    if (selected) {
+      this.passEncoder.end();
+      this.passEncoder = null;
+    }
     if (this.pendingCount >= this.flushThreshold) {
       this.flush();
     }
@@ -296,6 +364,8 @@ export class NNWebGPUContext {
     }
     if (this.commandEncoder) {
       const query = this.diagnosticQuery;
+      const selectedQuery = this.selectedQuery;
+      const selectedNames = this.selectedNames;
       const diagnosticDispatches = this.pendingCount;
       const diagnosticPassIndex = query ? ++this.diagnosticPassIndex : 0;
       let timingRead: GPUBuffer | null = null;
@@ -310,7 +380,42 @@ export class NNWebGPUContext {
         this.commandEncoder.resolveQuerySet(query, 0, 2, timingResolve, 0);
         this.commandEncoder.copyBufferToBuffer(timingResolve, 0, timingRead, 0, 16);
       }
+      let selectedRead: GPUBuffer | null = null;
+      let selectedResolve: GPUBuffer | null = null;
+      if (selectedQuery && selectedNames.length > 0) {
+        const bytes = selectedNames.length * 16;
+        selectedResolve = this.device.createBuffer({
+          size: bytes, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        });
+        selectedRead = this.device.createBuffer({
+          size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        this.commandEncoder.resolveQuerySet(selectedQuery, 0, selectedNames.length * 2,
+                                            selectedResolve, 0);
+        this.commandEncoder.copyBufferToBuffer(selectedResolve, 0, selectedRead, 0, bytes);
+      }
       this.device.queue.submit([this.commandEncoder.finish()]);
+      if (selectedQuery && selectedRead && selectedResolve) {
+        const read = selectedRead, resolve = selectedResolve, names = selectedNames;
+        read.mapAsync(GPUMapMode.READ).then(() => {
+          const ticks = new BigUint64Array(read.getMappedRange());
+          const byName: Record<string, { count: number; gpuMs: number }> = {};
+          for (let i = 0; i < names.length; i++) {
+            const row = byName[names[i]] || (byName[names[i]] = { count: 0, gpuMs: 0 });
+            row.count++;
+            row.gpuMs += Number(ticks[i * 2 + 1] - ticks[i * 2]) / 1e6;
+          }
+          const all = (globalThis as any).__wgpySelectedKernelPasses;
+          if (Array.isArray(all)) all.push({ dispatches: diagnosticDispatches, byName });
+          read.unmap();
+        }).catch(error => {
+          (globalThis as any).__wgpySelectedKernelError = String(error);
+        }).finally(() => {
+          read.destroy(); resolve.destroy(); selectedQuery.destroy();
+        });
+      } else if (selectedQuery) {
+        selectedQuery.destroy();
+      }
       if (query && timingRead && timingResolve) {
         const read = timingRead, resolve = timingResolve;
         read.mapAsync(GPUMapMode.READ).then(() => {
@@ -333,6 +438,8 @@ export class NNWebGPUContext {
         });
         this.diagnosticQuery = null;
       }
+      this.selectedQuery = null;
+      this.selectedNames = [];
       this.commandEncoder = null;
       this.pendingCount = 0;
     }
@@ -381,6 +488,7 @@ export class NNWebGPUContext {
     } finally {
       this.bindGroupCache.clear();
       this.pipelines.clear();
+      this.pendingPipelineChecks.length = 0;
       for (const buffer of this.readbackPool.values()) buffer.destroy();
       this.readbackPool.clear();
       this.device.destroy();
