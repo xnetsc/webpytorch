@@ -458,3 +458,69 @@ def test_webgl_q8_split_keeps_every_byte_and_scale():
 def test_webgl_fused_swiglu_does_not_read_a_split_q8_weight_as_words():
     src = inspect.getsource(wt.parallel_swiglu)
     assert "not any(isinstance(l.packed, WebGLQ8Matrix) for l in linears)" in src
+
+
+def test_every_templated_tiled_kernel_is_complete_and_reads_only_the_stored_buffer():
+    for name, (sb, hasb, _funcs) in wt._TILED_FORMATS.items():
+        src = wt._GGML_TILED[name]
+        assert name in wt._GGML_TYPES
+        for token in ("HELP", "FUNCS", "VALSu", "NSUBu", "SB4u", "SBu", "HASB_"):
+            assert token not in src, (name, token)
+        assert "var<storage,read> packed: array<vec4<u32>>" in src
+        assert "round(" not in src and "dot4I8Packed" not in src
+        assert ("s00 = s00 - e0 * r0" in src) == hasb, name     # offset term only if it has one
+        assert "fn QV(" in src and "fn QA(" in src and (("fn QB(" in src) == hasb)
+        assert wt._ggml_tiled_ok(name, 1024, 768)
+
+
+def test_tiled_kernels_match_the_stored_kernel_in_the_browser():
+    """Runs where WebGPU is: every templated format against the stored kernel on random,
+    valid blocks (the scale halves set to sane values), and against the host dequantizer."""
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    halves = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
+              "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82)}
+    rng = np.random.default_rng(7)
+    K, N = 512, 96
+    for fmt in wt._TILED_FORMATS:
+        vals, blk = wt._GGML_TYPES[fmt][2], wt._GGML_TYPES[fmt][3]
+        nb = K // vals
+        raw = rng.integers(0, 256, (N, nb, blk), dtype=np.uint8)
+        for o in halves[fmt]:
+            h = (rng.random((N, nb)) * 0.04 + 0.002).astype(np.float16)
+            raw[:, :, o:o + 2] = h.view(np.uint8).reshape(N, nb, 2)
+        raw = raw.tobytes()
+        lin = wt.GGMLLinear(raw, fmt, K, N, execution="stored")
+        ref = ggufload.dequant(ggufload.GGML_IDS[fmt], raw, N * K).reshape(N, K)
+        for M in (3, 70):
+            x = rng.standard_normal((M, K)).astype(np.float32)
+            got = np.asarray(wt.ggml_matmul(wt.xp.asarray(x), lin.packed, fmt, K, N,
+                                            execution="tiled").get()).reshape(M, N)
+            want = x.astype(np.float64) @ ref.T.astype(np.float64)
+            assert np.abs(got - want).max() / np.abs(want).max() < 1e-5, (fmt, M)
+
+
+def test_greedy_chunk_verdict_round_trips_through_the_device_profile(monkeypatch):
+    monkeypatch.setattr(wt, "_TUNED", {})
+    key = ("greedy_chunk_v1", "webgpu", "0123456789abcdef01234567")
+    wt._TUNED[key] = {"count": 4, "row": "compact", "median_ms": 6.1}
+    profile = wt.kernel_profile()
+    monkeypatch.setattr(wt, "_TUNED", {})
+    wt.use_kernel_profile(profile)
+    assert wt._TUNED[key] == {"count": 4, "row": "compact", "median_ms": 6.1}
+    from webtorch import llm
+    src = inspect.getsource(llm.CausalLM._tune_greedy_chunks)
+    assert 'memo_key = ("greedy_chunk_v1",)' in src
+    assert "plat.replay(graph)" in src          # timed by replaying, not by re-recording
+
+
+def test_jinja2_is_fetched_at_boot_and_the_template_waits_for_that_fetch():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    worker = (root / "webtorch/js/webtorch-worker.js").read_text()
+    assert "root.__webtorch_jinja2 = pyodide.loadPackage(['jinja2'])" in worker
+    from webtorch import llm
+    src = inspect.getsource(llm.BPETokenizer.prepare_template)
+    assert '__webtorch_jinja2' in src and "await pending" in src
+    load = inspect.getsource(llm.CausalLM._from_gguf)
+    assert load.index("await self.tok.prepare_template()") > load.index("self.mtp = await")

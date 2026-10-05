@@ -279,18 +279,31 @@ class BPETokenizer:
         return self.SPECIALS.get(name)
 
     async def prepare_template(self):
-        """Compile the model's chat template, if it has one. Async because jinja2 is loaded
-        on demand -- it ships with Pyodide, so this is a local package load, not a download,
-        and a model without a template never pays for it. Rendering itself stays sync."""
+        """Compile the model's chat template, if it has one. Async because jinja2 may still be
+        arriving: the worker starts fetching it at boot (`__webtorch_jinja2`), in the
+        background, and this waits for that fetch rather than starting one. Resolving it here
+        with micropip instead -- what this did before -- was a network round trip inside the
+        load: 3.4 s to 20 s of a 0.6B's load. Rendering itself stays sync."""
         if self._tpl is not None or not self.chat_template:
             return self._tpl
         try:
             try:
                 import jinja2
             except ImportError:
-                import micropip
-                await micropip.install("jinja2")
-                import jinja2
+                pending = None
+                try:
+                    import js
+                    pending = getattr(js.self, "__webtorch_jinja2", None)
+                except Exception:
+                    pending = None
+                if pending is not None:
+                    await pending
+                try:
+                    import jinja2
+                except ImportError:
+                    import micropip
+                    await micropip.install("jinja2")
+                    import jinja2
             env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
             env.globals["raise_exception"] = _tpl_raise
             env.policies["json.dumps_kwargs"] = {"ensure_ascii": False}
@@ -1688,7 +1701,10 @@ class CausalLM:
         self.tok = BPETokenizer({t: i for i, t in enumerate(_toks)},
                                 meta.get("tokenizer.ggml.merges", []), eos_ids=_eos,
                                 chat_template=meta.get("tokenizer.chat_template"), control=_ctrl)
-        await self.tok.prepare_template()
+        # The template is compiled after the weights, not here: jinja2 is still arriving
+        # from the worker's boot-time fetch, and waiting for it before reading a single
+        # weight put that whole fetch -- a network round trip, 2-14 s measured -- in front of
+        # the load instead of beside it.
         self._ginfo = {t["name"]: t for t in infos}; self._gds = ds
 
         # Preflight: report every unsupported quantization up front, from the header alone,
@@ -1885,6 +1901,7 @@ class CausalLM:
             self.layers.append(lay)
         self.final_norm = wt.Tensor(await self._gload("output_norm.weight"))
         self.mtp = await self._gload_mtp()
+        await self.tok.prepare_template()
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
@@ -4054,9 +4071,39 @@ class CausalLM:
         saved_sampling = self.__dict__.get("_sampling", None)
         saved_seen = list(getattr(self, "_seen", ()))
         name = "decode_chunk_tune"
+        # The race below records ten decode graphs and replays them for rounds -- 5.1 of a
+        # 0.6B's 9.2 s load with every other measurement already remembered, because this
+        # one was not. Its verdict is per device, model topology and kernel build, the same
+        # as the decode composition's, so it is kept under that digest and reused.
+        memo_key = None
+        try:
+            linears = self._stored_linears()
+            qshapes = sorted({(m.Kt, m.Nt) for m in linears
+                              if m.type_name == "Q4_K" and m.execution == "auto"})
+            plan_key = CausalLM._decode_composition_key(self, linears, qshapes, "device")
+            if plan_key is not None:
+                memo_key = ("greedy_chunk_v1",) + tuple(plan_key[1:])
+        except Exception:
+            memo_key = None
+        recorded = []
         try:
             self._set_sampling(temperature=0, do_sample=False, prompt_ids=[])
             self._ensure_chunk_buffers(4)
+            memo = wt._TUNED.get(memo_key) if memo_key is not None else None
+            if (isinstance(memo, dict) and memo.get("count") in (0, 1, 2, 4)
+                    and (memo["count"] == 0
+                         or memo.get("row") in self._embedding_row_candidates())):
+                chosen = (int(memo["count"]), str(memo.get("row") or "host"))
+                self._greedy_chunk_size = chosen[0]
+                self._embedding_row_execution = (chosen[1] if chosen[0] else "auto")
+                self.decode_plan["greedy_chunk"] = chosen[0]
+                self.decode_plan["embedding_row"] = self._embedding_row_execution
+                self.decode_plan["greedy_chunk_ms"] = memo.get("median_ms")
+                self.decode_plan["greedy_chunk_reused"] = True
+                if chosen[0]:
+                    self._set_chunk_inputs(0, 0, chosen[0])
+                    self._capture_greedy_chunk(chosen[0], row_execution=chosen[1])
+                return self._greedy_chunk_size
             local_row = self._tune_embedding_row()
             self.decode_plan["embedding_row_auto"] = local_row
             # Both physical layouts have already matched one another bit-for-bit.  Match the
@@ -4071,11 +4118,19 @@ class CausalLM:
                 self.decode_plan["greedy_chunk"] = 0
                 return 0
 
+            # Each candidate is recorded ONCE, under its own name, and timed by replaying it:
+            # the graphs are position-independent (inputs, rope rows and `ctl` are buffers
+            # written before each replay). Recording a candidate again before every timed
+            # sample -- 45 recordings in all -- is what made this race overrun its load
+            # budget on every load of a 0.6B, and give up with no verdict to keep.
+            def cname(which, row_route):
+                return name if not which else "%s_%d_%s" % (name, which, row_route)
+
             def record(which, row_route="transposed", token=0, pos=0):
                 if which:
                     self._set_chunk_inputs(token, pos, which)
                     return self._capture_greedy_chunk(
-                        which, name, row_execution=row_route)
+                        which, cname(which, row_route), row_execution=row_route)
                 self._set_inputs(token, pos)
                 self._chunk_tokens.buffer.set_data(np.zeros((5,), np.int32))
                 plat.beginCapture(name)
@@ -4090,35 +4145,39 @@ class CausalLM:
             # Token correctness is sequential: every candidate must reproduce the ordinary
             # host-fed route, not merely choose the same first token.
             ref_tokens = []
-            token = 0
-            for pos in range(4):
-                values = record(0, token=token, pos=pos)
-                token = int(values[1]); ref_tokens.append(token)
+            values = record(0, token=0, pos=0)
+            token = int(values[1]); ref_tokens.append(token)
+            for pos in range(1, 4):
+                self._set_inputs(token, pos)
+                plat.replay(name)
+                token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
+                ref_tokens.append(token)
             valid = [(0, "host")]
             for row_route in self._embedding_row_candidates():
                 for count in (1, 2, 4):
                     values = record(count, row_route, 0, 0)
                     if values[1:count + 1].tolist() == ref_tokens[:count]:
                         valid.append((count, row_route))
+            recorded = [cname(*c) for c in valid if c[0]]
 
             samples = {c: [] for c in valid}
 
             def bench(candidate):
                 which, row_route = candidate
-                record(which, row_route, 0, 32)
+                graph = cname(which, row_route)
                 token = 0; pos = 64
                 steps = 4 if hasattr(self, "_warm_deadline") else 16
                 t0 = time.perf_counter()
                 if which == 0:
                     for _ in range(steps):
                         self._set_inputs(token, pos)
-                        plat.replay(name)
+                        plat.replay(graph)
                         token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
                         pos += 1
                 else:
                     for _ in range(steps // which):
                         self._set_chunk_inputs(token, pos, which)
-                        plat.replay(name)
+                        plat.replay(graph)
                         values = np.asarray(self._chunk_tokens.get(), np.int32)
                         token = int(values[which]); pos += which
                 return (time.perf_counter() - t0) / steps
@@ -4154,6 +4213,9 @@ class CausalLM:
                 "%s/%s" % (candidate[0], candidate[1]): round(
                     _stats.median(samples[candidate]) * 1000, 4)
                 for candidate in valid}
+            if memo_key is not None:
+                wt._TUNED[memo_key] = {"count": int(chosen[0]), "row": str(chosen[1]),
+                                       "median_ms": self.decode_plan["greedy_chunk_ms"]}
             # This graph is independent of prompt position: inputs, rope rows and `ctl`
             # are mutable buffers populated immediately before replay.  Keep one verified
             # recording for the model lifetime instead of charging every API call for graph
@@ -4169,11 +4231,12 @@ class CausalLM:
             self.decode_plan["greedy_chunk_error"] = "%s: %s" % (type(exc).__name__, exc)
             return 0
         finally:
-            # Overwrite the potentially four-step tuning graph so it pins no model buffers.
-            try:
-                plat.beginCapture(name); plat.endCapture()
-            except Exception:
-                pass
+            # Overwrite every tuning graph so none of them pins model buffers.
+            for graph in [name] + list(recorded):
+                try:
+                    plat.beginCapture(graph); plat.endCapture()
+                except Exception:
+                    pass
             self._seen = saved_seen
             if saved_sampling is None:
                 self.__dict__.pop("_sampling", None)

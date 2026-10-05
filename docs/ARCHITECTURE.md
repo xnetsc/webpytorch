@@ -125,7 +125,9 @@ about any of this.
   and allocates nothing, and `ggml_matmul(execution="auto")` races it against the others per
   format, shape and row bucket. Q8_0 has it: 519×768×2304 takes 0.86 ms against 1.19
   materialized, 2.38 stored and 0.74 for the same product on half weights, and the Q8
-  xDecision encoder went 117.3 → 103.8 ms with unchanged answers.
+  xDecision encoder went 117.3 → 103.8 ms with unchanged answers. Q4_0, Q4_1, Q5_0, Q5_1,
+  Q4_K, Q5_K, Q6_K, Q3_K and Q2_K share one template (`_TILED_TEMPLATE`): each is A·q′ − B
+  per sub-block with q′ exact in a half, so a format supplies only how to read q′, A and B.
 - The quantised kernel it falls back to was bound by decoding the same weight again for
   every output row. One thread owned four rows, so a decoded value fed four multiplies; it
   now owns twelve (`_GGML_MROW`), and the per-row guard that put eleven branches in the

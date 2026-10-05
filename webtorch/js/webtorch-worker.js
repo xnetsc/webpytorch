@@ -304,6 +304,11 @@
     const pyodide = await loadPyodide({ indexURL: idx, stdout: opts.stdout, stderr: opts.stderr });
     root.pyodide = pyodide;
     await pyodide.loadPackage(['micropip', 'numpy']);
+    // Chat templates are Jinja. Fetched now, in the background and not awaited, so the first
+    // model that has a template does not wait on a package fetch inside its load: resolved
+    // there by micropip it was 3.4-20 s of a 0.6B's 5-22 s load, the spread being the
+    // network. `prepare_template` awaits this before falling back to micropip.
+    root.__webtorch_jinja2 = pyodide.loadPackage(['jinja2']).then(() => true, () => false);
 
     if (wanted !== 'cpu') {
       say('installing the ' + wanted + ' backend…');

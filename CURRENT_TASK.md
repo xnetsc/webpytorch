@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 0.6B load 12–16 s → 1.6 s; tiled kernels for nine more formats (WebGPU):**
+jinja2 is fetched at boot (it was a CDN download inside the load), the greedy-chunk race
+completes and is remembered (it overran its budget every load). Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/
+Q5_K/Q6_K/Q3_K/Q2_K share one exact tiled template. Next: the same formats on WebGL,
+then i-quants.
+
 **2026-10-05 WebGL Q8 2264 → 835 ms (F16 859 ms), answers unchanged:** Q8_0 weights on
 WebGL hold int8 four to an RGBA8UI texel plus R16F scales; per-block dot + scale in f32.
 All three requested items now done: WebGPU Q8 first request 526 → 121 ms and its steady

@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-10-05 ▸ 0.6B load 12–16 s → 1.6 s; tiled stored-format kernels for nine more block formats
+
+**Where the 0.6B's load went** (Qwen3-0.6B Q4_K_M, WebGPU, profile reused, every stage and
+loader function timed):
+- `prepare_template` — `micropip.install("jinja2")` from the Pyodide CDN, inside the load,
+  before a single weight was read: 2–20 s, the spread being the network (the comment said
+  "a local package load, not a download"; it was a download).
+- `warm-greedy` — `_tune_greedy_chunks` hit the 8 s warm budget on every load, cold or warm,
+  and gave up with nothing kept: 3.9–5.3 s per load. It re-recorded a whole decode graph
+  before every timed sample (45 recordings), and its verdict was never persisted.
+- the decode-composition tuner tests 0 candidates within the same budget (1–15 ms, not a
+  cost); run without a budget it did not finish in 25 minutes.
+
+**Changes:** the worker fetches jinja2 at boot, in the background (`__webtorch_jinja2`);
+`prepare_template` awaits that fetch (micropip only as a fallback) and runs after the weights,
+not before. The greedy race records each candidate once under its own graph name and times
+replays (the graphs are position-independent), releases every candidate graph afterwards,
+and its verdict is kept as `greedy_chunk_v1|webgpu|<topology digest>` in the device profile.
+
+| Qwen3-0.6B, profile reused | load | prepare_template | warm-greedy |
+|---|---|---|---|
+| before | 5–22 s | 2–20 s | 3.9–5.3 s (no verdict) |
+| after, model picked 8 s after boot | **1.63–1.65 s** | 65 ms | 0.15 s (reused) |
+
+Cold (no profile) the greedy race now completes in 1.8 s: 4 tokens per replay with the
+compact embedding row, 6.11 vs 6.88 ms per token. A load started the instant the page is
+ready still waits for the CDN fetch; that is the network, and the page's service worker
+caches the package for every later visit.
+
+**Tiled kernels for Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K (WebGPU).** Each is
+A·q′ − B per sub-block of 16 or 32 with q′ a small integer a half holds exactly, so one
+template (`_TILED_TEMPLATE`) serves them all, the format supplying only QV/QA/QB over four
+columns of the stored (word, row) buffer. A sub-block contributes A·Σq′x − B·Σx in f32.
+Browser test against the stored kernel and the host dequantizer on random valid blocks
+(M = 3, 70; N = 96 to cover a partial workgroup): relative error ≤ 5e-7 for every format.
+Microbench (K=512, N=768, 300 rows, ms, tiled/stored/materialized): Q4_K 0.214/0.327/0.314,
+Q6_K 0.195/0.372/0.266, Q3_K 0.212/0.353/0.278; Q5_1 is the one where materialized won
+(0.292 vs 0.411). They join the measured race; on the 0.6B the load-time ladder picked tiled
+for 19 of 20 prefill buckets, and second-and-later replies' first token went 169–180 →
+145–151 ms with unchanged greedy text. i-quants (codebook formats) are not templated yet.
+
 ## 2026-10-05 ▸ WebGL Q8_0: int8 four to a texel, scales as halves (decision 2264 → 835 ms)
 
 **Measured first:** knocking out the `ggml*` WebGL kernels (output shape kept, `main()`
