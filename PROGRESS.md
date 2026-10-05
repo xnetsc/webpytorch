@@ -1,5 +1,137 @@
 # Progress
 
+## 2026-10-05 ▸ requested remote checkpoint before further F16 GGUF work
+
+- Audited the pending decision profile, memory cleanup, capture-local reuse,
+  browser timing display, and version stamp changes. WebGL capture-local reuse
+  is absent after its same-input correctness failure; no WebGL capture speedup
+  is enabled. Decision-time tuning persistence avoids repeating measured route
+  selection on reload, while request cleanup and explicit Release reclaim
+  different classes of scratch and pinned resources respectively.
+- Host tests: 214 passed, one skipped (`test/test_*.py`); Node tests: 102
+  passed (`test/*.test.mjs`). The modified WebGPU wheel contains the same
+  `webgpu_buffer.py` bytes as source; `git diff --check`, JS syntax checks, and
+  content-version stamping passed. The WebGPU capture-local reuse has a
+  lifetime test, but its benefit is not yet browser-quantified. This checkpoint
+  does not claim full latency, accuracy, or backend acceptance.
+- The next isolated diagnostic uses the local `xDecision-F16.gguf`, not the
+  xDecision safetensors checkpoint. Serial Chrome WebGL testing found the same
+  417-token batched route as Laya but ~8.0/7.6 seconds on its first two
+  requests versus Laya's ~2.3–2.4 seconds. Root cause and correction remain
+  open; no network model download was used.
+
+## 2026-10-05 ▸ WebGL decision wait attribution and capture correctness
+
+- Chrome's loaded local Laya WebGL three-question request reported 2704 ms, with
+  2371 ms under `head` and 1749 ms in its final readback wait. That wait also
+  fences queued encoder work. On a comparable 423-token three-question input,
+  a diagnostic fence immediately after the encoder measured 1799 ms of pending
+  encoder work; the two head-layer fences measured
+  257 and 91 ms. The apparent head dominance in the unsynchronised profile is
+  therefore a timing-boundary artifact, not proof that the head owns the stall.
+- Controlled 22-layer encoder probes on that diagnostic shape found ~1106 ms in attention stages and
+  ~748 ms in MLP stages (44 diagnostic readbacks). Fencing each of 88 linears
+  associated ~670 ms with QKV projections and ~677 ms with MLP input
+  projections, versus ~522/218 ms for the attention/MLP output segments.
+  These are instrumented wall costs including readback and intervening work,
+  not additive production GPU timestamps. They identify dense projections as
+  the next candidate for isolated same-shape measurement; they do not justify
+  changing a kernel yet.
+- A temporary WebGL encoder capture with capture-local buffer aliasing produced
+  reproducibly different answers from eager execution on the SAME input.
+  Disabling only that new aliasing restored exact answer equality, so WebGL
+  capture-local reuse was removed. Six changed-input eager/capture pairs with
+  aliasing disabled were all answer-equal, but full-request median was 240.87
+  ms eager versus 276.05 ms captured for a short one-question shape. Capture
+  removed ~38 ms of encoder host submission yet lost ~35 ms end to end. It is
+  not a measured positive WebGL route and remains disabled in the SDK. All
+  temporary browser overrides and graphs were released; the user's loaded
+  Laya model remains available. Inspecting the bad short capture's dispatches
+  found zero same-dispatch input/output texture IDs, so the exact alias hazard
+  is not yet proven; do not attribute it specifically to framebuffer feedback.
+  Full host suite: 214 passed, one skipped; JavaScript suite: 102 passed.
+  No model was downloaded.
+
+## 2026-10-05 ▸ xDecision Q8 memory attribution; capture residency remains open
+
+- The existing disk-backed GGUF is 402,546,752 bytes. On the same local Chrome
+  WebGPU build it reported 134 MB GPU buffers after load and 127 MB after the
+  first three-question answer. On the second request, encoder capture for
+  `(batch=3, bucket=192)` raised the steady GPU ledger to 1.09 GB.
+- The backend's capture accounting then reported 776 pinned buffers totaling
+  1,033,578,476 bytes and zero bytes in its reusable idle pool. Only one
+  encoder capture slot existed. Thus the excess is retained capture buffers
+  (including touched weights/intermediates), not the on-disk GGUF expanding
+  into 1 GB of persistent model weights. The decision cleanup added this step
+  releases ordinary scratch but cannot free live capture pins by design.
+- Releasing the model returned reported GPU buffers to 0 KB and WASM heap
+  capacity from 2.38 GB to 50 MB. No across-release GPU leak was observed.
+  Captures can still hold excessive live memory, and the current four-slot
+  bound is not a byte budget. Any capture-memory change needs a measured
+  latency/semantics comparison; none is claimed here.
+- The three-question outputs kept `billing` 95.4% and duplicate-charge `true`
+  99.9%; the third answer remains outside the requested accuracy conclusion.
+  Full JS suite passed 102/102 and host Python suite 212 passed, one skipped.
+  No commit or push in this step.
+
+## 2026-10-05 ▸ decision cold-route reuse verified; hot GPU variance remains open
+
+- On the same local Chrome WebGPU page and 486-token three-question example,
+  five Laya hot diagnostic repeats took 213/129/196/141/185 ms. Their route
+  stayed `batch`, weight tuning remained 0 calls, and the final combined GPU
+  wait ranged from 86 to 185 ms. A separately observed Laya run reached 119
+  ms. These repeated-input runs diagnose variance, not changed-question product
+  throughput. The 119-ms path has not disappeared, but it is not stable.
+- Released Laya before loading the existing disk xDecision Q8 GGUF. Its first
+  request took 850 ms, of which encoder/head weight tuning was 299.5/379.2 ms
+  (3/5 calls). Its second request took 352 ms, including a 256.7-ms capture
+  submission. Five subsequent hot repeats took 264/160/193/172/177 ms, all
+  with zero tuning calls. Their range overlaps Laya's; no stable per-format
+  hot gap is established by these small, serial samples. Both models still
+  selected `billing` and treated duplicate charging as true on the first two
+  checked questions; the third is excluded from accuracy comparison.
+- Found a concrete repeat-cold root cause: the worker saved reply-time kernel
+  profiles for LLM generation but not for decision `decide`. Added conditional
+  persistence when a decision request creates new device/shape tuning entries.
+  A hot request neither exports nor writes an unchanged profile. After a fresh
+  local build stamp, first xDecision request took 955 ms with 825.2 ms of
+  tuning; after release and page reload, the next load reused 37 profile entries
+  (formerly 29) and its first identical request reported 333 ms and 0/0 tuning
+  calls. The first two answers were unchanged (billing 95.4%, true 99.9%).
+  The second request still took 332 ms, including 270.5 ms capture submission.
+  Thus repeated weight tuning is fixed, but first-ever tuning, capture cost,
+  steady GPU wait variance, and the target absolute decision latency remain open.
+- Two new JS profile-persistence tests pass. Full JavaScript suite: 102 passed;
+  focused Python decision suite: 60 passed. No commit or push in this step.
+
+## 2026-10-04 ▸ xDecision/Laya local parity and latency attribution (open)
+
+- Used only the existing local `xDecision-Q8_0.gguf` and
+  `convaiinnovations_laya-multilingual` files, never a model download and never
+  two resident models at once. Their 170 tensor names/shapes match exactly;
+  embedded encoder config and tokenizer JSON also match exactly. The decision
+  head config differs in post-training calibration, so exact probabilities are
+  not a parity requirement.
+- On the same three-question example, native CPU xDecision took 235.0 ms for
+  486 tokens and Laya took 226.9 ms; both selected `billing` and scored the
+  duplicate-charge statement true (0.9993 and 0.9939). The third question's
+  accuracy is excluded per user instruction. Both used one batched encoder and
+  one batched head pass. This establishes these checked semantics on CPU, not
+  full benchmark accuracy or browser backend equivalence.
+- Chrome WebGPU xDecision showed 1115 ms on the first three-question request;
+  the head's 621.5 ms included 453.0 ms queuing its first layer and 166.8 ms
+  queuing scores. The second request took 420 ms, including 144.7 ms capture
+  submission. Later requests still fluctuated around 313–330 ms in this
+  profile. The final head readback fence includes outstanding encoder and head
+  GPU work; it must not be described as head-only kernel time. Per-pass GPU
+  timestamp callbacks spilled into subsequent requests, so their totals are
+  not yet a reliable per-request attribution.
+- Added opt-in encoder/head weight-route tuning milliseconds and call counts
+  to `profile_decision` output so a fresh local browser load can distinguish
+  calibration from shader compilation and GPU execution. Related 60 Python
+  tests pass, `chat/app.js` syntax and `git diff --check` pass. The browser
+  re-run is blocked by macOS lock; no performance fix or GPU parity claim yet.
+
 ## 2026-10-04 ▸ serial WebGL 0.6B and 30B browser check (open)
 
 - Following the user's provisional acceptance of current WebGPU performance,

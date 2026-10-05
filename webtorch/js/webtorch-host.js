@@ -502,8 +502,12 @@ except ImportError:
       if (!ready) throw new Error('no runtime');
       root.__decide_in = JSON.stringify({ state: a.state, questions: a.questions,
                                          profile: !!a.profile });
-      return await pyJSON(`
-import js, json
+      try {
+        const scored = await pyJSON(`
+import js, json, webtorch
+import webtorch._core as _wt_core
+_tuning_before = (_wt_core._WEIGHT_TUNE_CALLS, len(_wt_core._TUNED),
+                  len(_wt_core._CHECKED), len(_wt_core._DEQ_OK), len(_wt_core._GQA_TUNED))
 _req = json.loads(js.self.__decide_in)
 _m = _MODEL["m"]
 if _m is None:
@@ -512,8 +516,50 @@ if not hasattr(_m, "decide"):
     raise RuntimeError("this model answers by writing text, not by scoring questions")
 _out = (_m.decide(_req["state"], _req["questions"], profile=True)
         if _req.get("profile") else _m.decide(_req["state"], _req["questions"]))
-json.dumps(_out)
+_tuning_after = (_wt_core._WEIGHT_TUNE_CALLS, len(_wt_core._TUNED),
+                 len(_wt_core._CHECKED), len(_wt_core._DEQ_OK), len(_wt_core._GQA_TUNED))
+json.dumps({"answer": _out, "new_tuning": _tuning_after != _tuning_before})
 `);
+        // The generation route already persists reply-time measurements. Decision requests
+        // discover new format/shape routes too; without this, every reload repeats the
+        // same expensive first-answer tournament. Do not add Python/IDB work to hot calls.
+        if (remember && scored.new_tuning) {
+          try {
+            const kpk = await kpKey();
+            if (kpk) await kpPut(kpk, JSON.parse(await py(
+              'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
+          } catch (e) {
+            report('tuning', 'could not keep the decision-time shape measurements: '
+                   + ((e && e.message) || e));
+          }
+        }
+        return scored.answer;
+      } finally {
+        root.__decide_in = null;
+        // Decision requests used to leave their last Python globals and the completed
+        // GPU scratch pool alive. Like generated replies, return only unpinned scratch;
+        // the model and recorded graphs remain live until explicit Release.
+        try {
+          await py(`
+for _wt_tmp in ("_req", "_m", "_out", "_tuning_before", "_tuning_after"):
+    globals().pop(_wt_tmp, None)
+globals().pop("_wt_tmp", None)
+import gc as _wt_gc
+_wt_gc.collect()
+import webtorch._core as _wt_core
+_wt_core._gpu_release_idle_pool()
+try:
+    import wgpy_backends.webgpu.webgpu_buffer as _wt_b
+    _wt_b.reap_now()
+except ImportError:
+    pass
+`);
+        } catch (e) {
+          report('memory', 'could not release completed decision scratch: '
+                 + ((e && e.message) || e));
+          throw e;
+        }
+      }
     },
 
     async calibrate(a) {

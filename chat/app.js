@@ -5222,6 +5222,12 @@ $('#dRun').onclick = async () => {
         + ' ms · encoder ' + (usage.encoder_ms ?? '?')
         + ' ms · head ' + (usage.head_ms ?? '?')
         + ' ms · answer ' + (usage.answer_ms ?? '?') + ' ms';
+      if (usage.encoder_tune_ms != null || usage.head_tune_ms != null) {
+        $('#dTiming').textContent += ' · tune encoder/head '
+          + (usage.encoder_tune_ms ?? 0) + '/' + (usage.head_tune_ms ?? 0)
+          + ' ms (' + (usage.encoder_tune_calls ?? 0) + '/'
+          + (usage.head_tune_calls ?? 0) + ' calls)';
+      }
       if (usage.encoder_capture) {
         const c = usage.encoder_capture;
         $('#dTiming').textContent += ' · capture write/submit/trim '

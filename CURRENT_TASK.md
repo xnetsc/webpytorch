@@ -1,6 +1,6 @@
 # Current task status
 
-> Last updated: 2026-10-04
+> Last updated: 2026-10-05
 
 ## Highest project principle
 
@@ -12,6 +12,54 @@ performance comparison and adopt whichever measured execution is fastest. Only b
 passing their recorded acceptance gates completes this task.
 
 ## One-line status
+
+**2026-10-05 checkpoint scope:** Decision reply-time device tuning now persists only
+when new routes are measured, avoiding repeated calibration on reload. Completed
+requests drop Python references and unpinned GPU scratch; explicit model release
+was observed to return reported GPU buffers to zero. WebGPU capture-local
+temporary reuse has a lifetime regression test, but its memory/latency benefit
+has not yet been established in a controlled browser comparison. WebGL
+capture-local reuse remains disabled after incorrect answers. The current
+WebGL three-question F16 GGUF investigation and broader project acceptance
+are **not** closed by this checkpoint.
+
+**2026-10-05 WebGL capture and operator check:** The 2704-ms local Laya
+three-question profile's final 1749-ms wait includes encoder GPU work. On a
+comparable 423-token three-question diagnostic, a barrier after the encoder
+measured 1799 ms pending there; 22 attention stages
+totalled ~1106 ms and MLP stages ~748 ms under diagnostic fences. QKV and MLP
+input projection segments were the largest (~670 and ~677 ms), though their
+per-operation barriers add readback cost. WebGL capture-local buffer reuse
+changed same-input answers and was removed. Without that alias, capture was
+correct on six changed-input pairs but slower end to end: median 276.05 ms
+versus 240.87 ms eager for a short one-question shape, despite reducing encoder
+submission by ~38 ms. Therefore no WebGL capture speedup is enabled. Continue
+isolated dense-projection measurement and three-question route optimization;
+the multi-backend and project acceptance gates remain open.
+
+**2026-10-05 xDecision/Laya comparison in progress:** Local files have the
+same 170 tensor names/shapes, encoder config and tokenizer; sequential CPU
+three-question runs agree on the first two checked answers and take 235.0 ms
+(xDecision Q8 GGUF) versus 226.9 ms (Laya safetensors). Ignore the third
+question's accuracy per user instruction. Browser timing now separates
+decision weight-route tuning from the normal request path. On a fresh local
+xDecision load, 825 ms of a 955-ms first request was weight tuning; saving
+reply-time decision routes and reloading the same local file reused 37 entries
+and reduced the next first request to 333 ms with 0 tuning calls. A 270-ms
+second-use capture cost and hot GPU wait variance remain open. Five hot Laya
+diagnostics spanned 129–213 ms (plus one 119-ms run); xDecision spanned
+160–264 ms, so a stable Q8-specific hot regression is not established. The
+final head readback fence includes encoder and head GPU work, not head alone.
+The local xDecision GGUF is 402,546,752 bytes on disk; WebGPU buffers were
+134 MB after load, 127 MB after the first three-question answer, then 1.09 GB
+after the second answer recorded an encoder graph. Its sole `(3, 192)` capture
+pinned 776 buffers / 1,033,578,476 bytes (including buffers it touched), while
+the idle pool reported zero. Releasing the model returned GPU buffers to 0 KB.
+This is capture residency, not a demonstrated unreleasable GGUF weight leak;
+the memory/performance tradeoff and possible accumulation across up to four
+capture shapes remain open. WASM heap capacity peaked at 2.38 GB, a separate
+metric from GPU buffers, and fell to 50 MB after release.
+No complete accuracy/performance acceptance is claimed by these observations.
 
 **2026-10-04 xDecision GGUF browser regression fixed and deployed:**
 Chrome on the published Pages build showed `RecursionError` while validating

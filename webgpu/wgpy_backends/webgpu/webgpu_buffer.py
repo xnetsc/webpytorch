@@ -86,6 +86,10 @@ _pinned_ids = {}
 # the decode step went 992ms -> 537ms. That is what was accumulating.
 _capture_name = None
 _pins = {}                    # capture name -> {buffer_id: byte length}
+# A dead temporary may be reused later in the SAME recording: the recorded
+# commands before its finalizer are already enqueued, and no subsequent Python
+# operation can name the dead object. Never share it with another recording.
+_capture_free = defaultdict(list)
 # A buffer whose Python object died while it was pinned. `_pool_put` had to refuse it, so
 # nothing will ever be called for it again -- it is reachable only from here, and this is
 # where it gets freed once the recording that pinned it is gone.
@@ -103,6 +107,7 @@ def begin_capture_pin(name=None):
     """
     global _capture_depth, _capture_name
     if _capture_depth == 0:
+        _capture_free.clear()
         key = name if name is not None else "?"
         if key in _pins:
             release_capture_pin(key)
@@ -131,9 +136,12 @@ def release_capture_pin(name):
 
 
 def end_capture_pin():
-    global _capture_depth
+    global _capture_depth, _capture_name
     if _capture_depth > 0:
         _capture_depth -= 1
+        if _capture_depth == 0:
+            _capture_free.clear()
+            _capture_name = None
 
 
 def reset_capture_pins():
@@ -150,6 +158,7 @@ def reset_capture_pins():
     _capture_name = None
     _pins.clear()
     _pinned_ids.clear()
+    _capture_free.clear()
     for bid, shape in list(_orphaned.items()):
         get_platform().disposeBuffer(bid)
         performance_metrics["webgpu.buffer.delete"] += 1
@@ -185,7 +194,12 @@ def _pool_put(texture_shape: WebGPUArrayTextureShape, buffer_id: int):
         # pooled nor freed now. Remembered here so that whoever releases that recording can
         # free it -- otherwise this is the last anyone ever hears of it.
         _orphaned[buffer_id] = texture_shape
-        return  # pinned by an active/recorded capture — never recycle
+        if (_capture_depth and _capture_name is not None
+                and buffer_id in _pins.get(_capture_name, ())
+                and not any(buffer_id in pins for name, pins in _pins.items()
+                            if name != _capture_name)):
+            _capture_free[texture_shape].append(buffer_id)
+        return  # pinned: only the current recording may reuse a dead temporary
     ids = _pool[texture_shape]
     if (len(ids) >= _POOL_PER_SHAPE
             or _pool_bytes + texture_shape.byte_length > _POOL_MAX_BYTES):
@@ -265,6 +279,12 @@ def _maybe_reap():
 
 def _pool_get(texture_shape: WebGPUArrayTextureShape) -> Optional[int]:
     global _pool_bytes
+    if _capture_depth:
+        reusable = _capture_free.get(texture_shape)
+        if reusable:
+            buffer_id = reusable.pop()
+            _orphaned.pop(buffer_id)
+            return buffer_id
     if len(_pool[texture_shape]) > 0:
         _pool_bytes -= texture_shape.byte_length
         return _pool[texture_shape].pop()
