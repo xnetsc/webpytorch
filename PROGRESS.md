@@ -1,5 +1,43 @@
 # Progress
 
+## 2026-10-05 ▸ WebGL Q8_0: int8 four to a texel, scales as halves (decision 2264 → 835 ms)
+
+**Measured first:** knocking out the `ggml*` WebGL kernels (output shape kept, `main()`
+writes zero) took the Q8 xDecision three-question request from 2264 to 284 ms — 1980 ms was
+the Q8 matmuls. The stored WebGL kernel reads the 34-byte blocks transposed into 32-bit words,
+so a group of four int8 straddles two words half the time, and fetches the activations one
+value at a time; F16 had already moved to four K-values per texel (`WebGLHalfMatrix`).
+
+**Change:** on WebGL a Q8_0 `GGMLLinear` that fits the texture limits holds a
+`WebGLQ8Matrix`: the int8 in an RGBA8UI texture (texel (j, k/4) = the bytes of W[j, k:k+4])
+and the scales in an R16F texture (texel (j, b)) — the file's bytes and halves rearranged,
+nothing converted. `ggml_matmul` runs `mmq8k4_<K>`: activations packed four to an RGBA32F
+texel (`mmk4_pack_x`, shared with F16), per block eight `dot`s with `u − 256·[u ≥ 128]` (exact
+int8), then `s += p · d` in f32 — the same arithmetic as WebGPU's tiled kernel. The stored
+word layout is not built for those weights; the fused WebGL SwiGLU keeps reading words, so a
+split weight takes its separate route. A module-level `_GL_HEAD` already existed (the GGML
+WebGL template); the K4 header is `_K4_GL_HEAD` (the first name silently replaced F16's pack
+kernel source with the template and failed to compile).
+
+**Measured** (WebGL2 via ANGLE Metal, M5; queued calls incl. packing, ms):
+
+| M×K×N | new | stored words | |
+|---|---|---|---|
+| 519×768×2304 | 6.8 | 30.4 | 4.5× |
+| 519×768×768 | 2.33 | 7.04 | 3.0× |
+| 519×1152×768 | 3.44 | 10.46 | 3.0× |
+| 64 rows | | | 3.0–3.6× |
+| 8 rows | | | 1.4–2.1× |
+| 1×768×2304 / 1×768×768 / 1×1152×768 | 0.211 / 0.135 / 0.131 | 0.409 / 0.122 / 0.132 | |
+
+Errors against a float64 reference unchanged (≤1.3e-5). End to end, xDecision three
+questions on WebGL: Q8 2264 → **835 ms** (first 856–870), load 5.3 → 3.4 s, answers identical
+(`billing 0.8966 0.979 1.7244`); F16 in the same session 859 ms. A test rebuilds the split
+layout and requires it to equal GGUF's Q8_0 dequantization exactly.
+
+**Limits:** one-row 768×768 is 10% slower than the word layout (both are kept for no
+weight, so decode takes it); other block formats still use the word layout on WebGL.
+
 ## 2026-10-05 ▸ LLMs race their routes after load too (0.6B first reply 466 → 255 ms to first token)
 
 The first reply of Qwen3-0.6B Q4_K_M spent 204 ms racing stored against unpacked weights for

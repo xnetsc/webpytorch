@@ -147,6 +147,12 @@ back, and chunked attention rounds each chunk's key extent up to 64. Padding per
 instead — `xp[:m] = xf` — is the trap: `__setitem__` goes through the host at 0.8 GB/s and
 cost 3.4 s, more than the cliff it was fixing.
 
+**WebGL Q8_0 is split, not decoded per word.** On WebGL a Q8_0 linear that fits holds its
+int8 four to an RGBA8UI texel and its scales as an R16F texture (`WebGLQ8Matrix`), the same
+bytes as the file. The matmul packs activations four to a texel and does a block's eight
+`dot`s before one scale multiply — 3–4.5× the word-layout kernel from 64 rows up; the Q8
+decision model went 2264 → 835 ms on WebGL, level with F16.
+
 **Races happen once, after a load — never inside an answer.** A route race
 (`_weight_execution`) for a new row bucket used to run the first time an answer needed it:
 461 ms of a 526 ms first request on the Q8 decision model. Now a model calibrates right

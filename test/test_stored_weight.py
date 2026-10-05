@@ -427,3 +427,34 @@ def test_llm_load_ladders_its_layer_weights_but_not_the_output_head():
     assert "wt.calibrate_rows(probe, 512, lo=16, step=4)" in src
     assert "layer_keys = set(owners)" in src
     assert src.index("layer_keys = set(owners)") < src.index('walk(getattr(self, "head", []))')
+
+
+def test_webgl_q8_split_keeps_every_byte_and_scale():
+    """The WebGL Q8_0 layout is the file's bytes rearranged: int8 four to a texel, scales as
+    halves. Rebuilt, it is exactly the GGUF dequantization."""
+    rng = np.random.default_rng(3)
+    N, K = 12, 96
+    nb = K // 32
+    d = (rng.random((N, nb)) * 0.02 + 1e-4).astype(np.float16)
+    q = rng.integers(-128, 128, (N, nb, 32)).astype(np.int8)
+    blocks = np.empty((N, nb, 34), np.uint8)
+    blocks[:, :, :2] = d.view(np.uint8).reshape(N, nb, 2)
+    blocks[:, :, 2:] = q.view(np.uint8)
+    raw = blocks.tobytes()
+    qt, dt = wt._q8_split(raw, K, N)
+    assert qt.shape == (K // 4, N, 4) and qt.dtype == np.uint8
+    assert dt.shape == (nb, N) and dt.dtype == np.float16
+    # What the shader does with a texel: u - 256 where u >= 128.
+    u = qt.astype(np.float32)
+    signed = u - 256.0 * (u >= 128)
+    w = signed.transpose(1, 0, 2).reshape(N, K) * np.repeat(dt.T.astype(np.float32), 32, axis=1)
+    ref = ggufload.dequant(ggufload.GGML_IDS["Q8_0"], raw, N * K).reshape(N, K)
+    np.testing.assert_array_equal(w, ref)
+    src = inspect.getsource(wt._webgl_matmul_q8k4)
+    assert "u - 256.0 * step(128.0, u)" in src
+    assert "s += p * texelFetch(tex_d" in src          # scale on the block's partial sum
+
+
+def test_webgl_fused_swiglu_does_not_read_a_split_q8_weight_as_words():
+    src = inspect.getsource(wt.parallel_swiglu)
+    assert "not any(isinstance(l.packed, WebGLQ8Matrix) for l in linears)" in src

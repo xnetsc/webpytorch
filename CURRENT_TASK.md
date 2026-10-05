@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGL Q8 2264 → 835 ms (F16 859 ms), answers unchanged:** Q8_0 weights on
+WebGL hold int8 four to an RGBA8UI texel plus R16F scales; per-block dot + scale in f32.
+All three requested items now done: WebGPU Q8 first request 526 → 121 ms and its steady
+gap explained (exact Q8 ~10–12% more GPU work than F16 at the encoder shapes), LLM
+load-time route ladder (0.6B first token 466 → 255 ms), WebGL Q8.
+
 **2026-10-05 user asked for all three:** (1) Q8 steady vs F16 on WebGPU — kernel variants
 exhausted (stage 1/2/3 blocks, 32/48/64-row tiles, bank layouts, f32/f16 tiles, double
 buffer): exact Q8 does ~10–12% more GPU work than F16 at the encoder's shapes (faster at
