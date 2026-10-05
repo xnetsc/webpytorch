@@ -524,3 +524,18 @@ def test_jinja2_is_fetched_at_boot_and_the_template_waits_for_that_fetch():
     assert '__webtorch_jinja2' in src and "await pending" in src
     load = inspect.getsource(llm.CausalLM._from_gguf)
     assert load.index("await self.tok.prepare_template()") > load.index("self.mtp = await")
+
+
+def test_every_format_derives_a_packed_activation_webgl_kernel():
+    """The packed variant is derived from each dense batched kernel by substitution; every
+    substitution must apply and nothing may still read the scalar activation texture."""
+    import re as _re
+    for name in wt._GGML_TYPES:
+        for mode in (0, 3):
+            src = wt._ggml_packed_x_src(wt._ggml_src_gl(name, False, False, False, mode,
+                                                        "selected"))
+            assert _re.search(r"\btex_x\b", src) is None, (name, mode)
+            assert "Xf(" not in src, (name, mode)
+            assert "uniform sampler2D tex_xp;" in src
+    src = inspect.getsource(wt._ggml_run_gl)
+    assert 'not moe and mode in (0, 3)' in src

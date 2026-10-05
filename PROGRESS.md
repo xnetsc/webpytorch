@@ -1,5 +1,23 @@
 # Progress
 
+## 2026-10-05 ▸ WebGL: packed activations as a raced candidate for every block format
+
+The WebGL GGML kernels fetch the activation one value per texel (`Xf`), four fetches per
+`ACC4`; `_GL_HEAD` records that packing them four to an RGBA32F texel LOST on the one-row
+decode sweep (34.9 → 16.3 GB/s), where the single row is cached. Batched rows are the other
+case — every fragment reads a whole row of its own — and Q8_0's K4 path had shown 3–4.5×
+there. So the packed form is derived from each dense batched kernel by substitution
+(`_ggml_packed_x_src`; every substitution must apply, and nothing may still read `tex_x`)
+and enters the `ggml_gl_exact` race for modes 0 and 3 (M ≥ 3, non-MoE), next to base and
+alternate; formats that had no alternate now race too. M = 1–2 are untouched.
+
+Measured (WebGL2/ANGLE-Metal, M5, K=1024, N=768, ms base/packed, errors identical):
+Q4_K M64 1.29/0.55 M300 4.73/1.75; Q2_K 1.41/0.65, 5.32/2.08; Q6_K 1.64/0.95, 6.12/3.21;
+Q5_0 no gain (5.45/5.38); at M=8 mixed (Q6_K 0.34/0.58, Q4_1 0.27/0.39). Qwen3-0.6B Q4_K_M
+on WebGL, same session: the load-time ladder picked packed for 12 buckets; first token of
+three replies 1874/1434/1228 ms vs 1945/1631/1654 with those forced back to base; same text.
+WebGL LLM decode is 21.5 tok/s for this model — a separate, open item.
+
 ## 2026-10-05 ▸ 0.6B load 12–16 s → 1.6 s; tiled stored-format kernels for nine more block formats
 
 **Where the 0.6B's load went** (Qwen3-0.6B Q4_K_M, WebGPU, profile reused, every stage and

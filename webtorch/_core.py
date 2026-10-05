@@ -3535,7 +3535,7 @@ def use_kernel_profile(profile):
                     int(parts[5]))] = v
             n += 1
         elif (len(parts) == 6 and parts[0] == "weight_exec"
-              and v in ("stored", "tiled", "dp4a", "materialized", "full",
+              and v in ("stored", "tiled", "dp4a", "materialized", "full", "packed",
                         "selected_full", "selected_q", "base", "alternate")):
             _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
@@ -11295,11 +11295,48 @@ def _gl_rowinit(moe, moedec):
 
 _ggml_gl = {"added": set()}
 
+# The same kernel reading its activations four to an RGBA32F texel (`_webgl_pack_x4`).
+# `_GL_HEAD`'s note records that this LOST on the one-row decode sweep, where the single
+# activation row is cached and a scalar fetch is cheaper than a vec4 fetch plus a dynamic
+# index -- so it is not a replacement. It is a candidate for the batched modes, where a
+# fragment reads a whole activation row of its own: four fetches become one, and the race in
+# `_ggml_run_gl` decides per format, shape and row bucket on the device.
+_GL_PACKED_X = (
+    ("uniform sampler2D tex_x;", "uniform sampler2D tex_xp; uniform int u_R; uniform int u_K4;"),
+    ("int _xw; int _ww;", "int _ry; int _bx; int _xw; int _ww;"),
+    ("  _xw = textureSize(tex_x, 0).x; _xh = textureSize(tex_x, 0).y;\n", ""),
+    ("void ACC(uint k, float v) { acc0 += Xf(int(xrow + k)) * v; }",
+     "void ACC(uint k, float v) {\n"
+     "  acc0 += texelFetch(tex_xp, ivec2(_bx + int(k >> 2u), _ry), 0)[int(k & 3u)] * v; }"),
+    ("void ACC4(uint k, vec4 v) { int i = int(xrow + k);\n"
+     "  acc0 += dot(vec4(Xf(i), Xf(i + 1), Xf(i + 2), Xf(i + 3)), v); }",
+     "void ACC4(uint k, vec4 v) {\n"
+     "  acc0 += dot(texelFetch(tex_xp, ivec2(_bx + int(k >> 2u), _ry), 0), v); }"),
+    ("  woff = 0u;\n  xrow = uint(r) * gm.K;",
+     "  woff = 0u;\n  xrow = uint(r) * gm.K;\n  _ry = r / u_R; _bx = (r - _ry * u_R) * u_K4;"),
+)
+
+
+def _ggml_packed_x_src(src):
+    """`src` (a dense batched GL kernel) reading packed activations; every substitution
+    must apply, so a change to the template is an error here rather than a kernel that
+    still reads `tex_x`."""
+    for old, new in _GL_PACKED_X:
+        if old not in src:
+            raise RuntimeError("WebGL GGML template changed; packed-activation variant "
+                               "cannot be derived (%r)" % old[:40])
+        src = src.replace(old, new)
+    # Nothing else may read the scalar activation texture.
+    i = src.index("float Xf(int i)")
+    j = src.index("\n}\n", i) + 3
+    return src[:i] + src[j:]
+
 
 def _ggml_name_gl(type_name, moe, moedec, bias=False, mode=1, exact_route="base"):
     return "ggml_gl_%s_%s_m%d_%s%s" % (type_name.lower().replace("-", "_"),
                                        "md" if moedec else ("mb" if moe else "d"), mode,
-                                       "xa" if exact_route == "alternate" else "xb",
+                                       {"alternate": "xa", "packed": "xp"}.get(exact_route,
+                                                                                "xb"),
                                        "_b" if bias else "")
 
 
@@ -11309,9 +11346,12 @@ def _ggml_add_gl(type_name, moe=False, moedec=False, bias=False, mode=1,
     if key in _ggml_gl["added"]:
         return
     plat = _copy_kernel["plat"]
+    if exact_route == "packed":
+        src = _ggml_packed_x_src(_ggml_src_gl(type_name, moe, moedec, bias, mode, "selected"))
+    else:
+        src = _ggml_src_gl(type_name, moe, moedec, bias, mode, exact_route)
     plat.addKernel(_ggml_name_gl(type_name, moe, moedec, bias, mode, exact_route),
-                   {"source": _ggml_src_gl(type_name, moe, moedec, bias, mode,
-                                            exact_route)})
+                   {"source": src})
     _ggml_gl["added"].add(key)
 
 
@@ -11328,8 +11368,16 @@ def _ggml_run_gl_exact(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=
     _ggml_add_gl(type_name, moe, moedec, bias is not None, mode, exact_route)
     of = _empty((rows, N))
     grid = _ggml_grid(type_name)
-    inputs = [{"name": "tex_x", "id": _contig(xf).buffer.buffer_id},
-              {"name": "tex_w", "id": packed.buffer.buffer_id}]
+    extra = []
+    if exact_route == "packed":
+        xp_buf, per_row, _ = _webgl_pack_x4(_contig(xf), int(K))
+        inputs = [{"name": "tex_xp", "id": xp_buf.buffer_id},
+                  {"name": "tex_w", "id": packed.buffer.buffer_id}]
+        extra = [{"name": "u_R", "value": int(per_row), "type": "int"},
+                 {"name": "u_K4", "value": int(K) // 4, "type": "int"}]
+    else:
+        inputs = [{"name": "tex_x", "id": _contig(xf).buffer.buffer_id},
+                  {"name": "tex_w", "id": packed.buffer.buffer_id}]
     if moe:
         inputs.append({"name": "tex_e", "id": eidx.buffer.buffer_id})
     if grid is not None:
@@ -11345,7 +11393,7 @@ def _ggml_run_gl_exact(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=
                                  U("u_M", M), U("u_N", N), U("u_K", K),
                                  U("u_rowb", (K // vals) * blk), U("u_estride", estride),
                                  U("u_eslot", eslot), U("u_xper", 1 if xper else 0),
-                                 U("u_ROWS", rows)]})
+                                 U("u_ROWS", rows)] + extra})
     return of
 
 
@@ -11470,7 +11518,13 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
                                   eslot=eslot, estride=estride, xper=xper, bias=bias,
                                   exact_route=route)
 
-    if override is None:
+    # Packed activations: dense batched modes only (a MoE kernel indexes its activation
+    # row differently), and only where RGBA32F renders.
+    packed_ok = (not moe and mode in (0, 3) and int(K) % 4 == 0
+                 and bool(get_platform_info_gl().get("supportsTexture32bit")))
+    candidates = (("base",) + (("alternate",) if override is not None else ())
+                  + (("packed",) if packed_ok else ()))
+    if len(candidates) == 1:
         return run("base")
     reference = [None]
 
@@ -11489,9 +11543,20 @@ def _ggml_run_gl(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0, xpe
                                      "slot" if moe and M <= 2 else "batch",
                                      "bias" if bias is not None else "nobias")
     route = _weight_execution("ggml_gl_exact", storage, K, N, M, run,
-                              candidates=("base", "alternate"), check=correct,
+                              candidates=candidates, check=correct,
                               rounds=9, repeat=2)
     return run(route)
+
+
+_GL_INFO = {}
+
+
+def get_platform_info_gl():
+    """This WebGL device's capability flags, asked of the platform once."""
+    if "v" not in _GL_INFO:
+        from wgpy_backends.webgl.platform import get_platform
+        _GL_INFO["v"] = get_platform().getDeviceInfo()
+    return _GL_INFO["v"]
 
 
 def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
