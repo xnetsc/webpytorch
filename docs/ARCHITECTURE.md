@@ -161,8 +161,12 @@ decision model went 2264 → 835 ms on WebGL, level with F16.
 after its weights arrive: `calibrate_rows` measures every race a weight can set off over a
 row-count ladder bisected in octaves (both ends, then the middle of any interval whose ends
 disagree), and from then on a row count no probe visited takes the nearest probe's measured
-choice. What is measured is per device and kept by the SDK (IndexedDB, keyed by adapter,
-dropped when the kernels change), so a second load measures nothing. Decision models
+choice. Only the ladder's cheap end runs inside the load; the rest (the top probe, where the
+stored kernel at 512 rows is most of the cost, and any bisection) is queued and advanced by
+the host a step at a time while no call is running (`calibrate_deferred`), answers borrowing
+the nearest measured bucket meanwhile. What is measured is per device and kept by the SDK
+(IndexedDB, keyed by adapter, dropped when the kernels change), so a second load measures
+nothing. Decision models
 ladder every stored linear and the head's row selection; LLMs ladder the weights their
 layers hold (16→512 rows) — not the output head, which a prefill reads for one row.
 

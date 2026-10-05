@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 tiled kernels cover 17 block formats (incl. i-quants); route ladders finish in
+idle time:** 27B cold load 95 → 62 s with no races in replies (hybrid linear-attention layers
+were missed by warm and ladder); Q8 decision cold load 2.5 s. WebGL: packed activations race
+for every format. Open: the 27B's 30 s one-row warm (pre-existing), WebGL LLM decode (21 tok/s
+on the 0.6B).
+
 **2026-10-05 0.6B load 12–16 s → 1.6 s; tiled kernels for nine more formats (WebGPU):**
 jinja2 is fetched at boot (it was a CDN download inside the load), the greedy-chunk race
 completes and is remembered (it overran its budget every load). Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/

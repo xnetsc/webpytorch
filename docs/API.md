@@ -784,7 +784,8 @@ to read.
 {"build": "a3f1c9e04b27d8e6",                  # digest of the kernel sources, see below
  "tuned":      {"ggml_shape|Q4_K|1024|512": "narrow", ...},
  "checked":    {"Q4_K|1|narrow|False": True, ...},
- "dequant_ok": {"Q4_K": True, ...}}
+ "dequant_ok": {"Q4_K": True, ...},
+ "calibrated": ["weight_exec|ggml|Q4_K|1024|3072", ...]}   # ladders measured in full
 ```
 
 **Key your storage by the GPU adapter** — a different device is a different answer, and the
@@ -808,6 +809,15 @@ wrong kernel.
 
 Keeping nothing is a supported choice: every load then behaves exactly as it did before this
 existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
+
+- `webtorch.calibrate_deferred(budget_s=0.5)` → how many route ladders are still queued.
+  A load measures the cheap end of each weight's row-count ladder and queues the rest; each
+  call runs queued probes for about `budget_s` seconds (at least one probe while any is
+  queued). Until a ladder finishes, calls borrow the nearest row count it has measured, so
+  nothing waits on it and nothing races inside an answer. `webtorch.start()` hosts call
+  this for you while no call is running and keep the profile when the queue is empty. Using
+  the Python SDK directly, call it when you are idle, then save `kernel_profile()` again;
+  not calling it is also correct, only the large row counts keep the borrowed choice.
 
 - `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
   nothing is. Reading this is the supported way to find out why a machine that should be
@@ -942,7 +952,9 @@ with you, and is off unless you ask:
 **What `start` does decide.** After a model's weights arrive the SDK races the kernel routes
 it can take, once, on this GPU (per weight format and shape, over a ladder of row counts),
 so that no answer ever waits on a measurement; a row count no probe visited takes the
-nearest probe's winner. It keeps those results itself -- a small JSON in this origin's
+nearest probe's winner. Only the cheap end of each ladder is measured inside the load; the
+rest runs a step at a time while no call is running, so a call that arrives waits for at
+most one probe. It keeps those results itself -- a small JSON in this origin's
 IndexedDB, keyed by the adapter's identity and dropped whole when the kernels change -- so
 the next load measures nothing. That is the SDK's mechanism, not a host policy; a host that
 must leave nothing in browser storage passes `start({ rememberTuning: false })`.

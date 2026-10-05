@@ -300,6 +300,8 @@ def loaded_models():
 
 def release_all():
     """Release every cached model (frees their weights). Returns how many were released."""
+    from . import _core as _c
+    _c.calibration_drop()
     n = 0
     for m in list(_LOADED.values()):
         m.release(); n += 1          # Model.release frees the impl's weights too
@@ -777,4 +779,7 @@ def release(model):
     for key, m in list(_LOADED.items()):         # drop any cache entry pointing at it
         if m is model or m.__dict__.get("impl") is model:
             _LOADED.pop(key, None)
+    # Queued route ladders hold this model's weights through their probes.
+    from . import _core as _c
+    _c.calibration_drop()
     return _free(model)

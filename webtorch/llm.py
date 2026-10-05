@@ -4651,7 +4651,13 @@ class CausalLM:
                 elif isinstance(value, (list, tuple)):
                     for item in value:
                         walk(item)
-                elif isinstance(value, wt.Module):
+                elif isinstance(value, wt.Module) or (
+                        # A layer this package defines without deriving Module -- the
+                        # linear-attention block is one -- still holds Linears. Missing it
+                        # left 17 of a hybrid 27B's projection shapes out of both this warm
+                        # pass and the route ladder, so its first prompt raced them (4.5 s).
+                        not isinstance(value, wt.Tensor) and hasattr(value, "__dict__")
+                        and type(value).__module__.startswith("webtorch.")):
                     for item in vars(value).values():
                         walk(item)
             walk(getattr(self, "layers", []))
@@ -4733,7 +4739,7 @@ class CausalLM:
                 def probe(m, lay=lay, kt=kt):
                     x = wt.Tensor(rng.standard_normal((m, int(kt))).astype(np.float32))
                     wt._sync_small(lay(x))
-                wt.calibrate_rows(probe, 512, lo=16, step=4)
+                wt.calibrate_rows(probe, 512, lo=16, step=4, defer=True)
                 _load_stage("tuning", done=i + 1, total=len(ladder))
             _warm_s = time.perf_counter() - _t0
             wt.flash_tune(self.NH, self.NKV, self.HD)

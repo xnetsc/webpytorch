@@ -1,5 +1,51 @@
 # Progress
 
+## 2026-10-05 ▸ The rest of a load's route ladders runs while idle; hybrid layers are no longer missed
+
+**Measured first, on the 27B (Qwen3.8-27B UD-Q2_K_XL, WebGPU, cold):** with every ladder
+inside the load, the load was 95.3 s — 40.0 s of it the 16→512 ladders, almost all the
+stored kernel at the 512-row probe of 5120×17408 weights — and the first reply still raced
+4.5 s, for 17 projection shapes no ladder had visited. Those were the linear-attention
+(Gated DeltaNet) layers: `LinearAttention` is a plain class, and `_warm_shapes` walked only
+dicts, lists and `wt.Module`, so the same 17 shapes had also been missing from the existing
+one-row warm pass (the "first decode step dispatched 13742 commands a second does not"
+warning).
+
+**Changes:**
+- `_warm_shapes` also walks objects of this package that are not Modules.
+- `calibrate_rows(..., defer=True)` measures only the ladder's bottom probe in the load; its
+  prefixes are borrowable at once (`_PROVISIONAL`), and the rest is queued. A ladder already
+  complete for every prefix it touches (a remembered profile) queues nothing.
+  `calibrate_deferred(budget_s)` advances the queue, at least one probe per call; the host
+  calls it a step at a time only while no call is in flight, then keeps the profile.
+  Releasing a model drops the queue (its probes hold the weights).
+
+**Measured:**
+
+| cold, WebGPU | load | ladder inside load | after load, idle | first reply | races in replies |
+|---|---|---|---|---|---|
+| 27B, ladder in load | 95.3 s | 40.0 s | — | 10.1 s first token | 4.5 s |
+| 27B, deferred | **62.3 s** | 9.8 s | 46.4 s | **6.6 s** first token | 0 |
+| xDecision Q8, deferred | **2.5 s** (was 3.2) | 0.9 s | 1.5 s | 118.7 ms | 0 |
+| Qwen3-0.6B, deferred | 7.0 s | 0.35 s | 1.45 s | later replies 147 ms | 0 |
+
+27B decode 6.9–7.3 tok/s; the 27B's warm-step went 12.7 → 7.8 s now that the hybrid shapes
+are warmed before the first step. 50 of 52 prefixes are calibrated; the other two are only
+ever one-row. Answers and greedy text unchanged. The 27B's remaining 29.9 s "warming" is the
+pre-existing one-row route races and decode shapes; with a kept profile none of it runs.
+
+## 2026-10-05 ▸ WebGPU tiled kernels for the i-quants (IQ4_NL/XS, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S)
+
+The i-quants are ~80% of the 27B UD-Q2_K_XL file's bytes (IQ3_XXS 25%, IQ2_S 16%, IQ3_S 13%,
+IQ2_XXS 9%, IQ2_XS 7%, IQ4_XS 6%, IQ1_S 3.5%) and are excluded from "materialized" (codebook
+formats), so a prefill ran them on the stored kernel. Their values are codebook entries times
+a sign — still integers a half holds exactly (IQ4's int8 table; IQ1_S's ±1/8 delta folded as
+8·(grid+δ) with A/8) — so they join `_TILED_TEMPLATE`, binding the stored kernel's own
+codebook buffer (`_ggml_grid`) at binding 4. Browser test on random valid blocks (K=512,
+N=96, M=3/70/300): tiled vs a float64 host dequant 1.3e-7–1.8e-7, stored vs the same 3.4e-7–
+5.2e-7; 300 rows 1.6–1.9× the stored kernel except IQ4_XS (equal). IQ1_M, TQ1_0/TQ2_0,
+MXFP4/NVFP4, Q1_0/Q2_0 are not templated (rare in the files here).
+
 ## 2026-10-05 ▸ WebGL: packed activations as a raced candidate for every block format
 
 The WebGL GGML kernels fetch the activation one value per texel (`Xf`), four fetches per

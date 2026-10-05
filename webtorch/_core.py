@@ -2992,7 +2992,9 @@ _WEIGHT_TUNE_CALLS = 0
 # visit takes the choice of the nearest bucket it did, instead of racing in front of the
 # person waiting. While calibrating, every race is run and every key asked is noted.
 _CALIBRATING = [0]
-_CALIBRATED = set()
+_CALIBRATED = set()        # full ladder measured (kept in the device profile)
+_PROVISIONAL = set()       # bottom probe measured, the rest of the ladder still queued
+_DEFERRED = []             # queued ladders, advanced by `calibrate_deferred` when idle
 _CALIB_TOUCHED = []
 _NEAREST = {}
 
@@ -3013,7 +3015,7 @@ def _nearest_tuned(key):
     """The measured choice of the bucket nearest `key`'s, in octaves, for a calibrated
     prefix; None when the prefix was never calibrated. A tie goes to the larger bucket."""
     prefix = key[:-1]
-    if prefix not in _CALIBRATED:
+    if prefix not in _CALIBRATED and prefix not in _PROVISIONAL:
         return None
     hit = _NEAREST.get(key)
     if hit is not None and hit[0] == len(_TUNED):
@@ -3030,7 +3032,50 @@ def _nearest_tuned(key):
     return choice
 
 
-def calibrate_rows(probe, top, lo=1, step=2):
+class _Ladder(object):
+    """One weight's row-count ladder: probes run one at a time, bisected in octaves."""
+
+    def __init__(self, probe, top, lo, step):
+        self.probe = probe
+        self.lo = 1 << (max(1, int(lo)) - 1).bit_length()
+        self.top = 1 << (max(1, int(top)) - 1).bit_length()
+        self.step = max(2, int(step))
+        self.seen = {}
+        self.need = [self.lo] + ([self.top] if self.top > self.lo else [])
+        self.todo = [(self.lo, self.top)]
+
+    def run(self, m):
+        del _CALIB_TOUCHED[:]
+        with _calibrating():
+            self.probe(m)
+        self.seen[m] = {k[:-1]: _TUNED[k] for k in _CALIB_TOUCHED if k in _TUNED}
+        del _CALIB_TOUCHED[:]
+
+    def advance(self):
+        """Run the next probe; False once the ladder is complete."""
+        while not self.need and self.todo:
+            a, b = self.todo.pop()
+            if b <= self.step * a or a not in self.seen or b not in self.seen:
+                continue
+            sa, sb = self.seen[a], self.seen[b]
+            if all(sa[k] == sb[k] for k in sa if k in sb):
+                continue
+            mid = 1 << ((a.bit_length() + b.bit_length()) // 2 - 1)
+            self.need.append(mid)
+            self.todo += [(a, mid), (mid, b)]
+        if not self.need:
+            return False
+        self.run(self.need.pop(0))
+        return True
+
+    def prefixes(self):
+        out = set()
+        for got in self.seen.values():
+            out.update(got)
+        return out
+
+
+def calibrate_rows(probe, top, lo=1, step=2, defer=False):
     """Measure every route race `probe(m)` sets off over a ladder of row counts, once.
 
     `probe(m)` runs the operation at m rows. The ladder is bisected in octaves: `lo` and
@@ -3038,38 +3083,57 @@ def calibrate_rows(probe, top, lo=1, step=2):
     race, until the ends are at most `step` times apart -- so the crossovers are found where
     they are, on this device, without visiting every bucket. Near a crossover the candidates
     are close by definition, so locating it to within `step` costs little. Each race's
-    prefix is then calibrated:
-    a row count between probes takes the nearest probe's measured choice, and one past
-    `top` takes `top`'s. Returns the row counts probed.
+    prefix is then calibrated: a row count between probes takes the nearest probe's
+    measured choice, and one past `top` takes `top`'s.
+
+    With `defer`, only `lo` -- the cheap end -- is measured now; its prefixes may be borrowed
+    from at once, and the rest of the ladder is queued for `calibrate_deferred`, which the
+    host runs while nothing is asking. A 27B's full ladder was 40 s of a 95 s first load,
+    almost all of it the stored kernel at the top probe. A ladder already complete for every
+    prefix it touches (a remembered profile) queues nothing. Returns the probes run now.
     """
-    lo, top = 1 << (max(1, int(lo)) - 1).bit_length(), 1 << (max(1, int(top)) - 1).bit_length()
-    seen = {}
-
-    def run(m):
-        del _CALIB_TOUCHED[:]
-        with _calibrating():
-            probe(m)
-        seen[m] = {k[:-1]: _TUNED[k] for k in _CALIB_TOUCHED if k in _TUNED}
-        del _CALIB_TOUCHED[:]
-
-    run(lo)
-    if top > lo:
-        run(top)
-    todo = [(lo, top)]
-    while todo:
-        a, b = todo.pop()
-        if b <= max(2, int(step)) * a:
-            continue
-        sa, sb = seen[a], seen[b]
-        if all(sa[k] == sb[k] for k in sa if k in sb):
-            continue
-        mid = 1 << ((a.bit_length() + b.bit_length()) // 2 - 1)
-        run(mid)
-        todo += [(a, mid), (mid, b)]
-    for got in seen.values():
-        _CALIBRATED.update(got)
+    ladder = _Ladder(probe, top, lo, step)
+    if defer:
+        ladder.run(ladder.need.pop(0))
+        got = ladder.prefixes()
+        if got and got <= _CALIBRATED:
+            return sorted(ladder.seen)
+        _PROVISIONAL.update(got - _CALIBRATED)
+        _DEFERRED.append(ladder)
+        _NEAREST.clear()
+        return sorted(ladder.seen)
+    while ladder.advance():
+        pass
+    _CALIBRATED.update(ladder.prefixes())
+    _PROVISIONAL.difference_update(_CALIBRATED)
     _NEAREST.clear()
-    return sorted(seen)
+    return sorted(ladder.seen)
+
+
+def calibrate_deferred(budget_s=0.5):
+    """Advance the queued ladders for about `budget_s` seconds of probes; return how many
+    ladders remain. Called by the host when no call is running, a step at a time, so a
+    caller that arrives waits for at most one probe."""
+    import time as _t
+    t0 = _t.perf_counter()
+    while _DEFERRED:                       # at least one step per call: progress is certain
+        ladder = _DEFERRED[0]
+        if not ladder.advance():
+            _DEFERRED.pop(0)
+            got = ladder.prefixes()
+            _CALIBRATED.update(got)
+            _PROVISIONAL.difference_update(got)
+        if _t.perf_counter() - t0 >= float(budget_s):
+            break
+    _NEAREST.clear()
+    return len(_DEFERRED)
+
+
+def calibration_drop():
+    """Forget queued ladders -- their probes hold the model being released."""
+    del _DEFERRED[:]
+    _PROVISIONAL.clear()
+    _NEAREST.clear()
 
 
 def _sync_small(a):
@@ -9439,6 +9503,163 @@ fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
 fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> { let o = b * 84u; return F16V(o + 80u, c4) * vec4<f32>(BV(o + s, c4) & vec4<u32>(15u)); }
 fn QB(b: u32, s: u32, c4: u32) -> vec4<f32> { let o = b * 84u; return F16V(o + 82u, c4) * vec4<f32>(BV(o + s, c4) >> vec4<u32>(4u)); }
 """
+# The i-quants. Their values are codebook entries (8, 25, 43 ...; int8 for IQ4) times a
+# sign, so q' is still an integer a half holds exactly; IQ1_S's +-1/8 offset is folded in by
+# taking 8*(grid + delta) and A/8. The codebooks are the same buffer the stored kernel binds
+# (`_ggml_grid`): 128 bytes of sign masks, then the entries from word 32. A grid lookup is
+# per column, so these assemble four columns' four k and transpose.
+_TILED_GRID = """
+@group(0) @binding(4) var<storage,read> gr: array<u32>;
+fn GBt(o: u32) -> u32 { return (gr[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+fn G4Vt(idx: u32) -> vec4<f32> { return unpack4x8unorm(gr[32u + idx]) * 255.0; }
+fn GI8Vt(o: u32) -> vec4<f32> {
+  let p = gr[o >> 2u];
+  return vec4<f32>(vec4<i32>(vec4<u32>(p << 24u, p << 16u, p << 8u, p)) >> vec4<u32>(24u));
+}
+fn SGN4t(m: u32, j0: u32) -> vec4<f32> {
+  return vec4<f32>(select(1.0, -1.0, (m & (1u << j0)) != 0u),
+                   select(1.0, -1.0, (m & (1u << (j0 + 1u))) != 0u),
+                   select(1.0, -1.0, (m & (1u << (j0 + 2u))) != 0u),
+                   select(1.0, -1.0, (m & (1u << (j0 + 3u))) != 0u));
+}
+"""
+_TILED_KV = """
+fn KV(t: u32) -> f32 {
+  let lo = select(0xBFAD9881u, 0xF6EADDCFu, (t & 4u) != 0u);
+  let hi = select(0x26190D01u, 0x71594535u, (t & 4u) != 0u);
+  let p = select(lo, hi, (t & 8u) != 0u);
+  return f32(i32(((p >> (8u * (t & 3u))) & 255u) << 24u) >> 24u);
+}
+fn KV4(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(KV(v.x), KV(v.y), KV(v.z), KV(v.w)); }
+"""
+_TILED_IQ4_NL = _TILED_KV + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let w = B4V(b * 18u + 2u + (kl & 15u), c4); let sh = select(0u, 4u, kl >= 16u);
+  let f = vec4<u32>(15u);
+  return mat4x4<f32>(KV4((w >> vec4<u32>(sh)) & f), KV4((w >> vec4<u32>(8u + sh)) & f),
+                     KV4((w >> vec4<u32>(16u + sh)) & f), KV4((w >> vec4<u32>(24u + sh)) & f));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> { return F16V(b * 18u, c4); }
+"""
+_TILED_IQ4_XS = _TILED_KV + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 136u; let ib = kl >> 5u; let r = kl & 31u;
+  let w = WV(((o + 8u + ib * 16u) >> 2u) + ((r & 15u) >> 2u), c4); let sh = select(0u, 4u, r >= 16u);
+  let f = vec4<u32>(15u);
+  return mat4x4<f32>(KV4((w >> vec4<u32>(sh)) & f), KV4((w >> vec4<u32>(8u + sh)) & f),
+                     KV4((w >> vec4<u32>(16u + sh)) & f), KV4((w >> vec4<u32>(24u + sh)) & f));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 136u;
+  let lo = (BV(o + 4u + (s >> 1u), c4) >> vec4<u32>(4u * (s & 1u))) & vec4<u32>(15u);
+  let hi = (B4V(o + 2u, c4) >> vec4<u32>(2u * s)) & vec4<u32>(3u);
+  return F16V(o, c4) * (vec4<f32>(lo | (hi << vec4<u32>(4u))) - 32.0);
+}
+"""
+_TILED_IQ2_XXS = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 66u; let ib = kl >> 5u; let l = (kl >> 3u) & 3u; let hf = (kl >> 2u) & 1u;
+  let qw = B4V(o + 2u + ib * 8u, c4); let a1 = B4V(o + 6u + ib * 8u, c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let gx = ((qw[c] >> (8u * l)) & 255u) * 2u + hf;
+    cols[c] = G4Vt(gx) * SGN4t(GBt((a1[c] >> (7u * l)) & 127u), hf * 4u);
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 66u; let a1 = B4V(o + 6u + s * 8u, c4);
+  return F16V(o, c4) * (vec4<f32>(0.5) + vec4<f32>(a1 >> vec4<u32>(28u))) * 0.25;
+}
+"""
+_TILED_IQ2_XS = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 74u; let ib = kl >> 5u; let l = (kl >> 3u) & 3u; let hf = (kl >> 2u) & 1u;
+  let qw = B4V(o + 2u + ib * 8u + select(0u, 4u, l >= 2u), c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let q = (qw[c] >> (16u * (l & 1u))) & 65535u;
+    cols[c] = G4Vt((q & 511u) * 2u + hf) * SGN4t(GBt(q >> 9u), hf * 4u);
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 74u; let sc = BV(o + 66u + (s >> 1u), c4);
+  let nib = select(sc & vec4<u32>(15u), sc >> vec4<u32>(4u), vec4<bool>((s & 1u) != 0u));
+  return F16V(o, c4) * (vec4<f32>(0.5) + vec4<f32>(nib)) * 0.25;
+}
+"""
+_TILED_IQ2_S = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 82u; let ib = kl >> 5u; let l = (kl >> 3u) & 3u; let hf = (kl >> 2u) & 1u;
+  let qw = B4V(o + 2u + ib * 4u, c4); let sw = B4V(o + 34u + ib * 4u, c4);
+  let qh = BV(o + 66u + ib, c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let gx = (((qw[c] >> (8u * l)) & 255u) | ((qh[c] << (8u - 2u * l)) & 768u)) * 2u + hf;
+    cols[c] = G4Vt(gx) * SGN4t((sw[c] >> (8u * l)) & 255u, hf * 4u);
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 82u; let sc = BV(o + 74u + (s >> 1u), c4);
+  let nib = select(sc & vec4<u32>(15u), sc >> vec4<u32>(4u), vec4<bool>((s & 1u) != 0u));
+  return F16V(o, c4) * (vec4<f32>(0.5) + vec4<f32>(nib)) * 0.25;
+}
+"""
+_TILED_IQ3_XXS = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 98u; let ib = kl >> 5u; let p = (kl >> 2u) & 7u;
+  let a1 = B4V(o + 66u + ib * 4u, c4);
+  let qw = B4V(o + 2u + ib * 8u + select(0u, 4u, p >= 4u), c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let sm = GBt((a1[c] >> (7u * (p >> 1u))) & 127u);
+    cols[c] = G4Vt((qw[c] >> (8u * (p & 3u))) & 255u) * SGN4t(sm, (p & 1u) * 4u);
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 98u; let a1 = B4V(o + 66u + s * 4u, c4);
+  return F16V(o, c4) * (vec4<f32>(0.5) + vec4<f32>(a1 >> vec4<u32>(28u))) * 0.5;
+}
+"""
+_TILED_IQ3_S = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 110u; let ib = kl >> 5u; let p = (kl >> 2u) & 7u;
+  let qw = B4V(o + 2u + ib * 8u + select(0u, 4u, p >= 4u), c4);
+  let qh = BV(o + 66u + ib, c4); let sw = BV(o + 74u + ib * 4u + (p >> 1u), c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let gi = ((qw[c] >> (8u * (p & 3u))) & 255u) | ((qh[c] << (8u - p)) & 256u);
+    cols[c] = G4Vt(gi) * SGN4t(sw[c], (p & 1u) * 4u);
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 110u; let scb = BV(o + 106u + (s >> 1u), c4);
+  let nib = select(scb & vec4<u32>(15u), scb >> vec4<u32>(4u), vec4<bool>((s & 1u) != 0u));
+  return F16V(o, c4) * (vec4<f32>(1.0) + 2.0 * vec4<f32>(nib));
+}
+"""
+_TILED_IQ1_S = _TILED_GRID + """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let o = b * 50u; let ib = kl >> 5u; let l = (kl >> 3u) & 3u; let hf = (kl >> 2u) & 1u;
+  let qh4 = B4V(o + 34u + ib * 2u, c4); let qw = B4V(o + 2u + ib * 4u, c4);
+  var cols: array<vec4<f32>, 4>;
+  for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+    let qh = qh4[c] & 65535u;
+    let gi = 128u + (((qw[c] >> (8u * l)) & 255u) | (((qh >> (3u * l)) & 7u) << 8u)) * 8u + 4u * hf;
+    // 8 * (grid + delta): an odd integer in [-9, 9]; A carries the 1/8.
+    cols[c] = GI8Vt(gi) * 8.0 + vec4<f32>(select(1.0, -1.0, (qh & 32768u) != 0u));
+  }
+  return transpose(mat4x4<f32>(cols[0], cols[1], cols[2], cols[3]));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
+  let o = b * 50u; let qh = B4V(o + 34u + s * 2u, c4) & vec4<u32>(65535u);
+  return F16V(o, c4) * (2.0 * vec4<f32>((qh >> vec4<u32>(12u)) & vec4<u32>(7u)) + 1.0) * 0.125;
+}
+"""
 # name: (sub-block values, has an offset, functions)
 _TILED_FORMATS = {
     "Q4_0": (32, False, _TILED_Q4_0), "Q4_1": (32, True, _TILED_Q4_1),
@@ -9446,6 +9667,10 @@ _TILED_FORMATS = {
     "Q4_K": (32, True, _TILED_Q4_K), "Q5_K": (32, True, _TILED_Q5_K),
     "Q6_K": (16, False, _TILED_Q6_K), "Q3_K": (16, False, _TILED_Q3_K),
     "Q2_K": (16, True, _TILED_Q2_K),
+    "IQ4_NL": (32, False, _TILED_IQ4_NL), "IQ4_XS": (32, False, _TILED_IQ4_XS),
+    "IQ2_XXS": (32, False, _TILED_IQ2_XXS), "IQ2_XS": (16, False, _TILED_IQ2_XS),
+    "IQ2_S": (16, False, _TILED_IQ2_S), "IQ3_XXS": (32, False, _TILED_IQ3_XXS),
+    "IQ3_S": (32, False, _TILED_IQ3_S), "IQ1_S": (32, False, _TILED_IQ1_S),
 }
 _TILED_TEMPLATE = """
 @group(0) @binding(0) var<storage,read> array_a: array<vec4<f32>>;
@@ -9603,10 +9828,14 @@ def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None):
     M, K, N = int(xf.shape[0]), int(K), int(N)
     plat = _adam_kernel["platform"]
     name = "ggml_tiled_" + type_name.lower()
+    grid = _ggml_grid(type_name) if "binding(4) var<storage,read> gr" in _GGML_TILED[type_name] \
+        else None
     if name not in _ggml_tiled_k["added"]:
         plat.addKernel(name, {"source": _GGML_TILED[type_name],
                               "bindingTypes": ["read-only-storage", "read-only-storage",
-                                               "storage", "read-only-storage"]})
+                                               "storage", "read-only-storage"]
+                                             + (["read-only-storage"] if grid is not None
+                                                else [])})
         _ggml_tiled_k["added"].add(name)
     if "ggml_tiled_reduce" not in _ggml_tiled_k["added"]:
         plat.addKernel("ggml_tiled_reduce", {"source": _MM_REDUCE_WGSL,
@@ -9620,7 +9849,8 @@ def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None):
     meta = _adam_kernel["make_meta"]((M, N, K, words, G), "u4,u4,u4,u4,u4")
     plat.runKernel({"name": name,
                     "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
-                                part.buffer.buffer_id, meta.buffer_id],
+                                part.buffer.buffer_id, meta.buffer_id]
+                               + ([grid.buffer.buffer_id] if grid is not None else []),
                     "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": G}})
     if G == 1:
         return part

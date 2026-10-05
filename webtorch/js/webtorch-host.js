@@ -153,6 +153,40 @@
   }
 
   async function py(code) { return await pyodide.runPythonAsync(code); }
+
+  // ---- route ladders a load queued, measured while nothing is asking --------------------
+  //
+  // A load measures the cheap end of each weight's route ladder and queues the rest
+  // (`calibrate_deferred`); answers borrow the nearest measured row count meanwhile. This
+  // advances the queue a step at a time, and only while no call is running, so a caller that
+  // arrives waits for at most one probe. When the queue is empty the measurements are kept,
+  // as a load's are, so the next load queues nothing.
+  let inflight = 0;
+  let idleLoop = null;
+  function calibrateWhenIdle() {
+    if (idleLoop) return;
+    idleLoop = (async () => {
+      try {
+        for (;;) {
+          await new Promise((r) => setTimeout(r, inflight ? 100 : 0));
+          if (!ready) return;
+          if (inflight) continue;
+          const left = Number(await py('import webtorch\nwebtorch.calibrate_deferred(0.25)'));
+          if (!(left > 0)) break;
+        }
+        if (remember) {
+          const kpk = await kpKey();
+          if (kpk) await kpPut(kpk, JSON.parse(await py(
+            'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
+        }
+      } catch (e) {
+        report('tuning', 'the route measurements queued after this load stopped: '
+               + ((e && e.message) || e));
+      } finally {
+        idleLoop = null;
+      }
+    })();
+  }
   async function pyJSON(code) { return JSON.parse(await py(code)); }
 
   // ---- what a caller can ask for -------------------------------------------------------
@@ -321,6 +355,7 @@ _json.dumps({"kind": getattr(_MODEL["m"], "kind", ""),
         }
       }
       emit(who, 'status', 'ready: ' + src);
+      calibrateWhenIdle();
       const info = JSON.parse(out);
       // Said to everyone, not just to whoever awaited this call: a model arriving or going
       // away changes what a whole interface may offer, and the part that has to react is
@@ -823,6 +858,7 @@ await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
     if (!d || d.__wt !== 'call') return;
     const fn = METHODS[d.method];
     if (tasks) tasks.enter();
+    inflight++;
     const prev = current;
     current = d.id;
     try {
@@ -838,6 +874,7 @@ await webtorch.migrate_cache(_dir, on_progress=lambda n, k: js.self.__mig(n, k))
       emit(0, 'error', { scope: d.method, message: message });
     } finally {
       current = prev;
+      inflight--;
       if (tasks) tasks.leave();
     }
   };

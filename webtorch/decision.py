@@ -1482,7 +1482,7 @@ def _calibrate_routes(model, webio):
 
         def probe(m, lin=lin, K=K):
             wt._sync_small(lin(Tensor(rng.standard_normal((m, K)).astype(np.float32))))
-        wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4)
+        wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
     if getattr(impl, "n_head_layers", 0) and callable(getattr(impl, "_score", None)):
         hidden = int(enc.cfg.hidden)
 
@@ -1490,7 +1490,7 @@ def _calibrate_routes(model, webio):
             T = max(int(m), 4)
             h = Tensor(rng.standard_normal((T, hidden)).astype(np.float32))
             impl._score(h, [1, T // 2, T - 1], 0)
-        wt.calibrate_rows(head, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=8)
+        wt.calibrate_rows(head, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=8, defer=True)
 
 
 def _warm_decision(model, dec_cfg, webio):

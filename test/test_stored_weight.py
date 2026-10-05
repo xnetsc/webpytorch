@@ -424,7 +424,7 @@ def test_llm_load_ladders_its_layer_weights_but_not_the_output_head():
     from webtorch import llm
     src = inspect.getsource(llm.CausalLM._warm_shapes) if hasattr(llm, "CausalLM") else \
         inspect.getsource(llm)
-    assert "wt.calibrate_rows(probe, 512, lo=16, step=4)" in src
+    assert "wt.calibrate_rows(probe, 512, lo=16, step=4, defer=True)" in src
     assert "layer_keys = set(owners)" in src
     assert src.index("layer_keys = set(owners)") < src.index('walk(getattr(self, "head", []))')
 
@@ -479,7 +479,9 @@ def test_tiled_kernels_match_the_stored_kernel_in_the_browser():
     if not wt._adam_backend_ready():
         pytest.skip("requires the WebGPU browser backend")
     halves = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
-              "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82)}
+              "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82),
+              "IQ4_NL": (0,), "IQ4_XS": (0,), "IQ2_XXS": (0,), "IQ2_XS": (0,), "IQ2_S": (0,),
+              "IQ3_XXS": (0,), "IQ3_S": (0,), "IQ1_S": (0,)}
     rng = np.random.default_rng(7)
     K, N = 512, 96
     for fmt in wt._TILED_FORMATS:
@@ -539,3 +541,36 @@ def test_every_format_derives_a_packed_activation_webgl_kernel():
             assert "uniform sampler2D tex_xp;" in src
     src = inspect.getsource(wt._ggml_run_gl)
     assert 'not moe and mode in (0, 3)' in src
+
+
+def test_a_deferred_ladder_measures_the_cheap_end_now_and_the_rest_when_idle(monkeypatch):
+    _fresh_route_state(monkeypatch)
+    monkeypatch.setattr(wt, "_PROVISIONAL", set())
+    monkeypatch.setattr(wt, "_DEFERRED", [])
+    probed = []
+
+    def probe(m):
+        probed.append(m)
+        key = ("weight_exec", "fam", "fmt", 1, 2, m)
+        wt._CALIB_TOUCHED.append(key)
+        wt._TUNED.setdefault(key, "a" if m < 100 else "b")
+
+    prefix = ("weight_exec", "fam", "fmt", 1, 2)
+    assert wt.calibrate_rows(probe, 512, lo=16, step=8, defer=True) == [16]
+    assert probed == [16] and len(wt._DEFERRED) == 1
+    # Borrowable at once: a 519-row call takes the 16-row choice until the ladder finishes.
+    assert prefix in wt._PROVISIONAL and prefix not in wt._CALIBRATED
+    assert wt._nearest_tuned(prefix + (1024,)) == "a"
+    while wt.calibrate_deferred(0):
+        pass
+    assert probed == [16, 512, 64]
+    assert prefix in wt._CALIBRATED and prefix not in wt._PROVISIONAL
+    assert wt._nearest_tuned(prefix + (1024,)) == "b"
+    # A remembered, complete ladder queues nothing on the next load.
+    probed.clear()
+    assert wt.calibrate_rows(probe, 512, lo=16, step=8, defer=True) == [16]
+    assert probed == [16] and wt._DEFERRED == []
+    # Releasing a model forgets queued work that would still reference it.
+    wt._DEFERRED.append(object()); wt._PROVISIONAL.add(("x",))
+    wt.calibration_drop()
+    assert wt._DEFERRED == [] and wt._PROVISIONAL == set()
