@@ -1,5 +1,55 @@
 # Progress
 
+## 2026-10-05 ▸ WebGL decision: where the GPU time goes, and the first two fixes (2230 → 1773 ms)
+
+**Instrument first.** Tried WebGL GPU timer queries: Chrome on Apple M5 exposes
+`EXT_disjoint_timer_query_webgl2`, but on ANGLE-Metal a `TIME_ELAPSED` reading is the queue
+latency of its command buffer, not the draw — every one of 486 draws read ~90–130 ms, an
+add the same as a matmul, 46.8 s summed for a 2.2-s request — and a `gl.flush()` per draw
+did not change that. `TIMESTAMP_EXT` reports 0 bits. So per-kernel GPU time is not
+available from WebGL on this device; the experiment was reverted rather than shipped.
+
+**Knockout attribution instead.** Each kernel family in turn keeps its output shape, draw
+count and bindings but computes nothing (`main()` writes a zero of its output type); the
+drop in the steady request time is what that family costs the pipeline. Committed scalar
+baseline, local `xDecision-F16.gguf`, 486-token three-question request, headless Chrome,
+median of 6: 2230 ms. Savings when knocked out: dense projections (88 draws) 1190 ms,
+LayerNorm (50) 544, attention bmm (48) 375, other matmul (12) 323, add (89) 218, qkv
+take (71) 213, softmax (24) 141, mul and geglu ~18. They sum to 135%: knocking one family
+out changes the data and the load the others see, so this ranks and sizes, it does not
+add up.
+
+**LayerNorm (24% by knockout).** Every output element recomputed its row's mean and
+variance: 1,536 fetches per element, a 519×768 LayerNorm reading as much as a 519×768×768
+matmul (10.9 ms a draw). Now a statistics pass writes each row's mean and inverse deviation
+once into an ordinary (rows, 2) tensor and a normalise pass reads them. Not bit-identical
+to the one-pass form (Metal's fast math orders the same loop differently in a different
+shader): at most 9.5e-7 apart on ~2% of elements, both 5.7e-6 from a numpy reference.
+Request 2230 → 1878 ms, same answers.
+
+**Softmax (6%).** The same per-element recomputation, plus a host-allocated `_zeros`
+output — a 4.3-MB upload of zeros per call, 24 a request, into a buffer the kernel
+overwrites; `_empty`'s own note already said softmax outputs belong there. Two-pass and
+`_empty`: 1878 → 1771 ms, bit-identical to the one-pass form at every shape measured.
+
+**When one pass still wins.** The RMSNorm path already keeps a one-pass form for few rows
+(one fragment per row in the two-pass form leaves the GPU idle). Measured for LayerNorm and
+softmax at 23 shapes (40 queued calls each): the crossover follows rows × width², not rows —
+16 rows of a 173-wide softmax are still one-pass work, one row 4096 wide already is not.
+`rows·width² ≤ 1.5e6` picks the faster form at every point (where it errs, by ~0.01 ms);
+the measured table is above `_one_pass` and pinned by `test_webgl_one_pass_rule.py`.
+Request with the rule: 1773 ms, same answers. WebGPU unchanged (96.9 ms, same 422-dispatch
+sequence and weights). Host 232 passed (13 new), JS 102.
+
+**Also tried, rejected:** stepping the LHS texel address instead of dividing per
+multiply-add in the scalar matmul — slower (2232 → 2466 ms); the division was not the bound.
+Codex's `pair2` stays stashed (`scratchpad/codex_pair2_binary.patch` was also saved).
+
+**Next:** dense projections are now the larger half of the request. The scalar kernel does
+two single-channel fetches per multiply-add; fetching four along K per texel (RGBA) is the
+remaining WebGL-native storage/instruction option that has not been built and measured at
+these row counts.
+
 ## 2026-10-05 ▸ WebGPU: F16 GGUF xDecision vs Laya safetensors — same path, same speed; load gap closed
 
 **Trigger:** the user asked whether the local `xDecision-F16.gguf` (post-trained from Laya)

@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGL decision latency 2230 → 1773 ms (three questions, 486 tokens):**
+WebGL timer queries are not draw-granular on ANGLE-Metal (M5), so attribution is by
+knockout. LayerNorm and softmax recomputed each row's statistics per element; both are now
+two-pass above a measured rows×width² line and one-pass below it. Same answers; WebGPU
+unchanged at ~97 ms. Dense projections are the next and largest item.
+
 **2026-10-05 WebGPU F16-GGUF parity with the Laya reference:** On WebGPU the local
 `xDecision-F16.gguf` and the Laya safetensors checkpoint hold identical resident weights
 (169-tensor fingerprint) and dispatch the identical 422-kernel sequence; steady medians are

@@ -223,6 +223,8 @@ person to have the idea should get the number rather than the afternoon.
 | RGBA textures in the WebGL matmul | 32 → 5 texture fetches per 16 multiply-adds | 9.5 → 13.8 ms, **worse** |
 | int8 / int4 weights | 4–8× fewer bytes read | 0.42–0.71× as fast, **worse** |
 | **the `m % 32` gate on the tiled matmul** | **nothing** | **131 ms, 6× on the matmuls** |
+| WebGL LayerNorm/softmax: row statistics once per row, not per element | 1,536 → ~3 fetches per LayerNorm output | decision request 2230 → 1773 ms |
+| WebGL scalar matmul: step the LHS texel address instead of dividing | one integer division per multiply-add | 2232 → 2466 ms, **worse** |
 
 The one that worked did not reduce anything. There were already two matmul kernels, and the
 fast one required the row count to be a multiple of 32 — which is the token count, the one

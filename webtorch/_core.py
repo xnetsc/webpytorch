@@ -4242,13 +4242,24 @@ _softmax_gl = {"added": set()}
 
 
 def _webgl_softmax(xd):
-    """Fused softmax over the last axis, one GLSL kernel (keyed by row width)."""
+    """Softmax over the last axis: each row's max and exp-sum once, then a normalise --
+    or, where the rows-times-width^2 work is small, one pass (see `_one_pass`).
+
+    The one-pass kernel recomputes both for every element of its row --
+    two full passes over the row per output, so a (36, 173, 173) attention softmax did
+    ~373M fetches and ~186M exps where ~3M suffice; measured on WebGL at 5.9 ms a draw. The
+    statistics run the same loops as the one-pass form; measured equal bit for bit at every
+    shape in the table above `_one_pass` (unlike LayerNorm, see its note). The output was also host-allocated with `_zeros`, which uploads a zeroed
+    copy every call (4.3 MB here, 24 times a request) to a buffer the kernel overwrites in
+    full; it is `_empty` now, as the note on `_empty` already says softmax outputs should be.
+    """
     plat = _copy_kernel["plat"]
     width = int(xd.shape[-1])
     rows = int(xd.size) // width
-    name = f"softmax_gl_{width}"
-    if name not in _softmax_gl["added"]:
-        plat.addKernel(name, {"source": f"""#version 300 es
+    if _one_pass(rows, width):
+        name = f"softmax_gl_{width}"
+        if name not in _softmax_gl["added"]:
+            plat.addKernel(name, {"source": f"""#version 300 es
 precision highp float; precision highp int; precision highp sampler2D;
 #define WIDTH {width}
 uniform int _ka_tex_output_texture_w; uniform sampler2D tex_in;
@@ -4264,10 +4275,52 @@ void main() {{
   fragColor = exp(fetch(tex_in, base + col) - mx) / sm;
 }}
 """})
-        _softmax_gl["added"].add(name)
-    s = _zeros(xd.shape)
-    plat.runKernel({"name": name,
+            _softmax_gl["added"].add(name)
+        s = _empty(xd.shape)
+        plat.runKernel({"name": name,
+            "inputs": [{"name": "tex_in", "id": xd.buffer.buffer_id}],
+            "output": s.buffer.buffer_id,
+            "uniforms": [{"name": "_ka_tex_output_texture_w", "value": s.buffer.texture_shape.width, "type": "int"}]})
+        return s
+    stats_name, norm_name = f"softmax_stats_{width}", f"softmax_norm_{width}"
+    if stats_name not in _softmax_gl["added"]:
+        head = (f"#version 300 es\nprecision highp float; precision highp int; "
+                f"precision highp sampler2D;\n#define WIDTH {width}\n"
+                f"uniform int _ka_tex_output_texture_w; uniform sampler2D tex_in;\n"
+                f"out float fragColor;\n{_GL_FETCH}\n")
+        # Fragment 2r writes row r's max, 2r+1 its sum of exp(x - max).
+        plat.addKernel(stats_name, {"source": head + f"""uniform int TOTAL;
+void main() {{
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (idx >= TOTAL) {{ return; }}
+  int row = idx / 2; int base = row * WIDTH;
+  float mx = fetch(tex_in, base);
+  for (int j = 1; j < WIDTH; j++) {{ float v = fetch(tex_in, base + j); if (v > mx) mx = v; }}
+  if (idx - row * 2 == 0) {{ fragColor = mx; return; }}
+  float sm = 0.0;
+  for (int j = 0; j < WIDTH; j++) {{ sm += exp(fetch(tex_in, base + j) - mx); }}
+  fragColor = sm;
+}}
+"""})
+        plat.addKernel(norm_name, {"source": head + f"""uniform sampler2D tex_stats;
+void main() {{
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  int row = idx / WIDTH;
+  float mx = fetch(tex_stats, row * 2); float sm = fetch(tex_stats, row * 2 + 1);
+  fragColor = exp(fetch(tex_in, idx) - mx) / sm;
+}}
+"""})
+        _softmax_gl["added"].add(stats_name)
+    stats = _empty((rows, 2))
+    plat.runKernel({"name": stats_name,
         "inputs": [{"name": "tex_in", "id": xd.buffer.buffer_id}],
+        "output": stats.buffer.buffer_id,
+        "uniforms": [{"name": "_ka_tex_output_texture_w", "value": stats.buffer.texture_shape.width, "type": "int"},
+                     {"name": "TOTAL", "value": rows * 2, "type": "int"}]})
+    s = _empty(xd.shape)
+    plat.runKernel({"name": norm_name,
+        "inputs": [{"name": "tex_in", "id": xd.buffer.buffer_id},
+                   {"name": "tex_stats", "id": stats.buffer.buffer_id}],
         "output": s.buffer.buffer_id,
         "uniforms": [{"name": "_ka_tex_output_texture_w", "value": s.buffer.texture_shape.width, "type": "int"}]})
     return s
@@ -4770,6 +4823,10 @@ def _webgl_ln_kernels(rows, width):
         return
     head = ("#version 300 es\nprecision highp float; precision highp int; precision highp sampler2D;\n"
             "uniform int _ka_tex_output_texture_w; uniform float EPS;\n")
+    # Few rows: one pass, each element deriving its row's statistics. It repeats work, but
+    # across `width` fragments at once, where the two-pass form below gives each row to a
+    # single fragment walking `width` dependent fetches while the GPU idles -- the trade the
+    # RMSNorm note above measured, and the reason both forms exist.
     plat.addKernel(f"ln_fwd_{width}", {"source": f"""{head}
 uniform sampler2D tex_x; uniform sampler2D tex_gamma; uniform sampler2D tex_beta;
 out float fragColor;
@@ -4778,6 +4835,38 @@ void main() {{
   int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
   int row = idx / {width}; int col = idx - row * {width}; int base = row * {width};
 {_gl_ln_stats(width)}
+  fragColor = (fetch(tex_x, base + col) - mu) * inv * fetch(tex_gamma, col) + fetch(tex_beta, col);
+}}
+"""})
+    # Many rows: a row's mean and inverse deviation, computed ONCE per row. The fused kernel
+    # replaces recomputed both for every element of the row: 1,536 fetches per output, so a
+    # 519x768 LayerNorm read as much as a 519x768x768 matmul -- measured on WebGL, 10.9 ms a
+    # draw and a quarter of a decision encoder's time. Two outputs per row, laid out as an
+    # ordinary (rows, 2) float tensor: fragment 2r writes the mean, 2r+1 the inverse
+    # deviation, each running the same loops as the one-pass form. Not bit-identical to it:
+    # ANGLE compiles to Metal, whose fast math may sum the same loop in a different order in
+    # a different shader. Measured at 519x768: at most 9.5e-7 apart on ~2% of elements, and
+    # both exactly as far from a numpy reference (5.7e-6).
+    plat.addKernel(f"ln_stats_{width}", {"source": f"""{head}
+uniform sampler2D tex_x; uniform int TOTAL;
+out float fragColor;
+{_GL_FETCH}
+void main() {{
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  if (idx >= TOTAL) {{ return; }}
+  int row = idx / 2; int base = row * {width};
+{_gl_ln_stats(width)}
+  fragColor = (idx - row * 2) == 0 ? mu : inv;
+}}
+"""})
+    plat.addKernel(f"ln_norm_{width}", {"source": f"""{head}
+uniform sampler2D tex_x; uniform sampler2D tex_stats; uniform sampler2D tex_gamma; uniform sampler2D tex_beta;
+out float fragColor;
+{_GL_FETCH}
+void main() {{
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  int row = idx / {width}; int col = idx - row * {width}; int base = row * {width};
+  float mu = fetch(tex_stats, row * 2); float inv = fetch(tex_stats, row * 2 + 1);
   fragColor = (fetch(tex_x, base + col) - mu) * inv * fetch(tex_gamma, col) + fetch(tex_beta, col);
 }}
 """})
@@ -4830,19 +4919,58 @@ void main() {{
     _ln_gl["added"].add(key)
 
 
+# One pass or two, for LayerNorm and softmax on WebGL. The one-pass form makes every element
+# re-derive its row's statistics: rows*width^2 work, spread over rows*width fragments. The
+# two-pass form does the statistics once per row, but each row is one fragment walking
+# `width` dependent fetches. Which wins depends on that product, not on the row count alone.
+# Measured on Apple M5 (Chrome, ANGLE Metal), 40 queued calls per point, ms per call:
+#
+#     LayerNorm w=768   rows   1: 0.235 / 0.348    2: 0.183 / 0.200    4: 0.324 / 0.249
+#                              8: 0.637 / 0.128   64: 1.490 / 0.127  519: 7.246 / 0.221
+#     softmax  w=173    rows  16: 0.058 / 0.079   64: 0.169 / 0.081  6228: 5.008 / 0.904
+#     softmax  w=1024   rows   1: 0.134 / 0.129    2: 0.117 / 0.127    4: 0.201 / 0.143
+#     softmax  w=4096   rows   1: 0.744 / 0.339  512: 185.7 / 1.437          (one / two)
+#
+# `rows * width^2 <= 1.5e6` picks the faster form at every point measured; where it is wrong
+# it is wrong by ~0.01 ms, and far from the line the two differ by up to 130x.
+_ONE_PASS_WORK = 1_500_000
+
+
+def _one_pass(rows, width):
+    return rows * width * width <= _ONE_PASS_WORK
+
+
 def _webgl_ln_fwd(xd, gd, bd, eps):
     plat = _copy_kernel["plat"]
     width = int(xd.shape[-1]); rows = int(xd.size) // width
     _webgl_ln_kernels(rows, width)
-    # The fragment shader covers the whole output texture, like the WebGPU kernel.
+    if _one_pass(rows, width):
+        out = _empty(xd.shape)
+        plat.runKernel({"name": f"ln_fwd_{width}",
+            "inputs": [{"name": "tex_x", "id": xd.buffer.buffer_id},
+                       {"name": "tex_gamma", "id": gd.buffer.buffer_id},
+                       {"name": "tex_beta", "id": bd.buffer.buffer_id}],
+            "output": out.buffer.buffer_id,
+            "uniforms": [{"name": "_ka_tex_output_texture_w", "value": out.buffer.texture_shape.width, "type": "int"},
+                         {"name": "EPS", "value": eps, "type": "float"}]})
+        return out
+    # Statistics once per row, then a normalise that only reads them. The fragment shader
+    # covers the whole output texture, like the WebGPU kernel.
+    stats = _empty((rows, 2))
+    plat.runKernel({"name": f"ln_stats_{width}",
+        "inputs": [{"name": "tex_x", "id": xd.buffer.buffer_id}],
+        "output": stats.buffer.buffer_id,
+        "uniforms": [{"name": "_ka_tex_output_texture_w", "value": stats.buffer.texture_shape.width, "type": "int"},
+                     {"name": "TOTAL", "value": rows * 2, "type": "int"},
+                     {"name": "EPS", "value": eps, "type": "float"}]})
     out = _empty(xd.shape)
-    plat.runKernel({"name": f"ln_fwd_{width}",
+    plat.runKernel({"name": f"ln_norm_{width}",
         "inputs": [{"name": "tex_x", "id": xd.buffer.buffer_id},
+                   {"name": "tex_stats", "id": stats.buffer.buffer_id},
                    {"name": "tex_gamma", "id": gd.buffer.buffer_id},
                    {"name": "tex_beta", "id": bd.buffer.buffer_id}],
         "output": out.buffer.buffer_id,
-        "uniforms": [{"name": "_ka_tex_output_texture_w", "value": out.buffer.texture_shape.width, "type": "int"},
-                     {"name": "EPS", "value": eps, "type": "float"}]})
+        "uniforms": [{"name": "_ka_tex_output_texture_w", "value": out.buffer.texture_shape.width, "type": "int"}]})
     return out
 
 
