@@ -317,3 +317,19 @@ def test_autogptq_zero_offset_is_part_of_the_materialized_shader():
     source = wt._gptq_src(wt._DQF_WGSL, 4, zoff=1.0)
     assert "ZOFFf" not in source
     assert "f32(zv) + 1.0" in source
+
+
+def test_tiled_route_reads_the_stored_blocks_and_rounds_nothing_below_f32():
+    """The tiled candidate is a same-width route: it binds the stored buffer, keeps the
+    integers exact (int8 fits a half), and applies the block scale to an f32 partial sum."""
+    assert set(wt._GGML_TILED) <= set(wt._GGML_TYPES)
+    src = wt._GGML_TILED["Q8_0"]
+    assert "var<storage,read> packed: array<vec4<u32>>" in src
+    assert "round(" not in src and "dot4I8Packed" not in src
+    assert "h2(sx(ga, 24u), sx(gb, 24u))" in src       # raw int8, no scale applied
+    assert "s00 = p00 * d0 + s00" in src                # scale on the partial sum
+    forward = inspect.getsource(wt.ggml_matmul)
+    assert '(("stored",) + (("tiled",) if can_tiled else ())' in forward
+    assert wt._ggml_tiled_ok("Q8_0", 768, 2304)
+    assert not wt._ggml_tiled_ok("Q8_0", 768, 2302)     # output is written as vec4
+    assert not wt._ggml_tiled_ok("Q8_0", 770, 2304)     # whole blocks only

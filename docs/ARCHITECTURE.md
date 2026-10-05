@@ -119,6 +119,13 @@ about any of this.
 - Above `_GGML_DEQ_M` rows the weights *are* unpacked, once, and the plain fp32 matmul runs
   on them — but only for formats `ggml_dequant_ok` allows. Every i-quant is excluded, which
   is 84% of a 27B's elements, so for that model this is not the prefill path at all.
+- A same-width route, `"tiled"`, decodes each block once per 32-row workgroup into
+  workgroup memory -- the integer values as halves, which are exact -- and multiplies from
+  there, the block's scale multiplying a per-block partial sum. It reads the stored buffer
+  and allocates nothing, and `ggml_matmul(execution="auto")` races it against the others per
+  format, shape and row bucket. Q8_0 has it: 519×768×2304 takes 0.86 ms against 1.19
+  materialized, 2.38 stored and 0.74 for the same product on half weights, and the Q8
+  xDecision encoder went 117.3 → 103.8 ms with unchanged answers.
 - The quantised kernel it falls back to was bound by decoding the same weight again for
   every output row. One thread owned four rows, so a decoded value fed four multiplies; it
   now owns twelve (`_GGML_MROW`), and the per-row guard that put eleven branches in the

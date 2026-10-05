@@ -3284,7 +3284,7 @@ def use_kernel_profile(profile):
                     int(parts[5]))] = v
             n += 1
         elif (len(parts) == 6 and parts[0] == "weight_exec"
-              and v in ("stored", "dp4a", "materialized", "full",
+              and v in ("stored", "tiled", "dp4a", "materialized", "full",
                         "selected_full", "selected_q", "base", "alternate")):
             _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
@@ -8871,6 +8871,176 @@ def ggml_dequant_ok(type_name):
     return ok
 
 
+# Many rows against a Q8_0 weight, without changing the weight's width.
+#
+# The stored kernel decodes a block once per output row group it serves, and at a prompt's
+# worth of rows that is the cost: on 519x768x2304 it took 2.38 ms where the same matmul on
+# the half-precision copy of these weights (mm_f16w) took 0.74. The measured winner until
+# now was "materialized" -- expand the whole weight to f32, then a dense matmul -- which is
+# a second, four-times-wider copy of every weight per call.
+#
+# Here one workgroup computes 32 rows x 64 columns. For each 32-value block its 64 threads
+# decode the block's 64 columns ONCE into workgroup memory, and every thread then multiplies
+# 4 rows x 8 columns out of it. What is held there is the int8 values as halves -- every
+# int8 is exact in f16 -- not d*q, which is not: the block's scale multiplies a per-block
+# partial sum instead, d * (sum of q*x), so the inner loop reads 16 bytes a k and unpacks
+# exactly as mm_f16w's does, and nothing is rounded to fewer bits than f32.
+#
+# Measured on Apple M5 (Chrome 154, medians of interleaved rounds, ms):
+#                      stored  materialized  tiled-f32-tile  this  mm_f16w
+#   519x768x2304        2.375         1.192           1.139  0.856    0.736
+#   519x768x768         0.781         0.650           0.436  0.336    0.286
+#   519x1152x768        1.119         0.606           0.615  0.466    0.403
+# The f32-tile version (d*q, exact in f32, 32 bytes a k) lost to this by a quarter: what the
+# loop reads per k is the cost, not the decode (filling the tile with a constant saved 5%)
+# or the barriers (removing them saved 3%). It is a candidate, not a rule: `ggml_matmul`
+# measures it against the others per format, shape and row bucket.
+_GGML_TILED_Q8_0_WGSL = """
+@group(0) @binding(0) var<storage,read> array_a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> packed: array<vec4<u32>>;
+@group(0) @binding(2) var<storage,read_write> array_c: array<vec4<f32>>;
+struct QMeta { M: u32, N: u32, K: u32, RW: u32, }
+@group(0) @binding(3) var<storage,read> qm: QMeta;
+// [k * 8 + c8]: one k of the block for 8 adjacent columns, as four half pairs.
+var<workgroup> bs: array<vec4<u32>, 256>;
+// The block's scales for the workgroup's 64 columns.
+var<workgroup> ds: array<vec4<f32>, 16>;
+fn sx(w: vec4<u32>, sh: u32) -> vec4<f32> {
+  return vec4<f32>(vec4<i32>(w << vec4<u32>(sh)) >> vec4<u32>(24u));
+}
+fn h2(v: vec4<f32>, u: vec4<f32>) -> vec4<u32> {
+  return vec4<u32>(pack2x16float(v.xy), pack2x16float(v.zw),
+                   pack2x16float(u.xy), pack2x16float(u.zw));
+}
+fn scale4(us: vec4<u32>, al: bool) -> vec4<f32> {
+  return vec4<f32>(unpack2x16float(select(us.x & 0xFFFFu, us.x >> 16u, al)).x,
+                   unpack2x16float(select(us.y & 0xFFFFu, us.y >> 16u, al)).x,
+                   unpack2x16float(select(us.z & 0xFFFFu, us.z >> 16u, al)).x,
+                   unpack2x16float(select(us.w & 0xFFFFu, us.w >> 16u, al)).x);
+}
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: vec3<u32>) {
+  let M = qm.M; let N = qm.N; let K = qm.K; let RW = qm.RW;
+  let KD4 = K >> 2u; let ND4 = N >> 2u;
+  let t = li.y * 8u + li.x;
+  // Decoding: 8 adjacent columns (c8) by 4 of the block's 32 k (kq).
+  let c8 = t & 7u; let kq = t >> 3u;
+  let col4 = (wg.x * 64u + c8 * 8u) >> 2u;
+  // Multiplying: 4 rows by 8 columns, as mm_f16w does.
+  let c0 = wg.x * 64u + li.x * 8u;
+  let row = wg.y * 32u + li.y * 4u;
+  let i0 = select(M - 1u, row, row < M);
+  let i1 = select(i0, row + 1u, row + 1u < M);
+  let i2 = select(i0, row + 2u, row + 2u < M);
+  let i3 = select(i0, row + 3u, row + 3u < M);
+  var s00 = vec4<f32>(); var s01 = vec4<f32>(); var s02 = vec4<f32>(); var s03 = vec4<f32>();
+  var s10 = vec4<f32>(); var s11 = vec4<f32>(); var s12 = vec4<f32>(); var s13 = vec4<f32>();
+  let nb = K >> 5u;
+  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+    // Block b is bytes 34b.. of the column: its scale is the low half of word w0, or the
+    // high half when the block starts mid-word -- and then its int8 are word-aligned.
+    let byte0 = b * 34u;
+    let w0 = byte0 >> 2u;
+    let al = (byte0 & 3u) == 2u;
+    if (kq == 0u) {
+      ds[c8 * 2u] = scale4(packed[w0 * ND4 + col4], al);
+      ds[c8 * 2u + 1u] = scale4(packed[w0 * ND4 + col4 + 1u], al);
+    }
+    // int8 group kq (k = 4kq..4kq+3) is word w0+1+kq when aligned, else the top half of
+    // w0+kq and the bottom half of w0+kq+1.
+    let wl = w0 + kq;
+    let in1 = wl + 1u < RW;
+    let wh = select(vec4<u32>(0u), packed[(wl + 1u) * ND4 + col4], in1);
+    let wh2 = select(vec4<u32>(0u), packed[(wl + 1u) * ND4 + col4 + 1u], in1);
+    let ga = select((packed[wl * ND4 + col4] >> vec4<u32>(16u)) | (wh << vec4<u32>(16u)),
+                    wh, vec4<bool>(al));
+    let gb = select((packed[wl * ND4 + col4 + 1u] >> vec4<u32>(16u)) | (wh2 << vec4<u32>(16u)),
+                    wh2, vec4<bool>(al));
+    let k0 = kq * 4u;
+    bs[(k0 + 0u) * 8u + c8] = h2(sx(ga, 24u), sx(gb, 24u));
+    bs[(k0 + 1u) * 8u + c8] = h2(sx(ga, 16u), sx(gb, 16u));
+    bs[(k0 + 2u) * 8u + c8] = h2(sx(ga, 8u), sx(gb, 8u));
+    bs[(k0 + 3u) * 8u + c8] = h2(sx(ga, 0u), sx(gb, 0u));
+    workgroupBarrier();
+    var p00 = vec4<f32>(); var p01 = vec4<f32>(); var p02 = vec4<f32>(); var p03 = vec4<f32>();
+    var p10 = vec4<f32>(); var p11 = vec4<f32>(); var p12 = vec4<f32>(); var p13 = vec4<f32>();
+    let kb4 = b * 8u;
+    for (var k4: u32 = 0u; k4 < 8u; k4 = k4 + 1u) {
+      let a0 = array_a[i0 * KD4 + kb4 + k4]; let a1 = array_a[i1 * KD4 + kb4 + k4];
+      let a2 = array_a[i2 * KD4 + kb4 + k4]; let a3 = array_a[i3 * KD4 + kb4 + k4];
+      for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+        let pk = bs[(k4 * 4u + j) * 8u + li.x];
+        let lo = vec4<f32>(unpack2x16float(pk.x), unpack2x16float(pk.y));
+        let hi = vec4<f32>(unpack2x16float(pk.z), unpack2x16float(pk.w));
+        p00 = vec4<f32>(a0[j]) * lo + p00; p10 = vec4<f32>(a0[j]) * hi + p10;
+        p01 = vec4<f32>(a1[j]) * lo + p01; p11 = vec4<f32>(a1[j]) * hi + p11;
+        p02 = vec4<f32>(a2[j]) * lo + p02; p12 = vec4<f32>(a2[j]) * hi + p12;
+        p03 = vec4<f32>(a3[j]) * lo + p03; p13 = vec4<f32>(a3[j]) * hi + p13;
+      }
+    }
+    let d0 = ds[li.x * 2u]; let d1 = ds[li.x * 2u + 1u];
+    s00 = p00 * d0 + s00; s10 = p10 * d1 + s10;
+    s01 = p01 * d0 + s01; s11 = p11 * d1 + s11;
+    s02 = p02 * d0 + s02; s12 = p12 * d1 + s12;
+    s03 = p03 * d0 + s03; s13 = p13 * d1 + s13;
+    workgroupBarrier();
+  }
+  // Columns past N (the last workgroup of a width that is not a multiple of 64) decoded
+  // whatever followed; each column's sum reads only its own column, so they are just not
+  // written.
+  if (row >= M || c0 >= N) { return; }
+  let cx = c0 >> 2u;
+  let wide = c0 + 4u < N;
+  array_c[cx + row * ND4] = s00;
+  if (wide) { array_c[cx + 1u + row * ND4] = s10; }
+  if (row + 1u < M) {
+    array_c[cx + (row + 1u) * ND4] = s01;
+    if (wide) { array_c[cx + 1u + (row + 1u) * ND4] = s11; }
+  }
+  if (row + 2u < M) {
+    array_c[cx + (row + 2u) * ND4] = s02;
+    if (wide) { array_c[cx + 1u + (row + 2u) * ND4] = s12; }
+  }
+  if (row + 3u < M) {
+    array_c[cx + (row + 3u) * ND4] = s03;
+    if (wide) { array_c[cx + 1u + (row + 3u) * ND4] = s13; }
+  }
+}
+"""
+# Formats with a tiled kernel. Adding one is adding its decode, not a branch elsewhere.
+_GGML_TILED = {"Q8_0": _GGML_TILED_Q8_0_WGSL}
+_ggml_tiled_k = {"added": set()}
+
+
+def _ggml_tiled_ok(type_name, K, N):
+    """Whether the tiled kernel takes this weight: its format has one, the output is whole
+    vec4s (N % 4), and the weight is whole blocks."""
+    if type_name not in _GGML_TILED:
+        return False
+    return int(K) % int(_GGML_TYPES[type_name][2]) == 0 and int(N) % 4 == 0
+
+
+def _ggml_tiled_matmul(xf, packed, type_name, K, N):
+    """xf(M,K) @ W(N,K).T from the stored blocks, through the tiled kernel above."""
+    M, K, N = int(xf.shape[0]), int(K), int(N)
+    plat = _adam_kernel["platform"]
+    name = "ggml_tiled_" + type_name.lower()
+    if name not in _ggml_tiled_k["added"]:
+        plat.addKernel(name, {"source": _GGML_TILED[type_name],
+                              "bindingTypes": ["read-only-storage", "read-only-storage",
+                                               "storage", "read-only-storage"]})
+        _ggml_tiled_k["added"].add(name)
+    vals, blk = int(_GGML_TYPES[type_name][2]), int(_GGML_TYPES[type_name][3])
+    words = ((K // vals) * blk + 3) // 4          # ggml_transpose pads a column to whole words
+    out = _empty((M, N))
+    meta = _adam_kernel["make_meta"]((M, N, K, words), "u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+                    "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": 1}})
+    return out
+
+
 def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                 xper=False, bias=None, execution="stored", shape_execution="auto"):
     """xf(M,K) @ packed(N,K).T -> (M,N), decoding ggml blocks in the shader.
@@ -8888,8 +9058,9 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     expands a supported weight on the GPU.  ``"auto"`` is reserved for a measured routing
     policy; callers must opt into it rather than silently changing representations.
     """
-    if execution not in ("stored", "dp4a", "materialized", "auto"):
-        raise ValueError("execution must be 'stored', 'dp4a', 'materialized', or 'auto'")
+    if execution not in ("stored", "tiled", "dp4a", "materialized", "auto"):
+        raise ValueError("execution must be 'stored', 'tiled', 'dp4a', 'materialized', "
+                         "or 'auto'")
     if shape_execution not in ("auto", None, "narrow", "balanced", "compact", "shortk"):
         raise ValueError("stored shape execution is not a known physical route")
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
@@ -8929,6 +9100,11 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     can_materialize = (execution in ("auto", "materialized")
                        and eidx is None and not xper and _adam_backend_ready()
                        and ggml_dequant_ok(type_name))
+    # The tiled kernel reads the same stored blocks, so it costs no memory and sits right
+    # after "stored" in the candidate order (an unproven race keeps the earlier one).
+    can_tiled = (execution in ("auto", "tiled")
+                 and eidx is None and not xper and _adam_backend_ready()
+                 and _ggml_tiled_ok(type_name, K, N))
     can_dp4a = (execution in ("auto", "dp4a")
                 and eidx is None and not xper and _adam_backend_ready()
                 and type_name in ("Q4_K", "Q6_K") and m == 1)
@@ -8936,9 +9112,12 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         raise RuntimeError("%s shape has no packed-dot comparison path" % type_name)
     if execution == "materialized" and not can_materialize:
         raise RuntimeError("%s has no verified materialized comparison path" % type_name)
+    if execution == "tiled" and not can_tiled:
+        raise RuntimeError("%s shape has no tiled stored-format path" % type_name)
     if execution == "auto":
-        if can_dp4a or can_materialize:
-            candidates = (("stored",) + (("dp4a",) if can_dp4a else ())
+        if can_tiled or can_dp4a or can_materialize:
+            candidates = (("stored",) + (("tiled",) if can_tiled else ())
+                          + (("dp4a",) if can_dp4a else ())
                           + (("materialized",) if can_materialize else ()))
             reference = [None]
 
@@ -8966,6 +9145,9 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                 "ggml", type_name, K, N, m, run, candidates=candidates, check=correct)
         else:
             execution = "stored"
+    if execution == "tiled":
+        of = _ggml_tiled_matmul(xf, packed, type_name, K, N)
+        return of if bias is None else of + bias
     if execution == "dp4a":
         of = (_q4k_dp4a_matmul(xf, packed, K, N) if type_name == "Q4_K"
               else _q6k_dp4a_matmul(xf, packed, K, N))
@@ -12224,8 +12406,9 @@ class GGMLLinear(Module):
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
     def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
-        if execution not in ("stored", "dp4a", "materialized", "auto"):
-            raise ValueError("execution must be 'stored', 'dp4a', 'materialized', or 'auto'")
+        if execution not in ("stored", "tiled", "dp4a", "materialized", "auto"):
+            raise ValueError("execution must be 'stored', 'tiled', 'dp4a', 'materialized', "
+                             "or 'auto'")
         b = np.frombuffer(raw, np.uint8)
         pad = (-b.size) % 4
         if pad:

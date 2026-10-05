@@ -1,5 +1,41 @@
 # Progress
 
+## 2026-10-05 ▸ WebGPU Q8_0 at many rows: a tiled stored-format kernel (117.3 → 103.8 ms)
+
+**Why Q8 was slower than F16** (GPU timestamps, xDecision encoder, three questions): every
+multi-row Q8 projection had measured "materialized" -- expand the weight to f32 per call
+(`ggmldeq_q8_0`, 93 × 0.123 ms) then the f32 matmul (`matmul_m32n64k4`, 93 × 0.638 ms) --
+70.8 ms against F16's `mm_f16w` 47.2 ms. Everything else was the same kernels.
+
+**Change:** `ggml_matmul` gains a same-width candidate, `"tiled"`, measured by the existing
+`_weight_execution` per format, shape and row bucket, ordered right after `"stored"` because
+it reads the same buffer and allocates nothing. One workgroup computes 32 rows × 64 columns;
+per 32-value block its 64 threads decode the block once into workgroup memory -- the int8
+values as halves, which are exact -- and each thread multiplies 4 rows × 8 columns from it,
+the block's scale multiplying a per-block partial sum (d·Σq·x, f32). Q8_0 has it today.
+
+**Measured before choosing** (M5, Chrome 154, medians of interleaved rounds, ms):
+
+| 519 rows × K × N | stored | materialized | f32 tile | **tiled (this)** | mm_f16w |
+|---|---|---|---|---|---|
+| 768 × 2304 | 2.375 | 1.192 | 1.139 | **0.856** | 0.736 |
+| 768 × 768 | 0.781 | 0.650 | 0.436 | **0.336** | 0.286 |
+| 1152 × 768 | 1.119 | 0.606 | 0.615 | **0.466** | 0.403 |
+
+Ablations on the 768 × 2304 case: decode replaced by a constant −5%, barriers removed −3%,
+the multiply loop removed −80%; an f32 tile (d·q, 32 bytes a k) +33%; 8 rows a thread and
+bank-conflict-free layouts made no difference. What the inner loop reads per k is the cost.
+Measured FMA ceiling of this GPU from WebGPU: 3.2 TFLOPS; `mm_f16w` runs at 2.4.
+
+**End to end** (local disk file through the page's file input, WebGPU, six requests):
+`xDecision-Q8_0.gguf` steady median 117.3 → **103.8 ms**, every answer unchanged
+(`billing 0.8966 0.979 1.7244`), 423 dispatches. All 93 multi-row projections chose
+`ggml_tiled_q8_0`: 54.2 ms GPU against 70.8.
+
+**Limits:** Q8 is still ~9% behind F16 (~95 ms), all of it in this kernel against
+`mm_f16w` (54.2 vs 47.2 ms GPU). Other block formats still race stored against
+materialized only. WebGL Q8 (2232 ms) is untouched.
+
 ## 2026-10-05 ▸ WebGL dense matmul: four K-values per texel (1773 → 856 ms); the head's weights joined it
 
 **Measured first, in isolation** (40 queued calls, including packing the activations per

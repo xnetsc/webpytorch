@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGPU Q8 GGUF 117.3 → 103.8 ms (answers unchanged):** multi-row Q8_0
+projections now race a tiled stored-format kernel (block decoded once per workgroup as exact
+halves, scale on per-block partial sums) and it wins every one: 54.2 ms GPU vs 70.8 for
+"materialized". Still ~9% behind F16 (~95 ms), all in that kernel vs `mm_f16w`; WebGL Q8
+(2232 ms) and the gap to MLX are next.
+
 **2026-10-05 WebGL decision 2230 → 856 ms; next Q8 and the WebGPU gap to MLX:** K4 RGBA
 `dot` matmul as WebGL's `matmul_f16w`, the head on the same half path, half width only for
 float16 sources. F16 GGUF and Laya: identical paths, WebGL ~857 ms, WebGPU ~95 ms. Q8 GGUF is
