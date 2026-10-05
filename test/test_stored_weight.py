@@ -328,8 +328,93 @@ def test_tiled_route_reads_the_stored_blocks_and_rounds_nothing_below_f32():
     assert "round(" not in src and "dot4I8Packed" not in src
     assert "h2(sx(ga, 24u), sx(gb, 24u))" in src       # raw int8, no scale applied
     assert "s00 = p00 * d0 + s00" in src                # scale on the partial sum
-    forward = inspect.getsource(wt.ggml_matmul)
-    assert '(("stored",) + (("tiled",) if can_tiled else ())' in forward
     assert wt._ggml_tiled_ok("Q8_0", 768, 2304)
     assert not wt._ggml_tiled_ok("Q8_0", 768, 2302)     # output is written as vec4
     assert not wt._ggml_tiled_ok("Q8_0", 770, 2304)     # whole blocks only
+
+
+def test_tiled_split_cuts_k_only_for_few_workgroups():
+    assert wt._ggml_tiled_split(8, 768) == 4         # 12 workgroups
+    assert wt._ggml_tiled_split(64, 1152) == 4       # 24
+    assert wt._ggml_tiled_split(128, 768) == 1       # 48: measured slower when cut
+    assert wt._ggml_tiled_split(64, 2304) == 1       # 72
+
+
+
+def _fresh_route_state(monkeypatch):
+    monkeypatch.setattr(wt, "_TUNED", {})
+    monkeypatch.setattr(wt, "_CALIBRATED", set())
+    monkeypatch.setattr(wt, "_NEAREST", {})
+    monkeypatch.setattr(wt, "_CALIB_TOUCHED", [])
+
+
+def test_calibration_bisects_only_where_the_winner_changes(monkeypatch):
+    _fresh_route_state(monkeypatch)
+
+    def probe(m):
+        key = ("weight_exec", "fam", "fmt", 1, 2, m)
+        wt._CALIB_TOUCHED.append(key)
+        wt._TUNED.setdefault(key, "a" if m < 100 else "b")
+
+    assert wt.calibrate_rows(probe, 512, lo=16, step=8) == [16, 64, 512]
+    assert ("weight_exec", "fam", "fmt", 1, 2) in wt._CALIBRATED
+
+    _fresh_route_state(monkeypatch)
+
+    def same(m):
+        key = ("weight_exec", "fam", "fmt", 1, 2, m)
+        wt._CALIB_TOUCHED.append(key)
+        wt._TUNED.setdefault(key, "a")
+
+    assert wt.calibrate_rows(same, 512, lo=16, step=8) == [16, 512]
+
+
+def test_an_answer_borrows_the_nearest_calibrated_bucket_and_never_races(monkeypatch):
+    _fresh_route_state(monkeypatch)
+    prefix = ("weight_exec", "ggml", "Q8_0", 768, 2304)
+    wt._TUNED[prefix + (16,)] = "stored"
+    wt._TUNED[prefix + (512,)] = "tiled"
+    raced = []
+
+    def run(which):
+        raced.append(which)
+        raise AssertionError("an answer must not race")
+
+    # Not calibrated: the old behaviour (race now) is kept, which the run above refuses.
+    with pytest.raises(RuntimeError):
+        wt._weight_execution("ggml", "Q8_0", 768, 2304, 519, run, candidates=("stored", "tiled"))
+    raced.clear()
+    wt._CALIBRATED.add(prefix)
+    assert wt._weight_execution("ggml", "Q8_0", 768, 2304, 519, run,
+                                candidates=("stored", "tiled")) == "tiled"     # 1024 -> 512
+    assert wt._weight_execution("ggml", "Q8_0", 768, 2304, 40, run,
+                                candidates=("stored", "tiled")) == "stored"    # 64 -> 16
+    assert raced == []
+    assert prefix + (1024,) not in wt._TUNED          # a borrowed choice is not a measurement
+    # While calibrating, the same call measures instead of borrowing.
+    with wt._calibrating():
+        with pytest.raises(RuntimeError):
+            wt._weight_execution("ggml", "Q8_0", 768, 2304, 519, run,
+                                 candidates=("stored", "tiled"))
+
+
+def test_calibrated_prefixes_round_trip_through_the_device_profile(monkeypatch):
+    _fresh_route_state(monkeypatch)
+    prefix = ("weight_exec", "ggml", "Q8_0", 768, 2304)
+    wt._TUNED[prefix + (512,)] = "tiled"
+    wt._CALIBRATED.add(prefix)
+    profile = wt.kernel_profile()
+    assert profile["calibrated"] == ["weight_exec|ggml|Q8_0|768|2304"]
+    _fresh_route_state(monkeypatch)
+    assert wt.use_kernel_profile(profile) >= 2
+    assert prefix in wt._CALIBRATED and wt._TUNED[prefix + (512,)] == "tiled"
+
+
+def test_the_sdk_keeps_its_measurements_unless_a_host_says_no():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    host = (root / "webtorch/js/webtorch-host.js").read_text()
+    main = (root / "webtorch/js/webtorch-main.js").read_text()
+    assert "remember = !(a && a.rememberTuning === false);" in host
+    assert "rememberTuning: opts.rememberTuning !== false" in main
+    assert "rememberTuning" not in (root / "chat/app.js").read_text()

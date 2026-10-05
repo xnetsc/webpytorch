@@ -113,7 +113,6 @@ function startSdk() { return webtorch.start({
   backendOrder: BACKEND_ORDER,
   pyodideIndexURL: PYODIDE_URL,
   version: SDK_VERSION,            // this page's cache-busting, not the SDK's
-  rememberTuning: true,            // keep what this GPU worked out, so reloads are quick
   // Given here, not through `on()` afterwards: bringing up the GPU, Python and the backend
   // is most of the wait, and a page that says nothing through it reads as a page that hung.
   onStatus: showStatus,

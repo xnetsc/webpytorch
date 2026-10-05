@@ -801,10 +801,12 @@ class DecisionModel(wt.Module):
 
             backend = ("webgpu" if wt._adam_backend_ready() else
                        "webgl" if wt._webgl_ready() else "cpu")
-            token_bucket = ((int(h.shape[0]) + 31) // 32) * 32
-            row_bucket = 1 << (len(rows) - 1).bit_length()
+            # The token count is the row dimension of this race (the last key field), so a
+            # length the load-time calibration did not visit takes the nearest one it did.
+            # What is saved is the dead rows' work, T - len(rows), so T is what matters;
+            # the option count is not part of the key.
             mode = wt._weight_execution("decision_head_" + backend, "selected_rows",
-                                        token_bucket, row_bucket, 1, run,
+                                        0, 0, int(h.shape[0]), run,
                                         candidates=("full", "selected_full", "selected_q"),
                                         check=correct, repeat=1)
         self._head_execution = mode
@@ -1445,11 +1447,61 @@ def _tokenizer_from_json(tj):
     return tok, vocab
 
 
+# How far up the row-count ladder the load-time route calibration goes, and where it
+# starts. Past the top the choice is the top probe's: by a few hundred rows every candidate is
+# in its arithmetic-bound regime and the ranking has stopped moving (measured for Q8_0 on M5
+# from 128 to 519 rows). Below the bottom, what the warm-up question measured covers it.
+_CALIBRATE_LO = 16
+_CALIBRATE_TOP = 512
+
+
+def _calibrate_routes(model, webio):
+    """Race every weight route this model can take, once, right after its weights arrive.
+
+    Answers never race: a row count no probe visited takes the nearest one that was
+    (`wt.calibrate_rows`). What is measured is per device, so another GPU keeps its own
+    winners; with a remembered kernel profile nothing here is measured again. Covers each
+    distinct stored-format linear by (format, K, N) -- the warm-up pass has created them all
+    by now -- and the final head layer's row selection by sequence length. Dense half
+    weights have one route and are not visited.
+    """
+    impl = getattr(model, "impl", model)
+    enc = getattr(impl, "enc", None)
+    if not (wt._adam_backend_ready() or wt._webgl_ready()):
+        return
+    webio.load_stage("tuning")
+    linears = {}
+    for table in (getattr(enc, "_ten", {}), getattr(impl, "_ten", {})):
+        for v in table.values():
+            if (getattr(v, "storage_format", None) is not None and hasattr(v, "Kt")
+                    and callable(getattr(v, "forward", None))):
+                linears.setdefault((str(v.storage_format), int(v.Kt), int(v.Nt)), v)
+    rng = np.random.default_rng(0)
+    for key in sorted(linears):
+        lin, K = linears[key], key[1]
+
+        def probe(m, lin=lin, K=K):
+            wt._sync_small(lin(Tensor(rng.standard_normal((m, K)).astype(np.float32))))
+        wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4)
+    if getattr(impl, "n_head_layers", 0) and callable(getattr(impl, "_score", None)):
+        hidden = int(enc.cfg.hidden)
+
+        def head(m):
+            T = max(int(m), 4)
+            h = Tensor(rng.standard_normal((T, hidden)).astype(np.float32))
+            impl._score(h, [1, T // 2, T - 1], 0)
+        wt.calibrate_rows(head, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=8)
+
+
 def _warm_decision(model, dec_cfg, webio):
     webio.load_stage("warm")
-    model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
-                                       "instructions": "warm up",
-                                       "criteria": ["a", "b"]}})
+    # Measured, not borrowed: this pass creates every projection and is the one place the
+    # small row counts a short question uses are raced.
+    with wt._calibrating():
+        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
+                                           "instructions": "warm up",
+                                           "criteria": ["a", "b"]}})
+    _calibrate_routes(model, webio)
 
 
 async def _from_gguf(src, **kw):

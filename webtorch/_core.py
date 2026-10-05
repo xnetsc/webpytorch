@@ -2848,6 +2848,101 @@ _GQA_SPLIT_ON = True   # A/B switch for the split-sequence decode attention
 _TUNED = {}
 _WEIGHT_TUNE_SECONDS = 0.0
 _WEIGHT_TUNE_CALLS = 0
+# Route races belong after a load, not inside an answer. A weight whose routes were measured
+# over a ladder of row counts (`calibrate_rows`) is "calibrated": its key prefix
+# (everything but the row bucket) is in `_CALIBRATED`, and a row count the ladder did not
+# visit takes the choice of the nearest bucket it did, instead of racing in front of the
+# person waiting. While calibrating, every race is run and every key asked is noted.
+_CALIBRATING = [0]
+_CALIBRATED = set()
+_CALIB_TOUCHED = []
+_NEAREST = {}
+
+
+class _calibrating(object):
+    """While inside, `_weight_execution` measures instead of borrowing."""
+
+    def __enter__(self):
+        _CALIBRATING[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        _CALIBRATING[0] -= 1
+        return False
+
+
+def _nearest_tuned(key):
+    """The measured choice of the bucket nearest `key`'s, in octaves, for a calibrated
+    prefix; None when the prefix was never calibrated. A tie goes to the larger bucket."""
+    prefix = key[:-1]
+    if prefix not in _CALIBRATED:
+        return None
+    hit = _NEAREST.get(key)
+    if hit is not None and hit[0] == len(_TUNED):
+        return hit[1]
+    want = int(key[-1]).bit_length()
+    best = None
+    for k, v in _TUNED.items():
+        if k[:-1] == prefix:
+            d = abs(int(k[-1]).bit_length() - want)
+            if best is None or d < best[0] or (d == best[0] and k[-1] > best[1]):
+                best = (d, k[-1], v)
+    choice = None if best is None else best[2]
+    _NEAREST[key] = (len(_TUNED), choice)
+    return choice
+
+
+def calibrate_rows(probe, top, lo=1, step=2):
+    """Measure every route race `probe(m)` sets off over a ladder of row counts, once.
+
+    `probe(m)` runs the operation at m rows. The ladder is bisected in octaves: `lo` and
+    `top` first, then the middle of any interval whose two ends chose differently for some
+    race, until the ends are at most `step` times apart -- so the crossovers are found where
+    they are, on this device, without visiting every bucket. Near a crossover the candidates
+    are close by definition, so locating it to within `step` costs little. Each race's
+    prefix is then calibrated:
+    a row count between probes takes the nearest probe's measured choice, and one past
+    `top` takes `top`'s. Returns the row counts probed.
+    """
+    lo, top = 1 << (max(1, int(lo)) - 1).bit_length(), 1 << (max(1, int(top)) - 1).bit_length()
+    seen = {}
+
+    def run(m):
+        del _CALIB_TOUCHED[:]
+        with _calibrating():
+            probe(m)
+        seen[m] = {k[:-1]: _TUNED[k] for k in _CALIB_TOUCHED if k in _TUNED}
+        del _CALIB_TOUCHED[:]
+
+    run(lo)
+    if top > lo:
+        run(top)
+    todo = [(lo, top)]
+    while todo:
+        a, b = todo.pop()
+        if b <= max(2, int(step)) * a:
+            continue
+        sa, sb = seen[a], seen[b]
+        if all(sa[k] == sb[k] for k in sa if k in sb):
+            continue
+        mid = 1 << ((a.bit_length() + b.bit_length()) // 2 - 1)
+        run(mid)
+        todo += [(a, mid), (mid, b)]
+    for got in seen.values():
+        _CALIBRATED.update(got)
+    _NEAREST.clear()
+    return sorted(seen)
+
+
+def _sync_small(a):
+    """Wait for the work that produced `a` by reading back one element of it, not all of
+    it: a race times each candidate to completion, and reading a 519x2304 answer back cost
+    more than the kernel being timed (2.3 of 3.2 ms)."""
+    d = a.data if isinstance(a, Tensor) else a
+    if not hasattr(d, "reshape") or not hasattr(d, "get"):
+        return
+    flat = d.reshape(-1)
+    np.asarray(_contig(flat[flat.shape[0] - 1:]).get())
 
 
 def _paired_evidence(samples, candidate, baseline):
@@ -2921,8 +3016,14 @@ def _weight_execution(family, storage_format, K, N, M, run,
     m = int(M)
     bucket = 1 << (m - 1).bit_length()
     key = ("weight_exec", str(family), str(storage_format), int(K), int(N), bucket)
+    if _CALIBRATING[0]:
+        _CALIB_TOUCHED.append(key)
     if key in _TUNED:
         return _TUNED[key]
+    if not _CALIBRATING[0]:
+        near = _nearest_tuned(key)
+        if near is not None:
+            return near
     import time as _t
     _tune_started = _t.perf_counter()
     candidates = tuple(candidates)
@@ -2938,8 +3039,7 @@ def _weight_execution(family, storage_format, K, N, M, run,
         t0 = _t.perf_counter()
         for _ in range(repeat):
             out = run(which)
-        if hasattr(out, "get"):
-            out.get()
+        _sync_small(out)
         return (_t.perf_counter() - t0) / repeat
 
     try:
@@ -2962,12 +3062,16 @@ def _weight_execution(family, storage_format, K, N, M, run,
             for which in order:
                 times[which].append(batch(which))
             # Five unanimous paired rounds are already p=1/32; more repetitions cannot
-            # make that decision more necessary. If ANY pair remains inconclusive, keep
-            # measuring through the requested rounds instead of dropping a local win.
-            if r >= 4 and all(
-                    _paired_faster(times, a, b) or _paired_faster(times, b, a)
-                    for i, a in enumerate(valid) for b in valid[:i]):
-                break
+            # make that decision more necessary. What has to be settled is the WINNER
+            # against each other candidate -- not how two losers rank against each other,
+            # which a race of three spent its remaining rounds on whenever they were close.
+            # If the winner is inconclusive against anything, keep measuring through the
+            # requested rounds instead of dropping a local win.
+            if r >= 4:
+                lead = _measured_choice(times, valid, default=valid[0])
+                if all(_paired_faster(times, lead, other)
+                       for other in valid if other != lead):
+                    break
         chosen = _measured_choice(times, valid, default=valid[0])
         _TUNED[key] = chosen
     finally:
@@ -3209,6 +3313,7 @@ def kernel_profile():
         "gqa_tuned": {"|".join(str(x) for x in k): v for k, v in _GQA_TUNED.items()},
         "checked": {"|".join(str(x) for x in k): bool(v) for k, v in _CHECKED.items()},
         "dequant_ok": dict(_DEQ_OK),
+        "calibrated": sorted("|".join(str(x) for x in k) for k in _CALIBRATED),
     }
 
 
@@ -3344,6 +3449,13 @@ def use_kernel_profile(profile):
     for k, v in (profile.get("dequant_ok") or {}).items():
         _DEQ_OK[str(k)] = bool(v)
         n += 1
+    for k in (profile.get("calibrated") or ()):
+        parts = str(k).split("|")
+        if (len(parts) == 5 and parts[0] == "weight_exec"
+                and parts[3].isdigit() and parts[4].isdigit()):
+            _CALIBRATED.add((parts[0], parts[1], parts[2], int(parts[3]), int(parts[4])))
+            n += 1
+    _NEAREST.clear()
     for k, v in (profile.get("gqa_tuned") or {}).items():
         parts = k.split("|")
         if len(parts) == 4 and type(v) is int and v in (4, 8, 16, 32):
@@ -8899,7 +9011,7 @@ _GGML_TILED_Q8_0_WGSL = """
 @group(0) @binding(0) var<storage,read> array_a: array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read> packed: array<vec4<u32>>;
 @group(0) @binding(2) var<storage,read_write> array_c: array<vec4<f32>>;
-struct QMeta { M: u32, N: u32, K: u32, RW: u32, }
+struct QMeta { M: u32, N: u32, K: u32, RW: u32, G: u32, }
 @group(0) @binding(3) var<storage,read> qm: QMeta;
 // [k * 8 + c8]: one k of the block for 8 adjacent columns, as four half pairs.
 var<workgroup> bs: array<vec4<u32>, 256>;
@@ -8935,8 +9047,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
   let i3 = select(i0, row + 3u, row + 3u < M);
   var s00 = vec4<f32>(); var s01 = vec4<f32>(); var s02 = vec4<f32>(); var s03 = vec4<f32>();
   var s10 = vec4<f32>(); var s11 = vec4<f32>(); var s12 = vec4<f32>(); var s13 = vec4<f32>();
+  // With G > 1 the blocks are cut G ways (workgroup z takes one share) and each share is
+  // written to its own (M, N) slice for a reduction pass: that is how a few rows still fill
+  // the device, exactly as mm_f16w does.
   let nb = K >> 5u;
-  for (var b: u32 = 0u; b < nb; b = b + 1u) {
+  let per = (nb + qm.G - 1u) / qm.G;
+  let b0 = wg.z * per;
+  let b1 = min(nb, b0 + per);
+  let sl = wg.z * M * ND4;
+  for (var b: u32 = b0; b < b1; b = b + 1u) {
     // Block b is bytes 34b.. of the column: its scale is the low half of word w0, or the
     // high half when the block starts mid-word -- and then its int8 are word-aligned.
     let byte0 = b * 34u;
@@ -8989,7 +9108,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
   // whatever followed; each column's sum reads only its own column, so they are just not
   // written.
   if (row >= M || c0 >= N) { return; }
-  let cx = c0 >> 2u;
+  let cx = sl + (c0 >> 2u);
   let wide = c0 + 4u < N;
   array_c[cx + row * ND4] = s00;
   if (wide) { array_c[cx + 1u + row * ND4] = s10; }
@@ -9020,8 +9139,25 @@ def _ggml_tiled_ok(type_name, K, N):
     return int(K) % int(_GGML_TYPES[type_name][2]) == 0 and int(N) % 4 == 0
 
 
-def _ggml_tiled_matmul(xf, packed, type_name, K, N):
-    """xf(M,K) @ W(N,K).T from the stored blocks, through the tiled kernel above."""
+def _ggml_tiled_split(M, N):
+    """How many ways the tiled kernel cuts K: four when there are too few workgroups to keep
+    the device busy, else none.
+
+    Its own line, not mm_f16w's (`_mm_split_groups`, which cuts below 128 workgroups): each
+    cut repeats the per-block decode setup and adds a reduction pass, and measured that costs
+    this kernel more than it costs mm_f16w. Apple M5, ms, K uncut / cut in 4:
+        768x768    M=8  (12 groups) 0.095 / 0.072    M=64  (24) 0.110 / 0.114
+        1152x768   M=8  (12 groups) 0.113 / 0.081    M=64  (24) 0.125 / 0.105
+        768x2304   M=32 (36 groups) 0.116 / 0.109    M=64  (72) 0.154 / 0.319
+        768x768    M=128 (48 groups) 0.118 / 0.157   M=256 (96) 0.176 / 0.202
+    """
+    groups = ((int(N) + 63) // 64) * ((int(M) + 31) // 32)
+    return 4 if groups < 48 else 1
+
+
+def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None):
+    """xf(M,K) @ W(N,K).T from the stored blocks, through the tiled kernel above.
+    `split` overrides how many ways K is cut (measurement only)."""
     M, K, N = int(xf.shape[0]), int(K), int(N)
     plat = _adam_kernel["platform"]
     name = "ggml_tiled_" + type_name.lower()
@@ -9030,14 +9166,27 @@ def _ggml_tiled_matmul(xf, packed, type_name, K, N):
                               "bindingTypes": ["read-only-storage", "read-only-storage",
                                                "storage", "read-only-storage"]})
         _ggml_tiled_k["added"].add(name)
+    if "ggml_tiled_reduce" not in _ggml_tiled_k["added"]:
+        plat.addKernel("ggml_tiled_reduce", {"source": _MM_REDUCE_WGSL,
+                                             "bindingTypes": ["storage", "read-only-storage",
+                                                              "read-only-storage"]})
+        _ggml_tiled_k["added"].add("ggml_tiled_reduce")
     vals, blk = int(_GGML_TYPES[type_name][2]), int(_GGML_TYPES[type_name][3])
     words = ((K // vals) * blk + 3) // 4          # ggml_transpose pads a column to whole words
-    out = _empty((M, N))
-    meta = _adam_kernel["make_meta"]((M, N, K, words), "u4,u4,u4,u4")
+    G = int(split) if split else _ggml_tiled_split(M, N)
+    part = _empty((G * M, N))
+    meta = _adam_kernel["make_meta"]((M, N, K, words, G), "u4,u4,u4,u4,u4")
     plat.runKernel({"name": name,
                     "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
-                                out.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": 1}})
+                                part.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": G}})
+    if G == 1:
+        return part
+    out = _empty((M, N))
+    rmeta = _adam_kernel["make_meta"]((M * N, G), "u4,u4")
+    plat.runKernel({"name": "ggml_tiled_reduce",
+                    "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
+                    "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}})
     return out
 
 
@@ -9100,8 +9249,7 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     can_materialize = (execution in ("auto", "materialized")
                        and eidx is None and not xper and _adam_backend_ready()
                        and ggml_dequant_ok(type_name))
-    # The tiled kernel reads the same stored blocks, so it costs no memory and sits right
-    # after "stored" in the candidate order (an unproven race keeps the earlier one).
+    # The tiled kernel reads the same stored blocks and allocates nothing.
     can_tiled = (execution in ("auto", "tiled")
                  and eidx is None and not xper and _adam_backend_ready()
                  and _ggml_tiled_ok(type_name, K, N))
@@ -9116,6 +9264,8 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         raise RuntimeError("%s shape has no tiled stored-format path" % type_name)
     if execution == "auto":
         if can_tiled or can_dp4a or can_materialize:
+            # The tiled kernel reads the same stored blocks and allocates nothing, so it
+            # sits right after "stored": an unproven race keeps the earlier candidate.
             candidates = (("stored",) + (("tiled",) if can_tiled else ())
                           + (("dp4a",) if can_dp4a else ())
                           + (("materialized",) if can_materialize else ()))

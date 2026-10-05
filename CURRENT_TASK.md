@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 Q8 first request 526 → 121 ms; route races run once after load, never in an
+answer:** load-time ladder calibration per weight shape + nearest-bucket reuse; the SDK keeps
+the measurements by default. Q8 cold load 2.3 → 3.2 s (1.76 s with the saved profile). Q8
+steady ~104 ms vs F16 ~97 still open (tiled kernel ~1.15× mm_f16w); WebGL Q8 next.
+
 **2026-10-05 WebGPU Q8 GGUF 117.3 → 103.8 ms (answers unchanged):** multi-row Q8_0
 projections now race a tiled stored-format kernel (block decoded once per workgroup as exact
 halves, scale on per-block partial sums) and it wins every one: 54.2 ms GPU vs 70.8 for

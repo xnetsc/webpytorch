@@ -268,11 +268,12 @@
   // host whose caching is a URL that changes with the bytes), `onStatus`, `onLog`,
   // `onModel` and `onError` -- which must be given here rather than through `on()` if a host
   // wants to see the boot, since all of it happens before this returns -- and
-  // `rememberTuning`, which
-  // lets the SDK keep what it measured about this GPU so the next load does not measure it
-  // again. That last one is off by default: leaving something behind in a browser's storage
-  // is the host's call, not the SDK's, and so is caching a model (install a writer with
-  // `run("webtorch.set_io_write(webtorch.default_io_write)")` if that is what you want).
+  // `rememberTuning: false`, for a host that must leave nothing in browser storage. By
+  // default the SDK keeps the route measurements it makes after a load (a small JSON per
+  // GPU, per kernel build) so the next load does not race them again; that is its own
+  // mechanism, not a host policy. Caching a model is still the host's call (install a
+  // writer with `run("webtorch.set_io_write(webtorch.default_io_write)")` if that is what
+  // you want).
   //
   //     const wt = await webtorch.start({ baseURL: '../' });
   //     const m  = await wt.load('org/repo/file.gguf', { onProgress: p => … });
@@ -509,7 +510,7 @@
     let started;
     try {
       started = await call('start', { pyodideIndexURL: opts.pyodideIndexURL,
-                                      rememberTuning: !!opts.rememberTuning });
+                                      rememberTuning: opts.rememberTuning !== false });
       if (started.backend !== backend) {
         throw new Error('backend mismatch: requested ' + backend
                         + ', worker initialized ' + (started.backend || 'none'));

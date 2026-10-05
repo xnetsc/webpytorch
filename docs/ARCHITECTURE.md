@@ -147,6 +147,16 @@ back, and chunked attention rounds each chunk's key extent up to 64. Padding per
 instead — `xp[:m] = xf` — is the trap: `__setitem__` goes through the host at 0.8 GB/s and
 cost 3.4 s, more than the cliff it was fixing.
 
+**Races happen once, after a load — never inside an answer.** A route race
+(`_weight_execution`) for a new row bucket used to run the first time an answer needed it:
+461 ms of a 526 ms first request on the Q8 decision model. Now a model calibrates right
+after its weights arrive: `calibrate_rows` measures every race a weight can set off over a
+row-count ladder bisected in octaves (both ends, then the middle of any interval whose ends
+disagree), and from then on a row count no probe visited takes the nearest probe's measured
+choice. What is measured is per device and kept by the SDK (IndexedDB, keyed by adapter,
+dropped when the kernels change), so a second load measures nothing. Models that do not
+calibrate yet (LLMs) keep racing on first use.
+
 **Nothing above is hardcoded on faith.** `tune(key, candidates, apply, bench, check)` runs
 the real kernel over the candidates at load time and keeps what measured fastest, per shape
 (`_warm_shapes`). That phase runs every distinct `(format, N, K)` at **two row counts**, not

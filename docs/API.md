@@ -937,11 +937,18 @@ with you, and is off unless you ask:
 | where model files come from | `wt.run('webtorch.set_io_read(webtorch.modelscope_read())')` |
 | whether model reads are cached | choose the installed reader's `cache=` option, for example `wt.run('webtorch.set_io_read(webtorch.hf_read(cache=True))')` |
 | where generated files are written | `wt.run('webtorch.set_io_write(webtorch.default_io_write)')` |
-| keeping what this GPU measured | `start({ rememberTuning: true })` |
 | how your files are cached | `start({ version })` — appended to the package's own file URLs, for a host whose cache policy is a URL that changes with the bytes. Leave it out and they are fetched plainly, so your server's headers decide. |
 
-The SDK sets no cache headers, registers no service worker and writes nothing to browser
-storage on its own. It used to force `cache: 'no-store'` and a timestamp onto every one of
+**What `start` does decide.** After a model's weights arrive the SDK races the kernel routes
+it can take, once, on this GPU (per weight format and shape, over a ladder of row counts),
+so that no answer ever waits on a measurement; a row count no probe visited takes the
+nearest probe's winner. It keeps those results itself -- a small JSON in this origin's
+IndexedDB, keyed by the adapter's identity and dropped whole when the kernels change -- so
+the next load measures nothing. That is the SDK's mechanism, not a host policy; a host that
+must leave nothing in browser storage passes `start({ rememberTuning: false })`.
+
+Apart from that, the SDK sets no cache headers, registers no service worker and writes
+nothing to browser storage on its own. It used to force `cache: 'no-store'` and a timestamp onto every one of
 its own module fetches, which began as a development convenience and shipped as a policy:
 1.3MB re-fetched on every load of every host, and — measured on the deployed page — 52
 service-worker cache entries written per visit under URLs that could never be matched again.

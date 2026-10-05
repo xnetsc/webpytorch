@@ -56,15 +56,15 @@
 
   // ---- what this device worked out about itself -----------------------------------------
   //
-  // Measuring the fastest shader shape for a model costs real time on every load, and the
-  // answer does not change between loads on the same GPU. Keeping it is worth a lot; the
-  // SDK still does not decide to.
-  //
-  // Writing to a browser's storage is the HOST's call -- it knows its quota, its privacy
-  // promises and whether this page should leave anything behind at all -- so this is off
-  // unless `start({rememberTuning: true})` asked for it. The shape of what gets stored
-  // stays in here, because that is the SDK's and a host has no business knowing it.
-  let remember = false;
+  // Measuring which kernel route is fastest costs real time -- a model's routes are raced
+  // once, right after its weights arrive -- and the answer does not change between loads on
+  // the same GPU with the same build. Keeping it is the SDK's own business, like the
+  // measuring: every host gets it without asking, so a service or an extension that
+  // embeds the SDK does not re-race every load just because it never knew to opt in. What
+  // is kept is a small JSON of route choices in this origin's IndexedDB, keyed by the
+  // adapter's identity and discarded whole when the kernels change. A host that must leave
+  // nothing behind says so with `start({rememberTuning: false})`.
+  let remember = true;
   let backendName = null;
   let profileKey;
   const KP_DB = 'webtorch-kernel-profile';
@@ -171,7 +171,7 @@
       });
       pyodide = r.pyodide; tasks = r.tasks;
       backendName = r.backend;
-      remember = !!(a && a.rememberTuning);
+      remember = !(a && a.rememberTuning === false);
       await py('import json, webtorch\n_MODEL = {"m": None, "id": None}\n');
       ready = true;
       // When it is not the GPU, the SDK says why. Recorded where it failed, which is the

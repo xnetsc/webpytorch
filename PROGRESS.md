@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-10-05 ▸ Route races move from the first answer to once after load (Q8 first request 526 → 121 ms)
+
+**Why Q8's first three-question request took 500–600 ms and F16's ~120:** measured on a
+fresh browser, 461 ms of Q8's 526 ms first request was `_weight_execution` racing routes for
+the new 1024-row bucket (5 weight shapes × stored/tiled/materialized): ~123 ms compiling the
+stored kernel's large-batch variants, ~211 ms of timed samples that each read back the whole
+1.6–4.8 MB output, ~87 ms of checks and warm runs. F16 weights have one route (`mm_f16w`) and
+race nothing. With a saved profile the same request was 117 ms — the race was all of it.
+
+**Change (SDK, not page):**
+- `calibrate_rows(probe, top, lo, step)`: right after a load, each route race a weight can
+  set off is measured over a row-count ladder bisected in octaves — both ends, then the
+  middle of any interval whose ends chose differently. Its prefix is then *calibrated*.
+- `_weight_execution`: for a calibrated prefix, a row count no probe visited takes the
+  nearest probe's measured choice instead of racing in front of the caller. Uncalibrated
+  prefixes (LLMs today) keep the old behaviour. Calibration measures; answers never do.
+- Decision models (`_warm_decision`): the warm-up question runs measured (it creates every
+  projection and races the small buckets), then every distinct stored linear (format, K, N)
+  gets a 16→512 ladder and the head's row-selection race a 16→512 ladder by token count.
+- A race stops once its winner beats every other candidate (p ≤ 1/32), not once every pair
+  of losers is ranked; samples sync on one element instead of reading the output back.
+- Tiled K-split has its own line (cut below 48 workgroups): measured, cutting at mm_f16w's
+  128 made 768×2304 at M=64 0.154 → 0.319 ms.
+- Persistence of the measurements is the SDK's by default (`rememberTuning` now defaults on;
+  `false` opts out). The chat page no longer passes it; laya-service and the browser-use
+  skill, which never passed it, now keep their measurements too.
+
+**Measured** (local Q8_0 GGUF via the page's file input, WebGPU, M5; answers identical
+`billing 0.8966 0.979 1.7244`):
+
+| Q8_0 | load | load-time races | first 3-question request | races during requests |
+|---|---|---|---|---|
+| before, cold | 2.3 s | 0.9 s | 526 ms | 461 ms |
+| now, cold (first load on a device/build) | 3.2 s | 1.67 s | 121 ms | 0 |
+| now, saved profile | 1.76 s | 0 | 107 ms | 0 |
+
+F16 GGUF cold: load 2.0 s (head ladder 0.45 s), first request 100.5 ms, no races in requests.
+
+**Limits:** only decision models calibrate; LLM prefill buckets still race on first use.
+The ladder stops at 512 rows: a longer request uses the 512 choice. Only measured on M5.
+
 ## 2026-10-05 ▸ WebGPU Q8_0 at many rows: a tiled stored-format kernel (117.3 → 103.8 ms)
 
 **Why Q8 was slower than F16** (GPU timestamps, xDecision encoder, three questions): every
