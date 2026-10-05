@@ -1304,20 +1304,17 @@ async def _gguf_header(path):
     """Read a GGUF header without knowing how large its embedded metadata is.
 
     A complete model may carry its tokenizer in metadata, so a fixed small header read is
-    not sufficient.  Grow only until the parser says it has the complete header; ordinary
-    LLM GGUFs stop on the first read, while self-contained artifacts may need more.
+    not sufficient. `read_header` grows its reads only as far as the header turns out to
+    go, and decodes no metadata array until something reads it.
     """
     from . import ggufload as G
 
-    size = 12 << 20
-    while True:
-        buf = await _rng(path, 0, size - 1)
-        try:
-            return G.parse_header(buf)
-        except EOFError:
-            size <<= 1
-            if size > (128 << 20):
-                raise ValueError("GGUF metadata exceeds the 128 MiB SDK header limit")
+    try:
+        return await G.read_header(lambda a, b: _rng(path, a, b))
+    except ValueError as e:
+        if "header limit" in str(e):
+            raise ValueError("GGUF metadata exceeds the 128 MiB SDK header limit")
+        raise
 
 
 def _gguf_meta_json(meta, key):

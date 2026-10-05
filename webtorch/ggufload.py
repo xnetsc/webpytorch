@@ -4,12 +4,15 @@ Parses the GGUF container (header + metadata KV + tensor info) and dequantizes
 ggml block-quant tensors to fp32, byte-compatible with llama.cpp. Dequant is
 vectorized numpy. Hook the returned fp32 arrays into webtorch like any weights.
 
-`parse_header(buf)` -> (version, metadata, tensor_infos, data_start).
+`parse_header(buf)` -> (version, metadata, tensor_infos, data_start); metadata arrays
+come back as `LazyArray`, decoded on first use. `read_header(read)` is the same through an
+async range reader, fetching only as much of the file as the header turns out to need.
 `dequant(ggml_type, raw_bytes, n_elements)` -> np.float32 (row-major, ggml order).
 `GGML_NAMES` maps type ids to names; `dims` in tensor_infos are ggml order
 (innermost first) — reverse for a numpy/torch (out,in) shape.
 """
 import struct
+from collections.abc import Sequence
 import numpy as np
 
 GGUF_MAGIC = 0x46554747
@@ -96,27 +99,268 @@ class _R:
         raise ValueError("bad metadata type %d" % t)
 
 
+# Element sizes of the fixed-width metadata types; STRING and ARRAY are variable-length.
+_FIXED = {U8: 1, I8: 1, U16: 2, I16: 2, U32: 4, I32: 4, F32V: 4, BOOLV: 1,
+          U64: 8, I64: 8, F64: 8}
+_U64 = struct.Struct("<Q")
+_ARRAY_HEAD = struct.Struct("<IQ")       # an array's element type and count
+
+
+def _short(p):
+    return EOFError("GGUF header exceeds buffer (need >= %d bytes)" % p)
+
+
+def _skip_strings(b, p, n, end):
+    """Past `n` length-prefixed strings starting at `p`; returns where they end."""
+    u64 = _U64.unpack_from
+    for _ in range(n):
+        if p + 8 > end:
+            raise _short(p + 8)
+        p += 8 + u64(b, p)[0]
+    if p > end:
+        raise _short(p)
+    return p
+
+
+# The same walk as `_skip_array`'s, for a browser. Python inside wasm pays ~1 us per loop
+# turn, and a tokenizer's arrays are ~840,000 turns: 344 ms of a 417-ms header, measured.
+# The loop reads Python's own bytes through a zero-copy buffer and returns where the array
+# ends, -1 for "the buffer stops first", -2 for a type it does not know.
+_JS_WALK_SOURCE = """
+const view = proxy.getBuffer('u8');
+try {
+  const b = view.data, end = b.length;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const FIX = [1, 1, 2, 2, 4, 4, 4, 1, -1, -1, 8, 8, 8];
+  const u64 = (q) => dv.getUint32(q + 4, true) * 4294967296 + dv.getUint32(q, true);
+  const walk = (q, t, count) => {
+    if (t === 8) {
+      for (let i = 0; i < count; i++) { if (q + 8 > end) return -1; q += 8 + u64(q); }
+      return q > end ? -1 : q;
+    }
+    if (t === 9) {
+      for (let i = 0; i < count; i++) {
+        if (q + 12 > end) return -1;
+        const it = dv.getUint32(q, true), c = u64(q + 4);
+        q = walk(q + 12, it, c);
+        if (q < 0) return q;
+      }
+      return q;
+    }
+    const s = t >= 0 && t < FIX.length ? FIX[t] : -1;
+    if (s < 0) return -2;
+    q += s * count;
+    return q > end ? -1 : q;
+  };
+  return walk(p, et, n);
+} finally { view.release(); }
+"""
+_JS_WALK = None      # the compiled walk; False where there is no JS to compile it in
+
+
+def _js_walk():
+    global _JS_WALK
+    if _JS_WALK is None:
+        try:
+            import js                                   # only inside Pyodide
+            from pyodide.ffi import create_proxy        # noqa: F401
+            _JS_WALK = js.Function.new("proxy", "p", "n", "et", _JS_WALK_SOURCE)
+        except Exception:
+            _JS_WALK = False
+    return _JS_WALK or None
+
+
+def _skip_array(r, et, n):
+    """Advance `r` past an array without decoding it.
+
+    A fixed-width array is one bounds check. A string array still has to walk its length
+    prefixes -- the next element starts where this one ends -- and an array of arrays has
+    to walk each inner array's head; both happen in one flat loop, never a call per
+    element. Measured in the browser on a 60-MB header: a tokenizer's 580,604 merges are an
+    array of two-string arrays, and walking them through one recursive call per element
+    was 886,983 calls and most of the header's time.
+    """
+    size = _FIXED.get(et)
+    if size is not None:
+        r.raw(size * n)
+        return
+    walk = _js_walk() if n > 4096 else None   # a crossing is only worth it for a long walk
+    if walk is not None:
+        from pyodide.ffi import create_proxy
+        proxy = create_proxy(r.b)
+        try:
+            q = walk(proxy, r.p, n, et)
+        finally:
+            proxy.destroy()
+        if q == -2:
+            raise ValueError("bad metadata array type in a type-%d array" % et)
+        if q < 0:
+            raise _short(len(r.b) + 1)
+        r.p = int(q)
+        return
+    b, p, end = r.b, r.p, len(r.b)
+    if et == STRING:
+        r.p = _skip_strings(b, p, n, end)
+        return
+    if et != ARRAY:
+        raise ValueError("bad metadata array type %d" % et)
+    head, u64 = _ARRAY_HEAD.unpack_from, _U64.unpack_from
+    for _ in range(n):
+        if p + 12 > end:
+            raise _short(p + 12)
+        it, cnt = head(b, p)
+        p += 12
+        size = _FIXED.get(it)
+        if size is not None:
+            p += size * cnt
+        elif it == STRING:
+            for _ in range(cnt):
+                if p + 8 > end:
+                    raise _short(p + 8)
+                p += 8 + u64(b, p)[0]
+        else:                            # arrays nested deeper than two: rare, so recurse
+            r.p = p
+            _skip_array(r, it, cnt)
+            p = r.p
+    if p > end:
+        raise _short(p)
+    r.p = p
+
+
+class LazyArray(Sequence):
+    """A metadata array, decoded the first time anything reads an element.
+
+    Walking the header only records where each array lives. Whoever reads one gets exactly
+    the list it always got; whoever does not, pays nothing for it. That is the whole point:
+    a self-contained decision checkpoint carries a llama.cpp tokenizer (256,000 tokens,
+    their types, 580,604 merges) beside the tokenizer JSON its loader actually uses, and
+    decoding those arrays was most of a 2.8-s header parse in the browser -- for values its
+    loader never looked at. An LLM building its vocabulary from them reads them, and pays
+    the same as before.
+    """
+    __slots__ = ("_h", "_off", "_type", "_n", "_v")
+
+    def __init__(self, header, off, etype, n):
+        self._h, self._off, self._type, self._n, self._v = header, off, etype, n, None
+
+    def _list(self):
+        if self._v is None:
+            r = _R(self._h.buf)
+            r.p = self._off
+            self._v = [r.value(self._type) for _ in range(self._n)]
+            self._h = None          # the header's buffer need not outlive these values
+        return self._v
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        return self._list()[i]
+
+    def __iter__(self):
+        return iter(self._list())
+
+    def __eq__(self, other):
+        if isinstance(other, (list, tuple, LazyArray)):
+            return list(self) == list(other)
+        return NotImplemented
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "LazyArray(%d items%s)" % (self._n, "" if self._v is None else ", decoded")
+
+
+class _Header:
+    """A GGUF header walked across reads of a growing prefix of the file.
+
+    How big a header is cannot be known until it has been walked, and a checkpoint that
+    carries its tokenizer in metadata can run to tens of megabytes. Every entry finished in
+    one pass stays finished: when the bytes run out partway through an entry, the walk backs
+    up to that entry's start and resumes there once more arrive. Reading and re-parsing from
+    the top instead walked a 60-MB header four times -- the 48-MB attempt alone spent 551 ms
+    on the host discovering it was short.
+    """
+
+    def __init__(self):
+        self.buf = b""
+        self.p = 0
+        self.version = self.n_tensors = self.n_kv = None
+        self.kv_done = 0
+        self.meta, self.infos = {}, []
+        self.data_start = None
+
+    def feed(self, buf):
+        """`buf` holds the file's first len(buf) bytes. True once the header is complete."""
+        self.buf = buf
+        r = _R(buf)
+        r.p = self.p
+        try:
+            if self.version is None:
+                if r.u32() != GGUF_MAGIC:
+                    raise ValueError("not a GGUF file")
+                version, n_tensors, n_kv = r.u32(), r.u64(), r.u64()
+                self.version, self.n_tensors, self.n_kv = version, n_tensors, n_kv
+                self.p = r.p
+            while self.kv_done < self.n_kv:
+                k = r.string()
+                vt = r.u32()
+                if vt == ARRAY:
+                    et, n = r.u32(), r.u64()
+                    off = r.p
+                    _skip_array(r, et, n)
+                    v = LazyArray(self, off, et, n)
+                else:
+                    v = r.value(vt)
+                self.meta[k] = v
+                self.kv_done += 1
+                self.p = r.p
+            while len(self.infos) < self.n_tensors:
+                name = r.string()
+                nd = r.u32()
+                dims = [r.u64() for _ in range(nd)]
+                ttype = r.u32()
+                off = r.u64()
+                self.infos.append({"name": name, "dims": dims, "type": ttype, "offset": off})
+                self.p = r.p
+        except EOFError:
+            return False
+        align = self.meta.get("general.alignment", 32)
+        self.data_start = (self.p + align - 1) // align * align
+        return True
+
+
 def parse_header(buf):
-    r = _R(buf)
-    if r.u32() != GGUF_MAGIC:
-        raise ValueError("not a GGUF file")
-    version = r.u32()
-    n_tensors = r.u64()
-    n_kv = r.u64()
-    meta = {}
-    for _ in range(n_kv):
-        k = r.string(); vt = r.u32(); meta[k] = r.value(vt)
-    infos = []
-    for _ in range(n_tensors):
-        name = r.string()
-        nd = r.u32()
-        dims = [r.u64() for _ in range(nd)]
-        ttype = r.u32()
-        off = r.u64()
-        infos.append({"name": name, "dims": dims, "type": ttype, "offset": off})
-    align = meta.get("general.alignment", 32)
-    data_start = (r.p + align - 1) // align * align
-    return version, meta, infos, data_start
+    """(version, metadata, tensor_infos, data_start) from a buffer that holds the header.
+
+    Metadata arrays come back as `LazyArray`. Raises EOFError if `buf` stops short of the
+    header's end; `read_header` is the way to read one whose size is not known.
+    """
+    h = _Header()
+    if not h.feed(buf):
+        raise EOFError("GGUF header exceeds buffer (%d bytes)" % len(buf))
+    return h.version, h.meta, h.infos, h.data_start
+
+
+async def read_header(read, first=12 << 20, limit=128 << 20):
+    """`parse_header` through `await read(start, end_inclusive) -> bytes`.
+
+    Reads grow geometrically from `first`, each fetching only the bytes not already held,
+    and the walk resumes where it stopped; an ordinary LLM header finishes in the first
+    read. Raises ValueError past `limit`, and EOFError if the file ends inside its header.
+    """
+    h = _Header()
+    buf = b""
+    size = first
+    while True:
+        buf += bytes(await read(len(buf), size - 1))
+        if h.feed(buf):
+            return h.version, h.meta, h.infos, h.data_start
+        if len(buf) < size:
+            raise EOFError("GGUF file ends inside its header (%d bytes)" % len(buf))
+        if size >= limit:
+            raise ValueError("GGUF metadata exceeds the %d MiB header limit" % (limit >> 20))
+        size = min(limit, size * 2)
 
 
 # --------------------------- dequantizers ----------------------------------

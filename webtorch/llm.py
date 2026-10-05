@@ -1601,15 +1601,7 @@ class CausalLM:
         from . import ggufload as G
         self._expert_norm_default = expert_weights_norm
         self.lmax = lmax; self._gguf = url
-        size = 12 << 20
-        while True:
-            buf = await self._grng(0, size - 1)
-            try:
-                _, meta, infos, ds = G.parse_header(buf); break
-            except EOFError:
-                size <<= 1
-                if size > (128 << 20):
-                    raise
+        _, meta, infos, ds = await G.read_header(self._grng)
         # `bits=None` follows the file (see _source_bits); an explicit width still wins.
         self.bits = int(bits) if bits else _source_bits(infos, G)
         # `quantize=False` (dtype="fp16") keeps the dequantized weights unquantized, so a GGUF

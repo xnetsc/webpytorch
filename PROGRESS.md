@@ -1,5 +1,59 @@
 # Progress
 
+## 2026-10-05 ▸ WebGPU: F16 GGUF xDecision vs Laya safetensors — same path, same speed; load gap closed
+
+**Trigger:** the user asked whether the local `xDecision-F16.gguf` (post-trained from Laya)
+takes exactly Laya's path on WebGPU, with the same performance. Laya is the performance
+reference; performance is the goal.
+
+**Method.** Local page `127.0.0.1:8119/chat/?backend=webgpu&profile_decision=1`, driven by a
+Playwright-launched system Chrome (headless, `--enable-unsafe-webgpu --use-angle=metal`).
+Each model is fed to the page's own `#localModelInput` / `#localDirInput` with
+`setInputFiles`, so it takes the app's `localPick → cache.import` route and the browser
+reads the file from disk — no HTTP for model bytes, no download. One model per browser,
+released before exit. Same three-question request (the app's billing example, 486 tokens).
+Path identity is checked two ways: a fingerprint of every resident weight (name, container
+type, dtype, shape), and the exact sequence of kernels dispatched on one request with the
+encoder capture forced off (replay would hide individual dispatches).
+
+**Inference (identical):**
+
+| | Laya safetensors | xDecision F16 GGUF |
+|---|---|---|
+| weight fingerprint (169 tensors) | `498026a00a26dc09` | `498026a00a26dc09` |
+| dispatch sequence, capture off | 422 · `1f3b06b3758d4e26` | 422 · `1f3b06b3758d4e26` |
+| steady median (10 requests) | 96.1 ms (94.9–100.5) | 95.6 ms (94.9–98.7) |
+| eager (capture off) | 93.3 ms | 94.5 ms |
+
+Answers differ, as post-training should make them, and each model's are stable run to run.
+
+**Load (was not identical, now near).** Per-function attribution of the loader: Laya 1598 ms,
+xDecision 4486 ms, and the whole difference was `_gguf_header` (2800 ms vs 1.1 ms for the
+safetensors header); everything else matched (warm 910/962, tensor reads 259/271,
+tokenizer 241/269 ms). The file's header is 60.3 MB: the tokenizer JSON its loader uses, plus
+a llama.cpp tokenizer it never reads (256,000 tokens, 256,000 types, 580,604 merges). The
+parser decoded every array element in Python, and the read ladder (12 → 24 → 48 → 96 MB)
+re-walked the header from the top each time; the 48-MB attempt alone cost 551 ms on the host.
+
+**Change (generic, any GGUF, both loaders):** one `ggufload.read_header(read)` replaces the
+two copies of the ladder in `decision.py` and `llm.py`; reads fetch only new bytes and the
+walk resumes at the last finished entry. Arrays become `LazyArray` (decoded on first access,
+otherwise the same list). Skipping them is one flat loop with no call per element — the
+nested merges had been 886,983 recursive calls — and in a browser that loop runs in JS over
+a zero-copy view of Python's bytes, falling back to Python on the host.
+
+**Measured, Chrome, same file:** header 2800 → 417 (lazy + resume + flat loop) → 79–100 ms
+(JS loop); whole load 4515 → 1707–1725 ms vs Laya 1612 ms. A browser check parsed the same
+header with the JS loop and with Python only: identical version, metadata (every array's
+length, offset and type), 170 tensor infos and data start (60,279,520). After the change the
+weight fingerprint, the 422-dispatch sequence and the answers are unchanged.
+Host: 219 passed, 1 skipped (4 new header tests); JS 102 passed.
+
+**Left as found:** Codex's uncommitted WebGL `pair2` matmul candidate and encoder-scoped
+route selection are stashed (`git stash list`), not committed: correct, but on this device
+the encoder selects scalar and the full request gains nothing (median 1920 ms). The WebGL
+decision latency itself (~1.9 s for three questions) remains the open performance item.
+
 ## 2026-10-05 ▸ measured WebGL decision operator costs before choosing a kernel change
 
 - Used the already-loaded local `xDecision-F16.gguf` in Chrome WebGL; no model

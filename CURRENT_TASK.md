@@ -13,6 +13,15 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGPU F16-GGUF parity with the Laya reference:** On WebGPU the local
+`xDecision-F16.gguf` and the Laya safetensors checkpoint hold identical resident weights
+(169-tensor fingerprint) and dispatch the identical 422-kernel sequence; steady medians are
+95.6 vs 96.1 ms for the three-question example. Load was 4.5 vs 1.6 s, entirely the GGUF
+header (60 MB with an unused llama.cpp tokenizer, decoded element by element and re-walked
+by a read ladder). The shared incremental, lazy header reader brings it to 1.7 vs 1.6 s with
+unchanged answers and dispatches. The WebGL decision latency (~1.9 s) is still the open
+performance item; Codex's `pair2` candidate is stashed, not committed.
+
 **2026-10-05 WebGL operator attribution, not optimization completion:**
 On the already-loaded local xDecision F16 GGUF, 417-token three-question
 inference spends about 1.87–2.02 s in the 22-layer encoder before the two head

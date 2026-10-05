@@ -33,7 +33,7 @@ Pyodide (Python-in-WASM) worker in the browser.
 | `llm.py` | `CausalLM` — loads AutoGPTQ (int4/int8), GGUF, or plain fp16/bf16 HF; prefill/decode, KV prefix reuse, chat templates and the tool-call API; `BPETokenizer` (which also *reads* the model's own template to learn its tool syntax) |
 | `constrain.py` | output constraints — `Verdict`, the callback protocol, and the built-ins (`json`, `regex`, `choices`, tool names) |
 | `toolcall.py` | pure functions for reading/writing tool calls in whatever delimiters and shape a model uses; knows no model family by name |
-| `ggufload.py` `hfcompat.py` `iqtables.py` | weight readers: GGUF (28 formats incl. i-quants) and HF/safetensors; `iqtables` is the i-quant codebook data |
+| `ggufload.py` `hfcompat.py` `iqtables.py` | weight readers: GGUF (28 formats incl. i-quants; header read incrementally, metadata arrays decoded on access) and HF/safetensors; `iqtables` is the i-quant codebook data |
 | `multimodal.py` | `register_encoder` + `MultimodalLM` — pairs any decoder with any media encoder |
 | `linear_attn.py` | SSM / linear-attention layers (the hybrid models) |
 | `backend.py` `webenv.py` `portable.py` | backend selection, browser-vs-host environment, and the numpy fallback that lets pure-Python logic be tested off-browser |

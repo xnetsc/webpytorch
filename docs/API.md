@@ -706,6 +706,18 @@ an unsupported file fails in seconds naming exactly what is missing, instead of 
 downloading gigabytes. `dtype="fp16"` runs a GGUF unquantized (the int kernel is GPU-only, so
 this is what makes GGUF work without a GPU).
 
+**The header is read only as far as it goes, and metadata is decoded only when read.** A
+self-contained checkpoint can carry tens of megabytes of metadata — a decision GGUF here has
+a 60-MB header holding both its tokenizer JSON and a llama.cpp tokenizer (256,000 tokens,
+their types, 580,604 merges). `ggufload.read_header(read)` fetches the header through an
+async range reader in growing reads, each fetching only bytes not yet held, and resumes the
+walk where it stopped. Metadata arrays come back as `ggufload.LazyArray`: a sequence that
+decodes on first access and is otherwise exactly the list it replaces, so a loader that
+uses them (an LLM's BPE vocabulary) gets what it always got, and one that does not pays only
+for stepping over them — done in a JS loop when running in a browser, with the Python one on
+the host. Measured on that header in Chrome: 2.8 s → 0.1 s; the whole decision load fell
+from 4.5 s to 1.7 s, against 1.6 s for the same weights as safetensors.
+
 ## Generic ONNX  (`webtorch.OnnxModel`)
 - `await webtorch.OnnxModel.from_source(src, io=None)` — `src`: url | bytes | async
   callback (str urls read via the global `io_read`; `io=` overrides per call).
