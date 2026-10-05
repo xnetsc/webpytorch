@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 user asked for all three:** (1) Q8 steady vs F16 on WebGPU — kernel variants
+exhausted (stage 1/2/3 blocks, 32/48/64-row tiles, bank layouts, f32/f16 tiles, double
+buffer): exact Q8 does ~10–12% more GPU work than F16 at the encoder's shapes (faster at
+768→3072 and small M); (2) LLM load-time route ladder — done, 0.6B first token 466 → 255 ms;
+(3) WebGL Q8 (2232 vs 856 ms) — next.
+
 **2026-10-05 Q8 first request 526 → 121 ms; route races run once after load, never in an
 answer:** load-time ladder calibration per weight shape + nearest-bucket reuse; the SDK keeps
 the measurements by default. Q8 cold load 2.3 → 3.2 s (1.76 s with the saved profile). Q8

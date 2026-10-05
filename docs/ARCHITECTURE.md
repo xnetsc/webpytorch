@@ -154,8 +154,9 @@ after its weights arrive: `calibrate_rows` measures every race a weight can set 
 row-count ladder bisected in octaves (both ends, then the middle of any interval whose ends
 disagree), and from then on a row count no probe visited takes the nearest probe's measured
 choice. What is measured is per device and kept by the SDK (IndexedDB, keyed by adapter,
-dropped when the kernels change), so a second load measures nothing. Models that do not
-calibrate yet (LLMs) keep racing on first use.
+dropped when the kernels change), so a second load measures nothing. Decision models
+ladder every stored linear and the head's row selection; LLMs ladder the weights their
+layers hold (16→512 rows) — not the output head, which a prefill reads for one row.
 
 **Nothing above is hardcoded on faith.** `tune(key, candidates, apply, bench, check)` runs
 the real kernel over the candidates at load time and keeps what measured fastest, per shape

@@ -418,3 +418,12 @@ def test_the_sdk_keeps_its_measurements_unless_a_host_says_no():
     assert "remember = !(a && a.rememberTuning === false);" in host
     assert "rememberTuning: opts.rememberTuning !== false" in main
     assert "rememberTuning" not in (root / "chat/app.js").read_text()
+
+
+def test_llm_load_ladders_its_layer_weights_but_not_the_output_head():
+    from webtorch import llm
+    src = inspect.getsource(llm.CausalLM._warm_shapes) if hasattr(llm, "CausalLM") else \
+        inspect.getsource(llm)
+    assert "wt.calibrate_rows(probe, 512, lo=16, step=4)" in src
+    assert "layer_keys = set(owners)" in src
+    assert src.index("layer_keys = set(owners)") < src.index('walk(getattr(self, "head", []))')

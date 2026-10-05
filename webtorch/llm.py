@@ -4591,7 +4591,11 @@ class CausalLM:
                 elif isinstance(value, wt.Module):
                     for item in vars(value).values():
                         walk(item)
-            walk(getattr(self, "layers", [])); walk(getattr(self, "head", []))
+            walk(getattr(self, "layers", []))
+            # What the layers hold is what a prompt's length reaches; the output head is
+            # read for the last position only, so it is built here but not laddered below.
+            layer_keys = set(owners)
+            walk(getattr(self, "head", []))
             eidx = wt._empty_i32((1,)) if any(k[3] for k in owners) else None
             if eidx is not None:
                 eidx.buffer.set_data(np.zeros((1,), np.int32))
@@ -4618,10 +4622,9 @@ class CausalLM:
             # one row reaches only the decode GEMV. Three is the first count that leaves it
             # for the batched kernel, which the reader's first prompt was compiling instead.
             #
-            # This load-time pass forces the stored path.  The stored-vs-materialized choice
-            # is measured later on the first real batch, whose row count is meaningful; doing
-            # it here with three synthetic rows would both answer the wrong shape and allocate
-            # an unpacked tensor while the uploaded model already fills the device.
+            # This pass forces the stored path: it only builds kernels. Which route each
+            # row count should take is measured right after it, over a ladder of row
+            # counts (see the calibration below), not on the reader's first prompt.
             #
             # One shape per distinct (format, N, K), not one per layer, so this is a pass over
             # a few dozen tensors rather than over the model.
@@ -4646,6 +4649,29 @@ class CausalLM:
                 except Exception:
                     pass
                 held.clear()
+            # Route races belong to the load, not to the first prompt. The first reply of a
+            # 0.6B spent 343 ms of its prefill racing stored against unpacked for the
+            # 256-row bucket of seven weight shapes. Each distinct (format, N, K) a layer
+            # holds is now raced over a 16..512 row ladder here, bisected where the winner
+            # changes; a prefill of any length then takes the nearest measured bucket and
+            # races nothing. Unpacking a weight to race it costs here what it cost on that
+            # first prompt -- the same transient, at the same moment of a session's life.
+            # Not the output head: a prefill reads its last row only, and laddering a
+            # 151936-wide head to 512 rows cost a 0.6B's load six seconds for a shape no
+            # prompt produces.
+            ladder = sorted(k for k in layer_keys if not k[3])
+            _load_stage("tuning", done=0, total=len(ladder))
+            rng = np.random.default_rng(0)
+            for i, (tname, nt, kt, moe) in enumerate(ladder):
+                lay = owners.get((tname, nt, kt, False))
+                if lay is None or getattr(lay, "execution", None) != "auto":
+                    continue
+
+                def probe(m, lay=lay, kt=kt):
+                    x = wt.Tensor(rng.standard_normal((m, int(kt))).astype(np.float32))
+                    wt._sync_small(lay(x))
+                wt.calibrate_rows(probe, 512, lo=16, step=4)
+                _load_stage("tuning", done=i + 1, total=len(ladder))
             _warm_s = time.perf_counter() - _t0
             wt.flash_tune(self.NH, self.NKV, self.HD)
             # What this phase actually spent, broken down, so the next slow load is a table

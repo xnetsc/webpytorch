@@ -1,5 +1,26 @@
 # Progress
 
+## 2026-10-05 ▸ LLMs race their routes after load too (0.6B first reply 466 → 255 ms to first token)
+
+The first reply of Qwen3-0.6B Q4_K_M spent 204 ms racing stored against unpacked weights for
+the 256-row prefill bucket of seven layer shapes. `_warm_shapes` now runs `calibrate_rows`
+over a 16→512 ladder for every distinct (format, N, K) the layers hold, so a prompt of any
+length takes the nearest measured bucket. The output head is excluded: a prefill reads its
+last row only, and laddering the 151936-wide head to 512 rows had cost six seconds of load.
+
+Measured (local file via the page's input, WebGPU, M5, greedy, three different prompts):
+
+| Qwen3-0.6B Q4_K_M | load | load-time races | 1st reply first token | races in replies | decode |
+|---|---|---|---|---|---|
+| before, cold | 12.8 s | 2.7 s (15) | 466 ms | 204 ms | 136–141 tok/s |
+| now, cold | 11.9–15.9 s | 3.3–3.5 s (29–31) | 254–257 ms | 0 | 135–141 tok/s |
+| now, saved profile | 13.2 s | 0 | 243 ms | 0 | 137–138 tok/s |
+
+Load wall time varies ±2 s between identical runs; the races add ~0.6 s of it on a cold
+device. Prefill picked "materialized" from 64 rows up for every Q4_K/Q6_K layer shape: those
+formats have no tiled kernel yet. The 0.6B's ~13 s load is mostly not tuning (0 with a
+profile) — not yet attributed.
+
 ## 2026-10-05 ▸ Route races move from the first answer to once after load (Q8 first request 526 → 121 ms)
 
 **Why Q8's first three-question request took 500–600 ms and F16's ~120:** measured on a
