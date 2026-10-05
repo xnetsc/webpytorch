@@ -13,6 +13,20 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGL operator attribution, not optimization completion:**
+On the already-loaded local xDecision F16 GGUF, 417-token three-question
+inference spends about 1.87–2.02 s in the 22-layer encoder before the two head
+layers (~0.35 s) and tiny scorer. Within the encoder, diagnostic fenced stage
+totals are attention ~1.15–1.22 s and MLP ~0.80–0.82 s. Across its 88 real
+linear calls, QKV and MLP input projections each account for roughly 0.4–0.45
+s under per-op barriers; output projections are smaller. The attention
+QK/PV/softmax group also matters, but fine-grained barriers substantially
+inflate whole-request time, so those estimates must not be added to the
+unmodified ~2.3-s request. The user requested measurement before any further
+candidate; no shader choice has been made. The loaded diagnostic wheel was
+left in incumbent accumulator mode 1; on-disk experimental shader changes
+were reverted. The broader performance and project gates remain open.
+
 **2026-10-05 local F16 GGUF route corrected:** The actual local
 `xDecision-F16.gguf` (not a safetensors checkpoint) has the same 170 tensor
 names, shapes and dtypes as the Laya checkpoint, with semantically equal

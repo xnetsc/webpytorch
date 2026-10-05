@@ -1,5 +1,43 @@
 # Progress
 
+## 2026-10-05 ▸ measured WebGL decision operator costs before choosing a kernel change
+
+- Used the already-loaded local `xDecision-F16.gguf` in Chrome WebGL; no model
+  download or second resident model. The representative three-question request
+  has lengths 137/130/150 (417 total), padded to 3×150 rows. This checkpoint
+  has 22 encoder layers, each with attention QKV/output and MLP input/output
+  projections, followed by two decision-head layers. The browser's temporary
+  accumulator experiment was set back to incumbent mode 1; its on-disk code
+  has already been reverted. No new performance candidate is enabled here.
+- The product's `head_ms` is not head-only GPU work: it includes the final
+  readback fence for queued encoder work. With an explicit fence just after
+  encoding on three same-shape changed states, encoder GPU/readback wait was
+  2018/1871/1871 ms, while the first full head layer took 267/261/272 ms,
+  selected final layer 90/86/90 ms, and scorer readback 0.8/1.9/0.7 ms.
+  Without intrusive fences, three further complete requests were
+  2448/2306/2305 ms and retained the checked `billing` answer.
+- A full-request 22-layer diagnostic with a barrier after each attention and
+  MLP stage measured 22 attention stages at 1220/1150 ms net of a repeated
+  idle readback and 22 MLP stages at 815/804 ms. These are diagnostic fenced
+  wall costs, **not** additive production GPU timestamps. They establish that
+  the encoder, particularly attention and MLP, dominates the ~2.3-s route.
+- Fencing immediately before and after each of the 88 real encoder linears,
+  then subtracting same-output idle readback cost, measured per-request sums:
+  QKV 439–452 ms (22 calls, ~19 ms each), MLP input 404–417 ms (22, ~18 ms),
+  MLP output 177–191 ms (22, ~8 ms), attention output 127–142 ms (22, ~6 ms).
+  The intervening work before attention-output projection was another
+  ~431 ms in a separately fenced run. Within attention, targeted fences
+  measured QK batched matmul 228 ms (22), PV matmul 136 ms (22), and softmax
+  107 ms (22); that run's total rose to 4296 ms because 66 extra barriers
+  change scheduling/readback, so these are **relative operator costs**, not
+  numbers to add to the normal request. The strongest observed individual
+  targets are QKV and MLP input projections, then QK/PV/softmax collectively.
+- Temporary Python method/function wrappers were restored after each run;
+  the original product route and answer were rechecked. No speculative shader
+  change is being selected from this measurement alone. Next work must test
+  a targeted candidate against this baseline for correctness and end-to-end
+  latency, including WebGL/other-backend parity.
+
 ## 2026-10-05 ▸ local xDecision F16 GGUF dense-route correction
 
 - Used `/Users/mccoy/Desktop/code/laya-model/release/xDecision-hf/models/gguf/xDecision-F16.gguf`
