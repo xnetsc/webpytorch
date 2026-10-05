@@ -797,8 +797,204 @@ def _mm_split_groups(M, N):
     return 4 if groups < 128 else 1
 
 
+class WebGLHalfMatrix(object):
+    """A (K, N) weight for `matmul_f16w` on WebGL: half precision, four K-values to a texel.
+
+    The WebGL half of the same contract WebGPU's packed weights keep: built once by
+    `pack_half_weight`, consumed only by `matmul_f16w`. Opaque on purpose -- texel (j, k/4)
+    holds W[k:k+4, j], which is not row-major element order, so a generic operator that
+    read it as an array would read the wrong numbers without a word. Nothing but the matmul
+    built for this layout ever sees the texture.
+
+    Why the layout: WebGL's scalar matmul fetches one value per texel on both sides, two
+    fetches per multiply-add, and that -- not bandwidth -- is its bound. Four values per
+    fetch and a `dot` is a quarter of the fetches for the same bytes. Measured on Apple M5
+    (Chrome, ANGLE Metal), 40 queued calls, scalar -> this, including packing the
+    activations each call: 519x768x2304 16.0 -> 10.0 ms, 519x768x768 5.26 -> 2.73,
+    519x1152x768 7.76 -> 4.17, 8x768x2304 0.35 -> 0.20, 1x768x2304 0.091 -> 0.085. It is
+    also closer to a float64 reference (4.3e-6 against 7.7e-6 at the first shape): a
+    four-term dot rounds less often than four separate additions.
+    """
+    __slots__ = ("array", "K", "N", "__weakref__")
+
+    def __init__(self, array, K, N):
+        self.array, self.K, self.N = array, int(K), int(N)
+
+
+def _webgl_half_matrix_ok(K, N):
+    if not _webgl_ready() or _adam_backend_ready():
+        return False
+    from wgpy_backends.webgl.platform import get_platform
+    from wgpy_backends.webgl.texture import get_max_texture_size
+    info = get_platform().getDeviceInfo()
+    mts = get_max_texture_size()
+    # The weight is only ever sampled; the activations are packed by rendering into an
+    # RGBA32F target, which needs float colour buffers.
+    return (K % 4 == 0 and N <= mts and K // 4 <= mts
+            and bool(info.get("supportsTexture16bit")) and bool(info.get("supportsTexture32bit")))
+
+
+def half_weight_ok(K, N):
+    """Can a (K, N) weight be held at half width for `matmul_f16w` on this backend?"""
+    K, N = int(K), int(N)
+    if _adam_backend_ready():
+        return N % 64 == 0 and K % 4 == 0 and N % 8 == 0
+    return _webgl_half_matrix_ok(K, N)
+
+
+def _k4_texels(w_out_in):
+    """(N, K) -> (K/4, N, 4): texel (j, k4) holds W^T[4k4:4k4+4, j] = W[j, 4k4:4k4+4]. One
+    strided copy from the file's layout, the same cost as the transpose it replaces."""
+    w = np.asarray(w_out_in, dtype=np.float32)
+    N, K = int(w.shape[0]), int(w.shape[1])
+    return np.ascontiguousarray(w.reshape(N, K // 4, 4).transpose(1, 0, 2))
+
+
+def pack_half_weight(w_out_in):
+    """The half-width weight `matmul_f16w` consumes, from a checkpoint's (N_out, K_in) layout.
+
+    WebGPU: two halves to a word, (K, N). WebGL: a `WebGLHalfMatrix`. None when this backend
+    cannot hold it -- ask `half_weight_ok` first and nothing is ever packed and refused.
+    """
+    w = np.asarray(w_out_in)
+    N, K = int(w.shape[0]), int(w.shape[1])
+    if _adam_backend_ready():
+        packed = pack_f16_weight(np.ascontiguousarray(np.asarray(w, dtype=np.float32).T))
+        return None if packed is None else Tensor(packed)
+    if not _webgl_half_matrix_ok(K, N):
+        return None
+    from wgpy_backends.webgl.texture import (WebGL2RenderingContext as GL,
+                                             WebGLArrayTextureShape)
+    from wgpy_backends.webgl.webgl_buffer import WebGLBuffer
+    from wgpy_backends.webgl.ndarray import ndarray as GLArray
+    texels = _k4_texels(w)
+    shape = WebGLArrayTextureShape(height=K // 4, width=N, internal_format=GL.RGBA16F,
+                                   format=GL.RGBA, type=GL.HALF_FLOAT)
+    buffer = WebGLBuffer(K * N, np.dtype(np.float32), shape)
+    buffer.set_data(texels)
+    return WebGLHalfMatrix(GLArray((K, N), np.float32, buffer=buffer), K, N)
+
+
+def half_weight(src):
+    """`pack_half_weight(src)` when the file already stores `src` at half precision.
+
+    Half width is a STORAGE choice that must not change what the model computes with: a
+    weight the checkpoint holds as float16 is computed at float16 either way, but one held as
+    float32 would be silently narrowed. So only float16 sources qualify; float32 -- and BF16,
+    which reads in as exact float32 -- keep the float32 path. `src` is (N_out, K_in) as
+    checkpoints store Linear weights. None when it does not qualify or this backend cannot
+    hold it; nothing is packed and then refused.
+    """
+    a = np.asarray(src)
+    if a.ndim != 2 or a.dtype != np.float16:
+        return None
+    N, K = int(a.shape[0]), int(a.shape[1])
+    if not half_weight_ok(K, N):
+        return None
+    return pack_half_weight(a)
+
+
+_mmk4 = {"added": set()}
+
+
+def _webgl_matmul_k4(x, w):
+    """`x @ w` for a `WebGLHalfMatrix` w: pack x's rows four K-values to a texel, then dot."""
+    from wgpy_backends.webgl.texture import (WebGL2RenderingContext as GL,
+                                             WebGLArrayTextureShape, get_max_texture_size)
+    from wgpy_backends.webgl.webgl_buffer import WebGLBuffer
+    plat = _copy_kernel["plat"]
+    xd = _contig(x.data if isinstance(x, Tensor) else x)
+    K, N = w.K, w.N
+    if int(xd.shape[-1]) != K:
+        raise ValueError("matmul_f16w: x has %d columns, the weight %d rows"
+                         % (int(xd.shape[-1]), K))
+    M = 1
+    for d in xd.shape[:-1]:
+        M *= int(d)
+    K4 = K // 4
+    # The packed rows are laid side by side, R to a texture row: texel (r*K4 + k4, i/R) of
+    # row i = i/R*R + r. A row per texture row would cap a call at 16,384 sequence rows,
+    # past which the only copy of the weight -- already dropped from the host -- could not
+    # be read any other way.
+    mts = get_max_texture_size()
+    R = max(1, mts // K4)
+    if (M + R - 1) // R > mts:
+        raise ValueError("matmul_f16w: %d rows of %d exceed one WebGL texture" % (M, K))
+    head = ("#version 300 es\nprecision highp float; precision highp int; "
+            "precision highp sampler2D;\n")
+    if "pk_x" not in _mmk4["added"]:
+        plat.addKernel("mmk4_pack_x", {"source": head + """uniform sampler2D tex_x;
+uniform int K; uniform int K4; uniform int R; uniform int M;
+out vec4 fragColor;
+float fx(int idx) { int tw = textureSize(tex_x, 0).x; int y = idx / tw;
+                    return texelFetch(tex_x, ivec2(idx - y * tw, y), 0).r; }
+void main() {
+  int x = int(gl_FragCoord.x); int r = x / K4; int k4 = x - r * K4;
+  int i = int(gl_FragCoord.y) * R + r;
+  if (i >= M) { fragColor = vec4(0.0); return; }
+  int b = i * K + k4 * 4;
+  fragColor = vec4(fx(b), fx(b + 1), fx(b + 2), fx(b + 3)); }
+"""})
+        _mmk4["added"].add("pk_x")
+    name = "mmk4_%d" % K
+    if name not in _mmk4["added"]:
+        # K is the loop bound, so it is compiled in; M and N are uniforms, so a new sequence
+        # length does not compile a new program.
+        plat.addKernel(name, {"source": head + """#define K4 %d
+uniform int _ka_tex_output_texture_w; uniform int M; uniform int N; uniform int R;
+uniform sampler2D tex_xp; uniform sampler2D tex_wp;
+out float fragColor;
+void main() {
+  int idx = int(gl_FragCoord.x) + int(gl_FragCoord.y) * _ka_tex_output_texture_w;
+  int i = idx / N; int j = idx - i * N;
+  if (i >= M) { return; }
+  int ry = i / R; int bx = (i - ry * R) * K4;
+  float s = 0.0;
+  int k4 = 0;
+  for (; k4 + 4 <= K4; k4 += 4) {
+    s += dot(texelFetch(tex_xp, ivec2(bx + k4, ry), 0), texelFetch(tex_wp, ivec2(j, k4), 0));
+    s += dot(texelFetch(tex_xp, ivec2(bx + k4 + 1, ry), 0), texelFetch(tex_wp, ivec2(j, k4 + 1), 0));
+    s += dot(texelFetch(tex_xp, ivec2(bx + k4 + 2, ry), 0), texelFetch(tex_wp, ivec2(j, k4 + 2), 0));
+    s += dot(texelFetch(tex_xp, ivec2(bx + k4 + 3, ry), 0), texelFetch(tex_wp, ivec2(j, k4 + 3), 0));
+  }
+  for (; k4 < K4; k4++) {
+    s += dot(texelFetch(tex_xp, ivec2(bx + k4, ry), 0), texelFetch(tex_wp, ivec2(j, k4), 0));
+  }
+  fragColor = s;
+}
+""" % K4})
+        _mmk4["added"].add(name)
+    per_row = min(R, M)
+    rows = (M + per_row - 1) // per_row
+    xshape = WebGLArrayTextureShape(height=rows, width=per_row * K4,
+                                    internal_format=GL.RGBA32F, format=GL.RGBA, type=GL.FLOAT)
+    xp_buf = WebGLBuffer(rows * per_row * K, np.dtype(np.float32), xshape)
+    plat.runKernel({"name": "mmk4_pack_x",
+                    "inputs": [{"name": "tex_x", "id": xd.buffer.buffer_id}],
+                    "output": xp_buf.buffer_id,
+                    "uniforms": [{"name": "K", "value": K, "type": "int"},
+                                 {"name": "K4", "value": K4, "type": "int"},
+                                 {"name": "R", "value": per_row, "type": "int"},
+                                 {"name": "M", "value": M, "type": "int"}]})
+    out = _empty((M, N))
+    plat.runKernel({"name": name,
+                    "inputs": [{"name": "tex_xp", "id": xp_buf.buffer_id},
+                               {"name": "tex_wp", "id": w.array.buffer.buffer_id}],
+                    "output": out.buffer.buffer_id,
+                    "uniforms": [{"name": "_ka_tex_output_texture_w",
+                                  "value": out.buffer.texture_shape.width, "type": "int"},
+                                 {"name": "M", "value": M, "type": "int"},
+                                 {"name": "N", "value": N, "type": "int"},
+                                 {"name": "R", "value": per_row, "type": "int"}]})
+    lead = tuple(int(d) for d in xd.shape[:-1])
+    return Tensor(out.reshape(*(lead + (N,))))
+
+
 def matmul_f16w(x, wpacked, K, N):
-    """`x @ w` with w held as packed half precision. Returns None without a GPU backend."""
+    """`x @ w` with w held as packed half precision (`pack_half_weight`). None without a GPU
+    backend, or where this backend cannot take the shape."""
+    if isinstance(wpacked, WebGLHalfMatrix):
+        return _webgl_matmul_k4(x, wpacked)
     if not _adam_backend_ready():
         return None
     xd = _contig(x.data if isinstance(x, Tensor) else x)

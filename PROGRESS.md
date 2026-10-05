@@ -1,5 +1,45 @@
 # Progress
 
+## 2026-10-05 ▸ WebGL dense matmul: four K-values per texel (1773 → 856 ms); the head's weights joined it
+
+**Measured first, in isolation** (40 queued calls, including packing the activations per
+call): scalar → RGBA K4 `dot`, 519×768×2304 16.0 → 10.0 ms, 519×768×768 5.26 → 2.73,
+519×1152×768 7.76 → 4.17, 8×768×2304 0.35 → 0.20, 1×768×2304 0.091 → 0.085. The scalar
+kernel's two single-value fetches per multiply-add are its bound; four values per fetch is
+a quarter of the fetches for the same bytes. Closer to a float64 reference too (4.3e-6 vs
+7.7e-6). The earlier "RGBA was worse" row in ARCHITECTURE was measured at 69 rows.
+
+**Built as WebGL's half of the existing `_packed`/`matmul_f16w` contract**, not a new route:
+`pack_half_weight` returns an opaque `WebGLHalfMatrix` (RGBA16F, texel (j, k/4) = Wᵀ[k:k+4, j])
+that only `matmul_f16w` reads — a generic operator reading that texture as an array would
+get wrong numbers silently, so none can reach it. Kernels compile per K only (M, N are
+uniforms). Packed activation rows sit side by side in the texture, so a call is not capped at
+16,384 rows. The encoder's code did not change; `half_weight_ok` asks the backend.
+
+**The decision head** had no half path on either backend — its projections were float32
+matrices, and on WebGL not row-aligned either (27 ms a matmul by knockout, twice the
+encoder's). It now takes the same `half_weight`/`matmul_f16w` path.
+
+**Width kept (gate 1).** `half_weight` only accepts weights the file stores as float16. The
+encoder had been packing any source to half width, which narrows a float32 checkpoint
+silently; float32 — and BF16, which reads in as exact float32 — now stay float32, here and in
+the R16F texture fallback.
+
+**Results** (486-token three-question request, median of 6):
+
+| | before | after |
+|---|---|---|
+| WebGL xDecision F16 | 1773 ms | **856–858 ms** |
+| WebGL Laya safetensors | — | 858 ms |
+| WebGPU xDecision F16 / Laya | 96.9 ms | 94.5 / 96.3 ms (same 427-dispatch sequence) |
+| WebGL / WebGPU xDecision Q8 | 2226 / 117.3 ms | 2232 / 117.4 ms (unchanged, as on HEAD) |
+
+Answers unchanged everywhere (each model its own). Host 235 passed (3 new: the float16 gate,
+backend refusal asked first, the K4 texel layout); JS 102.
+
+**Open:** Q8 is 2.6× slower than F16 on WebGL and 1.24× on WebGPU; WebGPU F16 at ~95 ms is
+4–5× the ~20 ms an MLX implementation reports for the same model.
+
 ## 2026-10-05 ▸ WebGL decision: where the GPU time goes, and the first two fixes (2230 → 1773 ms)
 
 **Instrument first.** Tried WebGL GPU timer queries: Chrome on Apple M5 exposes

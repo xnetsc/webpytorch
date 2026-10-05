@@ -169,10 +169,13 @@ class TextEncoder(wt.Module):
             a = self._src.get(name)
             if a is None:
                 raise KeyError(name)
+            half = np.asarray(a).dtype == np.float16
             a = _f32(a)
             if transposed:
                 matrix = np.ascontiguousarray(a.T)
-                got = wt.webgl_half_matrix(matrix)
+                # Half-width texture storage only for a weight the file stores at half
+                # width; a float32 weight keeps float32 (see `half_weight`).
+                got = wt.webgl_half_matrix(matrix) if half else None
                 if got is None:
                     got = Tensor(matrix)
             else:
@@ -203,17 +206,12 @@ class TextEncoder(wt.Module):
         # nothing to read. So every condition that path checks is checked here -- the
         # backend, and the widths it needs -- rather than discovering one of them later.
         src = self._src.get(name)
-        if src is None or not wt._adam_backend_ready():
+        if src is None:
             return None
-        n_out, n_in = self.shape_of[name]
-        if n_out % 64 or n_in % 4 or n_out % 8:
+        t = wt.half_weight(src)              # None unless stored as float16 and holdable
+        if t is None:
             self._ten[(name, "nof16")] = True
             return None
-        packed = wt.pack_f16_weight(np.ascontiguousarray(_f32(src).T))
-        if packed is None:
-            self._ten[(name, "nof16")] = True
-            return None
-        t = Tensor(packed)
         self._ten[key] = t
         self._src.pop(name, None)
         return t

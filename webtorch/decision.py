@@ -454,8 +454,38 @@ class DecisionModel(wt.Module):
         if linear is not None:
             y = linear(x)
         else:
-            y = x.matmul(self._t(wn, transposed=True))
+            y = None
+            if not x.requires_grad:
+                half = self._half(wn)
+                if half is not None:
+                    n_out, n_in = self._half_shape[wn]
+                    y = wt.matmul_f16w(x, half, n_in, n_out)
+            if y is None:
+                y = x.matmul(self._t(wn, transposed=True))
         return y + self._t(bn) if bn in self.have else y
+
+    def _half(self, wn):
+        """The weight at half width for `matmul_f16w`, built once, when the file stores it at
+        half width and the backend can hold it so -- the same storage the encoder's weights
+        get. Before this the head's projections stayed float32 matrices on both backends:
+        on WebGL, with no row-aligned texture either, 27 ms a matmul where the encoder's
+        similar ones took 13.5."""
+        if not hasattr(self, "_half_shape"):
+            self._half_shape = {}
+        key = (wn, "half")
+        if key in self._ten:
+            return self._ten[key]
+        if self._ten.get((wn, "nohalf")):
+            return None
+        src = self._src.get(wn)
+        t = None if src is None else wt.half_weight(src)
+        if t is None:
+            self._ten[(wn, "nohalf")] = True
+            return None
+        self._half_shape[wn] = (int(np.shape(src)[0]), int(np.shape(src)[1]))
+        self._ten[key] = t
+        self._src.pop(wn, None)
+        return t
 
     def _ln(self, x, n):
         b = (self._t(n + ".bias") if (n + ".bias") in self.have else self._zero())

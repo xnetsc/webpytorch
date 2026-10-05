@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 WebGL decision 2230 → 856 ms; next Q8 and the WebGPU gap to MLX:** K4 RGBA
+`dot` matmul as WebGL's `matmul_f16w`, the head on the same half path, half width only for
+float16 sources. F16 GGUF and Laya: identical paths, WebGL ~857 ms, WebGPU ~95 ms. Q8 GGUF is
+slower on both (2232 / 117 ms) and WebGPU F16 is 4–5× an MLX reference (~20 ms) — both
+requested by the user as the next work.
+
 **2026-10-05 WebGL decision latency 2230 → 1773 ms (three questions, 486 tokens):**
 WebGL timer queries are not draw-granular on ANGLE-Metal (M5), so attribution is by
 knockout. LayerNorm and softmax recomputed each row's statistics per element; both are now

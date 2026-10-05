@@ -225,6 +225,7 @@ person to have the idea should get the number rather than the afternoon.
 | **the `m % 32` gate on the tiled matmul** | **nothing** | **131 ms, 6× on the matmuls** |
 | WebGL LayerNorm/softmax: row statistics once per row, not per element | 1,536 → ~3 fetches per LayerNorm output | decision request 2230 → 1773 ms |
 | WebGL scalar matmul: step the LHS texel address instead of dividing | one integer division per multiply-add | 2232 → 2466 ms, **worse** |
+| WebGL dense matmul: four K-values per RGBA texel and `dot` (at 519 rows, not 69) | 2 → 0.5 fetches per multiply-add | 1.6–1.9× per matmul; decision request 1773 → 856 ms |
 
 The one that worked did not reduce anything. There were already two matmul kernels, and the
 fast one required the row count to be a multiple of 32 — which is the token count, the one
