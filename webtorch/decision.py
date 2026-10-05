@@ -1380,12 +1380,19 @@ async def _gguf_tensor(path, data_start, info):
 
 
 async def _gguf_weight(path, data_start, info):
-    """Read one GGUF tensor, preserving a native quantized Linear where possible."""
+    """Read one GGUF tensor, preserving encoded blocks only for quantized Linear.
+
+    GGUF F16/F32 are already dense values, not quantized blocks. Sending those
+    matrices through the generic ggml byte decoder bypasses the backend's dense
+    half/f32 matmul and gives identical values a different execution path from
+    safetensors. Use the same dense route regardless of which container held them.
+    """
     from . import ggufload as G
 
     shape = tuple(int(d) for d in reversed(info["dims"]))
     kind = G.GGML_NAMES.get(info["type"])
-    if (len(shape) == 2 and wt.ggml_native_supported(kind)
+    if (len(shape) == 2 and kind not in ("F16", "F32")
+            and wt.ggml_native_supported(kind)
             and shape[1] % wt._GGML_TYPES[kind][2] == 0):
         count = int(np.prod(shape, dtype=np.int64))
         offset = data_start + int(info["offset"])

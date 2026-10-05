@@ -13,6 +13,19 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-05 local F16 GGUF route corrected:** The actual local
+`xDecision-F16.gguf` (not a safetensors checkpoint) has the same 170 tensor
+names, shapes and dtypes as the Laya checkpoint, with semantically equal
+encoder configuration and tokenizer. On Chrome WebGL, the prior generic GGML
+byte-decoder route took 8011/7553 ms on the first two 417-token three-question
+requests. Unquantized GGUF F16/F32 matrices now enter the same dense path as
+other containers; Q8 and other quantized blocks remain stored-width GGML.
+The four matched WebGL requests took 2386/2256/2260/2347 ms, with unchanged
+first two checked answers. Serial WebGPU retest of that same local GGUF took
+172/138/94/93 ms. Both used one batched encoder and one batched head pass.
+This closes the F16-container-specific slowdown, **not** the shared WebGL
+~2.3-second decision latency or the wider backend/performance gates.
+
 **2026-10-05 checkpoint scope:** Decision reply-time device tuning now persists only
 when new routes are measured, avoiding repeated calibration on reload. Completed
 requests drop Python references and unpinned GPU scratch; explicit model release

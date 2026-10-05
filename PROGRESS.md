@@ -1,5 +1,35 @@
 # Progress
 
+## 2026-10-05 ▸ local xDecision F16 GGUF dense-route correction
+
+- Used `/Users/mccoy/Desktop/code/laya-model/release/xDecision-hf/models/gguf/xDecision-F16.gguf`
+  from the native browser file picker, not xDecision's safetensors checkpoint
+  and not a network source. Parsed the GGUF header read-only: 170 tensors,
+  169 F16 plus one F32, with exactly the same names, shapes and dtypes as the
+  local Laya checkpoint; embedded encoder config and tokenizer JSON are
+  semantically equal. Only one model was resident at a time.
+- Root cause: the decision GGUF loader represented every supported 2D type,
+  including unquantized F16, as `GGMLWeight`. This forced WebGL's generic
+  byte-decoding shader for matrices that were already dense F16, while the
+  same tensors from safetensors used WebGL's native R16F matrix route. The
+  format-capability fix returns ordinary arrays for F16/F32 GGUF matrices;
+  quantized GGML types still keep their packed blocks and native decoder.
+- Matched Chrome WebGL 417-token three-question inputs before the fix took
+  8011/7553 ms on the first two requests. After a release, reload and native
+  file re-selection, four requests took 2386/2256/2260/2347 ms. Route was
+  `batch` with `batched_selected_q` throughout; the checked billing choice
+  and duplicate-charge score remained `billing` and 0.9994. Browser runtime
+  inspection after the fix found zero `stored-linear` objects in both encoder
+  and head, only dense `Tensor` objects.
+- Released WebGL before switching to WebGPU and selected the same local GGUF.
+  Its four matched requests took 172/138/94/93 ms with the same batch route
+  and checked first two answers. These are serial local-browser diagnostics,
+  not a universal benchmark. The shared WebGL ~2.3-second latency is still
+  present in both dense Laya and F16 GGUF paths and remains open.
+- Added a unit regression covering both dense F16 and F32 GGUF matrices while
+  the existing quantized-block test remains in force. Host Python suite:
+  215 passed, one skipped; this change does not claim complete model accuracy.
+
 ## 2026-10-05 ▸ requested remote checkpoint before further F16 GGUF work
 
 - Audited the pending decision profile, memory cleanup, capture-local reuse,

@@ -82,6 +82,32 @@ def test_decision_gguf_preserves_supported_quantized_linear_blocks():
     )
 
 
+def test_decision_gguf_dense_matrix_uses_the_same_values_as_other_containers():
+    f16 = np.asarray([[1.25, -2.5], [3.0, 0.125]], dtype=np.float16)
+    f32 = np.asarray([[1.25, -2.5], [3.0, 0.125]], dtype=np.float32)
+    payload = f16.tobytes() + f32.tobytes()
+    original_rng = decision._rng
+    original_supported = decision.wt.ggml_native_supported
+
+    async def fake_rng(_path, start, end):
+        return payload[start:end + 1]
+
+    decision._rng = fake_rng
+    decision.wt.ggml_native_supported = lambda _kind: True
+    try:
+        for kind, value, offset in (("F16", f16, 0), ("F32", f32, f16.nbytes)):
+            got = asyncio.run(decision._gguf_weight("model.gguf", 0, {
+                "name": "encoder.layers.0.attn.Wqkv.weight", "dims": [2, 2],
+                "type": GGML_IDS[kind], "offset": offset,
+            }))
+            assert isinstance(got, np.ndarray)
+            assert got.dtype == value.dtype
+            np.testing.assert_array_equal(got, value)
+    finally:
+        decision._rng = original_rng
+        decision.wt.ggml_native_supported = original_supported
+
+
 def test_decision_gguf_does_not_preserve_a_non_linear_quantized_tensor():
     q8_values = np.arange(-16, 16, dtype=np.int8)
     payload = np.asarray([0.5], dtype=np.float16).tobytes() + q8_values.tobytes()
