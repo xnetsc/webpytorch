@@ -1,5 +1,40 @@
 # Progress
 
+## 2026-10-06 ▸ Greedy decode pipelined: the host's work on chunk n overlaps the GPU's on chunk n+1 (0.6B 138–145 → 175–181 tok/s)
+
+**Before:** a greedy chunk uploaded its seed token, rope rows and position (four writes, each
+a round trip to the GPU thread), replayed, read its tokens back (a full sync), and only then
+handed them to the caller — the GPU idle through the readback, the host's token work and the
+next chunk's uploads. Longer chunks (8/16) were tried to amortise that and gave nothing end to
+end, with loads of 22 s instead of 8.
+
+**Change:** a recorded chunk takes nothing per step from the host. A step reads its token from
+the slot the previous step's argmax wrote (slot `count` doubles as the next chunk's seed),
+advances the position counter `ctl[0]` on the device (`q6k_decode_input`), and takes its
+rotary rows from a per-position table covering the cache (`_ensure_chunk_buffers`, rebuilt when
+the cache grows). So chunk n+1 can be queued before chunk n is read. `replayStaged` (JS, one
+call per round) queues a replay plus a staged read of the token slots — a copy recorded behind
+the queued work into a mappable buffer (`copyAndSubmit`), delivered to a shared-memory slot when
+the GPU gets there (`stagedRead.ts`) — and collects the oldest staged read. `_greedy_chunks`
+drives it: never more chunks than the caller's token budget, never past the cache (growth only
+with nothing in flight, then a fresh start from the last token), at most one chunk left
+running when the caller stops (its rows lie past everything `_kv_commit` records). The
+load-time race times the candidates through the same driver; its verdict key is now
+`greedy_chunk_v2` (v1 verdicts timed one synchronised chunk at a time and are not imported).
+
+**Measured (WebGPU, M5, same session, 200 tokens, two prompts × three rounds):** host-fed
+138.6–144.8 tok/s; chunk 1 174.5–180.9; chunk 2 169.7–179.4; chunk 4 160.6–179.3. Text
+identical token for token across all four, both prompts. The race picks chunk 1 (5.9 ms a
+token). 128-token replies: 166–167 tok/s after the first, first token 83–85 ms; load 7.5 s
+(the race 2.8 s of it, from 5.4). A token now costs what the GPU takes (~5.4–5.6 ms), so the
+decode kernels are what is left.
+
+**Tests:** JS — slot/sequence logic including a late completion of an abandoned read, error
+wake-up, the GPU thread's copy → map → deliver → reuse, the copy recorded after the pending
+dispatches; host — the driver's queue/collect order, budget, early stop, cache growth with
+nothing in flight, record once; browser — the input kernel's token slot, counter advance,
+table row and clamp, in both row layouts.
+
 ## 2026-10-06 ▸ q/k/v without the transposing copies; the GPU is started as soon as it is idle
 
 **Copies:** a prefill layer transposed q, k and v to heads-first — three strided copies, each

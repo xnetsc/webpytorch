@@ -5,6 +5,7 @@ import {
 } from './webgpuTensorBuffer';
 import { GPUVocabSampler } from './vocabSampler';
 import { writeSharedReadbackError } from '../sharedReadback';
+import { stagedReadTarget } from '../stagedRead';
 
 export type WorkGroupDim = 'x' | 'y' | 'z';
 
@@ -116,6 +117,22 @@ export interface ComputeContextGPUMessageReleaseCapture {
   name: string;
 }
 
+export interface ComputeContextGPUMessageStageArena {
+  method: 'gpu.stageArena';
+  memory: SharedArrayBuffer;
+  error: SharedArrayBuffer;
+  slots: number;
+  slotBytes: number;
+}
+
+export interface ComputeContextGPUMessageStageRead {
+  method: 'gpu.stageRead';
+  id: number;
+  byteLength: number;
+  slot: number;
+  seq: number;
+}
+
 export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageAddKernel
   | ComputeContextGPUMessageCreateBuffer
@@ -133,7 +150,9 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageEndCapture
   | ComputeContextGPUMessageReplay
   | ComputeContextGPUMessageResetCaptures
-  | ComputeContextGPUMessageReleaseCapture;
+  | ComputeContextGPUMessageReleaseCapture
+  | ComputeContextGPUMessageStageArena
+  | ComputeContextGPUMessageStageRead;
 
 export class ComputeContextGPU {
   tensorBuffers: Map<number, WebGPUTensorBuffer> = new Map();
@@ -172,6 +191,8 @@ export class ComputeContextGPU {
 
   dispose() {
     this.resetCaptures();
+    for (const list of this.stageFree.values()) for (const buffer of list) buffer.destroy();
+    this.stageFree.clear();
     try {
       this.vocabSampler?.dispose();
       this.vocabSampler = null;
@@ -281,6 +302,51 @@ export class ComputeContextGPU {
       return Promise.reject(new Error(`WebGPU readback target ${id} was not created`));
     }
     return tb.getDataRaw() as Promise<Uint8Array>;
+  }
+
+  // Staged reads (see stagedRead.ts): where finished ones land, and mappable copies to
+  // reuse, by size. A copy is in the free list only while nothing is mapping it.
+  private stageTarget: ReturnType<typeof stagedReadTarget> | null = null;
+  private stageFree: Map<number, GPUBuffer[]> = new Map();
+
+  /** Copy `byteLength` bytes of buffer `id` behind everything queued so far, submit, and
+   * deliver them to the worker's `slot` when the GPU gets there. Returns at once. */
+  stageRead(id: number, byteLength: number, slot: number, seq: number): void {
+    const target = this.stageTarget;
+    if (!target) throw new Error('staged readback arena was not bound');
+    let staging: GPUBuffer | null = null;
+    try {
+      if (this.commandError) throw this.commandError;
+      const tb = this.tensorBuffers.get(id);
+      if (!tb) throw new Error(`WebGPU staged read target ${id} was not created`);
+      if (byteLength > target.slotBytes || byteLength > tb.bufferShape.byteLength) {
+        throw new Error(`WebGPU staged read of ${byteLength} bytes is out of range`);
+      }
+      const ctx = getNNWebGPUContext();
+      staging = this.stageFree.get(byteLength)?.pop()
+        ?? ctx.device.createBuffer({
+          size: byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+      ctx.copyAndSubmit(tb.gpuBuffer, staging, byteLength);
+      const buffer = staging;
+      Promise.all([buffer.mapAsync(GPUMapMode.READ), ctx.assertPipelinesReady()])
+        .then(() => {
+          ctx.assertAlive();
+          target.finish(slot, seq, new Uint8Array(buffer.getMappedRange(0, byteLength)));
+          buffer.unmap();
+          const free = this.stageFree.get(byteLength);
+          if (free) free.push(buffer); else this.stageFree.set(byteLength, [buffer]);
+        })
+        .catch(reason => {
+          console.error(reason);
+          target.finish(slot, seq, null, reason);
+          buffer.destroy();
+        });
+    } catch (reason) {
+      console.error(reason);
+      staging?.destroy();
+      target.finish(slot, seq, null, reason);
+    }
   }
 
   getDataInto(id: number, target: SharedArrayBuffer): Promise<void> {
@@ -491,6 +557,13 @@ export class ComputeContextGPU {
         break;
       case 'gpu.releaseCapture':
         this.releaseCapture(message.name);
+        break;
+      case 'gpu.stageArena':
+        this.stageTarget = stagedReadTarget(message.memory, message.error,
+                                            message.slots, message.slotBytes);
+        break;
+      case 'gpu.stageRead':
+        this.stageRead(message.id, message.byteLength, message.slot, message.seq);
         break;
     }
   }

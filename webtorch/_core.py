@@ -4274,7 +4274,9 @@ def use_kernel_profile(profile):
               and v in ("fused", "composed")):
             _TUNED[(parts[0], int(parts[1]), int(parts[2]))] = v
             n += 1
-        elif (len(parts) == 3 and parts[0] == "greedy_chunk_v1" and parts[1] == "webgpu"
+        # v2: chunks timed pipelined (`CausalLM._greedy_chunks`); a v1 verdict timed them one
+        # synchronised chunk at a time and does not describe how they run now.
+        elif (len(parts) == 3 and parts[0] == "greedy_chunk_v2" and parts[1] == "webgpu"
               and len(parts[2]) == 24 and all(c in "0123456789abcdef" for c in parts[2])
               and isinstance(v, dict) and v.get("count") in (0, 1, 2, 4)
               and isinstance(v.get("row", ""), str)):
@@ -11582,6 +11584,12 @@ def vocab_argmax(x, out=None, offset=0):
 # transposed 210-byte blocks already used by the vocabulary head.  The packed weight is not
 # widened or duplicated.  A containing greedy decoder can place several of these between
 # captured decode steps and cross the JS/WASM/GPU boundary once for the whole chunk.
+#
+# Nothing in it comes from the host per step: the token is read from a device slot (the one
+# the previous step's argmax wrote), the position is the device counter `ctl[0]` advanced
+# here, and the rotary rows are that position's rows of a table covering the whole cache.
+# So one recorded chunk can follow another on the GPU before the host has seen the first
+# chunk's tokens -- which is what lets the host's work on them overlap the next chunk.
 _Q6K_DECODE_INPUT_WGSL = """
 @group(0) @binding(0) var<storage,read> tokens: array<i32>;
 @group(0) @binding(1) var<storage,read> w: array<u32>;
@@ -11591,9 +11599,10 @@ _Q6K_DECODE_INPUT_WGSL = """
 @group(0) @binding(5) var<storage,read_write> cos_out: array<f32>;
 @group(0) @binding(6) var<storage,read_write> sin_out: array<f32>;
 @group(0) @binding(7) var<storage,read_write> ctl: array<i32>;
-struct IM { K:u32, N:u32, HD:u32, step:u32, inc:u32, pad0:u32, pad1:u32, pad2:u32, }
+struct IM { K:u32, N:u32, HD:u32, slot:u32, inc:u32, rows:u32, pad1:u32, pad2:u32, }
 @group(0) @binding(8) var<storage,read> im: IM;
 var<private> nrow:u32;
+var<workgroup> wpos:i32;
 fn W(wo:u32)->u32 { return w[wo*im.N+nrow]; }
 fn B4(o:u32)->u32 { let wo=o>>2u; let sh=(o&3u)*8u; let lo=W(wo);
   if(sh==0u){return lo;} return (lo>>sh)|(W(wo+1u)<<(32u-sh)); }
@@ -11605,8 +11614,10 @@ fn HF(h:u32)->f32 { let m=h&1023u; let e=(h>>10u)&31u; var v:f32;
   return select(v,-v,(h&32768u)!=0u); }
 fn I8(o:u32)->f32 { return f32(i32(B(o)<<24u)>>24u); }
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
-  let k=gid.x; nrow=u32(tokens[im.step]);
+fn main(@builtin(global_invocation_id) gid:vec3<u32>,
+        @builtin(local_invocation_index) li:u32,
+        @builtin(workgroup_id) wid:vec3<u32>) {
+  let k=gid.x; nrow=u32(tokens[im.slot]);
   if(k<im.K){
     let b=k/256u; let p=k-b*256u; let half=p/128u; let r=(p-half*128u)/32u;
     let l=p&31u; let ii=l>>4u; let o=b*210u;
@@ -11618,11 +11629,17 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     else {q=(c>>4u)|(((hh>>6u)&3u)<<4u);}
     h_out[k]=HF(U16(o+208u))*I8(so+ii+2u*r)*(f32(q)-32.0);
   }
-  if(k<im.HD){
-    cos_out[k]=cos_table[im.step*im.HD+k];
-    sin_out[k]=sin_table[im.step*im.HD+k];
+  // The step's position: one invocation advances the counter, the rest of its workgroup
+  // reads the new value after the barrier. No other workgroup touches `ctl`.
+  if(wid.x==0u){
+    if(li==0u){ let p=ctl[0]+i32(im.inc); ctl[0]=p; wpos=p; }
+    workgroupBarrier();
+    let p=u32(clamp(wpos,0,i32(im.rows)-1));
+    for(var j=li; j<im.HD; j=j+256u){
+      cos_out[j]=cos_table[p*im.HD+j];
+      sin_out[j]=sin_table[p*im.HD+j];
+    }
   }
-  if(k==0u && im.inc!=0u){ ctl[0]=ctl[0]+1; }
 }
 """
 
@@ -11641,9 +11658,12 @@ _q6k_decode_input_added = {"transposed": False, "compact": False}
 
 
 def q6k_decode_input(tokens, packed, K, N, cos_table, sin_table,
-                     h_out, cos_out, sin_out, ctl, step=0, increment=False,
+                     h_out, cos_out, sin_out, ctl, slot=0, increment=False,
                      layout="transposed"):
-    """Prepare one captured decode input from a device token and original Q6_K row."""
+    """Prepare one captured decode input from a device token and original Q6_K row.
+
+    The token is `tokens[slot]`; the position is `ctl[0]`, first advanced by one when
+    `increment`; `cos_table`/`sin_table` hold one row of `HD` per position."""
     if layout not in ("transposed", "compact"):
         raise ValueError("Q6_K row layout must be transposed or compact")
     if not _adam_backend_ready():
@@ -11666,8 +11686,11 @@ def q6k_decode_input(tokens, packed, K, N, cos_table, sin_table,
     so = sin_out.data if isinstance(sin_out, Tensor) else sin_out
     ct = ctl.data if isinstance(ctl, Tensor) else ctl
     HDr = int(co.size)
+    rows = int(cd.size) // HDr
+    if rows < 1 or int(sd.size) != rows * HDr:
+        raise ValueError("rotary tables must hold whole rows of the head dimension")
     meta = _adam_kernel["make_meta"](
-        (int(K), int(N), HDr, int(step), 1 if increment else 0, 0, 0, 0),
+        (int(K), int(N), HDr, int(slot), 1 if increment else 0, rows, 0, 0),
         "u4,u4,u4,u4,u4,u4,u4,u4")
     plat.runKernel({"name": name,
                     "tensors": [td.buffer.buffer_id, wd.buffer.buffer_id,

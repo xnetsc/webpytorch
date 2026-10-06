@@ -3949,13 +3949,28 @@ class CausalLM:
             and not any(self._is_linear_layer(i) for i in range(self.L)))
 
     def _ensure_chunk_buffers(self, count=4):
+        """Token slots for a chunk of up to `count`, and rotary rows for every cache row.
+
+        The rows are indexed by the device's position counter, so a chunk queued before the
+        host has read where the previous one ended still rotates at the right positions.
+        They are rebuilt when the cache grows; a graph that read the old ones is stale then
+        anyway, because the cache buffers moved too."""
         count = max(1, int(count))
-        if getattr(self, "_chunk_capacity", 0) >= count:
-            return
-        self._chunk_capacity = count
-        self._chunk_tokens = xp.empty((count + 1,), np.int32)
-        self._chunk_cos = wt._empty((count, self.HD))
-        self._chunk_sin = wt._empty((count, self.HD))
+        if getattr(self, "_chunk_capacity", 0) < count:
+            self._chunk_capacity = count
+            self._chunk_tokens = xp.empty((count + 1,), np.int32)
+            self._greedy_chunk_capture_ready = False
+        rows = int(self.kv_cap)
+        if getattr(self, "_chunk_rope_rows", 0) != rows:
+            HD = self.HD
+            cos = np.empty((rows, HD), np.float32); sin = np.empty((rows, HD), np.float32)
+            for a in range(0, rows, 4096):          # bounded float64 temporaries
+                b = min(rows, a + 4096)
+                cos[a:b], sin[a:b] = self._rope_np(a, b - a)
+            self._chunk_cos = xp.asarray(cos)
+            self._chunk_sin = xp.asarray(sin)
+            self._chunk_rope_rows = rows
+            self._greedy_chunk_capture_ready = False
 
     def _embedding_row_candidates(self):
         candidates = ["transposed"]
@@ -3969,8 +3984,9 @@ class CausalLM:
         return ("embedding_row", head.type_name, int(head.Kt), int(head.Nt),
                 int(getattr(self, "_embed_row_words", 0)))
 
-    def _decode_chunk_input(self, step=0, increment=False, execution=None):
-        """Decode one exact embedding row through an explicitly addressable layout."""
+    def _decode_chunk_input(self, slot=0, increment=True, execution=None):
+        """Decode the embedding row of the token in `slot` through an explicitly addressable
+        layout, and advance the position counter (`increment`) to the step's position."""
         head = self.head[0]
         route = self._embedding_row_execution if execution is None else execution
         if route == "auto":
@@ -3984,7 +4000,7 @@ class CausalLM:
             self._chunk_tokens, packed, head.Kt, stride,
             self._chunk_cos, self._chunk_sin,
             self.h_in, self.cos_b, self.sin_b, self.ctl,
-            step=step, increment=increment, layout=route)
+            slot=slot, increment=increment, layout=route)
 
     def _tune_embedding_row(self):
         """Choose a bit-exact row layout locally, before whole-decoder composition."""
@@ -3998,7 +4014,7 @@ class CausalLM:
         reference = None; valid = []
         for route in candidates:
             try:
-                self._decode_chunk_input(execution=route)
+                self._decode_chunk_input(slot=1, execution=route)
                 got = np.asarray(self.h_in.numpy()[0], np.float32).copy()
                 if reference is None:
                     reference = got
@@ -4013,7 +4029,7 @@ class CausalLM:
         def bench(route):
             t0 = time.perf_counter()
             for _ in range(16):
-                self._decode_chunk_input(execution=route)
+                self._decode_chunk_input(slot=1, execution=route)
             self.h_in.numpy()
             return (time.perf_counter() - t0) / 16.0
 
@@ -4028,30 +4044,26 @@ class CausalLM:
         return chosen
 
     def _set_chunk_inputs(self, token, pos, count):
-        """One host crossing for a complete greedy chunk, not one crossing per token."""
+        """Start a chain of greedy chunks at `pos` from the host's `token`: two writes for
+        the whole chain. The token goes in slot `count`, where every chunk's last step leaves
+        the token the next chunk starts from; the counter is set one short because every
+        step advances it before reading it."""
         self._ensure_chunk_buffers(count)
         seed = np.zeros((self._chunk_capacity + 1,), np.int32)
-        seed[0] = int(token)
-        c, s = self._rope_np(int(pos), int(count))
-        cbuf = np.zeros((self._chunk_capacity, self.HD), np.float32)
-        sbuf = np.zeros_like(cbuf)
-        cbuf[:count] = np.asarray(c, np.float32).reshape(count, self.HD)
-        sbuf[:count] = np.asarray(s, np.float32).reshape(count, self.HD)
+        seed[int(count)] = int(token)
         self._chunk_tokens.buffer.set_data(seed)
-        self._chunk_cos.buffer.set_data(cbuf.reshape(-1))
-        self._chunk_sin.buffer.set_data(sbuf.reshape(-1))
         self.ctl.buffer.set_data(np.asarray(
-            [int(pos), 1, self.NKV, self.HD, self.kv_cap], np.int32))
+            [int(pos) - 1, 1, self.NKV, self.HD, self.kv_cap], np.int32))
 
     def _capture_greedy_chunk(self, count, name="decode_chunk", row_execution=None):
         """Record and execute `count` chained exact-input greedy steps."""
         plat = wt._adam_kernel["platform"]
-        head = self.head[0]
+        count = int(count)
         plat.beginCapture(name)
         try:
-            for i in range(int(count)):
-                self._decode_chunk_input(
-                    step=i, increment=(i > 0), execution=row_execution)
+            for i in range(count):
+                # Step 0 starts from the slot the last step of the chunk before wrote.
+                self._decode_chunk_input(slot=(i if i else count), execution=row_execution)
                 logits = self._decode_fwd()
                 wt.vocab_argmax(logits.data, self._chunk_tokens, i + 1)
             values = np.asarray(self._chunk_tokens.get(), np.int32).copy()
@@ -4061,9 +4073,60 @@ class CausalLM:
             self._greedy_chunk_capture_ready = True
         return values
 
-    def _replay_greedy_chunk(self, count, name="decode_chunk"):
-        wt._adam_kernel["platform"].replay(name)
-        return np.asarray(self._chunk_tokens.get(), np.int32)[:int(count) + 1].copy()
+    def _greedy_chunks(self, token, pos, chunk, budget, graph="decode_chunk",
+                       row_execution=None):
+        """Greedy tokens `chunk` at a time, the next chunk already on the GPU while the
+        caller handles this one.
+
+        A recorded chunk takes its first token from the slot the previous chunk's last step
+        wrote and its position from the device counter, so it can be queued before the host
+        has read the chunk ahead of it. Each round is one call into JS: queue the next chunk
+        with a staged read of its tokens, then collect the oldest staged read. The GPU works
+        on chunk n+1 while the host takes chunk n's tokens, instead of waiting between them.
+
+        Yields each chunk's `chunk` tokens. Queues no chunk the caller cannot use -- never
+        more than `budget` tokens in all, never past the cache, which is grown (and the graph
+        recorded again) only with nothing in flight. A caller that stops early leaves at most
+        one chunk running; it writes cache rows past everything the caller keeps, which no
+        later step reads."""
+        plat = wt._adam_kernel["platform"]
+        chunk = int(chunk); nbytes = (chunk + 1) * 4
+        flight = []                  # staging slots of queued chunks, oldest first
+        ahead = int(pos)             # position after everything queued
+        given = 0                    # tokens yielded
+        slot = 0
+        while given < budget:
+            got = None
+            if not flight:
+                # Nothing queued: start from the host's token -- at the beginning, and after
+                # the cache had to grow.
+                if ahead + chunk > self.kv_cap:
+                    self._kv_reserve(ahead + chunk)
+                self._set_chunk_inputs(token, ahead, chunk)
+                ahead += chunk
+                if graph != "decode_chunk" or self._greedy_chunk_capture_ready:
+                    plat.replayStaged(graph, self._chunk_tokens.buffer.buffer_id, nbytes,
+                                      slot, -1)
+                    flight.append(slot); slot = (slot + 1) % 4
+                else:
+                    got = self._capture_greedy_chunk(
+                        chunk, row_execution=row_execution)[1:chunk + 1]
+                self.capture_ready = True
+            more = (given + chunk * (len(flight) + (got is not None)) < budget
+                    and ahead + chunk <= self.kv_cap)
+            if got is None:
+                raw = plat.replayStaged(graph if more else None,
+                                        self._chunk_tokens.buffer.buffer_id, nbytes,
+                                        slot if more else -1, flight.pop(0))
+                got = np.frombuffer(raw.to_bytes(), np.int32)[1:chunk + 1]
+            elif more:
+                plat.replayStaged(graph, self._chunk_tokens.buffer.buffer_id, nbytes,
+                                  slot, -1)
+            if more:
+                flight.append(slot); slot = (slot + 1) % 4; ahead += chunk
+            given += chunk
+            token = int(got[-1])
+            yield got
 
     def _release_idle_greedy_capture(self, plat, active_pick_mode):
         """Unpin a calibrated greedy graph until a greedy caller needs it."""
@@ -4103,7 +4166,8 @@ class CausalLM:
                               if m.type_name == "Q4_K" and m.execution == "auto"})
             plan_key = CausalLM._decode_composition_key(self, linears, qshapes, "device")
             if plan_key is not None:
-                memo_key = ("greedy_chunk_v1",) + tuple(plan_key[1:])
+                # v2: chunks run pipelined, the next queued before the last is read.
+                memo_key = ("greedy_chunk_v2",) + tuple(plan_key[1:])
         except Exception:
             memo_key = None
         recorded = []
@@ -4131,7 +4195,7 @@ class CausalLM:
             # winning reconstruction against the independent host GGUF decoder as well.
             probe = min(37, int(self.embed.shape[0]) - 1)
             self._set_chunk_inputs(probe, 0, 1)
-            self._decode_chunk_input(execution=local_row)
+            self._decode_chunk_input(slot=1, execution=local_row)
             got = np.asarray(self.h_in.numpy()[0], np.float32)
             ref = np.asarray(self.embed[probe], np.float32)
             if not np.array_equal(got, ref):
@@ -4164,11 +4228,12 @@ class CausalLM:
                 return values
 
             # Token correctness is sequential: every candidate must reproduce the ordinary
-            # host-fed route, not merely choose the same first token.
+            # host-fed route, not merely choose the same first token -- and across chunk
+            # boundaries, where a chunk starts from what the one before left on the device.
             ref_tokens = []
             values = record(0, token=0, pos=0)
             token = int(values[1]); ref_tokens.append(token)
-            for pos in range(1, 4):
+            for pos in range(1, 8):
                 self._set_inputs(token, pos)
                 plat.replay(name)
                 token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
@@ -4177,9 +4242,13 @@ class CausalLM:
             for row_route in self._embedding_row_candidates():
                 for count in (1, 2, 4):
                     values = record(count, row_route, 0, 0)
-                    if values[1:count + 1].tolist() == ref_tokens[:count]:
+                    recorded.append(cname(count, row_route))
+                    if values[1:count + 1].tolist() != ref_tokens[:count]:
+                        continue
+                    chained = [int(t) for got in self._greedy_chunks(
+                        0, 0, count, 8, graph=cname(count, row_route)) for t in got]
+                    if chained == ref_tokens:
                         valid.append((count, row_route))
-            recorded = [cname(*c) for c in valid if c[0]]
 
             samples = {c: [] for c in valid}
 
@@ -4187,7 +4256,8 @@ class CausalLM:
                 which, row_route = candidate
                 graph = cname(which, row_route)
                 token = 0; pos = 64
-                steps = 4 if hasattr(self, "_warm_deadline") else 16
+                # Long enough for a chunk of four to overlap the next one at all.
+                steps = 8 if hasattr(self, "_warm_deadline") else 16
                 t0 = time.perf_counter()
                 if which == 0:
                     for _ in range(steps):
@@ -4196,11 +4266,9 @@ class CausalLM:
                         token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
                         pos += 1
                 else:
-                    for _ in range(steps // which):
-                        self._set_chunk_inputs(token, pos, which)
-                        plat.replay(graph)
-                        values = np.asarray(self._chunk_tokens.get(), np.int32)
-                        token = int(values[which]); pos += which
+                    # The way generation runs it: pipelined, one call per chunk.
+                    for _got in self._greedy_chunks(token, pos, which, steps, graph=graph):
+                        pass
                 return (time.perf_counter() - t0) / steps
 
             for r in range(5 if hasattr(self, "_warm_deadline") else 15):
@@ -5819,26 +5887,25 @@ class CausalLM:
             span["path"] = "replay-chunk%d" % chunk
             dec = self.tok.stream_decoder()
             current = int(g0); pos = P; n = 0; steps = 0
-            captured = bool(getattr(self, "_greedy_chunk_capture_ready", False))
             t_first = time.perf_counter()
             try:
                 if current != eot and n < max_new:
                     piece = dec.push([current]); n += 1; self.stream_n = n
                     if piece:
                         yield piece
-                while current != eot and n < max_new and not self._stop_now():
-                    if pos + chunk > self.kv_cap:
-                        span["recut"].append(n)
-                        self._kv_reserve(pos + chunk)
-                        captured = False
-                    _tg = time.perf_counter()
-                    self._set_chunk_inputs(current, pos, chunk)
-                    values = (self._replay_greedy_chunk(chunk) if captured
-                              else self._capture_greedy_chunk(chunk))
-                    captured = True; self.capture_ready = True
+                cap0 = self.kv_cap
+                chunks = (self._greedy_chunks(current, pos, chunk, max_new - n)
+                          if current != eot and n < max_new and not self._stop_now() else ())
+                _tg = time.perf_counter()
+                for values in chunks:
+                    # Time to the chunk's tokens, waiting included. With the next chunk queued
+                    # behind it, that is the GPU's share of the token -- the host's own work
+                    # below overlaps the GPU and is not in it.
                     elapsed = time.perf_counter() - _tg
+                    if self.kv_cap != cap0:
+                        span["recut"].append(n); cap0 = self.kv_cap
                     used = 0
-                    for token in values[1:chunk + 1]:
+                    for token in values:
                         held.append(current)       # this input's row was written by the step
                         # Match the ordinary replay path exactly: a selected token always
                         # crosses the generation-state transition, including EOS.  Plain
@@ -5858,6 +5925,7 @@ class CausalLM:
                         span["each"].extend([elapsed / used] * used)
                     if current == eot or n >= max_new or self._stop_now():
                         break
+                    _tg = time.perf_counter()
             finally:
                 self._kv_commit(held)
             tail = dec.flush()
@@ -6088,17 +6156,11 @@ class CausalLM:
             # the ordinary one-token path because they need the host between every step.
             t_first = time.perf_counter()
             gen = [g0]; current = int(g0); pos = P; steps = 0
-            captured = bool(getattr(self, "_greedy_chunk_capture_ready", False))
             try:
-                while current != eot and len(gen) < max_new:
-                    if pos + chunk > self.kv_cap:
-                        self._kv_reserve(pos + chunk)
-                        captured = False
-                    self._set_chunk_inputs(current, pos, chunk)
-                    values = (self._replay_greedy_chunk(chunk) if captured
-                              else self._capture_greedy_chunk(chunk))
-                    captured = True; self.capture_ready = True
-                    for token in values[1:chunk + 1]:
+                chunks = (self._greedy_chunks(current, pos, chunk, max_new - len(gen))
+                          if current != eot and len(gen) < max_new else ())
+                for values in chunks:
+                    for token in values:
                         held.append(current)
                         current = self._accept_token(int(token))
                         pos += 1; steps += 1
@@ -6107,6 +6169,8 @@ class CausalLM:
                         gen.append(current)
                         if len(gen) >= max_new:
                             break
+                    if current == eot or len(gen) >= max_new:
+                        break
             finally:
                 self._kv_commit(held, embeds, rope_pos)
             return GenResult(self.tok.decode([g for g in gen if g != eot]), gen,

@@ -56,6 +56,10 @@ export declare class NNWebGPUContext {
      * commands the producer sends. A diagnostic pass being timed is left whole. */
     kick(): void;
     flush(): void;
+    /** Copy `byteLength` bytes of `src` into `dst` behind every dispatch encoded so far, in
+     * the same command buffer, and submit it. The copy sees those dispatches' results with no
+     * separate submission; `dst` may be mapped as soon as this returns. */
+    copyAndSubmit(src: GPUBuffer, dst: GPUBuffer, byteLength: number): void;
     deferDispose(buffer: GPUBuffer): void;
     rentReadback(byteLength: number): GPUBuffer;
     returnReadback(buffer: GPUBuffer, byteLength: number, reusable: boolean): void;

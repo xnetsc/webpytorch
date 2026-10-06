@@ -504,7 +504,7 @@ def test_tiled_kernels_match_the_stored_kernel_in_the_browser():
 
 def test_greedy_chunk_verdict_round_trips_through_the_device_profile(monkeypatch):
     monkeypatch.setattr(wt, "_TUNED", {})
-    key = ("greedy_chunk_v1", "webgpu", "0123456789abcdef01234567")
+    key = ("greedy_chunk_v2", "webgpu", "0123456789abcdef01234567")
     wt._TUNED[key] = {"count": 4, "row": "compact", "median_ms": 6.1}
     profile = wt.kernel_profile()
     monkeypatch.setattr(wt, "_TUNED", {})
@@ -512,8 +512,10 @@ def test_greedy_chunk_verdict_round_trips_through_the_device_profile(monkeypatch
     assert wt._TUNED[key] == {"count": 4, "row": "compact", "median_ms": 6.1}
     from webtorch import llm
     src = inspect.getsource(llm.CausalLM._tune_greedy_chunks)
-    assert 'memo_key = ("greedy_chunk_v1",)' in src
+    assert 'memo_key = ("greedy_chunk_v2",)' in src
     assert "plat.replay(graph)" in src          # timed by replaying, not by re-recording
+    # ...and a chunk is timed the way generation runs it, pipelined.
+    assert "self._greedy_chunks(token, pos, which, steps, graph=graph)" in src
 
 
 def test_jinja2_is_fetched_at_boot_and_the_template_waits_for_that_fetch():

@@ -76,6 +76,22 @@ captured as a WebGPU command graph on the first token and replayed afterwards, s
 CPU work is a handful of buffer writes rather than a re-record of every dispatch. Attention
 uses a split-K GQA kernel; how far to split is measured at load, not assumed.
 
+**Greedy decode keeps the GPU busy while the host handles tokens.** For a plain greedy call
+on a model whose tied embedding/head is Q6_K, a chunk of 1, 2 or 4 steps is recorded with
+nothing per step from the host: a step reads its token from the slot the previous step's
+argmax wrote, advances the position counter `ctl[0]` on the device, and takes its rotary rows
+from a per-position table covering the cache. So chunk n+1 is queued before chunk n has been
+read. Each round is one call into JS, `replayStaged`: queue the next chunk and a *staged
+read* of its token slots — a copy recorded behind the queued work, mapped when the GPU gets
+there, delivered to a shared-memory slot — then collect the oldest staged read. The host's
+per-token work (accepting, detokenising, streaming) runs while the GPU computes the next
+chunk; before, the GPU sat through the readback, that work and the next chunk's uploads.
+0.6B, same session, 200 tokens: 138–145 tok/s host-fed against 175–181 pipelined (chunk 1),
+text identical token for token. `_greedy_chunks` never queues past the caller's token budget
+or the cache (which grows only with nothing in flight), and a caller that stops early leaves
+at most one chunk running, whose rows lie past everything the cache records as held. The
+chunk size is raced at load through the same driver.
+
 Printing a decode step by kernel name is how you find work that is not work. On a 0.6B it
 showed `out0 = in0` — an identity copy — 28 times, one per layer, from asking for a layout
 the tensor already had (see `_attn_out`); `reshape` could not tell, because an axis of

@@ -496,6 +496,21 @@ export class NNWebGPUContext {
     }
   }
 
+  /** Copy `byteLength` bytes of `src` into `dst` behind every dispatch encoded so far, in
+   * the same command buffer, and submit it. The copy sees those dispatches' results with no
+   * separate submission; `dst` may be mapped as soon as this returns. */
+  copyAndSubmit(src: GPUBuffer, dst: GPUBuffer, byteLength: number): void {
+    this.assertAlive();
+    if (this.passEncoder) {
+      this.passEncoder.end();
+      this.passEncoder = null;
+    }
+    if (!this.commandEncoder) this.commandEncoder = this.device.createCommandEncoder();
+    this.commandEncoder.copyBufferToBuffer(src, 0, dst, 0, byteLength);
+    this.pendingCount++;
+    this.flush();
+  }
+
   // Defer a buffer destroy until the next flush: a dispatch already encoded in
   // the pending command buffer may still reference it.
   deferDispose(buffer: GPUBuffer): void {

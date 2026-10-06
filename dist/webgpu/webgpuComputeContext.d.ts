@@ -96,7 +96,21 @@ export interface ComputeContextGPUMessageReleaseCapture {
     method: 'gpu.releaseCapture';
     name: string;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture;
+export interface ComputeContextGPUMessageStageArena {
+    method: 'gpu.stageArena';
+    memory: SharedArrayBuffer;
+    error: SharedArrayBuffer;
+    slots: number;
+    slotBytes: number;
+}
+export interface ComputeContextGPUMessageStageRead {
+    method: 'gpu.stageRead';
+    id: number;
+    byteLength: number;
+    slot: number;
+    seq: number;
+}
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;
@@ -120,6 +134,11 @@ export declare class ComputeContextGPU {
     replay(name: string): void;
     setData(id: number, data: Uint8Array): void | Promise<void>;
     getData(id: number): Promise<Uint8Array>;
+    private stageTarget;
+    private stageFree;
+    /** Copy `byteLength` bytes of buffer `id` behind everything queued so far, submit, and
+     * deliver them to the worker's `slot` when the GPU gets there. Returns at once. */
+    stageRead(id: number, byteLength: number, slot: number, seq: number): void;
     getDataInto(id: number, target: SharedArrayBuffer): Promise<void>;
     sampleLogitsDevice(id: number, count: number, temperature: number, random: number, target: SharedArrayBuffer): Promise<number>;
     addKernel(name: string, descriptor: {

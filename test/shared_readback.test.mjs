@@ -14,6 +14,7 @@ async function loadTypeScript(path, imports) {
     module, exports: module.exports,
     require: name => {
       if (name === '../sharedReadback') return { writeSharedReadbackError() {} };
+      if (name === '../stagedRead') return { stagedReadTarget() { throw new Error('unused'); } };
       assert.ok(name in imports, `unexpected import ${name}`);
       return imports[name];
     },

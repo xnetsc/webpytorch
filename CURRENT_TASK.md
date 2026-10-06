@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 greedy decode pipelined:** the next chunk is queued on the GPU before the host
+reads the current one (device-side seed, position and rope rows; one JS call per round with a
+staged readback). 0.6B decode 138–145 → 175–181 tok/s same-session, text identical; tokens now
+cost the GPU's ~5.5 ms. Next: 27B load time (warming 39.5 s), the cached-model CORS errors
+in the service worker (user-reported), then decode GEMV kernels.
+
 **2026-10-06 q/k/v without copies; GPU started whenever idle:** prefill 852 → 452
 dispatches, host 82 → 47 ms; the GPU now starts while Python is still issuing (it waited for
 1024 commands or a sync point). 0.6B first token 117 ms first reply / ~85 ms after, decode

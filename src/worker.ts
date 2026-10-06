@@ -7,6 +7,7 @@ import { sharedUploader } from './sharedUpload';
 import { sampleLogits, SamplingOptions } from './sampleLogits';
 import { routeTopKInto } from './routeTopK';
 import { sharedReadbackArena } from './sharedReadback';
+import { stagedReadArena } from './stagedRead';
 import { fillDecisionKeyMaskCpu, stageDecisionCapture,
          stageDecisionKeyMask } from './decisionCapture';
 
@@ -259,6 +260,7 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
   const uploader = sharedUploader('gpu', postToMain);
   let samplerCounts = new Map<number, number>();
   const readback = sharedReadbackArena();
+  const staged = stagedReadArena();
   let commBuf: any = undefined;
   let commBufUint8Array: Uint8Array | undefined = undefined;
   (globalThis as any).gpu = {
@@ -488,6 +490,25 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     },
     releaseCapture: (name: string) => {
       commands.enqueue({ method: 'gpu.releaseCapture', name });
+    },
+    /** One crossing per round of a pipelined loop. Queue a replay of `name` (if given) and
+     * a staged read of the first `byteLength` bytes of buffer `id` into `stageSlot` (if
+     * >= 0), submit, then wait for the read staged earlier in `collectSlot` (if >= 0) and
+     * return its bytes. The GPU runs the new work while the caller handles the old. */
+    replayStaged: (name: string | null | undefined, id: number, byteLength: number,
+                   stageSlot: number, collectSlot: number) => {
+      if (name) commands.enqueue({ method: 'gpu.replay', name });
+      if (stageSlot >= 0) {
+        const seq = staged.stage(stageSlot, byteLength);
+        const bind = staged.binding();
+        if (bind) {
+          commands.flush();             // keep the order: the arena reaches the GPU thread first
+          postToMain({ method: 'gpu.stageArena', ...bind });
+        }
+        commands.enqueue({ method: 'gpu.stageRead', id, byteLength, slot: stageSlot, seq });
+      }
+      commands.flush();
+      return collectSlot >= 0 ? staged.collect(collectSlot, byteLength) : null;
     },
   };
 }

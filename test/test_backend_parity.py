@@ -95,8 +95,10 @@ def test_q6k_device_decode_input_reads_original_210_byte_blocks():
     src = wt._Q6K_DECODE_INPUT_WGSL
     assert "o=b*210u" in src
     assert "o+208u" in src
-    assert "tokens[im.step]" in src
-    assert "ctl[0]=ctl[0]+1" in src
+    assert "tokens[im.slot]" in src
+    # Position from the device counter, rotary rows from a per-position table.
+    assert "let p=ctl[0]+i32(im.inc); ctl[0]=p; wpos=p;" in src
+    assert "cos_table[p*im.HD+j]" in src
     assert "vocab_argmax(x, out=None, offset=0)" in inspect.getsource(wt.vocab_argmax)
 
 

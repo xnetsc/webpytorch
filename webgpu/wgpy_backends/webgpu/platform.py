@@ -260,6 +260,13 @@ class WebGPUPlatform:
     def replay(self, name):
         return gpu.replay(name)
 
+    def replayStaged(self, name, buffer_id, byte_length, stage_slot, collect_slot):
+        """One crossing per round of a pipelined loop: queue a replay of `name` (None for
+        none) and a staged read of buffer `buffer_id`'s first `byte_length` bytes into
+        `stage_slot` (-1 for none), then wait for the read staged earlier in `collect_slot`
+        (-1 for none) and return its bytes (a JS Uint8Array; `.to_bytes()`)."""
+        return gpu.replayStaged(name, buffer_id, byte_length, stage_slot, collect_slot)
+
 
 _instance = None
 
