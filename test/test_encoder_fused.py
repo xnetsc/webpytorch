@@ -250,3 +250,42 @@ def test_half_arithmetic_matmul_stays_within_its_bound_in_the_browser():
         f16 = np.asarray(wt.matmul_f16w(wt.Tensor(x), pk, K, N, execution="f16").numpy())
         assert np.abs(f32 - ref).max() / scale < 1e-5, (M, K, N)
         assert np.abs(f16 - ref).max() / scale < 5e-3, (M, K, N)
+
+
+def test_packed_meta_writes_the_bytes_numpy_would():
+    """`make_meta` packs 4-byte fields with a cached struct; the bytes must be exactly the
+    structured array's, and anything struct refuses must still go the numpy way."""
+    seen = []
+
+    def slow(values, dtype):
+        seen.append(dtype)
+        return np.array([values], dtype=dtype).tobytes()
+    meta = wt._packed_meta(slow, lambda b: b)
+    for values, dtype in (((3, 7, 1), "u4,u4,u4"), ((5, -2, 0.25), "u4,i4,f4"),
+                          ((1, 2, 3, 4, 5, 0.5, 6, 7, 8, 9), "u4,u4,u4,u4,u4,f4,u4,u4,u4,u4")):
+        assert meta(values, dtype) == np.array([values], dtype=dtype).tobytes()
+    assert seen == []
+    assert meta((1.5,), "u4") == slow((1.5,), "u4")      # a float in an integer field
+    assert meta((1, 2), "u2,u2") == slow((1, 2), "u2,u2")  # a format struct does not cover
+
+
+def test_prefill_reaps_only_past_the_budget(monkeypatch):
+    import types
+    calls = []
+    fake = types.SimpleNamespace(_bytes_since_reap=10, _reap_budget=100,
+                                 reap_now=lambda: calls.append(1))
+    monkeypatch.setattr(wt, "_adam_backend_ready", lambda: True)
+    monkeypatch.setattr(wt, "_gpu_stat_push", lambda force=False: None)
+    import sys
+    pkg = types.SimpleNamespace(__path__=[])
+    sub = types.SimpleNamespace(__path__=[], webgpu_buffer=fake)
+    pkg.webgpu = sub
+    monkeypatch.setitem(sys.modules, "wgpy_backends", pkg)
+    monkeypatch.setitem(sys.modules, "wgpy_backends.webgpu", sub)
+    monkeypatch.setitem(sys.modules, "wgpy_backends.webgpu.webgpu_buffer", fake)
+    wt.gpu_reap(budgeted=True)
+    assert calls == []
+    fake._bytes_since_reap = 200
+    wt.gpu_reap(budgeted=True)
+    wt.gpu_reap()
+    assert calls == [1, 1]

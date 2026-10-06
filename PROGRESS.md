@@ -1,5 +1,25 @@
 # Progress
 
+## 2026-10-06 ▸ Host time out of the prefill: first reply's first token 241 → 131 ms (0.6B)
+
+**Measured (cProfile in the page, 182-row prefill, 114 ms wall):** 20 ms in `gc.collect` (the
+every-8-layers reap), 15 ms parsing `make_meta` format strings in numpy (620 calls), and the
+dispatch trace showed (a) the prefill attention's split race running INSIDE the first reply —
+its load-time ladder probed `self.Kc`, which the first prefill allocates, so it was skipped —
+and (b) two add dispatches a layer from the decode plan's "composed" add+RMSNorm, each ~250 µs
+of host through wgpy's generic elementwise path.
+
+**Changes:** the attention ladder probes its own small zeroed caches; `make_meta` packs 4-byte
+fields with a cached `struct.Struct` (byte-identical; anything else takes numpy); the prefill
+reaps only past the backend's byte budget (`gpu_reap(budgeted=True)` — 8% of live, ≥256 MB; a
+27B still reaps); a prefill (rows > 1) uses fused add+RMSNorm where the decode plan said
+"composed" — a strict subset of its work, so not raced.
+
+**After (0.6B Q4_K_M, WebGPU):** first reply's first token (212 tokens) 241 → 131 ms; later
+161-token prompts 94 → 82 ms; decode 150–156 tok/s. Decision request unchanged (51.4 ms, same
+answers). Still open on this path: three `_contig` copies a layer (q/k/v permuted to heads
+first) — to be removed by kernels that read the projection's row layout.
+
 ## 2026-10-06 ▸ A picked folder never reaches the network (user-reported)
 
 **Reported:** loading the local Laya folder (not a GGUF) still made network requests.

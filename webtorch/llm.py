@@ -2080,8 +2080,18 @@ class CausalLM:
         Keeping that difference below this layer avoids either backend changing the model
         graph merely because its atomic primitive set differs.
         """
-        return wt.add_rmsnorm(residual, update, w, self.eps,
-                              execution=getattr(self, "_add_rms_execution", "auto"))
+        # The decode plan's choice is about one row. For more rows "fused" does a strict
+        # subset of "composed"'s work -- one pass that reads the pair once and writes both,
+        # against an add pass and a norm pass over its result -- so it is not raced there;
+        # the plan's "composed" (its exact reference when the plan ran out of time) was
+        # costing a prefill two extra dispatches a layer, each ~250 us of host time.
+        rows = 1
+        for d in tuple(getattr(getattr(residual, "data", residual), "shape", (1,)))[:-1]:
+            rows *= int(d)
+        route = getattr(self, "_add_rms_execution", "auto")
+        if rows > 1 and route == "composed" and wt._adam_backend_ready():
+            route = "fused"
+        return wt.add_rmsnorm(residual, update, w, self.eps, execution=route)
 
     def _audit(self):
         """Refuse a model whose weights do not agree with what its own file declares.
@@ -4778,22 +4788,26 @@ class CausalLM:
             # Prefill attention against the cache: how far to split the keys over workgroups
             # depends on how much context a few new rows read, so the ladder walks the
             # context with a short new segment. Reads one layer's cache; writes nothing.
+            # Its own small cache, not the model's: the model's is allocated by the first
+            # prefill, after this -- probing it here skipped the ladder, and the first long
+            # prompt then raced the splits inside its answer.
             kv0 = next((j for j in range(len(self.layers))
                         if not self._is_linear_layer(j)), None)
-            if self._gpu and wt.kv_f16() and kv0 is not None and getattr(self, "Kc", None):
-                K0, V0 = self.Kc[self._kv_i[kv0]], self.Vc[self._kv_i[kv0]]
+            if self._gpu and wt.kv_f16() and kv0 is not None and self.HD % 2 == 0:
+                top = 4096
+                words = int(self.NKV) * top * (int(self.HD) // 2)
+                K0 = wt.Tensor(np.zeros((words,), np.float32))
+                V0 = wt.Tensor(np.zeros((words,), np.float32))
                 sc0 = 1.0 / math.sqrt(self.HD)
 
-                def aprobe(m, K0=K0, V0=V0, sc0=sc0):
+                def aprobe(m, K0=K0, V0=V0, sc0=sc0, top=top):
                     t = min(32, int(m))
                     q = wt.Tensor(rng.standard_normal((self.NH, t, self.HD)).astype(np.float32))
                     o = wt.causal_attention_cache(q, K0, V0, int(m) - t, self.NH, self.NKV,
-                                                  self.HD, self.kv_cap, sc0)
+                                                  self.HD, top, sc0)
                     if o is not None:
                         wt._sync_small(o)
-                if int(self.kv_cap) >= 64:
-                    wt.calibrate_rows(aprobe, min(4096, int(self.kv_cap)), lo=64, step=4,
-                                      defer=True)
+                wt.calibrate_rows(aprobe, top, lo=64, step=4, defer=True)
             _warm_s = time.perf_counter() - _t0
             wt.flash_tune(self.NH, self.NKV, self.HD)
             # What this phase actually spent, broken down, so the next slow load is a table
@@ -5139,7 +5153,7 @@ class CausalLM:
             # and stays at 14.0-14.3GB with it. It also makes the prefill faster rather than
             # slower (100.2s to 87.2s), because the memory it stops using was being paged.
             if (i & 7) == 7:
-                wt.gpu_reap()
+                wt.gpu_reap(budgeted=True)
         # Kept, not just passed on: the load-time smoke test needs the logits this produced,
         # and the tensor is built here either way.
         # The LAST REAL row, which is not the last row when the prompt was padded above.

@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 host time out of the prefill:** attention ladder no longer skipped (no race in
+the first reply), `make_meta` without numpy, budgeted reaps, fused add+RMSNorm for prompts —
+0.6B first reply's first token 241 → 131 ms, later prompts 82 ms. Next: q/k/v without the
+permute copies (row-layout rope / KV write / attention), then decode GEMVs.
+
 **2026-10-06 a picked folder never reaches the network:** loading the local Laya folder made
 27 HEAD/GET requests for layout probes it does not contain; names under a picked folder that
 it lacks are now "not found" in the IO layer — 0 requests, same answers.

@@ -7236,9 +7236,11 @@ def _adam_backend_ready():
         return False
     try:
         from wgpy_backends.webgpu.platform import get_platform
-        from wgpy_backends.webgpu.webgpu_buffer import create_meta_buffer_from_structure
+        from wgpy_backends.webgpu.webgpu_buffer import (create_meta_buffer_from_structure,
+                                                         create_meta_buffer)
         _adam_kernel["platform"] = get_platform()
-        _adam_kernel["make_meta"] = create_meta_buffer_from_structure
+        _adam_kernel["make_meta"] = _packed_meta(create_meta_buffer_from_structure,
+                                                 create_meta_buffer)
         return True
     except Exception as e:
         _backend_why["platform"] = "%s: %s" % (type(e).__name__, e)
@@ -14186,8 +14188,40 @@ def _gpu_stat_push(force=False):
         _stat_why = type(e).__name__ + ": " + str(e)[:80]
 
 
-def gpu_reap():
+
+_META_STRUCTS = {}
+
+
+def _packed_meta(slow, create):
+    """`make_meta(values, "u4,u4,f4")` without numpy: every dispatch makes one, and building a
+    structured array parses the dtype string each time -- 620 of them were 15 ms of a 0.6B's
+    prefill. Formats of 4-byte fields pack with a cached `struct.Struct` (the same little-
+    endian bytes); anything else, or a value struct will not take, takes the numpy path."""
+    import struct
+
+    def meta(values, dtype):
+        st = _META_STRUCTS.get(dtype)
+        if st is None:
+            codes = {"u4": "I", "i4": "i", "f4": "f"}
+            parts = [p.strip() for p in str(dtype).split(",")]
+            st = (struct.Struct("<" + "".join(codes[p] for p in parts))
+                  if all(p in codes for p in parts) else False)
+            _META_STRUCTS[dtype] = st
+        if st:
+            try:
+                return create(st.pack(*values))
+            except (struct.error, TypeError):
+                pass
+        return slow(values, dtype)
+    return meta
+
+def gpu_reap(budgeted=False):
     """Return finished intermediates to the device. A no-op where there is nothing to return.
+
+    `budgeted`: only once the bytes allocated since the last reap pass the backend's budget
+    (8% of what is live, at least 256 MB). A collect costs ~5 ms of host time whether or not
+    there is anything to free -- four of them were 20 ms of a 0.6B's 114 ms prefill, which
+    never came near the budget; a 27B's prefill passes it and still reaps.
 
     Called at a LAYER boundary, not from the allocation path, and the difference is not
     subtle. A collect can only free what nothing refers to, and inside `WebGPUBuffer.__init__`
@@ -14200,6 +14234,8 @@ def gpu_reap():
     if not _adam_backend_ready():
         return                                   # WebGL, or no GPU backend at all
     import wgpy_backends.webgpu.webgpu_buffer as _b
+    if budgeted and getattr(_b, "_bytes_since_reap", 0) < getattr(_b, "_reap_budget", 0):
+        return
     fn = getattr(_b, "reap_now", None)
     if fn is not None:
         fn()
