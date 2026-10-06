@@ -618,7 +618,11 @@ class TextEncoder(wt.Module):
         self._last_capture_timing = None
         if not self._capture_ok():
             return None
-        if B > 1 and self._packed_ok():
+        # One question too: its inputs staged by JS in one call and its embedding looked up
+        # on the device, where the padded path read the rows back to upload them again and
+        # built its masks in Python -- 1.5 ms of host work a request, 6-7 ms once the CPU
+        # has dropped its clock between requests.
+        if self._packed_ok():
             got = self._replayed_packed(ids, T, B, valid)
             if got is not _NOT_PACKED:
                 return got                  # the result, or None: seen once, run it eagerly

@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-10-06 ▸ One question runs packed too: 42–47 → 33.5–37 ms when requests are seconds apart
+
+A single question still took the padded path, whose staging read the embedding rows back to
+upload them again and built per-head masks in Python: 1.5 ms of host work back to back, 6–7 ms
+once the CPU had dropped its clock. It now takes the packed path (one segment): tokens,
+segment, positions and gather staged by JS in one call, the lookup on the device. Laya folder,
+one question: two seconds apart 42–47 → 33.5–36.9 ms (staging 6–7 → 0.5–0.7), back to back
+16.2–16.5 → 15.2–15.9. Answers unchanged.
+
 ## 2026-10-06 ▸ What the decision request costs between requests; meta buffers packed without numpy's dtype parser
 
 **Trigger:** user — the first single question takes 80–90 ms, steady state 50–60, sometimes
