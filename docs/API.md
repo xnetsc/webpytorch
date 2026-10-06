@@ -1411,7 +1411,10 @@ Two ways out, and neither copies the model:
 - `await webtorch.import_model(handle, name=None)` — the same idea for either kind of
   handle: a `FileSystemFileHandle` registers one file, a `FileSystemDirectoryHandle`
   registers every file in it, which is what a multi-file model is. Nothing touches origin
-  storage; reads go to the offsets the loader asks for.
+  storage; reads go to the offsets the loader asks for. A folder registered this way is
+  read from disk and nowhere else: a name under it that the folder does not contain (a
+  loader probing for one layout's optional files) raises `FileNotFoundError` instead of
+  being fetched from the network.
 - `webtorch.local_files()` → the names currently satisfied this way, in registration order.
 - `webtorch.forget_model_file(name)` — stop serving `name` from a local file.
 

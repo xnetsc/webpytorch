@@ -1,5 +1,25 @@
 # Progress
 
+## 2026-10-06 ▸ A picked folder never reaches the network (user-reported)
+
+**Reported:** loading the local Laya folder (not a GGUF) still made network requests.
+**Reproduced** by recording every request from picking the folder to "ready": 27 requests,
+HEAD and GET for `…/<folder>/encoder/config.json`, `…/<folder>/decision_config.json` and
+`…/<folder>/tokenizer/tokenizer.json`, against the page's origin (a deployed page: another
+site). The directory loader probes each layout's conventional places in turn; this folder has
+`config.json`, `rl_agent_config.json` and `tokenizer.json` at its root, so the other names
+missed `_local_files` and both read callbacks fell through to fetching them.
+
+**Change (IO layer, not the loader):** registering `<folder>/<file>` records the folder as a
+local root; a name under a local root that is not registered is `FileNotFoundError` in both
+the default and the hub read callbacks, before any cache or network step. Forgetting the last
+file of a folder drops its root. Names outside picked folders behave as before.
+
+**After:** the same pick makes 0 requests; the model loads and answers as before (Laya:
+billing 1, duplicate 0.9939, urgency 1.9205; steady ~51 ms). `test/test_local_folder_reads.py`
+drives the default reader with recording `http_get`/`http_size`: the present file reads
+locally, the three probes raise, nothing is fetched.
+
 ## 2026-10-06 ▸ MoE prefill grouped by expert on the device: 30B first token 1.71 → 0.67 s
 
 **Why:** the 30B's 248-row prefill spent 1326 of 1617 ms GPU in `ggmlv2_q3_k_e` — every

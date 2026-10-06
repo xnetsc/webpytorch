@@ -660,6 +660,8 @@ def use_default_io(cache=True, cache_dir=None, max_parallel=16, prefetch=True, c
             data = await _read_local_file(h, offset, length)
             _report(name, len(data), None, offset)
             return data
+        if _local_miss(n):
+            raise FileNotFoundError("%s is not in the folder that was picked" % n)
         # Ask the cache; if it has not got them, that is this callback's problem to solve.
         hit = await read_cache(name, offset, length, cdir)
         if hit is not None and (length is None or len(hit) >= length):
@@ -1496,6 +1498,26 @@ def _at(offset):
 _stores = {}
 _dir_handle = {"h": None}
 _local_files = {}          # basename -> FileSystemFileHandle, read in place
+# Folders the person picked: a name under one of them is that folder's file or no file at
+# all. A loader probing for a layout's optional files ("encoder/config.json",
+# "decision_config.json", "tokenizer/tokenizer.json") asks for names the folder does not
+# have; those fell through to the network -- HEAD and GET against the page's own origin,
+# on a deployed page another site -- for a model that was never anywhere but on disk.
+_local_roots = {}          # root folder name -> how many registered files lie under it
+
+
+def _root_of(name):
+    n = str(name)
+    if "://" in n or n.startswith(("/", "./")) or "/" not in n:
+        return None
+    return n.split("/", 1)[0]
+
+
+def _local_miss(name):
+    """True for a name inside a picked folder that the folder does not contain: answered
+    "not found" here, never fetched."""
+    root = _root_of(name)
+    return root is not None and root in _local_roots and str(name) not in _local_files
 
 
 def use_model_file(handle, name=None):
@@ -1509,8 +1531,13 @@ def use_model_file(handle, name=None):
     ("…/resolve/master/model.gguf" against "model.gguf"), so a file picked from disk
     satisfies the very id the loader was going to fetch. Pass `name` to override.
     """
-    _local_files[name or handle.name] = handle
-    return name or handle.name
+    key = name or handle.name
+    if key not in _local_files:
+        root = _root_of(key)
+        if root is not None:
+            _local_roots[root] = _local_roots.get(root, 0) + 1
+    _local_files[key] = handle
+    return key
 
 
 def local_files():
@@ -1520,7 +1547,14 @@ def local_files():
 
 def forget_model_file(name):
     """Stop reading `name` from a local file."""
-    return _local_files.pop(name, None) is not None
+    if _local_files.pop(name, None) is None:
+        return False
+    root = _root_of(name)
+    if root is not None and root in _local_roots:
+        _local_roots[root] -= 1
+        if _local_roots[root] <= 0:
+            del _local_roots[root]
+    return True
 
 
 async def _read_local_file(handle, offset, length):
@@ -2596,6 +2630,8 @@ def _hub_reader(to_url, token, cache, cache_dir, max_parallel, prefetch, chunk_m
             data = await _read_local_file(h, offset, length)
             _report(name, len(data), None, offset)
             return data
+        if _local_miss(n):
+            raise FileNotFoundError("%s is not in the folder that was picked" % n)
         # A same-origin path ("/models/…", "./x.gguf") is a location, not a repo id: fetch it
         # where it is served and do NOT copy it into the hub cache — it is already local, so
         # caching it would burn quota for nothing. Only repo ids and full URLs map to the hub.

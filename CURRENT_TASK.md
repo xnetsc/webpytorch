@@ -13,6 +13,10 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 a picked folder never reaches the network:** loading the local Laya folder made
+27 HEAD/GET requests for layout probes it does not contain; names under a picked folder that
+it lacks are now "not found" in the IO layer — 0 requests, same answers.
+
 **2026-10-06 MoE prefill grouped by expert on the device:** 30B first token at 157 tokens
 1.71 → 0.67 s, decode 40.7–41.3 tok/s. 0.6B: first token 94 ms, decode ~150 tok/s; decision
 51.5 ms. Next: the local-directory load's network requests (user-reported), then per-request /
