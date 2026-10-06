@@ -1,5 +1,49 @@
 # Progress
 
+## 2026-10-06 ▸ Decision request 100.2 → 51.5 ms (WebGPU, F16 GGUF): fused attention and norms, half arithmetic raced
+
+**Why:** an MLX reference runs the same xDecision input in 19.1 ms (f16) / 51.5 ms (f32); this
+SDK took 100.2 ms. GPU time was 82.2 ms: dense matmuls 49.0, attention 21.0 (five dispatches a
+layer, 0.95 ms for ~0.3 GFLOP), LayerNorm + residual adds 9.6 (one thread per row: 519
+threads, ~25 GB/s); the other 18 ms were host.
+
+**Changes (all measured on the three-question request, 3 × 173 padded tokens):**
+
+| change | GPU | request | answers |
+|---|---|---|---|
+| `rope_qk` + `fused_attention`: projection to out-projection rows in two dispatches, online softmax, only the probability tile in workgroup memory | attention 21.0 → 4.5 ms | 100.2 → 79.2 ms | identical |
+| `add_layernorm` / row LayerNorm: a 64-thread workgroup per row, the residual add folded in, every add fused with the norm after it | 8.8 → 2.3 ms | 79.2 → 75.5 ms | identical |
+| decision scratch release (gc + reap, 6–7 ms even with nothing to free) after the answer, once idle 200 ms | — | 75.5 → 65.1 ms | identical |
+| host idle calibration: one probe per call instead of a 0.25 s budget (a request right after load waited 320 ms) | — | second request 414 → 142 ms | identical |
+| dense half weights: `mm_half` (products and 32-long sums in half, then f32) raced against `mm_f16w` after load, only where the device has `shader-f16` | matmuls 47.3 → 33.9 ms | 65.1 → **51.5 ms** | third/fourth decimal |
+
+Answers with half arithmetic: billing 0.8936 → 0.8935, duplicate 0.8755 → 0.8794, urgency
+1.7199 → 1.7194. MLX f16 against MLX f32 on its own input: 0, 0.0020, 0.0012. Summing 64
+products in half instead of 32 doubled the duplicate-charge shift (0.0066) at the same speed.
+
+**Hardware facts (Apple M5, Chrome 154 default, timestamp queries):** FMA 3.2 TFLOPS f32, 6.2
+f16; f16 operands with an f32 sum 3.1; no dual issue (f32 + f16 in one kernel take the sum of
+their times; integer work too). MLX's matmul reaches 12.0 TFLOPS f16 / 7.5 f32 on the same GPU
+— matrix units, which WebGPU reaches only through `chromium-experimental-subgroup-matrix`,
+present only with `--enable-unsafe-webgpu`. `mm_f16w` is at 91% of the f32 peak; `mm_half`
+at ~65% of the f16 peak (no loads: 96%) — loads and staging are what is left.
+
+**Device detection:** `shader-f16` and `subgroups` are requested whenever the adapter has them;
+`gpu_features()` reports features, subgroup sizes and limits to Python. Feature-gated kernels
+become candidates only where present; the choice is the existing per-device race. No vendor
+keys anything.
+
+**Tests:** `test/test_encoder_fused.py` (7 host, 3 browser: attention against a float64
+reference at HD 32/64/128, windows, three mask layouts, both tilings; row LayerNorm and its add
+at widths 30–4096; half matmul within 5e-3 of the output scale) — all pass in the browser.
+Host 256 passed / 5 skipped, JS 104 passed.
+
+**Open:** the 486- vs 480-token input mismatch against the MLX reference (answers differ by
+~0.013, more than any precision effect here); request host time ~8 ms (tokenize 1.5, staging
+2.3–3, trim 0.8, head dispatch ~3.5) — to move into JS per the user's rule that Python only
+schedules; RoPE and GeGLU into the matmul epilogues; the LLM side (llama.cpp Metal on the
+0.6B Q4_K_M: 6680 tok/s prefill, 233 tok/s decode, against our ~137 tok/s decode).
+
 ## 2026-10-06 ▸ Release's runtime restart: 8.5 s on the deployed page was revalidation, not work
 
 **Why Release shows "loading webtorch…":** the page's Release closes the whole runtime

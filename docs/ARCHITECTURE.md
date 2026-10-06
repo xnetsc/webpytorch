@@ -331,3 +331,53 @@ the time.
 
 One caveat on the last row: the quantised path has a dedicated GEMV kernel for a single row,
 which is the decode case. All of the above is measured at 69 rows, on the general path.
+
+### The seventh: once the pass is fed, what the GPU itself is bound by
+
+With the pass replayed, the request is GPU time plus whatever the host does around it. On the
+three-question request (3 × 173 padded tokens, a 22-layer 768-wide encoder, F16 GGUF) that was
+100.2 ms, of which 82.2 was GPU and 49.0 of that the dense matmuls. An MLX reference on the
+same input takes 19.1 ms in f16 and 51.5 in f32. What closed most of the distance, in order:
+
+| change | GPU time it took | request |
+|---|---|---|
+| attention as two dispatches (`rope_qk`, `fused_attention`) | 21.0 → 4.5 ms | 100.2 → 79.2 ms |
+| LayerNorm a workgroup per row, the residual add folded in (`add_layernorm`) | 8.8 → 2.3 ms | 79.2 → 75.5 ms |
+| the per-request scratch release moved after the answer, to idle time | — (host) | 75.5 → 65.1 ms |
+| dense half weights race half arithmetic (`_mm_half_src`) against f32 | 47.3 → 33.9 ms | 65.1 → 51.5 ms |
+
+Answers were bit-identical through the first three. The last one changes them in the third
+or fourth decimal (billing 0.8936 → 0.8935, duplicate charge 0.8755 → 0.8794, urgency 1.7199
+→ 1.7194) — the same order as MLX's own f16-against-f32 difference on this input (0, 0.0020,
+0.0012). That is what computing at the weights' width costs here, and why it is a raced
+*candidate* gated by an output check, not the only path.
+
+What sets the ceiling is the arithmetic the device exposes to standard WebGPU, measured with
+timestamp queries on an Apple M5 (Chrome 154, no flags): **3.2 TFLOPS f32 and 6.2 f16 FMA**,
+and no dual issue — f32 and f16 work mixed in one kernel take the sum of their times, and so
+does integer arithmetic. MLX reaches 12 TFLOPS on the same GPU because it uses matrix units
+that WebGPU reaches only through `chromium-experimental-subgroup-matrix`, which this Chrome
+exposes behind `--enable-unsafe-webgpu` and not otherwise. So the encoder's matmuls cannot
+match MLX on this GPU through default WebGPU; they can get to the FMA peak.
+
+The half kernel gets to about 65% of it (4.0 TFLOPS at 519×768×2304, 1.35× `mm_f16w`, which
+is itself at 91% of the f32 peak). Two things made the difference and several did not:
+
+- **The running sum must be half for the half rate**; f16 operands into an f32 sum run at the
+  f32 rate (3.1 TFLOPS). So a thread sums 32 products in half and adds that into f32. The
+  error grows as the square root of that span; 32 cost nothing over 64 and 16 cost 8–10%.
+- **Issue the workgroup loads of a 4-deep step before its FMAs**: 0.52 → 0.47 ms. Without
+  the loads at all the same FMAs run at 6.0 TFLOPS, so what remains is the loads and the
+  staging, not the arithmetic.
+- No help: activations already in half (−3%), larger tiles, 8 rows a thread, double-buffered
+  staging (slower — registers), wider workgroups, re-mapping threads so shared reads coalesce.
+
+All of this is per device. `gpu_features()` reports what the device was created with —
+`shader-f16` and `subgroups` are requested whenever the adapter has them, whatever its vendor
+— and a kernel that needs a feature is offered only where it is present; which eligible kernel
+runs is raced after load on the device itself (`_weight_execution`) and remembered per
+adapter. Nothing is keyed by vendor, so another GPU with a different f16 rate, or none,
+simply picks differently.
+
+The load's deferred route ladders now run one probe per call into Python. With a 0.25 s
+budget per call, a request that arrived right after a load waited 320 ms behind them.

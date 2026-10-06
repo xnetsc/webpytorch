@@ -815,7 +815,9 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   call runs queued probes for about `budget_s` seconds (at least one probe while any is
   queued). Until a ladder finishes, calls borrow the nearest row count it has measured, so
   nothing waits on it and nothing races inside an answer. `webtorch.start()` hosts call
-  this for you while no call is running and keep the profile when the queue is empty. Using
+  this for you while no call is running, one probe per call (`budget_s=0`) so a request
+  that arrives waits for at most the probe in progress, and keep the profile when the
+  queue is empty. Using
   the Python SDK directly, call it when you are idle, then save `kernel_profile()` again;
   not calling it is also correct, only the large row counts keep the borrowed choice.
 

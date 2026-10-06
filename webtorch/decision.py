@@ -1462,8 +1462,9 @@ def _calibrate_routes(model, webio):
     (`wt.calibrate_rows`). What is measured is per device, so another GPU keeps its own
     winners; with a remembered kernel profile nothing here is measured again. Covers each
     distinct stored-format linear by (format, K, N) -- the warm-up pass has created them all
-    by now -- and the final head layer's row selection by sequence length. Dense half
-    weights have one route and are not visited.
+    by now -- each dense half weight's shape where the device has half arithmetic (the only
+    case with more than one route), the encoder's attention by length, and the final head
+    layer's row selection by sequence length.
     """
     impl = getattr(model, "impl", model)
     enc = getattr(impl, "enc", None)
@@ -1483,6 +1484,33 @@ def _calibrate_routes(model, webio):
         def probe(m, lin=lin, K=K):
             wt._sync_small(lin(Tensor(rng.standard_normal((m, K)).astype(np.float32))))
         wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
+    # Dense half weights race f32 against half arithmetic, by (K, N) -- only where the device
+    # was created with `shader-f16`; elsewhere there is one route and nothing to measure.
+    if wt.gpu_features().get("f16"):
+        halves = {}
+        for table, shapes, tag in ((getattr(enc, "_ten", {}), getattr(enc, "shape_of", {}), "f16"),
+                                   (getattr(impl, "_ten", {}), getattr(impl, "_half_shape", {}),
+                                    "half")):
+            for k, v in table.items():
+                if (isinstance(k, tuple) and len(k) == 2 and k[1] == tag
+                        and isinstance(v, Tensor) and k[0] in shapes):
+                    n_out, n_in = shapes[k[0]]
+                    halves.setdefault((int(n_in), int(n_out)), v)
+        for (K, N) in sorted(halves):
+
+            def probe(m, pk=halves[(K, N)], K=K, N=N):
+                y = wt.matmul_f16w(Tensor(rng.standard_normal((m, K)).astype(np.float32)),
+                                   pk, K, N)
+                if y is not None:
+                    wt._sync_small(y)
+            wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
+    # The encoder's attention, by sequence length, once per kind of layer (full and windowed
+    # differ in how many key blocks a query block reads).
+    if enc is not None and callable(getattr(enc, "attention_probe", None)):
+        for kind in sorted(set(enc.cfg.layer_types)):
+            probe = enc.attention_probe(kind)
+            if probe is not None:
+                wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
     if getattr(impl, "n_head_layers", 0) and callable(getattr(impl, "_score", None)):
         hidden = int(enc.cfg.hidden)
 

@@ -145,6 +145,27 @@ export class ComputeContextGPU {
   private captures: Map<string, GPUKernelRunDescriptor[]> = new Map();
   private capturePins: Map<string, Set<number>> = new Map();
   private pinned: Set<number> = new Set();
+  /** What the device was created with: the optional features it has and the limits that
+   * decide which kernels can run on it. Detected on the device itself, for any GPU. */
+  features(): Record<string, unknown> {
+    try {
+      const ctx = getNNWebGPUContext();
+      const dev = ctx.device;
+      return {
+        f16: !!dev?.features?.has('shader-f16'),
+        subgroups: !!dev?.features?.has('subgroups'),
+        subgroupMinSize: ctx.adapterFacts.subgroupMinSize,
+        subgroupMaxSize: ctx.adapterFacts.subgroupMaxSize,
+        maxWorkgroupStorage: Number(dev?.limits?.maxComputeWorkgroupStorageSize || 0),
+        maxInvocations: Number(dev?.limits?.maxComputeInvocationsPerWorkgroup || 0),
+        vendor: ctx.adapterFacts.vendor,
+        architecture: ctx.adapterFacts.architecture,
+      };
+    } catch (_) {
+      return { f16: false, subgroups: false };
+    }
+  }
+
   async init() {
     await initializeNNWebGPUContext();
   }

@@ -255,6 +255,12 @@ class TextEncoder(wt.Module):
         b = (self._t(name + ".bias") if self._has(name + ".bias") else self._zero())
         return layernorm(x, g, b, self.cfg.eps)
 
+    def _add_norm(self, x, y, name):
+        """`x + y` and that sum's norm `name`, fused where the backend can."""
+        g = self._t(name + ".weight")
+        b = (self._t(name + ".bias") if self._has(name + ".bias") else self._zero())
+        return wt.add_layernorm(x, y, g, b, self.cfg.eps)
+
     def _zero(self):
         if "__zero__" not in self._ten:
             self._ten["__zero__"] = Tensor(np.zeros((self.cfg.hidden,), np.float32))
@@ -319,6 +325,15 @@ class TextEncoder(wt.Module):
             # (T, 3, heads, head_dim) and unbinds axis 1, which in memory is exactly three
             # consecutive slices of the flat row.
             qkv = self._lin(x, p + "Wqkv")                     # (T, 3*h*hd)
+            # The whole attention in two dispatches where the backend has it: q and k
+            # rotated, then one kernel from the projection to the out-projection's rows.
+            # None means this backend or shape keeps the expression below.
+            o = (None if x.requires_grad else
+                 wt.fused_attention(qkv, h, hd, T, 1.0 / (hd ** 0.5), mask,
+                                    self.cfg.window if kind == "sliding_attention" else 0,
+                                    B, cos, sin))
+            if o is not None:
+                return self._lin(o, p + "Wo" if self._has(p + "Wo.weight") else p + "o_proj")
             # Taken, transposed and rotated in one pass each. Written out, this is a slice
             # and a transpose before the rotation, and both are strided COPIES of the whole
             # tensor -- the backend has no view of a slice of a row -- so three of them per
@@ -381,6 +396,25 @@ class TextEncoder(wt.Module):
         else:
             o = o.reshape(B, h, T, hd).permute(0, 2, 1, 3).reshape(B * T, h * hd)
         return self._lin(o, p + "Wo" if self._has(p + "Wo.weight") else p + "o_proj")
+
+    def attention_probe(self, kind):
+        """`probe(m)`: one `kind` layer's attention at m tokens, for the load-time route
+        ladder; None where the backend has no fused attention to race."""
+        if not wt._adam_backend_ready():
+            return None
+        h, hd = self.cfg.heads, self.cfg.head_dim
+        window = self.cfg.window if kind == "sliding_attention" else 0
+        rng = np.random.default_rng(0)
+
+        def probe(m):
+            T = int(m)
+            qkv = Tensor(rng.standard_normal((T, 3 * h * hd)).astype(np.float32))
+            cos, sin = self._rope_tables(T, kind)
+            o = wt.fused_attention(qkv, h, hd, T, 1.0 / (hd ** 0.5), self._mask(T, None, kind),
+                                   window, 1, cos, sin)
+            if o is not None:
+                wt._sync_small(o)
+        return probe
 
     def _mlp(self, x, layer):
         p = "%slayers.%d.mlp." % (self.p, layer)
@@ -684,13 +718,27 @@ class TextEncoder(wt.Module):
         part is the same dispatches every time for a given length -- which is what makes it
         capturable."""
         x = self._norm(x, self.p + "embeddings.norm")
-        for i in range(self.cfg.layers):
+        L = self.cfg.layers
+        if not L:
+            return self._norm(x, self.p + "final_norm")
+
+        def attn_norm(i):
+            return "%slayers.%d.attn_norm" % (self.p, i)
+        # Every residual add is followed by a norm -- the next block's, or the final one -- so
+        # each is one `_add_norm`: the sum is the stream, the norm the next block's input.
+        xa = self._norm(x, attn_norm(0)) if self._has(attn_norm(0) + ".weight") else x
+        for i in range(L):
             kind = self.cfg.layer_types[i]
-            an = "%slayers.%d.attn_norm" % (self.p, i)
-            xa = self._norm(x, an) if self._has(an + ".weight") else x
-            x = x + self._attn(xa, i, kind, masks[kind], B)
-            x = x + self._mlp(self._norm(x, "%slayers.%d.mlp_norm" % (self.p, i)), i)
-        return self._norm(x, self.p + "final_norm")
+            x, h = self._add_norm(x, self._attn(xa, i, kind, masks[kind], B),
+                                  "%slayers.%d.mlp_norm" % (self.p, i))
+            m = self._mlp(h, i)
+            nxt = attn_norm(i + 1) if i + 1 < L else self.p + "final_norm"
+            if i + 1 < L and not self._has(nxt + ".weight"):
+                x = x + m
+                xa = x
+            else:
+                x, xa = self._add_norm(x, m, nxt)
+        return xa
 
     def _run(self, ids, T, B, valid):
         got = self._replayed(ids, T, B, valid)

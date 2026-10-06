@@ -1,6 +1,6 @@
 # Current task status
 
-> Last updated: 2026-10-05
+> Last updated: 2026-10-06
 
 ## Highest project principle
 
@@ -12,6 +12,13 @@ performance comparison and adopt whichever measured execution is fastest. Only b
 passing their recorded acceptance gates completes this task.
 
 ## One-line status
+
+**2026-10-06 decision request 100.2 → 51.5 ms on WebGPU (MLX f16 19.1, f32 51.5):** fused
+attention (21 → 4.5 ms GPU), row LayerNorm with the residual add (8.8 → 2.3), scratch release
+after the answer (−10 ms), dense half weights race half arithmetic (matmuls 47.3 → 33.9 ms,
+answers move in the 3rd–4th decimal, like MLX's own f16). WebGPU's ceiling here is the FMA
+peak (6.2 TFLOPS f16); MLX uses matrix units (12 TFLOPS) WebGPU only reaches behind a flag.
+Next: per-request host work into JS (Python only schedules), then the LLM side.
 
 **2026-10-06 Release restart on the deployed page 8.55 → 1.12 s:** the page's service
 worker revalidated every stamped SDK file (~30 × 300 ms, sequential); stamped URLs are now

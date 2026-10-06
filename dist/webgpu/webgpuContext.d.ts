@@ -19,6 +19,12 @@ export declare class NNWebGPUContext {
     initialized: boolean;
     isSupported: boolean;
     device: GPUDevice;
+    adapterFacts: {
+        vendor: string;
+        architecture: string;
+        subgroupMinSize: number;
+        subgroupMaxSize: number;
+    };
     private deviceLostReason;
     private pipelines;
     private pendingPipelineChecks;

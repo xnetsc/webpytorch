@@ -39,6 +39,11 @@ export class NNWebGPUContext {
 
   device!: GPUDevice;
 
+  // What the adapter said about itself, for `features()`. Diagnostic: no route keys on it.
+  adapterFacts: { vendor: string; architecture: string; subgroupMinSize: number;
+                  subgroupMaxSize: number } = { vendor: '', architecture: '',
+                                                subgroupMinSize: 0, subgroupMaxSize: 0 };
+
   private deviceLostReason: string | null = null;
 
   private pipelines: Map<string, WebGPURunnerPipeline>;
@@ -127,6 +132,23 @@ export class NNWebGPUContext {
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const requiredFeatures: GPUFeatureName[] = (PROFILE_GPU && adapter!.features.has('timestamp-query'))
       ? ['timestamp-query'] : [];
+    // Standard optional features, asked for whenever THIS adapter has them, whatever GPU it
+    // is: half-precision arithmetic (`shader-f16`) and subgroup operations (`subgroups`).
+    // Nothing is assumed from a vendor name. Python is told what the device ended up with
+    // (`features()`) and only then offers the kernels that need a feature as candidates;
+    // which of those is fastest is measured on the device itself.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    for (const f of ['shader-f16', 'subgroups'] as GPUFeatureName[]) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      if (adapter!.features.has(f)) requiredFeatures.push(f);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const info: any = (adapter as any)?.info || {};
+    this.adapterFacts = {
+      vendor: String(info.vendor || ''), architecture: String(info.architecture || ''),
+      subgroupMinSize: Number(info.subgroupMinSize || 0),
+      subgroupMaxSize: Number(info.subgroupMaxSize || 0),
+    };
     this.device = (await adapter!.requestDevice({ requiredLimits, requiredFeatures })) as GPUDevice;
     if (!this.device) {
       throw new Error('GPUAdapter.requestDevice() returned null');

@@ -105,6 +105,9 @@ export declare class ComputeContextGPU {
     private captures;
     private capturePins;
     private pinned;
+    /** What the device was created with: the optional features it has and the limits that
+     * decide which kernels can run on it. Detected on the device itself, for any GPU. */
+    features(): Record<string, unknown>;
     init(): Promise<void>;
     dispose(): void;
     createBuffer(id: number, byteLength: number): void;

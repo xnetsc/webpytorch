@@ -136,7 +136,7 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
         namespace: 'wgpy',
         method: 'initComplete',
         gl: glWorker ? glDeviceInfo : null,
-        gpu: contextGPU ? {} : null,
+        gpu: contextGPU ? contextGPU.features() : null,
       });
     } else if (e.data.method.startsWith('gl.')) {
       if (glWorker) {

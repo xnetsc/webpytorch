@@ -1128,9 +1128,146 @@ void main() {
     return out
 
 
-def matmul_f16w(x, wpacked, K, N):
+def gpu_features():
+    """What the WebGPU device was created with, detected on the device at start: optional
+    features (`f16`, `subgroups`), subgroup sizes and the limits kernels depend on. {} without
+    WebGPU. Kernels that need a feature are offered only where it is present; which of the
+    eligible ones runs is measured on the device, whatever its vendor."""
+    if not _adam_backend_ready():
+        return {}
+    if "v" not in _GPU_FEATURES:
+        try:
+            info = _adam_kernel["platform"].getDeviceInfo()
+            _GPU_FEATURES["v"] = dict(info) if isinstance(info, dict) else {}
+        except Exception:
+            _GPU_FEATURES["v"] = {}
+    return _GPU_FEATURES["v"]
+
+
+_GPU_FEATURES = {}
+
+
+def _mm_half_src(R=4, C=8, BK=32, FLUSH=32):
+    """`x @ w` for packed half weights with the products in half precision.
+
+    Where the device has `shader-f16`, a half FMA costs half an f32 one -- 6.2 against 3.2
+    TFLOPS measured on an Apple M5, and on several other GPUs the rate is likewise doubled --
+    but only when the running sum is half too. So each thread sums FLUSH products in half and
+    adds that partial into f32: products and short sums at the weights' own width, the long
+    sum at f32. The error grows with FLUSH (as its square root): 32 measured as fast as 64
+    and 16 cost 8-10%, so 32 -- about 1e-3 of the output scale, against ~1e-6 for `mm_f16w`.
+
+    8 x 8 threads, a 32-row x 64-column tile; each BK-deep stage stages the activations
+    (converted to half once, here) and the weights through workgroup memory. Thread (tx, ty)
+    owns rows ty + 8r and columns tx*C.. . Every workgroup load of a 4-deep step is issued
+    before its FMAs, which on the M5 took the kernel from 0.52 to 0.47 ms at 519x768x2304.
+    """
+    BM, BN = 8 * R, 8 * C
+    AST = BK // 4 + 1
+    WST = BN // 8
+    nv, G = C // 4, C // 8
+    pa, pw = BM * (BK // 4) // 64, BK * WST // 64
+    L = []
+    a = L.append
+    a("enable f16;")
+    a("@group(0) @binding(0) var<storage,read> A: array<vec4<f32>>;")
+    a("@group(0) @binding(1) var<storage,read> W: array<vec4<u32>>;")
+    a("@group(0) @binding(2) var<storage,read_write> O: array<vec4<f32>>;")
+    a("struct CMeta { M: u32, N: u32, K: u32, G: u32, }")
+    a("@group(0) @binding(3) var<storage,read> cm: CMeta;")
+    a("var<workgroup> as_: array<vec4<f16>, %d>;" % (BM * AST))
+    a("var<workgroup> ws: array<vec4<u32>, %d>;" % (BK * WST))
+    a("@compute @workgroup_size(8, 8, 1)")
+    a("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,")
+    a("        @builtin(local_invocation_index) li: u32) {")
+    a("  let M = cm.M; let N = cm.N; let K = cm.K;")
+    a("  let K4 = K / 4u; let N8 = N / 8u; let N4 = N / 4u;")
+    a("  let m0 = wg.y * %du; let n0 = wg.x * %du;" % (BM, BN))
+    a("  let tx = lid.x; let ty = lid.y;")
+    for r in range(R):
+        for v in range(nv):
+            a("  var S%d_%d = vec4<f32>(); var h%d_%d = vec4<f16>();" % (r, v, r, v))
+    for i in range(pa):
+        a("  let ar%d = (li + %du) / %du; let ac%d = (li + %du) %% %du;"
+          % (i, 64 * i, BK // 4, i, 64 * i, BK // 4))
+        a("  let ag%d = min(m0 + ar%d, M - 1u) * K4 + ac%d;" % (i, i, i))
+    for i in range(pw):
+        a("  let wr%d = (li + %du) / %du; let wc%d = (li + %du) %% %du;"
+          % (i, 64 * i, WST, i, 64 * i, WST))
+    a("  for (var k0 = 0u; k0 < K; k0 = k0 + %du) {" % BK)
+    for i in range(pa):
+        a("    as_[ar%d * %du + ac%d] = vec4<f16>(A[ag%d + k0 / 4u]);" % (i, AST, i, i))
+    for i in range(pw):
+        a("    ws[wr%d * %du + wc%d] = W[(k0 + wr%d) * N8 + n0 / 8u + wc%d];" % (i, WST, i, i, i))
+    a("    workgroupBarrier();")
+    a("    for (var kk = 0u; kk < %du; kk = kk + 1u) {" % (BK // 4))
+    for r in range(R):
+        a("      let a%d = as_[(ty + %du) * %du + kk];" % (r, 8 * r, AST))
+    for j in range(4):
+        for g in range(G):
+            a("      let p%d_%d = ws[(kk * 4u + %du) * %du + tx * %du + %du];" % (j, g, j, WST, G, g))
+    for j in range(4):
+        for g in range(G):
+            a("      let w%d_%d = vec4<f16>(bitcast<vec2<f16>>(p%d_%d.x), bitcast<vec2<f16>>(p%d_%d.y));"
+              % (j, 2 * g, j, g, j, g))
+            a("      let w%d_%d = vec4<f16>(bitcast<vec2<f16>>(p%d_%d.z), bitcast<vec2<f16>>(p%d_%d.w));"
+              % (j, 2 * g + 1, j, g, j, g))
+        for r in range(R):
+            for v in range(nv):
+                a("      h%d_%d = fma(vec4<f16>(a%d[%d]), w%d_%d, h%d_%d);" % (r, v, r, j, j, v, r, v))
+    if FLUSH < BK:
+        a("      if (((kk + 1u) %% %du) == 0u) {" % (FLUSH // 4))
+        for r in range(R):
+            for v in range(nv):
+                a("        S%d_%d = S%d_%d + vec4<f32>(h%d_%d); h%d_%d = vec4<f16>();"
+                  % (r, v, r, v, r, v, r, v))
+        a("      }")
+    a("    }")
+    a("    workgroupBarrier();")
+    if FLUSH >= BK:
+        a("    if (((k0 + %du) %% %du) == 0u || k0 + %du >= K) {" % (BK, FLUSH, BK))
+        for r in range(R):
+            for v in range(nv):
+                a("      S%d_%d = S%d_%d + vec4<f32>(h%d_%d); h%d_%d = vec4<f16>();"
+                  % (r, v, r, v, r, v, r, v))
+        a("    }")
+    a("  }")
+    for r in range(R):
+        a("  { let gm = m0 + ty + %du;" % (8 * r))
+        a("    if (gm < M) {")
+        for v in range(nv):
+            a("      O[gm * N4 + n0 / 4u + tx * %du + %du] = S%d_%d;" % (nv, v, r, v))
+        a("    } }")
+    a("}")
+    return "\n".join(L)
+
+
+_mm_half_added = {"v": False}
+
+
+def _mm_half(xd, wd, M, K, N):
+    plat = _adam_kernel["platform"]
+    if not _mm_half_added["v"]:
+        plat.addKernel("mm_half", {"source": _mm_half_src(),
+                                   "bindingTypes": ["read-only-storage", "read-only-storage",
+                                                    "storage", "read-only-storage"]})
+        _mm_half_added["v"] = True
+    out = _empty((M, N))
+    meta = _adam_kernel["make_meta"]((M, N, K, 1), "u4,u4,u4,u4")
+    plat.runKernel({"name": "mm_half",
+                    "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": 1}})
+    return out
+
+
+def matmul_f16w(x, wpacked, K, N, execution="auto"):
     """`x @ w` with w held as packed half precision (`pack_half_weight`). None without a GPU
-    backend, or where this backend cannot take the shape."""
+    backend, or where this backend cannot take the shape.
+
+    Two executions where the device has `shader-f16`: "f32" (`mm_f16w`, products and sums in
+    f32) and "f16" (`_mm_half_src`); the faster is measured per shape bucket on the device,
+    after an output check against "f32". Elsewhere "f32" is the only one."""
     if isinstance(wpacked, WebGLHalfMatrix):
         return _webgl_matmul_k4(x, wpacked)
     if not _adam_backend_ready():
@@ -1142,6 +1279,29 @@ def matmul_f16w(x, wpacked, K, N):
     K, N = int(K), int(N)
     if int(xd.shape[-1]) != K or N % 64 or K % 4:
         return None
+    wd = wpacked.data if isinstance(wpacked, Tensor) else wpacked
+    lead = tuple(xd.shape[:-1])
+    if execution == "auto" and K % 32 == 0 and gpu_features().get("f16"):
+        reference = [None]
+
+        def run(which):
+            return matmul_f16w(xd, wd, K, N, execution=which).data
+
+        def correct(which):
+            if which == "f32":
+                return True
+            if reference[0] is None:
+                reference[0] = np.asarray(run("f32").get(), np.float32)
+            got = np.asarray(run(which).get(), np.float32)
+            if not np.all(np.isfinite(got)):
+                return False
+            scale = max(1e-6, float(np.abs(reference[0]).max()))
+            return float(np.abs(got - reference[0]).max()) / scale < 1e-2
+
+        execution = _weight_execution("dense_half", "f16", K, N, M, run,
+                                      candidates=("f32", "f16"), check=correct)
+    if execution == "f16":
+        return Tensor(_mm_half(xd, wd, M, K, N).reshape(*(lead + (N,))))
     plat = _adam_kernel["platform"]
     if not _mmf16_k["added"]:
         plat.addKernel("mm_f16w", {"source": _MM_F16W_WGSL,
@@ -1151,7 +1311,6 @@ def matmul_f16w(x, wpacked, K, N):
                                           "bindingTypes": ["storage", "read-only-storage",
                                                            "read-only-storage"]})
         _mmf16_k["added"] = True
-    wd = wpacked.data if isinstance(wpacked, Tensor) else wpacked
     G = _mm_split_groups(M, N)
     part = _empty((G * M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, G), "u4,u4,u4,u4")
@@ -1159,7 +1318,6 @@ def matmul_f16w(x, wpacked, K, N):
                     "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
                                 part.buffer.buffer_id, meta.buffer_id],
                     "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": G}})
-    lead = tuple(xd.shape[:-1])
     if G == 1:
         return Tensor(part.reshape(*(lead + (N,))))
     out = _empty((M, N))
@@ -2616,6 +2774,287 @@ def banded_pv(prob, value, window):
                                    "y": (T + 15) // 16, "z": heads}})
     return Tensor(out)
 
+
+
+# ---- bidirectional attention straight off a packed projection ----------------------------
+#
+# An encoder layer's attention written as primitives is five dispatches over four full-size
+# intermediates: q, k and v each taken out of the packed projection (and q, k rotated), the
+# (heads, T, T) scores, their softmax, P @ V, and a transpose back to rows. Measured on a
+# 22-layer 768-wide encoder at 3 x 173 tokens that is 0.95 ms a layer, 21 ms of a 82 ms pass,
+# for about 0.3 GFLOP of arithmetic.
+#
+# Here it is two: the rotation of q and k (one pass, written out once, because every key block
+# would otherwise re-rotate the same rows), then one kernel per (sequence, head, query block)
+# that reads q, k and v where they are, keeps a running softmax over key blocks, and writes
+# the output already in the (rows, heads * head_dim) layout the out-projection reads. Nothing
+# T x T is ever stored.
+#
+# Workgroup memory holds only the probability tile and two reductions. A first version staged
+# q, k and v tiles there as well -- 32 KB a workgroup, so one or two workgroups fit a core and
+# the GPU waited on every barrier; reading them through the cache instead was twice as fast.
+
+_ROPE_QK_WGSL = """
+@group(0) @binding(0) var<storage,read_write> qk: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> qkv: array<vec4<f32>>;
+@group(0) @binding(2) var<storage,read> cosb: array<vec4<f32>>;
+@group(0) @binding(3) var<storage,read> sinb: array<vec4<f32>>;
+struct RMeta { rows: u32, T: u32, H: u32, HD4: u32, }
+@group(0) @binding(4) var<storage,read> rm: RMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  // One thread per (row, q or k, head, vec4 of the first half): the pair it rotates.
+  let half = rm.HD4 / 2u;
+  let per_row = 2u * rm.H * half;
+  let i = g.x + g.y * 65535u * 64u;
+  if (i >= rm.rows * per_row) { return; }
+  let row = i / per_row;
+  let r = i % per_row;
+  let which = r / (rm.H * half);
+  let hh = (r / half) % rm.H;
+  let d = r % half;
+  let t = row % rm.T;
+  let src = row * 3u * rm.H * rm.HD4 + which * rm.H * rm.HD4 + hh * rm.HD4;
+  let dst = row * 2u * rm.H * rm.HD4 + which * rm.H * rm.HD4 + hh * rm.HD4;
+  let lo = qkv[src + d]; let hi = qkv[src + d + half];
+  let cl = cosb[t * rm.HD4 + d]; let sl = sinb[t * rm.HD4 + d];
+  let ch = cosb[t * rm.HD4 + d + half]; let sh = sinb[t * rm.HD4 + d + half];
+  qk[dst + d] = lo * cl - hi * sl;
+  qk[dst + d + half] = hi * ch + lo * sh;
+}
+"""
+_rope_qk_kernel = {"added": False}
+
+
+def rope_qk(qkv, cos, sin, H, HD, T, B=1):
+    """q and k of a packed (B*T, 3*H*HD) projection, rotated, as one (B*T, 2*H*HD) tensor.
+
+    The rotation is `qkv_take`'s: the second half of each head negated into the first. Out of
+    place, so the projection is left as it was -- the attention kernel still reads v there.
+    None without WebGPU or for a shape this does not take."""
+    if not _adam_backend_ready():
+        return None
+    H, HD, T, B = int(H), int(HD), int(T), int(B)
+    xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+    if (tuple(xd.shape) != (B * T, 3 * H * HD) or HD % 8
+            or tuple(cd.shape) != (T, HD) or tuple(sd.shape) != (T, HD)):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _rope_qk_kernel["added"]:
+        plat.addKernel("rope_qk", {"source": _ROPE_QK_WGSL,
+                                   "bindingTypes": ["storage"] + ["read-only-storage"] * 4})
+        _rope_qk_kernel["added"] = True
+    out = _empty((B * T, 2 * H * HD))
+    n = B * T * H * (HD // 4)          # pairs of vec4: 2 (q, k) x H x HD/8 per row
+    meta = _adam_kernel["make_meta"]((B * T, T, H, HD // 4), "u4,u4,u4,u4")
+    plat.runKernel({"name": "rope_qk",
+                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, cd.buffer.buffer_id,
+                                sd.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": min((n + 63) // 64, 65535),
+                                   "y": (n + 64 * 65535 - 1) // (64 * 65535), "z": 1}})
+    return Tensor(out)
+
+
+def _attn_src(HD, RI, CJ):
+    """WGSL for one (sequence, head) and 8*RI queries against key blocks of 8*CJ.
+
+    8 x 8 threads. Thread (tx, ty) owns query rows ty + 8i (i < RI); for the scores, keys
+    tx*CJ .. tx*CJ+CJ-1 of the block; for the output, head-dim vec4s tx + 8e. A row's softmax
+    statistics are combined across its eight tx threads through workgroup memory, and each
+    thread writes its probabilities as whole vec4s -- assigning one component of a shared
+    vec4 compiles to a read-modify-write of all four, which two threads then race on.
+    """
+    HD4 = HD // 4
+    BQ, BK = 8 * RI, 8 * CJ
+    E = HD4 // 8
+    PS = BK // 4 + 1                   # padded vec4 stride of a probability row
+    L = []
+    a = L.append
+    a("""
+@group(0) @binding(0) var<storage,read> qks: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> vsrc: array<vec4<f32>>;
+@group(0) @binding(2) var<storage,read> mask: array<f32>;
+@group(0) @binding(3) var<storage,read_write> out: array<vec4<f32>>;
+struct AMeta { T: u32, H: u32, group: u32, window: u32, scale: f32,
+               qs: u32, qo: u32, ko: u32, vs: u32, vo: u32, }
+@group(0) @binding(4) var<storage,read> am: AMeta;
+var<workgroup> pt: array<vec4<f32>, %d>;
+var<workgroup> red: array<f32, %d>;
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y;
+  let T = am.T; let H = am.H;
+  let bh = wg.y; let b = bh / H; let h = bh %% H;
+  let q0 = wg.x * %du;
+  let DO = H * %du;
+  let masked = am.group > 0u;
+  let mbase = select(0u, (bh / max(am.group, 1u)) * T * T, masked);
+  let qcol = am.qo + h * %du; let kcol = am.ko + h * %du; let vcol = am.vo + h * %du;""" % (
+        BQ * PS, BQ * 8, BQ, HD4, HD4, HD4, HD4))
+    for i in range(RI):
+        a("  let qr%d = min(q0 + ty + %du, T - 1u); let qb%d = (b * T + qr%d) * am.qs + qcol;"
+          % (i, 8 * i, i, i))
+        a("  var m%d: f32 = -3.0e38; var l%d: f32 = 0.0;" % (i, i))
+        for e in range(E):
+            a("  var o%d_%d = vec4<f32>();" % (i, e))
+    a("""  var kb0 = 0u;
+  var kb1 = (T + %(BK)du - 1u) / %(BK)du;
+  if (am.window > 0u) {
+    // Blocks wholly outside every row's window are all mask; skipping them changes no
+    // probability. The mask itself still decides every score that is computed.
+    kb0 = select(0u, (q0 - am.window) / %(BK)du, q0 > am.window);
+    kb1 = min(kb1, min(T - 1u, q0 + %(BQ)du - 1u + am.window) / %(BK)du + 1u);
+  }
+  for (var kb = kb0; kb < kb1; kb = kb + 1u) {
+    let k0 = kb * %(BK)du;""" % dict(BK=BK, BQ=BQ))
+    for j in range(CJ):
+        a("    let kr%d = min(k0 + tx * %du + %du, T - 1u); let kp%d = (b * T + kr%d) * am.qs + kcol;"
+          % (j, CJ, j, j, j))
+    for i in range(RI):
+        for j in range(CJ):
+            a("    var s%d_%d: f32 = 0.0;" % (i, j))
+    a("    for (var d = 0u; d < %du; d = d + 1u) {" % HD4)
+    for i in range(RI):
+        a("      let qv%d = qks[qb%d + d];" % (i, i))
+    for j in range(CJ):
+        a("      let kv%d = qks[kp%d + d];" % (j, j))
+    for i in range(RI):
+        for j in range(CJ):
+            a("      s%d_%d = s%d_%d + dot(qv%d, kv%d);" % (i, j, i, j, i, j))
+    a("    }")
+    for i in range(RI):
+        for j in range(CJ):
+            a("    { let key = k0 + tx * %du + %du;" % (CJ, j))
+            a("      if (key >= T) { s%d_%d = -3.0e38; } else if (masked) {"
+              " s%d_%d = s%d_%d * am.scale + mask[mbase + qr%d * T + key]; }"
+              " else { s%d_%d = s%d_%d * am.scale; } }"
+              % (i, j, i, j, i, j, i, i, j, i, j))
+
+    def mx(names):
+        e = names[0]
+        for n in names[1:]:
+            e = "max(%s, %s)" % (e, n)
+        return e
+    for i in range(RI):
+        a("    red[(ty + %du) * 8u + tx] = %s;" % (8 * i, mx(["s%d_%d" % (i, j) for j in range(CJ)])))
+    a("    workgroupBarrier();")
+    for i in range(RI):
+        a("    var bm%d = red[(ty + %du) * 8u];" % (i, 8 * i))
+        a("    for (var t = 1u; t < 8u; t = t + 1u) { bm%d = max(bm%d, red[(ty + %du) * 8u + t]); }"
+          % (i, i, 8 * i))
+        a("    let mn%d = max(m%d, bm%d); let al%d = exp(m%d - mn%d); m%d = mn%d;"
+          % (i, i, i, i, i, i, i, i))
+        ps_ = []
+        for j in range(CJ):
+            a("    let p%d_%d = exp(s%d_%d - m%d);" % (i, j, i, j, i))
+            ps_.append("p%d_%d" % (i, j))
+        for g in range(CJ // 4):
+            a("    pt[(ty + %du) * %du + tx * %du + %du] = vec4<f32>(%s);"
+              % (8 * i, PS, CJ // 4, g, ", ".join(ps_[4 * g:4 * g + 4])))
+        a("    l%d = l%d * al%d + %s;" % (i, i, i, " + ".join(ps_)))
+        for e in range(E):
+            a("    o%d_%d = o%d_%d * al%d;" % (i, e, i, e, i))
+    a("    workgroupBarrier();")
+    a("    for (var c = 0u; c < %du; c = c + 1u) {" % (BK // 4))
+    for i in range(RI):
+        a("      let pp%d = pt[(ty + %du) * %du + c];" % (i, 8 * i, PS))
+    for u in range(4):
+        a("      let vr%d = (b * T + min(k0 + c * 4u + %du, T - 1u)) * am.vs + vcol;" % (u, u))
+        for e in range(E):
+            a("      let v%d_%d = vsrc[vr%d + tx + %du];" % (u, e, u, 8 * e))
+    for i in range(RI):
+        for e in range(E):
+            a("      o%d_%d = o%d_%d + pp%d.x * v0_%d + pp%d.y * v1_%d + pp%d.z * v2_%d"
+              " + pp%d.w * v3_%d;" % (i, e, i, e, i, e, i, e, i, e, i, e))
+    a("    }")
+    a("    workgroupBarrier();")
+    a("  }")
+    for i in range(RI):
+        a("  red[(ty + %du) * 8u + tx] = l%d;" % (8 * i, i))
+    a("  workgroupBarrier();")
+    for i in range(RI):
+        a("  { var lt = 0.0; for (var t = 0u; t < 8u; t = t + 1u) {"
+          " lt = lt + red[(ty + %du) * 8u + t]; }" % (8 * i))
+        a("    let qr = q0 + ty + %du;" % (8 * i))
+        a("    if (qr < T) { let inv = 1.0 / lt;")
+        for e in range(E):
+            a("      out[(b * T + qr) * DO + h * %du + tx + %du] = o%d_%d * inv;"
+              % (HD4, 8 * e, i, e))
+        a("    } }")
+    a("}")
+    return "\n".join(L)
+
+
+# Thread tilings raced per device: (rows, keys) per thread. The first is the default.
+_ATTN_TILES = {"4x4": (4, 4), "2x8": (2, 8)}
+_attn_added = set()
+
+
+def _attn_run(tile, src_qk, src_v, md, H, HD, T, B, scale, window, group, qs, qo, ko, vs, vo):
+    RI, CJ = _ATTN_TILES[tile]
+    name = "attn_%d_%s" % (HD, tile)
+    plat = _adam_kernel["platform"]
+    if name not in _attn_added:
+        plat.addKernel(name, {"source": _attn_src(HD, RI, CJ),
+                              "bindingTypes": ["read-only-storage"] * 3
+                              + ["storage", "read-only-storage"]})
+        _attn_added.add(name)
+    out = _empty((B * T, H * HD))
+    meta = _adam_kernel["make_meta"](
+        (T, H, group, int(window), float(scale), qs, qo, ko, vs, vo),
+        "u4,u4,u4,u4,f4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+                    "tensors": [src_qk.buffer.buffer_id, src_v.buffer.buffer_id,
+                                md.buffer.buffer_id, out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (T + 8 * RI - 1) // (8 * RI), "y": B * H, "z": 1}})
+    return out
+
+
+def fused_attention(qkv, H, HD, T, scale, mask=None, window=0, B=1, cos=None, sin=None):
+    """Bidirectional attention of a packed (B*T, 3*H*HD) projection, as (B*T, H*HD) rows.
+
+    q, k and v are the projection's three thirds, head-major inside each; with `cos`/`sin`
+    q and k are rotated first (`rope_qk`). `mask` is additive: (T, T) for every head, or
+    (P, T, T) with B*H a multiple of P, each plane serving B*H/P consecutive (sequence,
+    head) pairs. `window` > 0 lets whole key blocks outside |i - j| <= window be skipped --
+    the mask must still say so, it is what decides. Inference only: None with a gradient,
+    without WebGPU, or for a shape this does not take, and the caller keeps its expression.
+    """
+    if not _adam_backend_ready():
+        return None
+    if getattr(qkv, "requires_grad", False) or (mask is not None and mask.requires_grad):
+        return None
+    H, HD, T, B = int(H), int(HD), int(T), int(B)
+    xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
+    if tuple(xd.shape) != (B * T, 3 * H * HD) or HD % 32 or T < 1:
+        return None
+    if mask is None:
+        group, md = 0, xd
+    else:
+        md = _contig(mask.data if isinstance(mask, Tensor) else mask)
+        if tuple(md.shape) == (T, T):
+            group = B * H
+        elif (len(md.shape) == 3 and tuple(md.shape[1:]) == (T, T) and int(md.shape[0]) > 0
+              and (B * H) % int(md.shape[0]) == 0):
+            group = (B * H) // int(md.shape[0])
+        else:
+            return None
+    HD4 = HD // 4
+    if cos is not None and sin is not None:
+        qk = rope_qk(xd, cos, sin, H, HD, T, B)
+        if qk is None:
+            return None
+        src_qk, qs, qo, ko = qk.data, 2 * H * HD4, 0, H * HD4
+    else:
+        src_qk, qs, qo, ko = xd, 3 * H * HD4, 0, H * HD4
+    args = (src_qk, xd, md, H, HD, T, B, float(scale), int(window), group,
+            qs, qo, ko, 3 * H * HD4, 2 * H * HD4)
+    tile = _weight_execution("attention", "f32", HD, 1 if window else 0, T,
+                             lambda which: _attn_run(which, *args),
+                             candidates=tuple(_ATTN_TILES))
+    return Tensor(_attn_run(tile, *args))
 
 def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
     """Grouped-query attention WITHOUT materializing the KV head expansion.
@@ -5284,15 +5723,131 @@ def _wgpu_ln_meta(rows, width, eps):
     return _adam_kernel["make_meta"]((rows, width, eps), "u4,u4,f4")
 
 
+def _ln_rows_src(nv):
+    """LayerNorm with one 64-thread workgroup per row, optionally of a sum.
+
+    The row-per-THREAD kernel above gives a 519-row pass 519 threads -- eight workgroups on a
+    GPU that wants hundreds -- and each walks its 768 values three times: 130 us a call, about
+    25 GB/s. Here a row is 64 threads holding `nv` vec4s each in registers; mean and variance
+    are two exact passes over those registers, reduced through workgroup memory. With `add`
+    the row is `x + y` and that sum is written too: it is the residual stream the next block
+    adds to, so the add costs no pass of its own."""
+    L = ["""
+@group(0) @binding(0) var<storage,read> xin: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> yin: array<vec4<f32>>;
+@group(0) @binding(2) var<storage,read> gam: array<vec4<f32>>;
+@group(0) @binding(3) var<storage,read> bet: array<vec4<f32>>;
+@group(0) @binding(4) var<storage,read_write> sout: array<vec4<f32>>;
+@group(0) @binding(5) var<storage,read_write> lout: array<vec4<f32>>;
+struct LMeta { rows: u32, W4: u32, add: u32, eps: f32, }
+@group(0) @binding(6) var<storage,read> lm: LMeta;
+var<workgroup> red: array<f32, 64>;
+fn total(t: u32, v: f32) -> f32 {
+  red[t] = v;
+  workgroupBarrier();
+  for (var w = 32u; w > 0u; w = w >> 1u) {
+    if (t < w) { red[t] = red[t] + red[t + w]; }
+    workgroupBarrier();
+  }
+  let r = red[0];
+  workgroupBarrier();
+  return r;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wg.x + wg.y * 65535u;
+  if (row >= lm.rows) { return; }
+  let t = lid.x;
+  let base = row * lm.W4;
+  let add = lm.add != 0u;
+  var s = 0.0;"""]
+    for k in range(nv):
+        L.append("""  var v%(k)d = vec4<f32>();
+  let j%(k)d = t + %(o)du;
+  if (j%(k)d < lm.W4) {
+    v%(k)d = xin[base + j%(k)d];
+    if (add) { v%(k)d = v%(k)d + yin[base + j%(k)d]; sout[base + j%(k)d] = v%(k)d; }
+    s = s + (v%(k)d.x + v%(k)d.y) + (v%(k)d.z + v%(k)d.w);
+  }""" % dict(k=k, o=64 * k))
+    L.append("  let n = f32(lm.W4 * 4u);")
+    L.append("  let mu = total(t, s) / n;")
+    L.append("  var q = 0.0;")
+    for k in range(nv):
+        L.append("  if (j%(k)d < lm.W4) { let d = v%(k)d - vec4<f32>(mu); q = q + dot(d, d); }" % dict(k=k))
+    L.append("  let inv = 1.0 / sqrt(total(t, q) / n + lm.eps);")
+    for k in range(nv):
+        L.append("  if (j%(k)d < lm.W4) { lout[base + j%(k)d] = (v%(k)d - vec4<f32>(mu)) * inv"
+                 " * gam[j%(k)d] + bet[j%(k)d]; }" % dict(k=k))
+    L.append("}")
+    return "\n".join(L)
+
+
+_ln_rows_added = set()
+_ln_rows_sink = {}
+
+
+def _wgpu_ln_rows(xd, yd, gd, bd, eps):
+    """`(x + y, LN(x + y))` -- or just `LN(x)` with `yd` None -- by `_ln_rows_src`. None for a
+    width the kernel does not take (not a multiple of 4, or past 8192)."""
+    width = int(xd.shape[-1])
+    if width % 4 or width > 8192:
+        return None
+    rows = int(xd.size) // width
+    W4 = width // 4
+    nv = (W4 + 63) // 64
+    name = "ln_rows_%d" % nv
+    plat = _adam_kernel["platform"]
+    if name not in _ln_rows_added:
+        plat.addKernel(name, {"source": _ln_rows_src(nv),
+                              "bindingTypes": ["read-only-storage"] * 4 + ["storage", "storage",
+                                                                           "read-only-storage"]})
+        _ln_rows_added.add(name)
+    out = _empty(xd.shape)
+    if yd is not None:
+        ssum = _empty(xd.shape)
+    else:
+        # Never written without `add`, but a binding needs a buffer -- and not `out`: one
+        # buffer bound twice as writable fails validation and the pass computes nothing.
+        if "sink" not in _ln_rows_sink:
+            _ln_rows_sink["sink"] = _empty((4,))
+        ssum = _ln_rows_sink["sink"]
+    meta = _adam_kernel["make_meta"]((rows, W4, 1 if yd is not None else 0, float(eps)),
+                                     "u4,u4,u4,f4")
+    plat.runKernel({"name": name,
+                    "tensors": [xd.buffer.buffer_id, (yd if yd is not None else xd).buffer.buffer_id,
+                                gd.buffer.buffer_id, bd.buffer.buffer_id, ssum.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": min(rows, 65535), "y": (rows + 65534) // 65535, "z": 1}})
+    return (ssum if yd is not None else None), out
+
+
+def add_layernorm(x, y, gamma, beta, eps=1e-5):
+    """`s = x + y` and `layernorm(s)`, both returned: the residual stream and the next block's
+    input. One dispatch on WebGPU; elsewhere, or with a gradient, the two operations."""
+    if (_adam_backend_ready() and not (x.requires_grad or y.requires_grad
+                                       or gamma.requires_grad or beta.requires_grad)
+            and tuple(x.shape) == tuple(y.shape)):
+        got = _wgpu_ln_rows(_contig(x.data), _contig(y.data), _contig(gamma.data),
+                            _contig(beta.data), eps)
+        if got is not None:
+            return Tensor(got[0]), Tensor(got[1])
+    s = x + y
+    return s, layernorm(s, gamma, beta, eps)
+
+
 def _wgpu_ln_fwd(xd, gd, bd, eps):
     plat = _adam_kernel["platform"]
     if not _ln_wgpu["added"]:
+        # Registered here because `_wgpu_ln_bwd` runs them without registering.
         rw = ["read-only-storage", "read-only-storage", "read-only-storage", "storage", "read-only-storage"]
         plat.addKernel("ln_fwd", {"source": _LN_FWD_WGSL, "bindingTypes": rw})
         plat.addKernel("ln_dx", {"source": _LN_DX_WGSL, "bindingTypes": rw})
         plat.addKernel("ln_dgb", {"source": _LN_DGB_WGSL, "bindingTypes":
                                   ["read-only-storage", "read-only-storage", "storage", "storage", "read-only-storage"]})
         _ln_wgpu["added"] = True
+    got = _wgpu_ln_rows(_contig(xd), None, _contig(gd), _contig(bd), eps)
+    if got is not None:
+        return got[1]
     width = int(xd.shape[-1]); rows = int(xd.size) // width
     # Every output lane is written by ln_fwd. Host-backed zero-fill would upload
     # the entire activation before this kernel, serialising the preceding queue.

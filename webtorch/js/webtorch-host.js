@@ -171,7 +171,10 @@
           await new Promise((r) => setTimeout(r, inflight ? 100 : 0));
           if (!ready) return;
           if (inflight) continue;
-          const left = Number(await py('import webtorch\nwebtorch.calibrate_deferred(0.25)'));
+          // One probe per call into Python, the event loop between them: a call that
+          // arrives waits for the probe in progress, not for a time budget of them. A
+          // 0.25 s budget held a decision request for 320 ms right after a load.
+          const left = Number(await py('import webtorch\nwebtorch.calibrate_deferred(0)'));
           if (!(left > 0)) break;
         }
         if (remember) {
@@ -188,6 +191,52 @@
     })();
   }
   async function pyJSON(code) { return JSON.parse(await py(code)); }
+
+  // ---- what a finished decision left behind, released once the caller has its answer ----
+  //
+  // Decision requests used to leave their last Python globals and the completed GPU scratch
+  // pool alive, so this release is needed -- but not before the answer: a collect and a reap
+  // cost 6-7 ms even with nothing to free, measured, on a ~75 ms request. It runs once no
+  // call has arrived for DECISION_SCRATCH_IDLE_MS: a burst of requests reuses the scratch
+  // it would otherwise have destroyed and re-made, and the memory comes back when it ends.
+  // A burst cannot grow without bound meanwhile -- the allocation path reaps on its own
+  // budget. The model and recorded graphs stay live until an explicit Release either way.
+  const DECISION_SCRATCH_IDLE_MS = 200;
+  let scratchDue = 0;
+  let scratchLoop = null;
+  function releaseDecisionScratchWhenIdle() {
+    scratchDue = Date.now() + DECISION_SCRATCH_IDLE_MS;
+    if (scratchLoop) return;
+    scratchLoop = (async () => {
+      try {
+        for (;;) {
+          await new Promise((r) => setTimeout(r, Math.max(scratchDue - Date.now(), 0)
+                                                    + (inflight ? 50 : 0)));
+          if (!ready) return;
+          if (!inflight && Date.now() >= scratchDue) break;
+        }
+        await py(`
+for _wt_tmp in ("_req", "_m", "_out", "_tuning_before", "_tuning_after"):
+    globals().pop(_wt_tmp, None)
+globals().pop("_wt_tmp", None)
+import gc as _wt_gc
+_wt_gc.collect()
+import webtorch._core as _wt_core
+_wt_core._gpu_release_idle_pool()
+try:
+    import wgpy_backends.webgpu.webgpu_buffer as _wt_b
+    _wt_b.reap_now()
+except ImportError:
+    pass
+`);
+      } catch (e) {
+        report('memory', 'could not release completed decision scratch: '
+               + ((e && e.message) || e));
+      } finally {
+        scratchLoop = null;
+      }
+    })();
+  }
 
   // ---- what a caller can ask for -------------------------------------------------------
   const METHODS = {
@@ -571,29 +620,7 @@ json.dumps({"answer": _out, "new_tuning": _tuning_after != _tuning_before})
         return scored.answer;
       } finally {
         root.__decide_in = null;
-        // Decision requests used to leave their last Python globals and the completed
-        // GPU scratch pool alive. Like generated replies, return only unpinned scratch;
-        // the model and recorded graphs remain live until explicit Release.
-        try {
-          await py(`
-for _wt_tmp in ("_req", "_m", "_out", "_tuning_before", "_tuning_after"):
-    globals().pop(_wt_tmp, None)
-globals().pop("_wt_tmp", None)
-import gc as _wt_gc
-_wt_gc.collect()
-import webtorch._core as _wt_core
-_wt_core._gpu_release_idle_pool()
-try:
-    import wgpy_backends.webgpu.webgpu_buffer as _wt_b
-    _wt_b.reap_now()
-except ImportError:
-    pass
-`);
-        } catch (e) {
-          report('memory', 'could not release completed decision scratch: '
-                 + ((e && e.message) || e));
-          throw e;
-        }
+        releaseDecisionScratchWhenIdle();
       }
     },
 
