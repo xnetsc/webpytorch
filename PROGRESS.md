@@ -1,5 +1,27 @@
 # Progress
 
+## 2026-10-06 ▸ What the decision request costs between requests; meta buffers packed without numpy's dtype parser
+
+**Trigger:** user — the first single question takes 80–90 ms, steady state 50–60, sometimes
+30-something, while MLX answers in 20-odd.
+
+**Measured (Laya folder, M5), the same requests two ways:** back to back — one question
+16.2–16.5 ms, two 29.5–31, three 42.6–44.7 (MLX f16 three: 19.1); two seconds apart — one
+question 42–47 ms, three 63–85. Nothing of ours explains the difference (turning the idle
+scratch release off changes nothing): a fixed GPU workload takes 6.2 ms back to back and
+15–16.6 ms after ≥200 ms idle (GPU timestamps), a fixed CPU loop 1.4 → 4.5–5.5 ms after
+≥50 ms — the machine's clocks. A light GPU heartbeat (every 20–100 ms) does not keep them up.
+MLX meets the same GPU behaviour; compare like with like (spaced or back to back).
+
+**Ours, and fixable:** the second request of each new length bucket records its graph (60–68
+ms); a single question's head is issued op by op from Python (~12 ms of host work, which the
+low CPU clock multiplies by 3–4). Next: the head captured with the encoder; graphs per row
+capacity with the real row count read on the device, recorded at load.
+
+**Change now:** `create_meta_buffer_from_structure` packs with a `struct.Struct` per dtype
+string; numpy re-parsed "u4,i4,f4" (27 regex matches a parse) 32 times a decision request.
+0.6B decode 166 → 170 tok/s (its eager helpers too); decision unchanged, answers identical.
+
 ## 2026-10-06 ▸ No capability assumed: every kernel checked against the device; races sized to their work
 
 **Trigger:** user — every optimisation must rest on WebGPU's general capabilities, or on a

@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 decision latency as the user sees it:** back to back one question 16 ms / three
+43 ms; two seconds apart 42–47 / 63–85 — the M5's clocks after idle (GPU 2.6x, CPU 3-4x,
+measured outside the SDK). Ours to fix: graph recording on new lengths (60–68 ms) and the
+head issued op by op (~12 ms host). Next: head captured with the encoder, capacity-tier graphs
+with device-side row counts, recorded at load.
+
 **2026-10-06 no capability assumed:** every kernel is checked against the device's reported
 features/limits (or WebGPU's guarantees) at registration; races skip what cannot run; an
 audit found four unchecked assumptions (packed-dot language feature, 17 KB narrow GEMVs, 32 KB

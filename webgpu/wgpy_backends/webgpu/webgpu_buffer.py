@@ -1,6 +1,8 @@
 from collections import defaultdict
 from typing import List, Optional
 from time import perf_counter
+import struct
+
 import numpy as np
 from wgpy_backends.webgpu.webgpu_data_type import WebGPULogicalDType, WebGPUStorageDType
 from wgpy_backends.webgpu.texture import (
@@ -563,10 +565,25 @@ def create_meta_buffer(data: bytes) -> WebGPUMetaBuffer:
     return new_buf
 
 
+# A packer per dtype string, built once. numpy re-parses a structured dtype string on every
+# `np.array(..., dtype="u4,i4,f4")` -- 27 regex matches a parse, 32 parses a decision
+# request -- for what is a fixed little-endian layout of 4-byte fields.
+_META_STRUCTS = {}
+_META_CODES = {"u4": "I", "i4": "i", "f4": "f"}
+
+
 def create_meta_buffer_from_structure(data_tuple: tuple, dtype) -> WebGPUMetaBuffer:
     """
     example: data_tuple = (2, 1.5), dtype = "i4,f4"
     """
+    packer = _META_STRUCTS.get(dtype)
+    if packer is None:
+        fields = [f.strip() for f in dtype.split(",")] if isinstance(dtype, str) else None
+        packer = (struct.Struct("<" + "".join(_META_CODES[f] for f in fields))
+                  if fields and all(f in _META_CODES for f in fields) else False)
+        _META_STRUCTS[dtype] = packer
+    if packer:
+        return create_meta_buffer(packer.pack(*data_tuple))
     structured_array = np.array([data_tuple], dtype=dtype)
     data = structured_array.tobytes()
     return create_meta_buffer(data)
