@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 Release restart on the deployed page 8.55 → 1.12 s:** the page's service
+worker revalidated every stamped SDK file (~30 × 300 ms, sequential); stamped URLs are now
+cache-first and the SDK fetches its modules in parallel. Release still restarts the runtime
+on purpose (WASM 722 MB → 52 MB).
+
 **2026-10-05 tiled kernels cover 17 block formats (incl. i-quants); route ladders finish in
 idle time:** 27B cold load 95 → 62 s with no races in replies (hybrid linear-attention layers
 were missed by warm and ladder); Q8 decision cold load 2.5 s. WebGL: packed activations race

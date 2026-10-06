@@ -21,7 +21,9 @@ module manifest and all modules in parallel, starting before Pyodide boots, inst
 after another afterwards (a first visit or a new version pays the network once, overlapped).
 
 Locally after the change: restart 1.1 s; all 32 stamped requests answered by the cache with
-no revalidation. Deployed-page numbers in the next entry.
+no revalidation. On the deployed page (4a3ce87, service worker in control, same 0.6B):
+Release's restart 8.55 → **1.12 s**, "loading webtorch…" 6.7 → 0.28 s, 31 stamped requests,
+none revalidated. Every page load takes the same boot path, so it gains the same.
 
 ## 2026-10-05 ▸ The rest of a load's route ladders runs while idle; hybrid layers are no longer missed
 
