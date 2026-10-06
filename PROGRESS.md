@@ -1,5 +1,45 @@
 # Progress
 
+## 2026-10-06 ▸ 27B load 62 → 43 s; a hybrid's reply no longer uploads its zero state (first token −1 s)
+
+**Trigger:** user — the 27B loads slowly ("warming 39.5s · tuning … · warm-step 3.5s").
+
+**Where it went** (headless, M5, UD-Q2_K_XL, fresh profile): reading 12 s; warming 32 s;
+row ladder 11.5 s; warm step 5–8 s. cProfile of the warming: 4471 synchronous readbacks,
+30 s; 55 thread-shape tunes 18.4 s and 98 route races 22 s, none above 2 s; `gc.collect` on
+the allocation path 412 × 13 ms; self-checks 4.6 s. Shader compilation is not it: all 137
+kernels compile in 141 ms (serially; the Metal cache holds them). The warm step was 607
+uploads of 11.5 ms — the recurrent layers' zero states and constants, each upload waiting
+for every layer queued ahead of it.
+
+**Changes:**
+- `_race` (shared by `tune` and `_weight_execution`): from round three a candidate whose
+  every sample is slower than every sample of the current fastest is out; a winner with a
+  repeatable paired win over every survivor ends the race. No candidate that could still be
+  shown faster is dropped.
+- Warm-ups are one run, not a timed batch (`tune(..., warm=)`; `_weight_execution`).
+- The thread-shape race checks an explicitly raced 'shortk' at the coverage shape: unreachable
+  by routing, it had fallen back to the model's own N × K (≈1 s per format). Checked in the
+  browser at both shapes for eight formats: passes.
+- Self-check blocks and their reference decode are drawn once per (format, blocks).
+- The allocation-path reap collects the young generations, and the full heap only when that
+  leaves the ledger above its allowance; a full collect before the warm step.
+- `LinearAttentionState`: a reset clears the device buffers in place (`device_clear`: WebGPU
+  `clearBuffer`, WebGL `clearBufferfv`, a native command in order); a fresh state is device
+  zeros; no host copy unless the host path asks (151 MB of WASM heap on the 27B).
+  `prepare_device` uploads a layer's constants at load.
+
+**Measured:** 27B load 61.9–65.1 → 42.3–43.4 s (warming 32 → 17 s, ladder 11.5 → 6.7 s,
+checks 4.6 → 0.37 s); first token 6.5/5.7/5.9 → 5.0/4.5/4.5 s; decode 6.6–7.3 tok/s; replies
+identical (58/65/49 tokens). 30B MoE load 42.0 → 35.9 s, replies identical, 41.8–42.4 tok/s.
+0.6B load 7.5 s (warming 3.0 → 1.9 s), 168 tok/s; one reply's wording differs where its
+prefill took the other side of a full-width/half-precision near-tie. Decision (xDecision F16)
+51.8 ms steady, answers identical.
+
+**Left:** the warm step's first full decode touches all 9.8 GB once; under this machine's
+memory pressure (24 GB) that is 4–7 s and not our code. Every kernel edit still invalidates
+every saved verdict (the build stamp digests all WGSL), so a reload after an update re-races.
+
 ## 2026-10-06 ▸ Greedy decode pipelined: the host's work on chunk n overlaps the GPU's on chunk n+1 (0.6B 138–145 → 175–181 tok/s)
 
 **Before:** a greedy chunk uploaded its seed token, rope rows and position (four writes, each

@@ -29,35 +29,84 @@ class LinearAttentionState:
     causal-conv ring buffer. Fixed size — it does not grow with sequence length."""
 
     def __init__(self, n_v_heads, k_dim, v_dim, conv_width, conv_channels):
-        self.S = np.zeros((n_v_heads, k_dim, v_dim), np.float32)
-        self.conv = np.zeros((conv_width - 1, conv_channels), np.float32) if conv_width > 1 else None
+        self._s_shape = (n_v_heads, k_dim, v_dim)
+        self._c_shape = (conv_width - 1, conv_channels) if conv_width > 1 else None
+        # Host copies are made when the host path asks for them. A device-driven model never
+        # does, and on a 27B the 48 layers' zeros were 151 MB of WASM heap held for nothing.
+        self._S = None
+        self._conv = None
         # A GPU copy exists only while the GPU path is driving. Whichever side was written
         # last is the authoritative one, and asking for the other syncs it -- so prefill on
         # the host and decode on the device can be mixed without either going stale.
         self._gpu = None
+        # Zero, and nothing has written it since it was made or reset: then neither side
+        # needs data from the other, and each makes its zeros where it is.
+        self._zero = True
+
+    @property
+    def S(self):
+        if self._S is None:
+            self._S = np.zeros(self._s_shape, np.float32)
+        return self._S
+
+    @S.setter
+    def S(self, value):
+        self._S = value
+
+    @property
+    def conv(self):
+        if self._c_shape is None:
+            return None
+        if self._conv is None:
+            self._conv = np.zeros(self._c_shape, np.float32)
+        return self._conv
+
+    @conv.setter
+    def conv(self, value):
+        self._conv = value
 
     def reset(self):
-        self.S[:] = 0.0
-        if self.conv is not None:
-            self.conv[:] = 0.0
-        self._gpu = None
+        """Back to the zero state, where the state lives. On the device that is a clear of the
+        buffers it already has -- nothing uploaded, nothing reallocated. It used to drop them
+        and upload host zeros on the next step: 3 MB a layer, each upload waiting for all the
+        work queued ahead of it, at the start of every reply of a hybrid model."""
+        self._S = None
+        self._conv = None
+        if self._gpu is not None:
+            for b in self._gpu:
+                if b is not None:
+                    wt.device_clear(b)
+        self._zero = True
 
     def gpu(self):
-        """State on the device: (S, conv) as GPU arrays, uploading if the host wrote last."""
+        """State on the device: (S, conv) as GPU arrays -- made as zeros on the device when
+        the state is zero, uploaded only when the host wrote last."""
         if self._gpu is None:
             # Both go straight to kernels, so both stay raw device arrays.
-            self._gpu = [wt.xp.asarray(self.S.reshape(-1)),
-                         None if self.conv is None else wt.xp.asarray(self.conv.reshape(-1))]
+            if self._zero:
+                self._gpu = [wt.device_zeros(int(np.prod(self._s_shape))),
+                             None if self._c_shape is None
+                             else wt.device_zeros(int(np.prod(self._c_shape)))]
+            else:
+                self._gpu = [wt.xp.asarray(self.S.reshape(-1)),
+                             None if self._c_shape is None
+                             else wt.xp.asarray(self.conv.reshape(-1))]
+            self._S = None
+            self._conv = None
+        self._zero = False                  # whoever asked is about to write it
         return self._gpu
 
     def host(self):
         """State on the host, downloading if the device wrote last."""
         if self._gpu is not None:
             g = self._gpu
-            self.S = np.asarray(wt.cp.asnumpy(g[0]), np.float32).reshape(self.S.shape)
-            if self.conv is not None and g[1] is not None:
-                self.conv = np.asarray(wt.cp.asnumpy(g[1]), np.float32).reshape(self.conv.shape)
+            if not self._zero:              # a cleared, untouched device copy is zeros
+                self._S = np.asarray(wt.cp.asnumpy(g[0]), np.float32).reshape(self._s_shape)
+                if self._c_shape is not None and g[1] is not None:
+                    self._conv = np.asarray(wt.cp.asnumpy(g[1]),
+                                            np.float32).reshape(self._c_shape)
             self._gpu = None
+        self._zero = False                  # the host path writes it in place
         return self
 
 
@@ -374,6 +423,17 @@ class LinearAttention:
         return all(not callable(self.w.get(n)) or hasattr(self.w.get(n), "forward")
                    for n in ("qkv", "q", "k", "v", "beta", "alpha", "g", "o")
                    if self.w.get(n) is not None)
+
+    def prepare_device(self):
+        """Put the constants the device step reads on the device now, at load, while nothing
+        else is queued. Left to the first step, each upload waited for every layer queued
+        ahead of it to finish: 11.5 ms apiece, most of a 27B's 6.6 s warm step."""
+        if not self._gpu_step_ok():
+            return
+        self._zero_t()
+        self._konst()
+        if self.w.get("norm") is not None:
+            self._norm_t()
 
     def forward(self, x, state):
         """x: (T, H) ndarray -> (T, H). Sequential over T (the recurrence is inherently

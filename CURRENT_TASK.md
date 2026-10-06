@@ -13,6 +13,13 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 27B load 62 → 43 s, first token −1 s:** races stop timing candidates that lost
+every round by complete separation, one-run warm-ups, small self-check shapes, young-gen reaps;
+hybrid recurrent state cleared on the device instead of uploaded. Replies identical on 27B /
+30B / decision. Next: the cached-model CORS errors (user-reported), then the decision speed
+gap to MLX (51 ms vs 19 ms f16: GEMM efficiency, host work into JS), saved verdicts that
+survive unrelated kernel edits.
+
 **2026-10-06 greedy decode pipelined:** the next chunk is queued on the GPU before the host
 reads the current one (device-side seed, position and rope rows; one JS call per round with a
 staged readback). 0.6B decode 138–145 → 175–181 tok/s same-session, text identical; tokens now

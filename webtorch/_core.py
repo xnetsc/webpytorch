@@ -1964,6 +1964,26 @@ def moe_weighted_sum(values, weights, k, execution="auto"):
     return fused() if mode == "fused" else composed()
 
 
+def device_clear(a):
+    """Zero the device array `a` where it lives: the backend's own fill (a buffer clear on
+    WebGPU, a framebuffer clear on WebGL), in command order. No host array is made and
+    nothing is uploaded -- a zero state is a fact about the buffer, not data to move."""
+    if _adam_backend_ready():
+        _adam_kernel["platform"].clearBuffer(a.buffer.buffer_id)
+    elif _webgl_ready():
+        _copy_kernel["plat"].clearBuffer(a.buffer.buffer_id)
+    else:
+        a[...] = 0
+    return a
+
+
+def device_zeros(n):
+    """A float32 device array of `n` zeros, filled on the device (see `device_clear`)."""
+    if not (_adam_backend_ready() or _webgl_ready()):
+        return np.zeros((int(n),), np.float32)
+    return device_clear(xp.empty((int(n),), np.float32))
+
+
 def _empty_i32(shape):
     """A small int32 buffer the host rewrites between dispatches -- a step's control block,
     or the expert indices a MoE layer routes to. Persistent, so a capture can bind it once
@@ -3882,6 +3902,41 @@ def _measured_choice(samples, candidates, default=None):
 
 
 
+def _race(valid, sample, rounds, early_from=None):
+    """Interleaved rounds of `sample(c)` -> seconds over `valid`, the order alternating so no
+    candidate always follows another. Returns {candidate: samples} for the candidates still
+    in at the end; the choice among them is `_measured_choice`'s.
+
+    Two rules end measurements that can no longer change the answer -- the GPU work being
+    timed IS the cost of a race, so every sample not taken is load time given back:
+
+    - From the third round, a candidate all of whose samples are slower than all of the
+      current fastest's is out. Three-against-three complete separation happens by chance
+      one time in twenty for two equal candidates, and then they were equal; a candidate
+      that is actually faster essentially never loses every round. The losers it removes
+      are typically other thread shapes 1.3-3x slower, timed five more times for nothing.
+    - From round `early_from` (if given), measuring stops once the fastest has a repeatable
+      paired win over every candidate still in."""
+    import statistics as _s
+    live = list(valid)
+    times = {c: [] for c in live}
+    for r in range(max(1, int(rounds))):
+        order = live if not (r & 1) else list(reversed(live))
+        for c in order:
+            times[c].append(sample(c))
+        if r >= 2 and len(live) > 1:
+            lead = min(live, key=lambda c: _s.median(times[c]))
+            top = max(times[lead])
+            live = [c for c in live if c == lead or min(times[c]) <= top]
+        if len(live) == 1:
+            break
+        if early_from is not None and r + 1 >= early_from:
+            lead = _measured_choice(times, live, default=live[0])
+            if all(_paired_faster(times, lead, other) for other in live if other != lead):
+                break
+    return {c: times[c] for c in live}
+
+
 def _route_names():
     """Every value a `_weight_execution` race can record, for accepting a saved profile. Taken
     from the candidate tables themselves, so a new route is kept across reloads the day it
@@ -3940,7 +3995,7 @@ def _weight_execution(family, storage_format, K, N, M, run,
             try:
                 if check is not None and not check(which):
                     raise RuntimeError("%s failed the correctness gate" % which)
-                batch(which)                     # compile/warm before timing
+                _sync_small(run(which))          # build and warm once before timing
                 valid.append(which)
             except Exception as exc:
                 raise RuntimeError("execution candidate %r failed for %s/%s shape (%d,%d,%d)"
@@ -3948,23 +4003,15 @@ def _weight_execution(family, storage_format, K, N, M, run,
         if not valid:
             raise RuntimeError("no correct execution candidate")
         valid = tuple(valid)
-        times = {which: [] for which in valid}
-        for r in range(max(5, int(rounds))):
-            order = valid if not (r & 1) else tuple(reversed(valid))
-            for which in order:
-                times[which].append(batch(which))
-            # Five unanimous paired rounds are already p=1/32; more repetitions cannot
-            # make that decision more necessary. What has to be settled is the WINNER
-            # against each other candidate -- not how two losers rank against each other,
-            # which a race of three spent its remaining rounds on whenever they were close.
-            # If the winner is inconclusive against anything, keep measuring through the
-            # requested rounds instead of dropping a local win.
-            if r >= 4:
-                lead = _measured_choice(times, valid, default=valid[0])
-                if all(_paired_faster(times, lead, other)
-                       for other in valid if other != lead):
-                    break
-        chosen = _measured_choice(times, valid, default=valid[0])
+        # Five unanimous paired rounds are already p=1/32; more repetitions cannot make that
+        # decision more necessary. What has to be settled is the WINNER against each other
+        # candidate -- not how two losers rank against each other. If the winner is
+        # inconclusive against anything, measuring goes on through the requested rounds
+        # instead of dropping a local win; a candidate that has lost every round to it by
+        # complete separation stops being measured (`_race`).
+        times = _race(valid, batch, max(5, int(rounds)), early_from=5)
+        live = tuple(w for w in valid if w in times)
+        chosen = _measured_choice(times, live, default=live[0])
         _TUNED[key] = chosen
     finally:
         # Aggregate even failed calibration; a failed candidate must never be cached as
@@ -3975,11 +4022,13 @@ def _weight_execution(family, storage_format, K, N, M, run,
     return chosen
 
 
-def tune(key, candidates, apply, bench, check=None, rounds=5, default=None):
+def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm=None):
     """The best of `candidates` on this device, remembered under `key`.
 
     `apply(v)` installs a candidate, `bench()` runs the work once and returns only when the
-    GPU has, `check(v)` (optional) returns True if the candidate is correct.
+    GPU has, `check(v)` (optional) returns True if the candidate is correct. `warm()`
+    (optional) is the least work that builds and proves a candidate runnable before timing
+    -- one dispatch rather than a whole timed batch; without it, `bench()` serves.
     """
     if key in _TUNED:
         return _TUNED[key]
@@ -3990,26 +4039,26 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None):
             apply(v)
             if check is not None and not check(v):
                 raise RuntimeError("candidate failed its correctness gate")
-            bench()
+            (warm or bench)()
             ok.append(v)
         except Exception as exc:
             raise RuntimeError("execution candidate %r failed for tune key %r"
                                % (v, key)) from exc
     if not ok:
         raise RuntimeError("no execution candidates for tune key %r" % (key,))
-    times = {v: [] for v in ok}
-    for r in range(rounds):
-        # Alternate the queue order so a candidate cannot win merely because it always
-        # follows (or always precedes) another implementation.  This is the same paired
-        # evidence rule used by the stored-weight and containing-layer tuners.
-        order = ok if not (r & 1) else tuple(reversed(ok))
-        for v in order:
-            apply(v)
-            t0 = _t.perf_counter()
-            bench()
-            times[v].append(_t.perf_counter() - t0)
-    chosen = _measured_choice(times, ok,
-                              default=(default if default in ok else ok[0]))
+
+    def sample(v):
+        apply(v)
+        t0 = _t.perf_counter()
+        bench()
+        return _t.perf_counter() - t0
+
+    # The same paired-evidence rule as the stored-weight and containing-layer tuners, with
+    # candidates that can no longer win dropped as soon as the samples say so (`_race`).
+    times = _race(ok, sample, rounds)
+    live = [v for v in ok if v in times]
+    chosen = _measured_choice(times, live,
+                              default=(default if default in live else live[0]))
     _TUNED[key] = chosen
     return chosen
 
@@ -4080,7 +4129,7 @@ def _ggml_shape_for(type_name, N, K, packed):
         # three blocks per row so an unaligned block offset cannot hide -- the Q3_K bug that
         # cost half the columns of every tensor. Coverage is what those numbers are for; the
         # model's own N adds rows, not coverage.
-        shape = _selfcheck_shape(kind, vals) or (int(N), max(3, nb))
+        shape = _selfcheck_shape(kind, vals, explicit=True) or (int(N), max(3, nb))
         t0 = _t.perf_counter()
         try:
             _selfcheck_one(type_name, 1, kind, False, *shape)
@@ -4109,11 +4158,14 @@ def _ggml_shape_for(type_name, N, K, packed):
             o = _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"])
         o.get()
 
+    def warm():
+        _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"]).get()
+
     _t0 = _t.perf_counter()
     try:
         return tune(key, ("narrow", "balanced", "compact", "shortk", None),
                     apply, bench, check=check,
-                    default=fallback)
+                    default=fallback, warm=warm)
     finally:
         _TUNE_COST["tune_s"] += _t.perf_counter() - _t0
         _TUNE_COST["shapes"] += 1
@@ -9797,8 +9849,14 @@ def _ggml_src(type_name, mode, cfg=None, moe=False, mrow=None):
     return src
 
 
-def _selfcheck_shape(kind, vals):
+def _selfcheck_shape(kind, vals, explicit=False):
     """An (N, blocks-per-row) that provably lands on `kind`, or None if it cannot.
+
+    `explicit`: the caller dispatches `kind` by name rather than through `_shape_kind`, as a
+    thread-shape race does, so the kind is reached whatever the threshold says and only the
+    coverage has to be chosen. Without it an explicitly raced 'shortk' found no shape here
+    and its check fell back to the model's own N x K -- tens of millions of values reference-
+    decoded in numpy, once per format, about 1 s each on a 27B's load.
 
     The self-check used a single shape -- two output rows, three blocks -- for every variant
     it tested. Two rows is below `_SMALL_N`, so `_shape_kind` called every one of them
@@ -9810,7 +9868,7 @@ def _selfcheck_shape(kind, vals):
     N is deliberately not a multiple of the group width, so the last group is partial and the
     `n < gm.N` guard is exercised rather than assumed."""
     n_wide = _SMALL_N + 64
-    if kind in ("balanced", "compact"):
+    if kind in ("balanced", "compact") or (explicit and kind == "shortk"):
         # Explicit candidates do not come from `_shape_kind`; this still covers an output
         # tail and three independently byte-aligned packed blocks.
         return n_wide, 3
@@ -9873,6 +9931,9 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False, mrow=_AUTO):
     _selfcheck_one(type_name, mode, small, moe, *shape, mrow=mrow)
 
 
+_SELFCHECK_BLOCKS = {}
+
+
 def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None, gl_m=None):
     """One (thread shape, N, blocks) against the reference. Raises on a mismatch."""
     from . import ggufload as G
@@ -9894,19 +9955,32 @@ def _selfcheck_one(type_name, mode, small, moe, N, NB, mrow=None, gl_m=None):
     # bits fixes it but costs coverage of the quantized fields, so the masks are tried in
     # order and the loosest one that yields a finite block wins -- full coverage for the
     # formats that can take it, and a checkable block for the ones that cannot.
-    for mask in (0xBF, 0x3F, 0x0F):
-        for seed in range(32):
-            rng = np.random.default_rng(seed)
-            raw = (rng.integers(0, 256, (N, NB * blk), dtype=np.uint8) & mask).tobytes()
-            ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, N * K),
-                             np.float32).reshape(N, K)
-            if np.all(np.isfinite(ref)) and float(np.abs(ref).max()) < 1e4:
-                break
+    #
+    # The blocks and their reference decode depend only on (format, blocks per row), and a
+    # row decodes independently of the others, so they are drawn once for the most rows any
+    # check asks of that format and every check takes its first N rows. The thread shapes of
+    # one format were each decoding their own copy in numpy -- 2.4 s of a 27B load.
+    Nd = max(int(N), _SMALL_N + 64)
+    got = _SELFCHECK_BLOCKS.get((type_name, NB))
+    if got is None or got[0] < N:
+        for mask in (0xBF, 0x3F, 0x0F):
+            for seed in range(32):
+                rng = np.random.default_rng(seed)
+                raw = (rng.integers(0, 256, (Nd, NB * blk), dtype=np.uint8) & mask).tobytes()
+                ref = np.asarray(G.dequant(G.GGML_IDS[type_name], raw, Nd * K),
+                                 np.float32).reshape(Nd, K)
+                if np.all(np.isfinite(ref)) and float(np.abs(ref).max()) < 1e4:
+                    break
+            else:
+                continue
+            break
         else:
-            continue
-        break
-    else:
-        raise RuntimeError("could not draw a finite %s block to self-check against" % type_name)
+            raise RuntimeError("could not draw a finite %s block to self-check against"
+                               % type_name)
+        got = _SELFCHECK_BLOCKS[(type_name, NB)] = (Nd, raw, ref, seed)
+    raw = got[1][:N * NB * blk]
+    ref = got[2][:N]
+    rng = np.random.default_rng(got[3])
     # The batched path is checked at more than two ROW GROUPS, not at three rows. A
     # workgroup covers `mrow * KSG` rows and each of a thread's rows is its own accumulator
     # and its own guarded write, so M = 3 leaves every accumulator above the third untouched

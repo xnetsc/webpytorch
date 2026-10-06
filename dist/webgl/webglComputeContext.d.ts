@@ -83,7 +83,11 @@ export interface ComputeContextGLMessageReleaseCapture {
     method: 'gl.releaseCapture';
     name: string;
 }
-export type ComputeContextGLMessage = ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageUploadMemory | ComputeContextGLMessageSharedUpload | ComputeContextGLMessageReleaseUploadMemory | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures | ComputeContextGLMessageReleaseCapture;
+export interface ComputeContextGLMessageClearBuffer {
+    method: 'gl.clearBuffer';
+    id: number;
+}
+export type ComputeContextGLMessage = ComputeContextGLMessageClearBuffer | ComputeContextGLMessageAddKernel | ComputeContextGLMessageCreateBuffer | ComputeContextGLMessageDisposeBuffer | ComputeContextGLMessageGetData | ComputeContextGLMessageRunKernel | ComputeContextGLMessageSetData | ComputeContextGLMessageUploadMemory | ComputeContextGLMessageSharedUpload | ComputeContextGLMessageReleaseUploadMemory | ComputeContextGLMessageBeginCapture | ComputeContextGLMessageEndCapture | ComputeContextGLMessageReplay | ComputeContextGLMessageResetCaptures | ComputeContextGLMessageReleaseCapture;
 export declare class ComputeContextGL {
     tensorBuffers: Map<number, WebGLTensorBuffer>;
     commandError: unknown;

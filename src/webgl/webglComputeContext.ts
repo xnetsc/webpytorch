@@ -102,7 +102,13 @@ export interface ComputeContextGLMessageReleaseCapture {
   name: string;
 }
 
+export interface ComputeContextGLMessageClearBuffer {
+  method: 'gl.clearBuffer';
+  id: number;
+}
+
 export type ComputeContextGLMessage =
+  | ComputeContextGLMessageClearBuffer
   | ComputeContextGLMessageAddKernel
   | ComputeContextGLMessageCreateBuffer
   | ComputeContextGLMessageDisposeBuffer
@@ -418,6 +424,12 @@ export class ComputeContextGL {
       case 'gl.releaseCapture':
         this.releaseCapture(message.name);
         break;
+      case 'gl.clearBuffer': {
+        const tb = this.tensorBuffers.get(message.id);
+        if (!tb) throw new Error(`WebGL clear target ${message.id} was not created`);
+        tb.clear();
+        break;
+      }
     }
   }
 }

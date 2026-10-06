@@ -262,6 +262,25 @@ export class WebGLTensorBuffer {
     this.isBoundToDrawFrameBuffer = true;
   }
 
+  /** Zero every texel where it lives: the framebuffer clear, layer by layer, typed to the
+   * texture's own format. No data comes from the host. */
+  clear(): void {
+    const { gl } = getNNWebGLContext();
+    const layers = this.textureShape.dim === '2DArray' ? this.textureShape.depth : 1;
+    const type = this.textureShape.type;
+    for (let layer = 0; layer < layers; layer++) {
+      this.bindToDrawTexture(layer);
+      try {
+        if (type === gl.INT) gl.clearBufferiv(gl.COLOR, 0, new Int32Array(4));
+        else if (type === gl.UNSIGNED_INT || type === gl.UNSIGNED_BYTE) {
+          gl.clearBufferuiv(gl.COLOR, 0, new Uint32Array(4));
+        } else gl.clearBufferfv(gl.COLOR, 0, new Float32Array(4));
+      } finally {
+        this.unbindFromDrawTexture();
+      }
+    }
+  }
+
   unbindFromDrawTexture(): void {
     if (!this.isBoundToDrawFrameBuffer) return;
 

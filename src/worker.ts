@@ -252,6 +252,10 @@ function initGLInterface(glAvailable: boolean, glDeviceInfo: any) {
     releaseCapture: (name: string) => {
       commands.enqueue({ method: 'gl.releaseCapture', name });
     },
+    /** Zero a buffer where it lives, in command order: no host data crosses. */
+    clearBuffer: (id: number) => {
+      commands.enqueue({ method: 'gl.clearBuffer', id });
+    },
   };
 }
 
@@ -490,6 +494,10 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     },
     releaseCapture: (name: string) => {
       commands.enqueue({ method: 'gpu.releaseCapture', name });
+    },
+    /** Zero a buffer where it lives, in command order: no host data crosses. */
+    clearBuffer: (id: number) => {
+      commands.enqueue({ method: 'gpu.clearBuffer', id });
     },
     /** One crossing per round of a pipelined loop. Queue a replay of `name` (if given) and
      * a staged read of the first `byteLength` bytes of buffer `id` into `stageSlot` (if

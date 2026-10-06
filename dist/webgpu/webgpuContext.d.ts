@@ -60,6 +60,9 @@ export declare class NNWebGPUContext {
      * the same command buffer, and submit it. The copy sees those dispatches' results with no
      * separate submission; `dst` may be mapped as soon as this returns. */
     copyAndSubmit(src: GPUBuffer, dst: GPUBuffer, byteLength: number): void;
+    /** Zero `buffer` behind every dispatch encoded so far, in the same command buffer: the
+     * device's own fill, with no data from the host and no submission of its own. */
+    clearBuffer(buffer: GPUBuffer): void;
     deferDispose(buffer: GPUBuffer): void;
     rentReadback(byteLength: number): GPUBuffer;
     returnReadback(buffer: GPUBuffer, byteLength: number, reusable: boolean): void;

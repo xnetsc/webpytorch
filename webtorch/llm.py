@@ -3067,6 +3067,9 @@ class CausalLM:
         # recurrent states for linear-attention layers (fixed size, independent of length)
         self.lin_state = [lay["linear"].new_state() if lay.get("linear") else None
                           for lay in getattr(self, "layers", [])]
+        for lay in getattr(self, "layers", []):
+            if lay.get("linear") is not None and hasattr(lay["linear"], "prepare_device"):
+                lay["linear"].prepare_device()
         # Only full-attention layers hold a context-length K/V cache; a recurrent layer
         # carries its fixed-size state instead, so allocating a cache for it would be pure
         # waste — on a stack that is mostly linear that is most of the KV memory.
@@ -3106,6 +3109,9 @@ class CausalLM:
             _load_stage("warm-oracle")
             self._tune_decode_composition()
             _load_stage("warm-step")
+            # A phase boundary is where the full collect belongs: what the races left in
+            # reference cycles goes before the first step touches every weight.
+            wt.gpu_reap()
             wt._gpu_release_idle_pool()
             self._warm_decode_step()
             _load_stage("warm-greedy")

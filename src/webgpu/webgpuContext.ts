@@ -511,6 +511,20 @@ export class NNWebGPUContext {
     this.flush();
   }
 
+  /** Zero `buffer` behind every dispatch encoded so far, in the same command buffer: the
+   * device's own fill, with no data from the host and no submission of its own. */
+  clearBuffer(buffer: GPUBuffer): void {
+    this.assertAlive();
+    if (this.passEncoder) {
+      this.passEncoder.end();
+      this.passEncoder = null;
+    }
+    if (!this.commandEncoder) this.commandEncoder = this.device.createCommandEncoder();
+    this.commandEncoder.clearBuffer(buffer);
+    this.pendingCount++;
+    if (this.pendingCount >= this.flushThreshold) this.flush();
+  }
+
   // Defer a buffer destroy until the next flush: a dispatch already encoded in
   // the pending command buffer may still reference it.
   deferDispose(buffer: GPUBuffer): void {

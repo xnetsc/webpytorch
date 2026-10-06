@@ -96,6 +96,10 @@ export interface ComputeContextGPUMessageReleaseCapture {
     method: 'gpu.releaseCapture';
     name: string;
 }
+export interface ComputeContextGPUMessageClearBuffer {
+    method: 'gpu.clearBuffer';
+    id: number;
+}
 export interface ComputeContextGPUMessageStageArena {
     method: 'gpu.stageArena';
     memory: SharedArrayBuffer;
@@ -110,7 +114,7 @@ export interface ComputeContextGPUMessageStageRead {
     slot: number;
     seq: number;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead;
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;

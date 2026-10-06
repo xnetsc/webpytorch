@@ -235,6 +235,22 @@ work. Where measurement said a knob does not pay (`_GGML_KSG`,
 widening `_SMALL_N`) it is *not* made dynamic, and the negative result is recorded next to
 the constant so it is not rediscovered.
 
+**What a race costs is the GPU work it times**, so measurements that cannot change the
+answer are not taken (`_race`): from the third round, a candidate all of whose samples are
+slower than all of the current fastest's is out — complete separation, three against three,
+which two equal candidates produce one time in twenty and a genuinely faster one essentially
+never — and a race whose winner has a repeatable paired win over every survivor stops. A
+candidate is warmed with one run (it only has to build and prove it runs), not a timed batch,
+and a variant raced by name is self-checked at the small coverage shape rather than at the
+model's own N × K. A 27B's load: warming 32 → 17 s, its row ladder 11.5 → 6.7 s, checks
+4.6 → 0.4 s; the replies of the 27B, the 30B MoE and the decision model came out identical.
+
+A hybrid model's recurrent state is **zeroed where it lives**: a reset clears the device
+buffers it already has (WebGPU's `clearBuffer`, WebGL's `clearBufferfv` on the texture), and
+a fresh state is made as device zeros, so a reply starts without sending the host's zeros —
+3 MB a layer, each upload waiting for everything queued ahead of it. 27B first token
+5.7–6.5 → 4.5–5.0 s. The layers' constants go up at load, while nothing else is queued.
+
 **KV reuse.** A reply keeps its cache; the next turn re-uses the longest common prefix of
 token ids rather than re-reading the prompt. The invariant that makes it safe: the cache's
 id list is committed in a `finally`, so an aborted or errored generation leaves the recorded

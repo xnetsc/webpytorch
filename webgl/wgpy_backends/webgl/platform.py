@@ -101,6 +101,10 @@ class WebGLPlatform:
     def replay(self, name):
         return gl.replay(name)
 
+    def clearBuffer(self, buffer_id):
+        """Zero a buffer where it lives, in command order. No host data crosses."""
+        return gl.clearBuffer(buffer_id)
+
 
 _instance = None
 

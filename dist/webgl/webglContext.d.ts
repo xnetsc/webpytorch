@@ -82,6 +82,9 @@ export declare class WebGLTensorBuffer {
     bindToReadTexture(unit: number): void;
     unbindFromReadTexture(): void;
     bindToDrawTexture(layer?: number): void;
+    /** Zero every texel where it lives: the framebuffer clear, layer by layer, typed to the
+     * texture's own format. No data comes from the host. */
+    clear(): void;
     unbindFromDrawTexture(): void;
     getDataRawFloat32(): Float32Array;
     getDataRaw(target?: ArrayBufferView): {

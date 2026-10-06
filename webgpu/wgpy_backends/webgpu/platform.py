@@ -260,6 +260,10 @@ class WebGPUPlatform:
     def replay(self, name):
         return gpu.replay(name)
 
+    def clearBuffer(self, buffer_id):
+        """Zero a buffer where it lives, in command order. No host data crosses."""
+        return gpu.clearBuffer(buffer_id)
+
     def replayStaged(self, name, buffer_id, byte_length, stage_slot, collect_slot):
         """One crossing per round of a pipelined loop: queue a replay of `name` (None for
         none) and a staged read of buffer `buffer_id`'s first `byte_length` bytes into

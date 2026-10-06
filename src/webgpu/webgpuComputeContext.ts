@@ -117,6 +117,11 @@ export interface ComputeContextGPUMessageReleaseCapture {
   name: string;
 }
 
+export interface ComputeContextGPUMessageClearBuffer {
+  method: 'gpu.clearBuffer';
+  id: number;
+}
+
 export interface ComputeContextGPUMessageStageArena {
   method: 'gpu.stageArena';
   memory: SharedArrayBuffer;
@@ -152,7 +157,8 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageResetCaptures
   | ComputeContextGPUMessageReleaseCapture
   | ComputeContextGPUMessageStageArena
-  | ComputeContextGPUMessageStageRead;
+  | ComputeContextGPUMessageStageRead
+  | ComputeContextGPUMessageClearBuffer;
 
 export class ComputeContextGPU {
   tensorBuffers: Map<number, WebGPUTensorBuffer> = new Map();
@@ -565,6 +571,12 @@ export class ComputeContextGPU {
       case 'gpu.stageRead':
         this.stageRead(message.id, message.byteLength, message.slot, message.seq);
         break;
+      case 'gpu.clearBuffer': {
+        const tb = this.tensorBuffers.get(message.id);
+        if (!tb) throw new Error(`WebGPU clear target ${message.id} was not created`);
+        getNNWebGPUContext().clearBuffer(tb.gpuBuffer);
+        break;
+      }
     }
   }
 }
