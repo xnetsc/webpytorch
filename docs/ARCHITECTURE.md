@@ -128,6 +128,12 @@ about any of this.
   xDecision encoder went 117.3 → 103.8 ms with unchanged answers. Q4_0, Q4_1, Q5_0, Q5_1,
   Q4_K, Q5_K, Q6_K, Q3_K and Q2_K share one template (`_TILED_TEMPLATE`): each is A·q′ − B
   per sub-block with q′ exact in a half, so a format supplies only how to read q′, A and B.
+  Where the device has `shader-f16` the same template also yields `"tiled_half"`
+  (`_ggml_tiled_half_src`): the stage holds A·q′ as halves (the dequantised weight, so a half
+  sum never sees q′ times an activation), the activations are staged once as halves, a
+  32-deep stage is summed in half and added into f32. A phase-two cross-width route
+  (`_PHASE2_CROSS_WIDTH`), raced with a 1e-2 output gate: ~1e-3 of the output scale,
+  1.4–1.6× the f32 kernel at 0.6B prefill shapes; a 161-token first token 112 → 94 ms.
 - The quantised kernel it falls back to was bound by decoding the same weight again for
   every output row. One thread owned four rows, so a decoded value fed four multiplies; it
   now owns twelve (`_GGML_MROW`), and the per-row guard that put eleven branches in the

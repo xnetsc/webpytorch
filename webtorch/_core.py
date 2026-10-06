@@ -3881,6 +3881,15 @@ def _measured_choice(samples, candidates, default=None):
     return chosen
 
 
+
+def _route_names():
+    """Every value a `_weight_execution` race can record, for accepting a saved profile. Taken
+    from the candidate tables themselves, so a new route is kept across reloads the day it
+    is added rather than silently re-measured on every load."""
+    return ({"stored", "tiled", "tiled_half", "dp4a", "materialized", "full", "packed",
+             "selected_full", "selected_q", "base", "alternate", "f32", "f16"}
+            | set(_ATTN_TILES) | set(_CATTN_TARGETS))
+
 def _weight_execution(family, storage_format, K, N, M, run,
                       candidates=("stored", "materialized"), check=None, rounds=9,
                       repeat=4):
@@ -4282,9 +4291,7 @@ def use_kernel_profile(profile):
             _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
             n += 1
-        elif (len(parts) == 6 and parts[0] == "weight_exec"
-              and v in ("stored", "tiled", "dp4a", "materialized", "full", "packed",
-                        "selected_full", "selected_q", "base", "alternate")):
+        elif (len(parts) == 6 and parts[0] == "weight_exec" and v in _route_names()):
             _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
             n += 1
@@ -10591,6 +10598,138 @@ def _ggml_tiled_src(type_name):
     return src
 
 
+def _ggml_tiled_half_src(type_name):
+    """The tiled kernel with its products in half precision, where the device has
+    `shader-f16`.
+
+    The stage holds the dequantised weight A*q' as halves (as llama.cpp's Metal matmul does)
+    rather than q' with A applied per sub-block afterwards, so a running half sum never sees
+    q' times an activation -- 63 x a large activation summed 16 times can leave the half
+    range, the weight times it cannot. The activations are staged once per workgroup as
+    halves; each thread sums a 32-deep stage in half and adds it into f32. Formats with a
+    min keep B times the row sums per sub-block in f32. ~1e-3 of the output scale against
+    ~1e-6 for the f32 kernel; 1.4-1.6x faster on an Apple M5 at prefill shapes."""
+    sb, hasb, funcs = _TILED_FORMATS[type_name]
+    vals = int(_GGML_TYPES[type_name][2])
+    t = _TILED_TEMPLATE
+    subs = [
+        ("var<workgroup> sB: array<vec4<f32>, 32>;",
+         "var<workgroup> sB: array<vec4<f32>, 32>;\n"
+         "// The stage's 32 rows x 32 k of activations, once, as halves: [row * 9 + k4].\n"
+         "var<workgroup> xsh: array<vec4<f16>, 288>;"),
+        ("""    let mlo = QV(b, kl0 + kq * 4u, c4);
+    let mhi = QV(b, kl0 + kq * 4u, c4 + 1u);
+    for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+      bs[(kq * 4u + j) * 8u + c8] = h2(mlo[j], mhi[j]);
+    }
+    if (kq < NSUBu) {
+      let s = kl0 / SBu + kq;
+      sA[kq * 16u + c8 * 2u] = QA(b, s, c4);
+      sA[kq * 16u + c8 * 2u + 1u] = QA(b, s, c4 + 1u);
+      HASB_STORE
+    }
+    workgroupBarrier();""",
+         """    if (kq < NSUBu) {
+      let s = kl0 / SBu + kq;
+      sA[kq * 16u + c8 * 2u] = QA(b, s, c4);
+      sA[kq * 16u + c8 * 2u + 1u] = QA(b, s, c4 + 1u);
+      HASB_STORE
+    }
+    let mlo = QV(b, kl0 + kq * 4u, c4);
+    let mhi = QV(b, kl0 + kq * 4u, c4 + 1u);
+    for (var q = 0u; q < 4u; q = q + 1u) {
+      let e = t + q * 64u; let rr = e >> 3u; let cc = e & 7u;
+      let ir = min(wg.y * 32u + rr, M - 1u);
+      xsh[rr * 9u + cc] = vec4<f16>(array_a[ir * KD4 + (kg >> 2u) + cc]);
+    }
+    workgroupBarrier();
+    // A is per sub-block: computed once above, read here by the threads of its k-quads.
+    let sub0 = (kq * 4u) / SBu;
+    let alo = sA[sub0 * 16u + c8 * 2u]; let ahi = sA[sub0 * 16u + c8 * 2u + 1u];
+    for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+      bs[(kq * 4u + j) * 8u + c8] = h2(mlo[j] * alo, mhi[j] * ahi);
+    }
+    workgroupBarrier();
+    var p00 = vec4<f16>(); var p01 = vec4<f16>(); var p02 = vec4<f16>(); var p03 = vec4<f16>();
+    var p10 = vec4<f16>(); var p11 = vec4<f16>(); var p12 = vec4<f16>(); var p13 = vec4<f16>();"""),
+        ("""      var p00 = vec4<f32>(); var p01 = vec4<f32>(); var p02 = vec4<f32>(); var p03 = vec4<f32>();
+      var p10 = vec4<f32>(); var p11 = vec4<f32>(); var p12 = vec4<f32>(); var p13 = vec4<f32>();
+""", ""),
+        ("""        let a0 = array_a[i0 * KD4 + kb4 + k4]; let a1 = array_a[i1 * KD4 + kb4 + k4];
+        let a2 = array_a[i2 * KD4 + kb4 + k4]; let a3 = array_a[i3 * KD4 + kb4 + k4];
+        HASB_ROWSUM
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+          let pk = bs[((sub * SB4u + k4) * 4u + j) * 8u + li.x];
+          let lo = vec4<f32>(unpack2x16float(pk.x), unpack2x16float(pk.y));
+          let hi = vec4<f32>(unpack2x16float(pk.z), unpack2x16float(pk.w));
+          p00 = vec4<f32>(a0[j]) * lo + p00; p10 = vec4<f32>(a0[j]) * hi + p10;
+          p01 = vec4<f32>(a1[j]) * lo + p01; p11 = vec4<f32>(a1[j]) * hi + p11;
+          p02 = vec4<f32>(a2[j]) * lo + p02; p12 = vec4<f32>(a2[j]) * hi + p12;
+          p03 = vec4<f32>(a3[j]) * lo + p03; p13 = vec4<f32>(a3[j]) * hi + p13;
+        }
+      }
+      let d0 = sA[sub * 16u + li.x * 2u]; let d1 = sA[sub * 16u + li.x * 2u + 1u];
+      s00 = p00 * d0 + s00; s10 = p10 * d1 + s10;
+      s01 = p01 * d0 + s01; s11 = p11 * d1 + s11;
+      s02 = p02 * d0 + s02; s12 = p12 * d1 + s12;
+      s03 = p03 * d0 + s03; s13 = p13 * d1 + s13;
+      HASB_APPLY
+    }""",
+         """        let xo = sub * SB4u + k4;
+        let h0 = xsh[(li.y * 4u) * 9u + xo]; let h1 = xsh[(li.y * 4u + 1u) * 9u + xo];
+        let h2v = xsh[(li.y * 4u + 2u) * 9u + xo]; let h3 = xsh[(li.y * 4u + 3u) * 9u + xo];
+        let a0 = vec4<f32>(h0); let a1 = vec4<f32>(h1); let a2 = vec4<f32>(h2v); let a3 = vec4<f32>(h3);
+        HASB_ROWSUM
+        // Every workgroup load of the step before its FMAs.
+        let pk0 = bs[((sub * SB4u + k4) * 4u) * 8u + li.x];
+        let pk1 = bs[((sub * SB4u + k4) * 4u + 1u) * 8u + li.x];
+        let pk2 = bs[((sub * SB4u + k4) * 4u + 2u) * 8u + li.x];
+        let pk3 = bs[((sub * SB4u + k4) * 4u + 3u) * 8u + li.x];
+        HALFFMA
+      }
+      HASB_APPLY
+    }
+    s00 = s00 + vec4<f32>(p00); s10 = s10 + vec4<f32>(p10);
+    s01 = s01 + vec4<f32>(p01); s11 = s11 + vec4<f32>(p11);
+    s02 = s02 + vec4<f32>(p02); s12 = s12 + vec4<f32>(p12);
+    s03 = s03 + vec4<f32>(p03); s13 = s13 + vec4<f32>(p13);"""),
+    ]
+    for old, new in subs:
+        assert t.count(old) == 1, old[:60]
+        t = t.replace(old, new)
+    fma = []
+    for j in range(4):
+        fma.append(
+            "{ let lo = bitcast<vec4<f16>>(pk%(j)d.xy); let hi = bitcast<vec4<f16>>(pk%(j)d.zw);\n"
+            "          p00 = fma(vec4<f16>(h0[%(j)d]), lo, p00); p10 = fma(vec4<f16>(h0[%(j)d]), hi, p10);\n"
+            "          p01 = fma(vec4<f16>(h1[%(j)d]), lo, p01); p11 = fma(vec4<f16>(h1[%(j)d]), hi, p11);\n"
+            "          p02 = fma(vec4<f16>(h2v[%(j)d]), lo, p02); p12 = fma(vec4<f16>(h2v[%(j)d]), hi, p12);\n"
+            "          p03 = fma(vec4<f16>(h3[%(j)d]), lo, p03); p13 = fma(vec4<f16>(h3[%(j)d]), hi, p13); }"
+            % dict(j=j))
+    t = "enable f16;\n" + t.replace("HALFFMA", "\n        ".join(fma))
+    src = (t.replace("HELP", _TILED_HELP).replace("FUNCS", funcs)
+           .replace("VALSu", "%du" % vals).replace("NSUBu", "%du" % (32 // sb))
+           .replace("SB4u", "%du" % (sb // 4)).replace("SBu", "%du" % sb))
+    if hasb:
+        src = (src.replace("HASB_STORE",
+                           "sB[kq * 16u + c8 * 2u] = QB(b, s, c4);\n"
+                           "      sB[kq * 16u + c8 * 2u + 1u] = QB(b, s, c4 + 1u);")
+               .replace("HASB_ROWSUM",
+                        "let one = vec4<f32>(1.0);\n"
+                        "        r0 = r0 + dot(a0, one); r1 = r1 + dot(a1, one);\n"
+                        "        r2 = r2 + dot(a2, one); r3 = r3 + dot(a3, one);")
+               .replace("HASB_APPLY",
+                        "let e0 = sB[sub * 16u + li.x * 2u]; let e1 = sB[sub * 16u + li.x * 2u + 1u];\n"
+                        "      s00 = s00 - e0 * r0; s10 = s10 - e1 * r0;\n"
+                        "      s01 = s01 - e0 * r1; s11 = s11 - e1 * r1;\n"
+                        "      s02 = s02 - e0 * r2; s12 = s12 - e1 * r2;\n"
+                        "      s03 = s03 - e0 * r3; s13 = s13 - e1 * r3;"))
+    else:
+        src = (src.replace("HASB_STORE", "").replace("HASB_ROWSUM", "")
+               .replace("HASB_APPLY", ""))
+    return src
+
+
 # Formats with a tiled kernel. Adding one is adding its decode, not a branch elsewhere.
 _GGML_TILED = {"Q8_0": _GGML_TILED_Q8_0_WGSL}
 _GGML_TILED.update({name: _ggml_tiled_src(name) for name in _TILED_FORMATS})
@@ -10622,16 +10761,18 @@ def _ggml_tiled_split(M, N):
     return 4 if groups < 48 else 1
 
 
-def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None):
+def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None, half=False):
     """xf(M,K) @ W(N,K).T from the stored blocks, through the tiled kernel above.
-    `split` overrides how many ways K is cut (measurement only)."""
+    `split` overrides how many ways K is cut (measurement only); `half` takes the
+    half-arithmetic kernel (`_ggml_tiled_half_src`)."""
     M, K, N = int(xf.shape[0]), int(K), int(N)
     plat = _adam_kernel["platform"]
-    name = "ggml_tiled_" + type_name.lower()
+    name = ("ggml_tiledh_" if half else "ggml_tiled_") + type_name.lower()
     grid = _ggml_grid(type_name) if "binding(4) var<storage,read> gr" in _GGML_TILED[type_name] \
         else None
     if name not in _ggml_tiled_k["added"]:
-        plat.addKernel(name, {"source": _GGML_TILED[type_name],
+        plat.addKernel(name, {"source": (_ggml_tiled_half_src(type_name) if half
+                                         else _GGML_TILED[type_name]),
                               "bindingTypes": ["read-only-storage", "read-only-storage",
                                                "storage", "read-only-storage"]
                                              + (["read-only-storage"] if grid is not None
@@ -10679,9 +10820,9 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     expands a supported weight on the GPU.  ``"auto"`` is reserved for a measured routing
     policy; callers must opt into it rather than silently changing representations.
     """
-    if execution not in ("stored", "tiled", "dp4a", "materialized", "auto"):
-        raise ValueError("execution must be 'stored', 'tiled', 'dp4a', 'materialized', "
-                         "or 'auto'")
+    if execution not in ("stored", "tiled", "tiled_half", "dp4a", "materialized", "auto"):
+        raise ValueError("execution must be 'stored', 'tiled', 'tiled_half', 'dp4a', "
+                         "'materialized', or 'auto'")
     if shape_execution not in ("auto", None, "narrow", "balanced", "compact", "shortk"):
         raise ValueError("stored shape execution is not a known physical route")
     # A dedicated two-row kernel, not the batched one: verifying a speculative draft is a
@@ -10728,6 +10869,11 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
     can_tiled = (execution in ("auto", "tiled")
                  and eidx is None and not xper and _adam_backend_ready()
                  and _ggml_tiled_ok(type_name, K, N))
+    # Its half-arithmetic twin, only where the device has `shader-f16`.
+    can_tiled_half = (execution in ("auto", "tiled_half")
+                      and eidx is None and not xper and _adam_backend_ready()
+                      and type_name in _TILED_FORMATS and _ggml_tiled_ok(type_name, K, N)
+                      and bool(gpu_features().get("f16")))
     can_dp4a = (execution in ("auto", "dp4a")
                 and eidx is None and not xper and _adam_backend_ready()
                 and type_name in ("Q4_K", "Q6_K") and m == 1)
@@ -10737,11 +10883,14 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
         raise RuntimeError("%s has no verified materialized comparison path" % type_name)
     if execution == "tiled" and not can_tiled:
         raise RuntimeError("%s shape has no tiled stored-format path" % type_name)
+    if execution == "tiled_half" and not can_tiled_half:
+        raise RuntimeError("%s shape has no half-arithmetic tiled path here" % type_name)
     if execution == "auto":
-        if can_tiled or can_dp4a or can_materialize:
+        if can_tiled or can_tiled_half or can_dp4a or can_materialize:
             # The tiled kernel reads the same stored blocks and allocates nothing, so it
             # sits right after "stored": an unproven race keeps the earlier candidate.
             candidates = (("stored",) + (("tiled",) if can_tiled else ())
+                          + (("tiled_half",) if can_tiled_half else ())
                           + (("dp4a",) if can_dp4a else ())
                           + (("materialized",) if can_materialize else ()))
             reference = [None]
@@ -10763,15 +10912,17 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                 # Activation INT8 is an explicit phase-two approximation.  The bound is on
                 # the operator output, measured against this weight and real activation;
                 # expanded-float remains a same-values comparison with the tighter bound.
-                limit = 0.03 if which == "dp4a" else 1e-3
+                # Half arithmetic: ~1e-3 of the output scale measured, bounded at 1e-2.
+                limit = (0.03 if which == "dp4a" else 1e-2 if which == "tiled_half"
+                         else 1e-3)
                 return float(np.abs(got - reference[0]).max()) / scale < limit
 
             execution = _weight_execution(
                 "ggml", type_name, K, N, m, run, candidates=candidates, check=correct)
         else:
             execution = "stored"
-    if execution == "tiled":
-        of = _ggml_tiled_matmul(xf, packed, type_name, K, N)
+    if execution in ("tiled", "tiled_half"):
+        of = _ggml_tiled_matmul(xf, packed, type_name, K, N, half=execution == "tiled_half")
         return of if bias is None else of + bias
     if execution == "dp4a":
         of = (_q4k_dp4a_matmul(xf, packed, K, N) if type_name == "Q4_K"
@@ -12891,6 +13042,16 @@ _PHASE2_CROSS_WIDTH = {
         "webgpu": "measured_per_format_shape_device",
         "webgl": "primitive_unavailable_keep_stored",
     },
+    # Activations and running sums in half (`shader-f16`), output in f32. Offered only where
+    # the device was created with the feature; gated per input against the f32 route.
+    "dense_half_activation_f16": {            # `_mm_half_src`, raced in `matmul_f16w`
+        "webgpu": "measured_per_shape_device_when_shader_f16",
+        "webgl": "primitive_unavailable_keep_f32",
+    },
+    "ggml_tiled_activation_f16": {            # `_ggml_tiled_half_src`, raced in `ggml_matmul`
+        "webgpu": "measured_per_format_shape_device_when_shader_f16",
+        "webgl": "primitive_unavailable_keep_stored",
+    },
 }
 
 
@@ -14097,9 +14258,9 @@ class GGMLLinear(Module):
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
 
     def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
-        if execution not in ("stored", "tiled", "dp4a", "materialized", "auto"):
-            raise ValueError("execution must be 'stored', 'tiled', 'dp4a', 'materialized', "
-                             "or 'auto'")
+        if execution not in ("stored", "tiled", "tiled_half", "dp4a", "materialized", "auto"):
+            raise ValueError("execution must be 'stored', 'tiled', 'tiled_half', 'dp4a', "
+                             "'materialized', or 'auto'")
         vals, blk = _GGML_TYPES[type_name][2], _GGML_TYPES[type_name][3]
         if _webgl_q8_ok(type_name, K, N):
             self.packed = _webgl_q8_pack(raw, K, N)

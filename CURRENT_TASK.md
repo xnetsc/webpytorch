@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 quantised prefill in half arithmetic (phase two, gated, `shader-f16` only):**
+0.6B first token at 161 tokens 112 → 94 ms; one of three greedy replies continues
+differently (near-tie). Saved profiles keep all new route names. Next: decode step (562
+dispatches; Q6_K GEMV; fusion), then per-token work out of Python.
+
 **2026-10-06 prefill attention reads the half KV cache in place:** per layer 3–11× faster
 (182 rows 1.41 → 0.31 ms; 64 rows after 2000 cached 8.1 → 0.70 ms); 0.6B first token at 161
 tokens 140–149 → 112 ms. Prefill is now the quantised tiled matmuls (f32, ~2 TFLOPS) -- next:

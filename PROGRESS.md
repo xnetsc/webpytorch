@@ -1,5 +1,36 @@
 # Progress
 
+## 2026-10-06 ▸ Quantised prefill in half arithmetic (phase two): 161-token first token 112 → 94 ms
+
+**Why:** after the attention change a 252-row prefill was 114 of 143 ms GPU in the tiled
+quantised matmuls (f32 arithmetic, ~2 TFLOPS); the device does 6.2 TFLOPS in half.
+
+**Change:** `"tiled_half"` (`_ggml_tiled_half_src`), generated from the same template for all
+17 tiled formats and offered only where the device has `shader-f16`. The stage stores the
+dequantised weight A·q′ as halves (llama.cpp's Metal matmul does the same) instead of q′ —
+q′ times a large activation summed in half can overflow, the weight times it cannot; A is
+computed once per sub-block into workgroup memory; activations are staged once per workgroup
+as halves; a 32-deep stage is summed in half and added into f32; B·Σx stays per sub-block in
+f32. Raced in `ggml_matmul` beside stored/tiled/materialized with a 1e-2 output gate, and
+declared in `_PHASE2_CROSS_WIDTH` with the dense half route (phase two: cross-width,
+measured, gated).
+
+| 252 rows (wall incl. ~0.06 ms host) | f32 tiled | half tiled | error (of output max) |
+|---|---|---|---|
+| Q4_K 1024→3072 | 0.906 ms | 0.657 ms | 1.1e-3 |
+| Q4_K 3072→1024 | 1.188 ms | 0.723 ms | 1.1e-3 |
+| Q6_K 1024→3072 | 0.865 ms | 0.673 ms | 8.9e-4 |
+
+0.6B Q4_K_M end to end: first token at 161 tokens 112 → 94 ms (prefill 107 → 90 ms), first
+reply 301 → 241 ms; the race took half for six of seven shapes. **Text:** two of the three
+greedy replies are unchanged; the second now continues "Improved visual…" where it read
+"Clarified the ne…" — a near-tie flipped by half arithmetic in the prompt pass, the same kind
+of difference f16 inference has in MLX or llama.cpp's Metal path.
+
+Also: saved profiles now keep every route a race can record (`_route_names()`, derived from
+the candidate tables) — the attention tilings, context splits and half routes added today were
+being dropped on reload and re-measured.
+
 ## 2026-10-06 ▸ Prefill attention reads the half KV cache in place: 161-token first token 140–149 → 112 ms
 
 **Why:** a 28-token prefill (after a cached prefix) spent 13.8 of its 37.4 ms of GPU in

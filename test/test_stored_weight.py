@@ -601,3 +601,55 @@ def test_decode_shape_race_registers_the_key_the_runner_checks(monkeypatch):
     wt._ggml_shape_for("Q4_K", 1024, 1024, packed=None)
     assert set(ran) >= {"narrow", "balanced", "compact", "shortk", None}
     assert set(built) == {"narrow", "balanced", "compact", "shortk", None}
+
+
+def test_saved_profiles_keep_every_route_a_race_can_choose():
+    """A profile entry whose value a race can record must survive `use_kernel_profile`;
+    otherwise every reload re-measures it (attention tilings, half arithmetic, splits)."""
+    names = wt._route_names()
+    for v in (set(wt._ATTN_TILES) | set(wt._CATTN_TARGETS)
+              | {"tiled_half", "f16", "f32", "tiled", "stored"}):
+        assert v in names, v
+
+
+def test_half_tiled_kernels_stay_within_their_bound_in_the_browser():
+    """Every templated format through the half-arithmetic tiled kernel, against the host
+    dequantizer: ~1e-3 of the output scale measured, the race's gate is 1e-2."""
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    if not wt.gpu_features().get("f16"):
+        pytest.skip("this device has no shader-f16")
+    halves = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
+              "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82),
+              "IQ4_NL": (0,), "IQ4_XS": (0,), "IQ2_XXS": (0,), "IQ2_XS": (0,), "IQ2_S": (0,),
+              "IQ3_XXS": (0,), "IQ3_S": (0,), "IQ1_S": (0,)}
+    rng = np.random.default_rng(8)
+    K, N = 512, 96
+    for fmt in wt._TILED_FORMATS:
+        vals, blk = wt._GGML_TYPES[fmt][2], wt._GGML_TYPES[fmt][3]
+        nb = K // vals
+        raw = rng.integers(0, 256, (N, nb, blk), dtype=np.uint8)
+        for o in halves[fmt]:
+            h = (rng.random((N, nb)) * 0.04 + 0.002).astype(np.float16)
+            raw[:, :, o:o + 2] = h.view(np.uint8).reshape(N, nb, 2)
+        raw = raw.tobytes()
+        lin = wt.GGMLLinear(raw, fmt, K, N, execution="stored")
+        ref = ggufload.dequant(ggufload.GGML_IDS[fmt], raw, N * K).reshape(N, K)
+        for M in (3, 70):
+            x = rng.standard_normal((M, K)).astype(np.float32)
+            got = np.asarray(wt.ggml_matmul(wt.xp.asarray(x), lin.packed, fmt, K, N,
+                                            execution="tiled_half").get()).reshape(M, N)
+            want = x.astype(np.float64) @ ref.T.astype(np.float64)
+            assert np.abs(got - want).max() / np.abs(want).max() < 1e-2, (fmt, M)
+
+
+def test_half_arithmetic_routes_are_declared_cross_width_and_feature_gated():
+    """Half activations are a phase-two (cross-width) route like activation INT8: declared,
+    WebGPU-only, offered only with `shader-f16`, gated against the f32 route."""
+    for name in ("dense_half_activation_f16", "ggml_tiled_activation_f16"):
+        route = wt._PHASE2_CROSS_WIDTH[name]
+        assert route["webgpu"].endswith("when_shader_f16")
+        assert route["webgl"].startswith("primitive_unavailable")
+    src = inspect.getsource(wt.ggml_matmul)
+    assert 'gpu_features().get("f16")' in src and '"tiled_half"' in src
+    assert 'gpu_features().get("f16")' in inspect.getsource(wt.matmul_f16w)
