@@ -9979,6 +9979,17 @@ def ggml_dequant_ok(type_name):
         nbytes = (K // vals) * N * blk
         raw = np.random.default_rng(0).integers(0, 200, nbytes + (-nbytes % 4),
                                                 dtype=np.uint8)
+        # A float format's bytes ARE its values: random bytes viewed as F32 include NaN,
+        # infinities and 3e38, both sides come back non-finite, and the check refused F32 --
+        # which failed a 30B MoE's load at its F32 router. Such formats get finite values.
+        floats = {"F32": lambda v: v.view(np.uint8),
+                  "F16": lambda v: v.astype(np.float16).view(np.uint8),
+                  "BF16": lambda v: (v.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8)}
+        if type_name in floats:
+            v = np.random.default_rng(0).standard_normal(K * N).astype(np.float32) * 0.1
+            enc = floats[type_name](v)
+            raw = np.zeros(nbytes + (-nbytes % 4), np.uint8)
+            raw[:enc.size] = enc
         W = Tensor(raw.view(np.float32).copy()).data
         # One row against many. The quantised GEMV is the reference because decode uses it
         # every token; the batched rows are what the fast path replaces. Checking only one

@@ -653,3 +653,14 @@ def test_half_arithmetic_routes_are_declared_cross_width_and_feature_gated():
     src = inspect.getsource(wt.ggml_matmul)
     assert 'gpu_features().get("f16")' in src and '"tiled_half"' in src
     assert 'gpu_features().get("f16")' in inspect.getsource(wt.matmul_f16w)
+
+
+def test_unpack_check_passes_float_formats_in_the_browser():
+    """`ggml_dequant_ok` once built F32 weights from random bytes -- NaN, infinities, 3e38 --
+    so both sides were non-finite and F32 was refused, failing a 30B MoE's load at its F32
+    router. Float formats now get finite values; every non-codebook format must pass."""
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    for t in ("F32", "F16", "BF16", "Q4_K", "Q6_K", "Q8_0"):
+        wt._DEQ_OK.pop(t, None)
+        assert wt.ggml_dequant_ok(t) is True, t

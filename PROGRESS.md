@@ -1,5 +1,19 @@
 # Progress
 
+## 2026-10-06 ▸ 30B MoE load failed at its F32 router ("materialized GGUF F32 disagrees"); 37–38 tok/s again
+
+**Found while re-checking the 30B gate:** the load stopped in `_smoke` → MoE router (F32) →
+`ggml_dequant_ok("F32")`. That check builds its test weight from random bytes; viewed as F32
+those include NaN, infinities and 3.4e38, both the packed and the unpacked side come back
+non-finite, and the check called the format broken. Every F32 shape variant was verified
+correct against numpy first (errors 1e-7–1e-6), so the kernels were never at fault. Float
+formats (F32/F16/BF16) now get finite normal values; a browser test checks F32/F16/BF16/Q4_K/
+Q6_K/Q8_0 pass.
+
+Qwen3-30B-A3B UD-Q3_K_XL after the fix (WebGPU, M5): load 58 s; decode 37.4–38.0 tok/s
+(gate ≥30); first token at 157 tokens 1.71 s, of which prefill 1.63 s — the MoE prefill is the
+next large item on this model.
+
 ## 2026-10-06 ▸ Quantised prefill in half arithmetic (phase two): 161-token first token 112 → 94 ms
 
 **Why:** after the attention change a 252-row prefill was 114 of 143 ms GPU in the tiled

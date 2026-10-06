@@ -13,6 +13,9 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 30B MoE loads again (F32 unpack check used NaN test data); decode 37–38 tok/s,
+MoE prefill 1.6 s at 157 tokens is the next item on that model.**
+
 **2026-10-06 quantised prefill in half arithmetic (phase two, gated, `shader-f16` only):**
 0.6B first token at 161 tokens 112 → 94 ms; one of three greedy replies continues
 differently (near-tie). Saved profiles keep all new route names. Next: decode step (562
