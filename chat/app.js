@@ -1639,10 +1639,63 @@ function directSource(url, probePath) {
     revision: null };
 }
 
+// The URL the reader will ask for `path` on `source` -- the same expression
+// `installApplicationReader` hands the SDK, so it names the same cache entry.
+function readerUrl(source, repo, path, probePath) {
+  if (source.kind === 'direct') return path === probePath ? source.url : source.baseUrl + path;
+  return (source.kind === 'modelscope' ? source.endpoint + '/models/' : source.endpoint + '/')
+    + repo + '/resolve/' + source.revision + '/' + path;
+}
+
+// The source a complete cached copy of this model was downloaded under, or null. A load from
+// it reads the cache and nothing else, so racing the hubs first costs requests and decides
+// nothing: with the model in the cache, every probe to every hub went out anyway -- 302s to
+// a CDN and CORS refusals from the hubs that do not allow a cross-origin range read.
+async function cachedModelSource(spec) {
+  const { repo, probe: probePath, url, file } = spec;
+  let listing;
+  try { listing = await (await sdk).cache.list(); } catch { return null; }
+  const items = new Map((listing.items || []).map(item => [item.key, item]));
+  const groups = new Map((listing.groups || []).map(group => [group.name, group]));
+  const bare = (u) => u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  const candidates = [];
+  const direct = directSource(url, probePath);
+  if (direct) candidates.push(direct);
+  if (repo) candidates.push(...APPLICATION_MODEL_SOURCES);
+  for (const source of candidates) {
+    const baseUrl = sourceBase(source, repo);
+    if (file || source.kind === 'direct') {
+      // One file is the model: it is there or it is not.
+      const item = items.get(bare(readerUrl({ ...source, baseUrl }, repo, file || probePath,
+                                            probePath)));
+      if (item && item.complete) {
+        return { ...source, baseUrl, cached: true, total: item.total || item.size,
+                 latency: 0, sampled: 0, measured: false, rate: 0, alternates: [] };
+      }
+    } else {
+      // A repository: everything this source's copy holds, complete.
+      const group = groups.get(bare(readerUrl(source, repo, '', probePath)).replace(/\/$/, ''));
+      if (group && group.complete) {
+        return { ...source, baseUrl, cached: true, total: group.total || group.size,
+                 latency: 0, sampled: 0, measured: false, rate: 0, alternates: [] };
+      }
+    }
+  }
+  return null;
+}
+
 async function applicationModelSource(spec, validate) {
   const { repo, probe: probePath, url } = spec;
   const key = `${repo || ''}@${probePath}@${url || ''}`;
   if (chosenModelSources.has(key)) return chosenModelSources.get(key);
+  // A structured manifest is read from the network to be validated, so only a plain model
+  // can be answered from the cache listing alone.
+  // Not remembered as the choice: if the entry is deleted later in this session, the next
+  // load ranks the hubs again instead of inheriting a source with no alternates.
+  if (!validate) {
+    const cached = await cachedModelSource(spec);
+    if (cached) return cached;
+  }
   // First establish where the artifact exists with the smallest useful request. Throughput
   // only resolves a choice: when exactly one host has it, there is nothing to race and the
   // model starts loading immediately.

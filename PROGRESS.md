@@ -1,5 +1,30 @@
 # Progress
 
+## 2026-10-06 ▸ A cached model is loaded without probing the hubs (the CORS errors, user-reported)
+
+**Trigger:** user — loading Qwen3-0.6B, cached in the browser, still showed requests from the
+service worker: 302s and "CORS error" rows (`cache-sw.js:228`, `webtorch-sw.js`).
+
+**Cause:** the page ranks sources before every load of a listed model — a one-byte existence
+probe and a 1 MB `Range` sample on ModelScope (.cn, .ai), Hugging Face and the listed URL,
+`cache: 'no-cache'` — before the SDK reader is even asked. The service worker forwards range
+requests to the network untouched (line 228), so each probe is a real request: Hugging Face's
+302 to its CDN, and CORS refusals from hosts that do not allow a cross-origin range read.
+`Promise.allSettled` swallowed the failures, so loads worked; the requests were for nothing.
+
+**Change:** `cachedModelSource` asks the SDK's cache listing first. A single-file model whose
+entry is complete under one of its sources (key = the URL the reader will ask for,
+`readerUrl`, the same expression `installApplicationReader` installs), or a repository whose
+cached group is complete, is loaded from that source with no probe; the reader then has one
+builder and answers every read from the cache. Not remembered as the session's choice, so a
+deleted entry is raced again. Manifest-validated sources (vision decision) still read the
+manifest, as before.
+
+**Tests:** the real `applicationModelSource` against a stubbed listing: complete → that source,
+no probe; partial → raced over the network; a complete repository group → no probe; the key
+expression is the reader's. Not checked with a real hub-cached load: that needs the model
+downloaded from a hub first.
+
 ## 2026-10-06 ▸ 27B load 62 → 43 s; a hybrid's reply no longer uploads its zero state (first token −1 s)
 
 **Trigger:** user — the 27B loads slowly ("warming 39.5s · tuning … · warm-step 3.5s").

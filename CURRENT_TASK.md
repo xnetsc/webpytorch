@@ -13,6 +13,10 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 cached models load without probing hubs:** the page asked every hub for 1 MB
+before each load even when the cache had the whole model (the user's CORS rows); now the cache
+listing picks the source and nothing goes out. Next: the decision speed gap to MLX.
+
 **2026-10-06 27B load 62 → 43 s, first token −1 s:** races stop timing candidates that lost
 every round by complete separation, one-run warm-ups, small self-check shapes, young-gen reaps;
 hybrid recurrent state cleared on the device instead of uploaded. Replies identical on 27B /

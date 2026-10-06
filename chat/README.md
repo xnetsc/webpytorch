@@ -13,6 +13,10 @@ A ChatGPT-style chat UI that runs models **in your browser** via webtorch (Pyodi
   This is page policy: it installs one of the SDK's existing readers and does not alter SDK
   download behavior. One selected source is pinned for the whole load. Sources that do not
   permit browser CORS, such as `hf-mirror.com`, cannot participate in a Pages download.
+  A model already complete in the browser cache is loaded from the source it was cached under
+  with no probe at all: the cache listing answers which one, and racing the hubs for a file
+  that is read from the cache only produced requests -- including the CORS refusals of hubs
+  that do not allow a cross-origin range read.
 - **Optional metadata stays optional.** An omitted size is not shown. Selecting that entry
   probes its source; when a file server reports a total byte count, the option is updated with
   the measured size. `hash` may be supplied for an immutable publication but is not required.

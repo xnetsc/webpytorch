@@ -350,3 +350,53 @@ test('finished chat turns clear only a stale stopping status', () => {
                                   appSource.indexOf("$('#send').addEventListener('click'"));
   assert.match(runTurn, /streaming = null;\s*syncButtons\(\);[^\n]*\n\s*clearStopNote\(\);/);
 });
+
+test('a model complete in the cache loads from its source without probing any hub', async () => {
+  const take = (head, tail) => {
+    const start = appSource.indexOf(head);
+    const end = appSource.indexOf(tail, start);
+    assert.ok(start >= 0 && end > start, head);
+    return appSource.slice(start, end + tail.length);
+  };
+  const code = [
+    take('const APPLICATION_MODEL_SOURCES = [', '\n];'),
+    take('function sourceBase(', '\n}\n'),
+    take('function directSource(', '\n}\n'),
+    take('function readerUrl(', '\n}\n'),
+    take('async function cachedModelSource(', '\n}\n'),
+    take('async function applicationModelSource(', '\n}\n'),
+    'this.pick = applicationModelSource;',
+  ].join('\n');
+  const probes = [];
+  const listing = { items: [], groups: [] };
+  const context = vm.createContext({
+    URL, location: { href: 'https://app.example/chat/' },
+    chosenModelSources: new Map(),
+    sdk: Promise.resolve({ cache: { list: async () => listing } }),
+    probeSource: async (source) => { probes.push(source.id); return { ...source, latency: 1 }; },
+    sampleSource: async (source) => ({ ...source, measured: true, rate: 1 }),
+  });
+  vm.runInContext(code, context);
+  const spec = { repo: 'org/Model-GGUF', file: 'model-Q4_K_M.gguf', probe: 'model-Q4_K_M.gguf',
+                 url: '' };
+  listing.items = [{ key: 'modelscope.cn/models/org/Model-GGUF/resolve/master/model-Q4_K_M.gguf',
+                     complete: true, size: 397, total: 397 }];
+  const got = await context.pick(spec);
+  assert.equal(got.id, 'modelscope-cn');
+  assert.equal(got.cached, true);
+  assert.equal(got.total, 397);
+  assert.deepEqual(probes, []);                                   // no request to any hub
+  listing.items[0].complete = false;                              // a partial copy is not a load
+  const raced = await context.pick(spec);
+  assert.ok(probes.length >= 3 && !raced.cached);
+  probes.length = 0;
+  context.chosenModelSources.clear();
+  const repoSpec = { repo: 'org/Model', file: '', probe: 'config.json', url: '' };
+  listing.groups = [{ name: 'huggingface.co/org/Model/resolve/main', complete: true,
+                      size: 1000, total: 1000 }];
+  const repo = await context.pick(repoSpec);
+  assert.equal(repo.id, 'huggingface');
+  assert.deepEqual(probes, []);
+  // The cache key is the URL the reader asks for: the same expression in both places.
+  assert.match(appSource, /\(s\.kind === 'modelscope' \? s\.endpoint \+ '\/models\/' : s\.endpoint \+ '\/'\)\s*\+ ' \+ repo \+ ' \+ JSON\.stringify\('\/resolve\/' \+ s\.revision \+ '\/'\) \+ ' \+ path'/);
+});
