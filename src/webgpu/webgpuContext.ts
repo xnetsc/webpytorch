@@ -66,6 +66,12 @@ export class NNWebGPUContext {
   // pure overhead -- and creating a bind group is one of the more expensive WebGPU calls.
   private bindGroupCache: Map<string, GPUBindGroup> = new Map();
   private pendingCount = 0;
+  // Submissions the GPU has not finished. While it is working, dispatches accumulate into one
+  // submit; once it has nothing, what is pending goes at once (`kick`) instead of waiting for
+  // the threshold or the next readback. Without this a prefill whose Python issued its 452
+  // dispatches in 47 ms left the GPU idle for those 47 ms and then ran 71 ms of work behind
+  // the final readback -- 118 ms where the two could overlap.
+  private inflight = 0;
   private pendingDisposes: GPUBuffer[] = [];
   // One reusable staging buffer per readback shape. Kept behind an opt-in switch
   // until an end-to-end A/B establishes a positive gain on the actual device.
@@ -371,6 +377,12 @@ export class NNWebGPUContext {
     }
   }
 
+  /** Submit what is pending if the GPU has nothing to do; called after each batch of
+   * commands the producer sends. A diagnostic pass being timed is left whole. */
+  kick(): void {
+    if (this.inflight === 0 && this.pendingCount > 0 && !this.diagnosticQuery) this.flush();
+  }
+
   // Submit all accumulated dispatches in one queue.submit, then safely destroy
   // any buffers whose disposal was deferred while they might still be referenced.
   flush(): void {
@@ -417,6 +429,11 @@ export class NNWebGPUContext {
         this.commandEncoder.copyBufferToBuffer(selectedResolve, 0, selectedRead, 0, bytes);
       }
       this.device.queue.submit([this.commandEncoder.finish()]);
+      this.inflight++;
+      this.device.queue.onSubmittedWorkDone().then(() => {
+        this.inflight--;
+        this.kick();                     // what accumulated while it worked goes now
+      }, () => { this.inflight--; });
       if (selectedQuery && selectedRead && selectedResolve) {
         const read = selectedRead, resolve = selectedResolve, names = selectedNames;
         read.mapAsync(GPUMapMode.READ).then(() => {

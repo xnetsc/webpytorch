@@ -126,6 +126,8 @@ export declare class ComputeContextGPU {
         source: string;
         bindingTypes: GPUBufferBindingType[];
     }): void;
+    /** After a batch of commands from the producer: start the GPU on them if it is idle. */
+    afterBatch(): void;
     runKernel(descriptor: GPUKernelRunDescriptor): void;
     mdata: SharedArrayBuffer | null;
     mnotify: Int32Array | null;

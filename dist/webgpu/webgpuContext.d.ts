@@ -33,6 +33,7 @@ export declare class NNWebGPUContext {
     private passEncoder;
     private bindGroupCache;
     private pendingCount;
+    private inflight;
     private pendingDisposes;
     private readbackPool;
     private diagnosticQuery;
@@ -51,6 +52,9 @@ export declare class NNWebGPUContext {
     private nextBufferId;
     private bufferKey;
     runKernel(request: WebGPURunnerRequest): void;
+    /** Submit what is pending if the GPU has nothing to do; called after each batch of
+     * commands the producer sends. A diagnostic pass being timed is left whole. */
+    kick(): void;
     flush(): void;
     deferDispose(buffer: GPUBuffer): void;
     rentReadback(byteLength: number): GPUBuffer;

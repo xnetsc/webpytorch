@@ -308,6 +308,11 @@ export class ComputeContextGPU {
     ctx.createPipeline(name, descriptor.source, descriptor.bindingTypes);
   }
 
+  /** After a batch of commands from the producer: start the GPU on them if it is idle. */
+  afterBatch(): void {
+    try { getNNWebGPUContext().kick(); } catch (_) { /* no device yet: nothing to submit */ }
+  }
+
   runKernel(descriptor: GPUKernelRunDescriptor) {
     if (this.capturing) {
       // record the dispatch and pin its buffers so they survive across replays

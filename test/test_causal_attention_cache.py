@@ -69,3 +69,38 @@ def test_cache_attention_matches_the_reference_in_the_browser():
                                            vc.data, T, start, NH, NKV, HD, LMAX,
                                            scale).get()).reshape(T, -1)
             assert np.abs(got - want).max() < 1e-4, (NH, NKV, HD, T, start, target)
+
+
+def test_rows_rope_and_cache_writes_match_the_reference_in_the_browser():
+    """`rope_qk_rows_kv` from the projections' (T, heads, HD) rows: q rotated heads-first, k
+    rotated and v written as halves into the packed caches at rows start.."""
+    if not (wt._adam_backend_ready() and wt.kv_f16()):
+        pytest.skip("requires the WebGPU browser backend with a half KV cache")
+    rng = np.random.default_rng(12)
+    for (T, NH, NKV, HD, LMAX, start) in ((7, 4, 2, 64, 64, 10), (33, 16, 8, 128, 128, 0)):
+        q = rng.standard_normal((T, NH, HD)).astype(np.float32)
+        k = rng.standard_normal((T, NKV, HD)).astype(np.float32)
+        v = rng.standard_normal((T, NKV, HD)).astype(np.float32)
+        c, s = wt.rope_tables(T, HD, 10000.0, offset=start)
+        c, s = np.asarray(c, np.float32), np.asarray(s, np.float32)
+        kc = wt.Tensor(np.zeros((NKV * LMAX * HD // 2,), np.float32))
+        vc = wt.Tensor(np.zeros((NKV * LMAX * HD // 2,), np.float32))
+        kc.data = kc.data.reshape(NKV, LMAX, HD // 2)
+        vc.data = vc.data.reshape(NKV, LMAX, HD // 2)
+        got = wt.rope_qk_rows_kv(wt.Tensor(q), wt.Tensor(k), wt.Tensor(v), wt.Tensor(c),
+                                 wt.Tensor(s), kc, vc, start, NH, NKV, HD, LMAX)
+        half = HD // 2
+
+        def rot(x):
+            r = np.concatenate([-x[..., half:], x[..., :half]], -1)
+            return x * c[:, None, :] + r * s[:, None, :]
+        assert np.abs(np.asarray(got.numpy()) - rot(q).transpose(1, 0, 2)).max() < 1e-5
+        kh = np.asarray(kc.data.get(), np.float32).view(np.uint32).view(np.float16)
+        vh = np.asarray(vc.data.get(), np.float32).view(np.uint32).view(np.float16)
+        kh = kh.reshape(NKV, LMAX, HD).astype(np.float32)[:, start:start + T]
+        vh = vh.reshape(NKV, LMAX, HD).astype(np.float32)[:, start:start + T]
+        # The rotation is f32 on both sides but not bit-identical (contraction), so a value
+        # sitting on a half's rounding boundary can land one half-ulp either way.
+        kref = rot(k).transpose(1, 0, 2)
+        assert np.all(np.abs(kh - kref) <= 2.0 ** -10 * np.maximum(np.abs(kref), 2.0 ** -14))
+        assert np.abs(vh - v.astype(np.float16).astype(np.float32).transpose(1, 0, 2)).max() == 0

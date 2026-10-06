@@ -161,6 +161,7 @@ export async function initMain(worker: Worker, options: WgpyInitOptions): Promis
             console.error(error);
           } finally {
             if (e.data.method === 'gpu.signal') releaseShared(sharedGPU, e.data.slot);
+            contextGPU.afterBatch();
           }
         }
       } else {

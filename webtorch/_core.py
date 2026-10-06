@@ -4785,6 +4785,120 @@ _kvw = {"added": False}
 _kvwp = {"f32": False, "f16": False}
 
 
+
+# ---- a prompt's q/k/v from the projections' own rows, without the transposing copies ----
+#
+# The prefill took q, k and v out of the projections as (T, heads, HD) rows, transposed them
+# to heads first -- three strided COPIES a layer, each ~250 us of host through the generic
+# elementwise path -- then rotated q and k (two dispatches) and wrote k and v into the cache
+# (two more). Here kernel A reads the rows, rotates q into the heads-first layout attention
+# reads and rotates k straight into the packed cache; kernel B packs v into the cache from its
+# rows. Seven dispatches a layer become two and nothing is copied that is not also computed.
+
+_ROPE_QK_ROWS_KV_WGSL = """
+@group(0) @binding(0) var<storage,read> qsrc: array<vec2<f32>>;
+@group(0) @binding(1) var<storage,read> ksrc: array<vec2<f32>>;
+@group(0) @binding(2) var<storage,read> cosb: array<vec2<f32>>;
+@group(0) @binding(3) var<storage,read> sinb: array<vec2<f32>>;
+@group(0) @binding(4) var<storage,read_write> qout: array<vec2<f32>>;
+@group(0) @binding(5) var<storage,read_write> kc: array<u32>;
+struct RM { T: u32, NH: u32, NKV: u32, HD: u32, LMAX: u32, start: u32, }
+@group(0) @binding(6) var<storage,read> rm: RM;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  // One thread per (row, q-or-k head, j): dims 2j, 2j+1 and their partners half further on.
+  let H2 = rm.HD / 2u; let Q = rm.HD / 4u; let heads = rm.NH + rm.NKV;
+  let i = g.x + g.y * 65535u * 64u;
+  if (i >= rm.T * heads * Q) { return; }
+  let t = i / (heads * Q);
+  let r = i % (heads * Q);
+  let hh = r / Q;
+  let j = r % Q;
+  let c0 = cosb[(t * rm.HD) / 2u + j]; let s0 = sinb[(t * rm.HD) / 2u + j];
+  let c1 = cosb[(t * rm.HD + H2) / 2u + j]; let s1 = sinb[(t * rm.HD + H2) / 2u + j];
+  var lo: vec2<f32>; var hi: vec2<f32>;
+  if (hh < rm.NH) {
+    let b = (t * rm.NH + hh) * rm.HD / 2u;
+    lo = qsrc[b + j]; hi = qsrc[b + j + H2 / 2u];
+  } else {
+    let b = (t * rm.NKV + (hh - rm.NH)) * rm.HD / 2u;
+    lo = ksrc[b + j]; hi = ksrc[b + j + H2 / 2u];
+  }
+  let rl = lo * c0 - hi * s0;
+  let rh = hi * c1 + lo * s1;
+  if (hh < rm.NH) {
+    let o = (hh * rm.T + t) * rm.HD / 2u;
+    qout[o + j] = rl; qout[o + j + H2 / 2u] = rh;
+  } else {
+    let o = ((hh - rm.NH) * rm.LMAX + rm.start + t) * H2;
+    kc[o + j] = pack2x16float(rl); kc[o + j + H2 / 2u] = pack2x16float(rh);
+  }
+}
+"""
+_KV_WRITE_ROWS_WGSL = """
+@group(0) @binding(0) var<storage,read_write> vc: array<u32>;
+@group(0) @binding(1) var<storage,read> vsrc: array<vec2<f32>>;
+struct VM { T: u32, NKV: u32, HD: u32, LMAX: u32, start: u32, }
+@group(0) @binding(2) var<storage,read> vm: VM;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let H2 = vm.HD / 2u;
+  let i = g.x + g.y * 65535u * 64u;
+  if (i >= vm.T * vm.NKV * H2) { return; }
+  let t = i / (vm.NKV * H2);
+  let r = i % (vm.NKV * H2);
+  let kvh = r / H2; let j = r % H2;
+  vc[(kvh * vm.LMAX + vm.start + t) * H2 + j] = pack2x16float(vsrc[(t * vm.NKV + kvh) * H2 + j]);
+}
+"""
+_rows_kv_added = {"v": False}
+
+
+def _grid1(n):
+    return {"x": min((n + 63) // 64, 65535), "y": (n + 64 * 65535 - 1) // (64 * 65535), "z": 1}
+
+
+def rope_qk_rows_kv(q, k, v, cos, sin, kcache, vcache, start, NH, NKV, HD, LMAX):
+    """From the projections' (T, heads, HD) rows: q rotated into (NH, T, HD); k rotated and v,
+    as halves, written into the packed caches at rows start..start+T-1. Full rotary only
+    (`cos`/`sin` are the (T, HD) tables). None where this does not apply."""
+    if not (_adam_backend_ready() and kv_f16()):
+        return None
+    NH, NKV, HD, LMAX, start = int(NH), int(NKV), int(HD), int(LMAX), int(start)
+    qd = _contig(q.data if isinstance(q, Tensor) else q)
+    kd = _contig(k.data if isinstance(k, Tensor) else k)
+    vd = _contig(v.data if isinstance(v, Tensor) else v)
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+    kc = kcache.data if isinstance(kcache, Tensor) else kcache
+    vc = vcache.data if isinstance(vcache, Tensor) else vcache
+    T = int(qd.shape[0])
+    if (HD % 4 or tuple(qd.shape) != (T, NH, HD) or tuple(kd.shape) != (T, NKV, HD)
+            or tuple(vd.shape) != (T, NKV, HD) or tuple(cd.shape) != (T, HD)
+            or int(kc.shape[-1]) * 2 != HD or start + T > LMAX):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _rows_kv_added["v"]:
+        plat.addKernel("rope_qk_rows_kv", {"source": _ROPE_QK_ROWS_KV_WGSL,
+                                           "bindingTypes": ["read-only-storage"] * 4
+                                           + ["storage", "storage", "read-only-storage"]})
+        plat.addKernel("kv_write_rows", {"source": _KV_WRITE_ROWS_WGSL,
+                                         "bindingTypes": ["storage", "read-only-storage",
+                                                          "read-only-storage"]})
+        _rows_kv_added["v"] = True
+    qo = _empty((NH, T, HD))
+    meta = _adam_kernel["make_meta"]((T, NH, NKV, HD, LMAX, start), "u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "rope_qk_rows_kv",
+                    "tensors": [qd.buffer.buffer_id, kd.buffer.buffer_id, cd.buffer.buffer_id,
+                                sd.buffer.buffer_id, qo.buffer.buffer_id, kc.buffer.buffer_id,
+                                meta.buffer_id],
+                    "workGroups": _grid1(T * (NH + NKV) * (HD // 4))})
+    vmeta = _adam_kernel["make_meta"]((T, NKV, HD, LMAX, start), "u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "kv_write_rows",
+                    "tensors": [vc.buffer.buffer_id, vd.buffer.buffer_id, vmeta.buffer_id],
+                    "workGroups": _grid1(T * NKV * (HD // 2))})
+    return Tensor(qo)
+
 def kv_write(cache, src, pos, T, nkv, hd, lmax, ctl=None):
     """cache[:, pos:pos+T, :] = src, in place on GPU (no readback).
     cache: WgPy ndarray (NKV,LMAX,HD); src: (NKV,T,HD). `ctl`, if given, is a

@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 q/k/v without copies; GPU started whenever idle:** prefill 852 → 452
+dispatches, host 82 → 47 ms; the GPU now starts while Python is still issuing (it waited for
+1024 commands or a sync point). 0.6B first token 117 ms first reply / ~85 ms after, decode
+~155 tok/s; 30B 41–43 tok/s. Prefill is GPU-bound now (tiled GEMMs ~60 of ~71 ms).
+
 **2026-10-06 host time out of the prefill:** attention ladder no longer skipped (no race in
 the first reply), `make_meta` without numpy, budgeted reaps, fused add+RMSNorm for prompts —
 0.6B first reply's first token 241 → 131 ms, later prompts 82 ms. Next: q/k/v without the

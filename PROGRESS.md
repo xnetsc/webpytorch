@@ -1,5 +1,32 @@
 # Progress
 
+## 2026-10-06 ▸ q/k/v without the transposing copies; the GPU is started as soon as it is idle
+
+**Copies:** a prefill layer transposed q, k and v to heads-first — three strided copies, each
+~250 µs of host through wgpy's generic elementwise path — then rotated q and k and wrote k and
+v into the cache (four dispatches). `rope_qk_rows_kv` reads the projections' (T, heads, HD)
+rows: one kernel rotates q into the heads-first layout attention reads and rotates k straight
+into the packed cache, a second packs v into it (≤ 7 bindings, so the default 8-buffer limit
+still holds). 0.6B prefill: 852 → 452 dispatches, host 82 → 47 ms; full rotary and a half
+cache only, otherwise the old path.
+
+**Submission:** that made the prefill SLOWER at first (same-session A/B, 182 rows: 82.8 →
+100.8 ms). cProfile showed why: Python issued everything in 47 ms, then waited 76 ms on the
+final readback — the commands sat in the encoder until 1024 accumulated or a sync point came,
+and the old path's elementwise copies had been providing sync points (their meta uploads
+flushed). Now `kick()` submits what is pending whenever the GPU has nothing in flight (after
+each batch of commands from the worker, and when a submission completes); while it works,
+commands accumulate into one submit. Same A/B after: 81.9 (rows) / 79.5 (old) ms — both
+GPU-bound now.
+
+**End to end (WebGPU, M5):** 0.6B first reply's first token 131 → 117 ms, later 82 → 84–86 ms,
+decode 154–159 tok/s, text unchanged; 30B MoE first token 673–680 ms, decode 41–43 tok/s;
+decision request 51.4 ms with first calls 73/78 → 64/61 ms, answers unchanged.
+
+**Tests:** browser — `rope_qk_rows_kv` against a numpy rotation (q to 1e-5, caches to one half
+ulp / exact); JS — `kick` submits only when idle, leaves a timed pass whole, and the submit
+path re-kicks on completion.
+
 ## 2026-10-06 ▸ Host time out of the prefill: first reply's first token 241 → 131 ms (0.6B)
 
 **Measured (cProfile in the page, 182-row prefill, 114 ms wall):** 20 ms in `gc.collect` (the

@@ -4403,7 +4403,7 @@ class CausalLM:
                                        execution=self._gate_up_execution)
         return lay["down"](activated)
 
-    def _qkv(self, lay, x, T, apply_norm=True):
+    def _qkv(self, lay, x, T, apply_norm=True, rows=False):
         """q,k,v projections -> (heads, T, HD). Applies per-head QK-norm (RMSNorm over head_dim,
         before rope) when `lay` carries `qn`/`kn` weights.
 
@@ -4432,6 +4432,8 @@ class CausalLM:
         if apply_norm:
             q = self._qk_norm(q, lay.get("qn"), T, self.NH)
             k = self._qk_norm(k, lay.get("kn"), T, self.NKV)
+        if rows:                          # (T, heads, HD) as the projections wrote them
+            return q, k, vraw.reshape(T, self.NKV, self.HD)
         v = vraw.reshape(T, self.NKV, self.HD).permute(1, 0, 2)
         return q.permute(1, 0, 2), k.permute(1, 0, 2), v
 
@@ -5111,15 +5113,30 @@ class CausalLM:
         sc = 1.0 / math.sqrt(HD)
         x = self._rms(h, self.layers[0]["in_ln"]) if self.layers else None
         fin = self._rms(h, self.final_norm) if not self.layers else None
+        # The row-layout q/k/v path: full rotary, a half cache, rows that fit.
+        rows_qkv = (wt._adam_backend_ready() and wt.kv_f16() and HD % 4 == 0
+                    and getattr(self, "rope_dim", HD) == HD and end <= LMAX
+                    and getattr(self, "_fused", False) and wt._ROPE_FUSED)
         for i, lay in enumerate(self.layers):
             if self._is_linear_layer(i):                       # recurrent (fixed-state) layer
                 mix = self._linear_mixer(i, lay, x, T)
             else:                                              # softmax attention layer
-                q, k, v = self._qkv(lay, x, T)
-                q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
-                K.data = wt.kv_write(K.data, wt._contig(k).data, start, T, NKV, HD, LMAX)
-                V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
+                rows = None
+                if rows_qkv:
+                    # q/k/v straight from the projections' rows: k and v land in the cache
+                    # and q heads-first for attention, with no transposing copy between.
+                    qr, kr, vr = self._qkv(lay, x, T, rows=True)
+                    q = wt.rope_qk_rows_kv(qr, kr, vr, cos_t, sin_t, K, V, start,
+                                           NH, NKV, HD, LMAX)
+                    if q is None:
+                        raise RuntimeError("row-layout rope/KV write refused a prefill shape "
+                                           "it was checked for")
+                else:
+                    q, k, v = self._qkv(lay, x, T)
+                    q = self._rope_qk(q, cos_t, sin_t, T); k = self._rope_qk(k, cos_t, sin_t, T)
+                    K.data = wt.kv_write(K.data, wt._contig(k).data, start, T, NKV, HD, LMAX)
+                    V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
                 # Where the backend has it, attention reads the packed cache where it lies
                 # and writes the out-projection's rows: no widened copy of the span, no
                 # transpose back. None keeps the path below.
