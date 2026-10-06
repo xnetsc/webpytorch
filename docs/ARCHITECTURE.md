@@ -153,6 +153,18 @@ about any of this.
   writing the scores down but runs at 94 GFLOPS here; the chunked form spends memory
   traffic to spend its arithmetic in the 2117-GFLOPS kernel), flash below it.
 
+- A routed (MoE) layer in a prefill used to run every (token, slot) pair as its own GEMV
+  against its expert, reading an expert's weights once per token routed to it — 1984 reads
+  where 128 would do on a 30B at 248 tokens, 1.33 of a 1.62 s prefill. `moe_group` now
+  groups the slots by expert on the device (counts, starts, a permutation and a table of
+  (expert, 32-row tile), one workgroup, no readback) and `_ggml_tiled_moe_src` re-points the
+  tiled kernel at it: one workgroup per (expert, tile) x 64 columns, the expert's weights at
+  its stride, the rows read through the permutation (a token's row for gate/up, so the
+  activations are no longer copied k times; a slot's row for down), each written to its
+  slot. `GGMLMoELinear.forward_routed` races per slot over GEMV, grouped and grouped in half,
+  laddered at load from 16 to 4096 slots: the slot GEMVs keep small prompts, the grouped
+  kernels take the rest. Qwen3-30B-A3B: first token at 157 tokens 1.71 → 0.67 s.
+
 **Alignment is load-bearing, not a detail.** The backend's fp32 matmul falls off a cliff
 when the row count is not a multiple of `_MATMUL_ROW_ALIGN` (32) or the key extent not a
 multiple of 64. So prefill pads its token sequence to 32 *once* and takes the last real row

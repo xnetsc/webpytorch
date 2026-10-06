@@ -3887,7 +3887,8 @@ def _route_names():
     from the candidate tables themselves, so a new route is kept across reloads the day it
     is added rather than silently re-measured on every load."""
     return ({"stored", "tiled", "tiled_half", "dp4a", "materialized", "full", "packed",
-             "selected_full", "selected_q", "base", "alternate", "f32", "f16"}
+             "selected_full", "selected_q", "base", "alternate", "f32", "f16",
+             "slots", "grouped", "grouped_half"}
             | set(_ATTN_TILES) | set(_CATTN_TARGETS))
 
 def _weight_execution(family, storage_format, K, N, M, run,
@@ -13059,6 +13060,10 @@ _PHASE2_CROSS_WIDTH = {
         "webgpu": "measured_per_shape_device_when_shader_f16",
         "webgl": "primitive_unavailable_keep_f32",
     },
+    "moe_grouped_activation_f16": {           # "grouped_half", raced in `forward_routed`
+        "webgpu": "measured_per_format_shape_device_when_shader_f16",
+        "webgl": "primitive_unavailable_keep_stored",
+    },
     "ggml_tiled_activation_f16": {            # `_ggml_tiled_half_src`, raced in `ggml_matmul`
         "webgpu": "measured_per_format_shape_device_when_shader_f16",
         "webgl": "primitive_unavailable_keep_stored",
@@ -14308,6 +14313,174 @@ class GGMLLinear(Module):
         return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
 
 
+
+# ---- routed experts for a whole prompt: one weight read per expert, not per (token, slot) --
+#
+# A prefill's routed layer ran every (token, slot) pair as its own GEMV against the expert it
+# was routed to (`GGMLMoELinear.forward` with a row per slot), which reads an expert's weights
+# once for EVERY token routed to it. On a 30B (128 experts, 8 per token) at 248 tokens that
+# is 1984 reads where 128 do: the expert GEMVs were 1.33 of a 1.62 s prefill. Here the slots
+# are first grouped by expert on the device, then each expert's rows are one small GEMM over
+# its weights (the tiled kernel, re-pointed): 39.9 -> 9.9 ms for that model's gate/up.
+
+_MOE_GROUP_WGSL = """
+// Group the routed slots by expert, on the device: counts, starts, a permutation that lists
+// each expert's slots together, and a table of (expert, first row) for every 32-row tile.
+@group(0) @binding(0) var<storage,read> eidx: array<i32>;
+@group(0) @binding(1) var<storage,read_write> grp: array<u32>;
+struct GMeta { S: u32, E: u32, PERM0: u32, TT0: u32, TOT: u32, }
+@group(0) @binding(2) var<storage,read> gmm: GMeta;
+var<workgroup> cnt: array<atomic<u32>, 256>;
+var<workgroup> fill: array<atomic<u32>, 256>;
+var<workgroup> tst: array<u32, 257>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) li: vec3<u32>) {
+  let t = li.x; let S = gmm.S; let E = gmm.E;
+  atomicStore(&cnt[t], 0u);
+  workgroupBarrier();
+  for (var i = t; i < S; i = i + 256u) { atomicAdd(&cnt[u32(eidx[i])], 1u); }
+  workgroupBarrier();
+  if (t == 0u) {
+    var s = 0u; var ts = 0u;
+    for (var e = 0u; e < E; e = e + 1u) {
+      let c = atomicLoad(&cnt[e]);
+      grp[e] = s; atomicStore(&fill[e], s); tst[e] = ts;
+      s = s + c; ts = ts + (c + 31u) / 32u;
+    }
+    grp[E] = s; tst[E] = ts; grp[gmm.TOT] = ts;
+  }
+  workgroupBarrier();
+  for (var i = t; i < S; i = i + 256u) {
+    let p = atomicAdd(&fill[u32(eidx[i])], 1u);
+    grp[gmm.PERM0 + p] = i;
+  }
+  if (t < E) {
+    let c = atomicLoad(&cnt[t]);
+    for (var j = 0u; j < (c + 31u) / 32u; j = j + 1u) {
+      grp[gmm.TT0 + 2u * (tst[t] + j)] = t;
+      grp[gmm.TT0 + 2u * (tst[t] + j) + 1u] = j * 32u;
+    }
+  }
+}
+"""
+_moe_group_added = {"v": False}
+
+
+def moe_group(eidx, S, E):
+    """Group S routed slots by expert, on the device: (grp, info) for `_ggml_tiled_moe_src`.
+    `grp` holds the experts' start offsets, the permutation and the tile table."""
+    S, E = int(S), int(E)
+    if E > 256:
+        return None
+    plat = _adam_kernel["platform"]
+    if not _moe_group_added["v"]:
+        plat.addKernel("moe_group", {"source": _MOE_GROUP_WGSL,
+                                     "bindingTypes": ["read-only-storage", "storage",
+                                                      "read-only-storage"]})
+        _moe_group_added["v"] = True
+    PERM0 = E + 1
+    TT0 = PERM0 + S
+    maxT = (S + 31) // 32 + E
+    TOT = TT0 + 2 * maxT
+    grp = _empty_i32((TOT + 1,))
+    meta = _adam_kernel["make_meta"]((S, E, PERM0, TT0, TOT), "u4,u4,u4,u4,u4")
+    plat.runKernel({"name": "moe_group",
+                    "tensors": [eidx.buffer.buffer_id, grp.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": 1, "y": 1, "z": 1}})
+    return grp, (PERM0, TT0, TOT, maxT)
+
+
+def _ggml_tiled_moe_src(type_name, half):
+    """The tiled kernel (f32 or half) over the rows `moe_group` grouped by expert.
+
+    One workgroup per (expert, 32-row tile) x 64 columns, its expert's weights at
+    `expert * estride` and its rows read through the permutation: a token's row directly
+    for the first projection (no k-fold copy of the activations), a slot's row for the
+    second. Each row is written to its slot."""
+    src = _ggml_tiled_half_src(type_name) if half else _GGML_TILED[type_name]
+    gbind = 5 if "binding(4) var<storage,read> gr" in src else 4
+    subs = [
+        ("struct QMeta { M: u32, N: u32, K: u32, RW: u32, G: u32, }",
+         "struct QMeta { M: u32, N: u32, K: u32, RW: u32, G: u32, ESTR4: u32, KSLOT: u32, SLOTROWS: u32, PERM0: u32, TT0: u32, TOT: u32, }\n"
+         "@group(0) @binding(%d) var<storage,read> grp: array<u32>;\nvar<private> EOFF: u32;" % gbind),
+        ("  return packed[w * ND4 + c4];", "  return packed[EOFF + w * ND4 + c4];"),
+        ("""  let row = wg.y * 32u + li.y * 4u;
+  let i0 = select(M - 1u, row, row < M);
+  let i1 = select(i0, row + 1u, row + 1u < M);
+  let i2 = select(i0, row + 2u, row + 2u < M);
+  let i3 = select(i0, row + 3u, row + 3u < M);""",
+         """  let tt = wg.y;
+  if (tt >= grp[qm.TOT]) { return; }
+  let ge = grp[qm.TT0 + 2u * tt]; let r0 = grp[qm.TT0 + 2u * tt + 1u];
+  let es = grp[ge]; let cnt = grp[ge + 1u] - es;
+  EOFF = ge * qm.ESTR4;
+  let lrow = r0 + li.y * 4u;
+  let o0 = grp[qm.PERM0 + es + min(lrow, cnt - 1u)];
+  let o1 = grp[qm.PERM0 + es + min(lrow + 1u, cnt - 1u)];
+  let o2 = grp[qm.PERM0 + es + min(lrow + 2u, cnt - 1u)];
+  let o3 = grp[qm.PERM0 + es + min(lrow + 3u, cnt - 1u)];
+  let i0 = select(o0 / qm.KSLOT, o0, qm.SLOTROWS != 0u);
+  let i1 = select(o1 / qm.KSLOT, o1, qm.SLOTROWS != 0u);
+  let i2 = select(o2 / qm.KSLOT, o2, qm.SLOTROWS != 0u);
+  let i3 = select(o3 / qm.KSLOT, o3, qm.SLOTROWS != 0u);"""),
+        ("""  if (row >= M || c0 >= N) { return; }
+  let cx = sl + (c0 >> 2u);
+  let wide = c0 + 4u < N;
+  array_c[cx + row * ND4] = s00;
+  if (wide) { array_c[cx + 1u + row * ND4] = s10; }
+  if (row + 1u < M) { array_c[cx + (row + 1u) * ND4] = s01; if (wide) { array_c[cx + 1u + (row + 1u) * ND4] = s11; } }
+  if (row + 2u < M) { array_c[cx + (row + 2u) * ND4] = s02; if (wide) { array_c[cx + 1u + (row + 2u) * ND4] = s12; } }
+  if (row + 3u < M) { array_c[cx + (row + 3u) * ND4] = s03; if (wide) { array_c[cx + 1u + (row + 3u) * ND4] = s13; } }""",
+         """  if (c0 >= N) { return; }
+  let cx = c0 >> 2u;
+  let wide = c0 + 4u < N;
+  if (lrow < cnt) { array_c[cx + o0 * ND4] = s00; if (wide) { array_c[cx + 1u + o0 * ND4] = s10; } }
+  if (lrow + 1u < cnt) { array_c[cx + o1 * ND4] = s01; if (wide) { array_c[cx + 1u + o1 * ND4] = s11; } }
+  if (lrow + 2u < cnt) { array_c[cx + o2 * ND4] = s02; if (wide) { array_c[cx + 1u + o2 * ND4] = s12; } }
+  if (lrow + 3u < cnt) { array_c[cx + o3 * ND4] = s03; if (wide) { array_c[cx + 1u + o3 * ND4] = s13; } }"""),
+    ]
+    if half:
+        subs.append(("      let ir = min(wg.y * 32u + rr, M - 1u);",
+                     "      let os = grp[qm.PERM0 + es + min(r0 + rr, cnt - 1u)];\n"
+                     "      let ir = select(os / qm.KSLOT, os, qm.SLOTROWS != 0u);"))
+    for old, new in subs:
+        assert src.count(old) == 1, (type_name, half, old[:50])
+        src = src.replace(old, new)
+    return src, gbind
+
+
+_moe_tiled_added = set()
+
+
+def _moe_grouped_run(stack, xd, group, k, slot_rows, S, half):
+    t = stack.type_name
+    src, gbind = _ggml_tiled_moe_src(t, half)
+    name = "moe_tiled%s_%s" % ("h" if half else "", t.lower())
+    grid = _ggml_grid(t) if gbind == 5 else None
+    plat = _adam_kernel["platform"]
+    if name not in _moe_tiled_added:
+        plat.addKernel(name, {"source": src,
+                              "bindingTypes": ["read-only-storage", "read-only-storage",
+                                               "storage", "read-only-storage"]
+                                             + (["read-only-storage"] if grid is not None
+                                                else []) + ["read-only-storage"]})
+        _moe_tiled_added.add(name)
+    vals, blk = int(_GGML_TYPES[t][2]), int(_GGML_TYPES[t][3])
+    K, N = int(stack.Kt), int(stack.Nt)
+    words = ((K // vals) * blk + 3) // 4
+    grp, (PERM0, TT0, TOT, maxT) = group
+    out = _empty((int(S), N))
+    meta = _adam_kernel["make_meta"](
+        (int(xd.shape[0]), N, K, words, 1, int(stack.estride) // 4, int(k),
+         1 if slot_rows else 0, PERM0, TT0, TOT), "u4,u4,u4,u4,u4,u4,u4,u4,u4,u4,u4")
+    plat.runKernel({"name": name,
+                    "tensors": [xd.buffer.buffer_id, stack.packed.buffer.buffer_id,
+                                out.buffer.buffer_id, meta.buffer_id]
+                               + ([grid.buffer.buffer_id] if grid is not None else [])
+                               + [grp.buffer.buffer_id],
+                    "workGroups": {"x": (N + 63) // 64, "y": maxT, "z": 1}})
+    return out
+
 class GGMLMoELinear(Module):
     """One projection of a sparse-MoE layer: every expert's weight, stacked in one buffer.
 
@@ -14390,6 +14563,60 @@ class GGMLMoELinear(Module):
         of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed, self.type_name,
                          self.Kt, self.Nt, eidx=eidx, estride=self.estride, xper=xper)
         return Tensor(of)
+
+    def forward_routed(self, x, eidx, k, slot_rows, cache=None):
+        """Every routed slot of a prompt: (S, N), a row per slot, S = len(eidx).
+
+        `x` is (T, K) token rows when `slot_rows` is False (slot s reads token s // k) and
+        (S, K) slot rows when True. Three executions, raced per format/shape/slot count:
+        "slots" (a GEMV per slot -- the old path, with the token rows repeated), "grouped" and
+        "grouped_half" (`_ggml_tiled_moe_src`; half only with `shader-f16`). `cache` shares
+        one grouping between the projections of a layer."""
+        xd = _contig(x.data if isinstance(x, Tensor) else x)
+        S = int(eidx.shape[0])
+        k = int(k)
+
+        def slots():
+            rows = xd if slot_rows else repeat_rows(xd, k, execution="device")
+            return ggml_matmul(_contig(rows.reshape(-1, self.Kt)), self.packed,
+                               self.type_name, self.Kt, self.Nt, eidx=eidx,
+                               estride=self.estride, xper=True)
+        can = (_adam_backend_ready() and self.type_name in _GGML_TILED
+               and self.type_name in _TILED_FORMATS and int(self.n_experts) <= 256
+               and _ggml_tiled_ok(self.type_name, self.Kt, self.Nt) and S > 2)
+        if not can:
+            return Tensor(slots())
+
+        def grouped(half):
+            group = cache.get("group") if cache is not None else None
+            if group is None:
+                group = moe_group(eidx, S, self.n_experts)
+                if cache is not None:
+                    cache["group"] = group
+            return _moe_grouped_run(self, xd, group, k, slot_rows, S, half)
+
+        def run(which):
+            if which == "slots":
+                return slots()
+            return grouped(which == "grouped_half")
+        candidates = ("slots", "grouped") + (("grouped_half",) if gpu_features().get("f16")
+                                              else ())
+        reference = [None]
+
+        def correct(which):
+            if which == "slots":
+                return True
+            if reference[0] is None:
+                reference[0] = np.asarray(run("slots").get(), np.float32)
+            got = np.asarray(run(which).get(), np.float32)
+            if not np.all(np.isfinite(got)):
+                return False
+            scale = max(1e-6, float(np.abs(reference[0]).max()))
+            limit = 1e-2 if which == "grouped_half" else 1e-4
+            return float(np.abs(got - reference[0]).max()) / scale < limit
+        which = _weight_execution("moe_routed", self.type_name, self.Kt, self.Nt, S, run,
+                                  candidates=candidates, check=correct)
+        return Tensor(run(which))
 
     def nbytes(self):
         return int(self.packed.size) * 4

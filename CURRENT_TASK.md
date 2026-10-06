@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 MoE prefill grouped by expert on the device:** 30B first token at 157 tokens
+1.71 → 0.67 s, decode 40.7–41.3 tok/s. 0.6B: first token 94 ms, decode ~150 tok/s; decision
+51.5 ms. Next: the local-directory load's network requests (user-reported), then per-request /
+per-token work into JS (Python only schedules), decode GEMV bandwidth.
+
 **2026-10-06 30B MoE loads again (F32 unpack check used NaN test data); decode 37–38 tok/s,
 MoE prefill 1.6 s at 157 tokens is the next item on that model.**
 

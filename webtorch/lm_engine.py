@@ -401,12 +401,21 @@ def moe_mlp(lm, lay, x):
             # Keeping only one there still forces a readback at every MoE layer;
             # the containing full-model path measured no positive gain until
             # both transfers were removed together.
-            xg = wt.Tensor(wt.repeat_rows(x.data, k, execution="device"))
             eidx = wt._empty_i32((T * k,))
             ew = wt.Tensor(wt._empty((T * k,)))
             wt.moe_route(rlog.data, eidx, ew.data, ne, k, norm)
-            gu = st["gate_up"].forward(xg, eidx)
-            y = st["down"].forward(_swiglu(gu), eidx)
+            routed = getattr(st["gate_up"], "forward_routed", None)
+            if callable(routed) and callable(getattr(st["down"], "forward_routed", None)):
+                # Token rows in, a row per slot out; the slots are grouped by expert once
+                # and both projections read each routed expert's weights once.
+                shared = {}
+                gu = routed(x, eidx, k, slot_rows=False, cache=shared)
+                y = st["down"].forward_routed(_swiglu(gu), eidx, k, slot_rows=True,
+                                              cache=shared)
+            else:
+                xg = wt.Tensor(wt.repeat_rows(x.data, k, execution="device"))
+                gu = st["gate_up"].forward(xg, eidx)
+                y = st["down"].forward(_swiglu(gu), eidx)
             return wt.moe_weighted_sum(y, ew, k,
                                        execution=reduce_execution)
 

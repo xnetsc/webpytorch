@@ -4753,6 +4753,28 @@ class CausalLM:
                     wt._sync_small(lay(x))
                 wt.calibrate_rows(probe, 512, lo=16, step=4, defer=True)
                 _load_stage("tuning", done=i + 1, total=len(ladder))
+            # A prompt's routed experts: per slot GEMV against grouped small GEMMs, by how
+            # many slots there are. One ladder per distinct stacked projection; the probe
+            # routes random slots over all of the layer's experts.
+            routed = {}
+            for lay in self.layers:
+                st = (lay.get("moe") or {}).get("stacked") if isinstance(lay, dict) else None
+                if st:
+                    for name, slot_rows in (("gate_up", False), ("down", True)):
+                        lin = st.get(name)
+                        if callable(getattr(lin, "forward_routed", None)):
+                            routed.setdefault((lin.type_name, lin.Kt, lin.Nt), (lin, slot_rows))
+            for (tname, kt, nt), (lin, slot_rows) in sorted(routed.items()):
+                kk = max(1, int(self.top_k or 2))
+
+                def rprobe(m, lin=lin, slot_rows=slot_rows, kk=kk):
+                    S = max(kk, (int(m) // kk) * kk)
+                    rows = S if slot_rows else S // kk
+                    x = wt.Tensor(rng.standard_normal((rows, int(lin.Kt))).astype(np.float32))
+                    e = wt._empty_i32((S,))
+                    e.buffer.set_data(rng.integers(0, int(lin.n_experts), S).astype(np.int32))
+                    wt._sync_small(lin.forward_routed(x, e, kk, slot_rows))
+                wt.calibrate_rows(rprobe, 4096, lo=16, step=4, defer=True)
             # Prefill attention against the cache: how far to split the keys over workgroups
             # depends on how much context a few new rows read, so the ladder walks the
             # context with a short new segment. Reads one layer's cache; writes nothing.

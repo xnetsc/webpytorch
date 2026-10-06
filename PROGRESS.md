@@ -1,5 +1,37 @@
 # Progress
 
+## 2026-10-06 ▸ MoE prefill grouped by expert on the device: 30B first token 1.71 → 0.67 s
+
+**Why:** the 30B's 248-row prefill spent 1326 of 1617 ms GPU in `ggmlv2_q3_k_e` — every
+(token, slot) pair ran as a GEMV against its expert, so an expert's weights were read once per
+token routed to it (S = 1984 slots, 128 experts).
+
+**Change:** `moe_group` (one 256-thread workgroup: atomic counts per expert, starts, a
+permutation listing each expert's slots together, an (expert, 32-row tile) table; no readback)
+and `_ggml_tiled_moe_src` (the f32 or half tiled kernel with the expert's weights at
+`expert * estride`, rows through the permutation — token rows for gate/up, so the k-fold
+repeat of the activations is gone — and each row written to its slot).
+`GGMLMoELinear.forward_routed` races "slots"/"grouped"/"grouped_half" per (format, K, N, slot
+bucket) with a correctness gate (1e-4; half 1e-2, declared in `_PHASE2_CROSS_WIDTH`) and a
+load-time ladder (16..4096 slots); the device prefill route uses it for both projections,
+sharing one grouping.
+
+| 30B shapes, 1984 slots, 128 experts (wall per call) | slots | grouped f32 | grouped half |
+|---|---|---|---|
+| gate/up Q3_K 2048→1536 | 39.9 ms | 12.2 ms | 9.9 ms |
+| down Q4_K 768→2048 | 12.1 ms | 7.2 ms | 5.6 ms |
+
+Grouped f32 equals the slot route to ~3e-7, half ~9e-4 of the output scale. The ladder kept the
+slot GEMVs up to 256 slots and took grouped half from 1024.
+
+Qwen3-30B-A3B UD-Q3_K_XL end to end: first token at 157 tokens 1.71 → 0.67 s (prefill 1.63 →
+0.64 s), first reply 4.27 → 1.26 s, decode 37–38 → 40.7–41.3 tok/s, load 58 → 47 s; reply text
+unchanged.
+
+**Tests:** `test/test_moe_grouped.py` (host: kernels for every tiled format, binding layout,
+route names; browser: Q4_K/Q3_K/Q6_K/IQ4_XS × f32/half × token/slot rows against the slot
+route) — pass.
+
 ## 2026-10-06 ▸ 30B MoE load failed at its F32 router ("materialized GGUF F32 disagrees"); 37–38 tok/s again
 
 **Found while re-checking the 30B gate:** the load stopped in `_smoke` → MoE router (F32) →
