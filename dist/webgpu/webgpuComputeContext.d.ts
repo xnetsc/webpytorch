@@ -96,6 +96,11 @@ export interface ComputeContextGPUMessageReleaseCapture {
     method: 'gpu.releaseCapture';
     name: string;
 }
+export interface ComputeContextGPUMessageSharedUploadMany {
+    method: 'gpu.sharedUploadMany';
+    parts: Array<[number, number, number]>;
+    ctorType?: string;
+}
 export interface ComputeContextGPUMessageClearBuffer {
     method: 'gpu.clearBuffer';
     id: number;
@@ -114,7 +119,7 @@ export interface ComputeContextGPUMessageStageRead {
     slot: number;
     seq: number;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer;
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer | ComputeContextGPUMessageSharedUploadMany;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;

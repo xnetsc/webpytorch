@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 no capability assumed:** every kernel is checked against the device's reported
+features/limits (or WebGPU's guarantees) at registration; races skip what cannot run; an
+audit found four unchecked assumptions (packed-dot language feature, 17 KB narrow GEMVs, 32 KB
+flash tiles, a nine-buffer kernel) — all now detected. Races sized to their work. Next: the
+decision request as the user sees it (first single question 80–90 ms, steady 50–60).
+
 **2026-10-06 decision request 49.8 → 44.5 ms (questions end to end, not padded):** answers
 identical with the same routes. The GEMMs are at the browser's ceiling on this GPU (4 TFLOPS of
 a 6.2 FMA peak; subgroup matrices measured 3.9, flag-only) — MLX's 19 ms f16 uses matrix units

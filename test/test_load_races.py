@@ -88,9 +88,10 @@ def test_route_race_warms_each_candidate_with_one_run(monkeypatch):
     runs = []
     wt._weight_execution("unit", "f32", 8, 8, 4, lambda w: runs.append(w) or w,
                          candidates=("stored", "other"), rounds=5, repeat=4)
-    # One warm-up each, then batches of four for at most five rounds.
+    # One warm-up run each; then one untimed batch each that sizes the samples; then at
+    # most nine rounds of batches no longer than the cap (four here).
     assert runs[:2] == ["stored", "other"]
-    assert len(runs) <= 2 + 5 * 2 * 4
+    assert len(runs) <= 2 + 2 * 4 + 9 * 2 * 4
 
 
 def test_an_explicitly_raced_short_k_variant_is_checked_at_the_small_shape():

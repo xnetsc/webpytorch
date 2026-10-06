@@ -120,6 +120,7 @@ type BufferProxy = {
 type UploadArena = {
   prepare(bytes: number): Uint8Array;
   uploadPrepared(id: number, offset: number, bytes: number, ctor?: string): number;
+  uploadPreparedMany?(parts: Array<[number, number, number]>, ctor?: string): void;
   releasePrepared(): void;
 };
 
@@ -338,13 +339,18 @@ export function stageDecisionPacked(
       indexBytes, batch, length, rows, hidden, vocab, padId);
     flush();
     const ctor = backend === 'gl' ? 'Float32Array' : undefined;
-    const parts: Array<[number, number, number]> = [
+    const parts = ([
       [xId, 0, embedBytes], [tokId, o1, tokBytes], [segId, o2, segBytes],
-      [posId, o3, posBytes], [gatherId, o4, gatherBytes]];
-    for (const [id, offset, bytes] of parts) {
-      if (id < 0 || !bytes) continue;
-      if (uploader.uploadPrepared(id, offset, bytes, ctor) < 0) {
-        throw new Error('packed decision upload failed');
+      [posId, o3, posBytes], [gatherId, o4, gatherBytes]] as Array<[number, number, number]>)
+      .filter(([id, , bytes]) => id >= 0 && bytes > 0);
+    if (uploader.uploadPreparedMany) {
+      // One message for all of them, and no wait: the pass is queued behind it.
+      uploader.uploadPreparedMany(parts, ctor);
+    } else {
+      for (const [id, offset, bytes] of parts) {
+        if (uploader.uploadPrepared(id, offset, bytes, ctor) < 0) {
+          throw new Error('packed decision upload failed');
+        }
       }
     }
   } finally {

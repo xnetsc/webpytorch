@@ -117,6 +117,12 @@ export interface ComputeContextGPUMessageReleaseCapture {
   name: string;
 }
 
+export interface ComputeContextGPUMessageSharedUploadMany {
+  method: 'gpu.sharedUploadMany';
+  parts: Array<[number, number, number]>;     // (buffer id, staging offset, bytes)
+  ctorType?: string;
+}
+
 export interface ComputeContextGPUMessageClearBuffer {
   method: 'gpu.clearBuffer';
   id: number;
@@ -158,7 +164,8 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageReleaseCapture
   | ComputeContextGPUMessageStageArena
   | ComputeContextGPUMessageStageRead
-  | ComputeContextGPUMessageClearBuffer;
+  | ComputeContextGPUMessageClearBuffer
+  | ComputeContextGPUMessageSharedUploadMany;
 
 export class ComputeContextGPU {
   tensorBuffers: Map<number, WebGPUTensorBuffer> = new Map();
@@ -183,6 +190,15 @@ export class ComputeContextGPU {
         subgroupMaxSize: ctx.adapterFacts.subgroupMaxSize,
         maxWorkgroupStorage: Number(dev?.limits?.maxComputeWorkgroupStorageSize || 0),
         maxInvocations: Number(dev?.limits?.maxComputeInvocationsPerWorkgroup || 0),
+        maxStorageBuffers: Number(dev?.limits?.maxStorageBuffersPerShaderStage || 0),
+        maxWorkgroupSizeX: Number(dev?.limits?.maxComputeWorkgroupSizeX || 0),
+        maxWorkgroupSizeY: Number(dev?.limits?.maxComputeWorkgroupSizeY || 0),
+        maxWorkgroupSizeZ: Number(dev?.limits?.maxComputeWorkgroupSizeZ || 0),
+        maxStorageBinding: Number(dev?.limits?.maxStorageBufferBindingSize || 0),
+        maxBufferSize: Number(dev?.limits?.maxBufferSize || 0),
+        // WGSL language features (`requires ...` in a shader) are the browser's, not the
+        // device's: a kernel that requires one is only offered where it is listed here.
+        wgsl: Array.from(((navigator as any).gpu?.wgslLanguageFeatures as Iterable<string>) || []),
         vendor: ctx.adapterFacts.vendor,
         architecture: ctx.adapterFacts.architecture,
       };
@@ -505,6 +521,31 @@ export class ComputeContextGPU {
         this.uploadMemory = null;
         this.uploadNotify = null;
         break;
+      case 'gpu.sharedUploadMany': {
+        // Several regions of the staging memory, one acknowledgement when all are applied.
+        const notify = this.uploadNotify;
+        if (!notify) throw new Error('WebGPU shared upload was not initialized');
+        const finish = (status: number, reason?: unknown) => {
+          if (reason) { this.commandError = reason; console.error(reason); }
+          notify[0] = status;
+          Atomics.notify(notify, 0);
+        };
+        try {
+          const pendings: Promise<void>[] = [];
+          for (const [id, offset, byteLength] of message.parts) {
+            if (!this.uploadMemory || offset < 0 || offset + byteLength > this.uploadMemory.byteLength) {
+              throw new Error('WebGPU shared upload size exceeds staging memory');
+            }
+            const pending = this.setData(id, new Uint8Array(this.uploadMemory, offset, byteLength));
+            if (pending) pendings.push(pending);
+          }
+          if (pendings.length) void Promise.all(pendings).then(() => finish(1), r => finish(-1, r));
+          else finish(1);
+        } catch (reason) {
+          finish(-1, reason);
+        }
+        break;
+      }
       case 'gpu.sharedUpload': {
         const notify = this.uploadNotify;
         if (!notify) throw new Error('WebGPU shared upload was not initialized');

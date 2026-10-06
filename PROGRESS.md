@@ -1,5 +1,36 @@
 # Progress
 
+## 2026-10-06 ▸ No capability assumed: every kernel checked against the device; races sized to their work
+
+**Trigger:** user — every optimisation must rest on WebGPU's general capabilities, or on a
+specific capability that is detected first; nothing may assume something "must" be there.
+
+**Audit:** the 178 kernels the 0.6B, 30B and 27B register, against WebGPU's guarantees:
+packed-dot routes `require` `packed_4x8_integer_dot_product` and were offered unchecked (and
+a race raised, not skipped, when a candidate failed — a browser without it could not load a
+Q4_K/Q6_K model); twelve narrow decode GEMVs use 17.4 KB of workgroup memory (16 KB
+guaranteed); flash tiles were filtered against a fixed 32 KB; the greedy chunk's input kernel
+binds nine storage buffers (eight guaranteed). Half arithmetic was already gated.
+
+**Change:** `features()` reports the device's limits and the browser's WGSL language
+features; `WebGPUPlatform.addKernel` checks every kernel's features, language features,
+storage buffers, workgroup memory and size against them (or the guaranteed minimum) and raises
+`KernelUnsupported` before compiling; races leave such candidates out; `_auto_kind`,
+`_flash_fits`, the packed-dot candidates and `_can_chunk_greedy` ask first. Simulated in the
+browser as a device with only the guarantees: the 0.6B generates at 138–143 tok/s and the
+decision model answers exactly the full-width answers (56 ms), on the routes that remain.
+
+**Also:** a race now sizes each sample to ~6 ms of work from an untimed sizing run (which also
+lets the clock settle; the first rounds ran 2-3x slow) — the 1152x768 decision GEMM had picked
+its 27%-slower route one race in six, now 6/6 the faster. BPE words are cached (decision
+tokenisation 1.19 → 0.12 ms). The packed decision staging uploads its four buffers in one
+message without waiting (1.2 → 0.5 ms).
+
+**Measured (WebGPU, M5):** decision steady 44.3 ms (first call 51.4), answers unchanged; 0.6B
+166 tok/s, first token 83–84 ms; 30B MoE 40.9–41.8 tok/s (a first run at 38.8–39.6 repeated
+at 41+: memory-state variance, its warm step swung 8 → 21 s between runs), replies identical;
+27B load 43.4 → 36.9 s, 6.8–7.3 tok/s, replies identical.
+
 ## 2026-10-06 ▸ Decision request: questions end to end, not padded (49.8 → 44.5 ms); the GEMM ceiling measured
 
 **Trigger:** user — MLX answers the Laya/xDecision request in ~20 ms; WebGPU took several

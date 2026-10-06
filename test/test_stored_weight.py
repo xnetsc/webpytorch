@@ -182,7 +182,8 @@ def test_phase_two_cross_width_policy_is_explicit_for_both_browser_backends():
     assert "dot4I8Packed" in wt._gptq_dp4a_src(8)
     assert "dot4I8Packed" not in wt._GL_GPTQ
     forward = inspect.getsource(wt.QuantizedLinear.forward)
-    assert '("stored", "dp4a", "materialized")' in forward
+    # The packed-dot candidate only where this browser's WGSL offers the language feature.
+    assert '(("dp4a",) if _wgsl_feature("packed_4x8_integer_dot_product")' in forward
     assert "_gptq_dp4a_matmul" in forward
 
 

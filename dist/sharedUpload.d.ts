@@ -6,5 +6,11 @@ export declare function sharedUploader(backend: 'gl' | 'gpu', send: (message: Re
     upload: (id: number, source: Uint8Array, ctorType?: string, operation?: string) => number;
     prepare: (byteLength: number) => Uint8Array;
     uploadPrepared: (id: number, byteOffset: number, byteLength: number, ctorType?: string, operation?: string) => number;
+    uploadPreparedMany: (parts: Array<[
+        number,
+        number,
+        number
+    ]>, ctorType?: string) => void;
+    settle: () => void;
     releasePrepared: () => void;
 };

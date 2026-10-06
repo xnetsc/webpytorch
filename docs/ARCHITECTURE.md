@@ -453,5 +453,22 @@ runs is raced after load on the device itself (`_weight_execution`) and remember
 adapter. Nothing is keyed by vendor, so another GPU with a different f16 rate, or none,
 simply picks differently.
 
+**No capability is assumed.** Every kernel is checked when it is registered
+(`WebGPUPlatform.addKernel` → `unsupported_reason`): the features it enables (`f16`,
+`subgroups`), the WGSL language features it `requires` (the browser's
+`wgslLanguageFeatures`), the storage buffers it binds, its workgroup memory and size —
+against what the device reported in `features()`, or WebGPU's guaranteed minimum (8 storage
+buffers, 16 KB, 256 invocations) where it reported nothing. A kernel that does not fit raises
+`KernelUnsupported` before anything is compiled, instead of a pipeline that fails later and
+writes nothing. A race leaves such a candidate out; any other failure still stops it. The
+choices made without a race ask first: the decode thread shape falls back to the default
+where the narrow one does not fit (`_auto_kind`), flash tiles are sized to the device's
+workgroup memory (`_flash_fits`; it had been a fixed 32 KB), the packed-dot routes need
+`packed_4x8_integer_dot_product`, and the greedy chunk path needs the nine storage buffers
+its input kernel binds. An audit of every kernel the 0.6B, 30B and 27B load (178) found 36
+that a device with only the guarantees could not run — all optional variants — and with
+Python told it was such a device, the 0.6B and the decision model ran correctly on the
+remaining routes (138–143 tok/s; the decision answers exactly the full-width ones).
+
 The load's deferred route ladders now run one probe per call into Python. With a 0.25 s
 budget per call, a request that arrived right after a load waited 320 ms behind them.

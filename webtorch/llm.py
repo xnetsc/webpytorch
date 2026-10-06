@@ -222,7 +222,17 @@ class BPETokenizer:
         for t, i in self.SPECIALS.items():
             self.dec[i] = t
 
+    # Words merged before, remembered. A word's merges depend on nothing but the word, and
+    # the words of a request mostly recur -- the same questions and options every time, and
+    # the common words of any text: a decision request spent 0.7 of its 1.2 ms of
+    # tokenisation re-merging them. Bounded; cleared whole when full.
+    _BPE_CACHE_MAX = 1 << 16
+
     def _bpe(self, tok):
+        cache = self.__dict__.setdefault("_bpe_cache", {})
+        got = cache.get(tok)
+        if got is not None:
+            return got
         word = list(tok)
         while len(word) > 1:
             pairs = {(word[i], word[i + 1]): i for i in range(len(word) - 1)}
@@ -230,6 +240,9 @@ class BPETokenizer:
             if best not in self.ranks:
                 break
             i = pairs[best]; word = word[:i] + [best[0] + best[1]] + word[i + 2:]
+        if len(cache) >= self._BPE_CACHE_MAX:
+            cache.clear()
+        cache[tok] = word
         return word
 
     def _encode_metaspace(self, text):
@@ -3946,6 +3959,8 @@ class CausalLM:
         """
         return bool(
             self._gpu and self._capturable()
+            # Its input kernel binds nine storage buffers; WebGPU guarantees eight.
+            and wt._device_limit("maxStorageBuffers") >= 9
             and getattr(self, "_tied_embed_head", False)
             and len(getattr(self, "head", ())) == 1
             and isinstance(self.head[0], wt.GGMLLinear)

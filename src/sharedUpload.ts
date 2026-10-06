@@ -11,6 +11,17 @@ export function sharedUploader(
   let notify: SharedArrayBuffer | null = null;
   let status: Int32Array | null = null;
   let capacity = 0;
+  // A batch sent by `uploadPreparedMany` and not yet acknowledged. Its bytes are still in
+  // the staging memory, so nothing may write there until the GPU thread has taken them.
+  let pending = false;
+
+  /** Wait for the unacknowledged batch, if any; throw if the GPU thread could not apply it. */
+  function settle() {
+    if (!pending) return;
+    pending = false;
+    Atomics.wait(status!, 0, 0);
+    if (Atomics.load(status!, 0) < 0) throw new Error('a staged upload batch failed');
+  }
 
   function ensure(byteLength: number) {
     if (memory && capacity >= byteLength) return;
@@ -24,6 +35,7 @@ export function sharedUploader(
 
   function releaseOversized() {
     if (capacity <= retainedLimit) return;
+    settle();
     // A single giant weight must not leave a giant staging arena resident.
     send({ method: `${backend}.releaseUploadMemory` });
     memory = null;
@@ -34,6 +46,7 @@ export function sharedUploader(
 
   function uploadPrepared(id: number, byteOffset: number, byteLength: number,
                           ctorType?: string, operation = 'sharedUpload'): number {
+    settle();
     if (!memory || byteOffset < 0 || byteLength < 0 ||
         byteOffset + byteLength > capacity) {
       throw new Error('shared upload region is outside staging memory');
@@ -44,7 +57,23 @@ export function sharedUploader(
     return Atomics.load(status!, 0);
   }
 
+  /** Several regions of the prepared staging memory into several buffers, in one message
+   * and without waiting: the next use of the staging memory waits for the acknowledgement
+   * instead. Commands sent after this run after it on the GPU thread (one FIFO channel). */
+  function uploadPreparedMany(parts: Array<[number, number, number]>, ctorType?: string): void {
+    settle();
+    for (const [, byteOffset, byteLength] of parts) {
+      if (!memory || byteOffset < 0 || byteLength < 0 || byteOffset + byteLength > capacity) {
+        throw new Error('shared upload region is outside staging memory');
+      }
+    }
+    Atomics.store(status!, 0, 0);
+    send({ method: `${backend}.sharedUploadMany`, parts, ctorType });
+    pending = true;
+  }
+
   function prepare(byteLength: number): Uint8Array {
+    settle();
     ensure(byteLength);
     return new Uint8Array(memory!, 0, byteLength);
   }
@@ -60,5 +89,6 @@ export function sharedUploader(
     }
   }
 
-  return { upload, prepare, uploadPrepared, releasePrepared: releaseOversized };
+  return { upload, prepare, uploadPrepared, uploadPreparedMany, settle,
+           releasePrepared: releaseOversized };
 }

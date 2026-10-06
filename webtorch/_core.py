@@ -1128,6 +1128,37 @@ void main() {
     return out
 
 
+# What WebGPU guarantees every device (mirrors the platform's table). A limit `gpu_features`
+# did not report is this, never "unlimited".
+_GUARANTEED_LIMITS = {"maxStorageBuffers": 8, "maxWorkgroupStorage": 16384,
+                      "maxInvocations": 256}
+_UNSUPPORTED_SEEN = []          # candidates left out because this device lacks what they need
+
+
+def _device_limit(key):
+    """A device limit a kernel depends on: what the device reported, or WebGPU's guaranteed
+    minimum where it reported nothing."""
+    v = gpu_features().get(key)
+    return int(v) if v else _GUARANTEED_LIMITS[key]
+
+
+def _wgsl_feature(name):
+    """Whether this browser's WGSL offers the language feature `name` (for `requires`)."""
+    return name in (gpu_features().get("wgsl") or ())
+
+
+def _unsupported_here(exc):
+    """Whether `exc` (or what caused it) says a kernel needs something this device lacks --
+    the platform's `KernelUnsupported` -- as opposed to a kernel that is wrong."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ == "KernelUnsupported":
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def gpu_features():
     """What the WebGPU device was created with, detected on the device at start: optional
     features (`f16`, `subgroups`), subgroup sizes and the limits kernels depend on. {} without
@@ -3442,7 +3473,7 @@ def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
         # shape whose tiles do not fit workgroup memory.
         if T >= _ATTN_CHUNK_MIN_T:
             return chunked_attention(q, k, v, start=causal_start, scale=scale)
-        if 2 * _FLASH_BQ * hd + _FLASH_BK * hd + _FLASH_BQ * _FLASH_BK <= 8192:
+        if _flash_fits(_FLASH_BQ, _FLASH_BK, hd):
             return flash_attention(q, k, v, start=causal_start, scale=scale)
         a = Tensor(_fused_causal_softmax(bmm(qg, transpose_last2(k)).data,
                                          T, causal_start, scale))
@@ -4049,6 +4080,11 @@ def _route_names():
              "slots", "grouped", "grouped_half"}
             | set(_ATTN_TILES) | set(_CATTN_TARGETS))
 
+# What one race sample should cost (see `_weight_execution`): enough work that the readback's
+# own noise is small against the difference being measured.
+_RACE_SAMPLE_S = 0.006
+
+
 def _weight_execution(family, storage_format, K, N, M, run,
                       candidates=("stored", "materialized"), check=None, rounds=9,
                       repeat=4):
@@ -4082,7 +4118,8 @@ def _weight_execution(family, storage_format, K, N, M, run,
     # both multiplies transient expanded-weight memory and puts thousands of calibration
     # dispatches before the first answer. Keep the same paired correctness/evidence gate,
     # but size each sample to the operator's work rather than a fixed repetition count.
-    repeat = max(1, min(int(repeat), 1 if m >= 128 else 2 if m >= 32 else 4))
+    cap = max(1, int(repeat))
+    repeat = max(1, min(cap, 1 if m >= 128 else 2 if m >= 32 else 4))
 
     def batch(which):
         out = None
@@ -4101,11 +4138,25 @@ def _weight_execution(family, storage_format, K, N, M, run,
                 _sync_small(run(which))          # build and warm once before timing
                 valid.append(which)
             except Exception as exc:
+                # A device without what a candidate needs simply does not have that
+                # candidate; anything else failing is a bug and stops here.
+                if _unsupported_here(exc):
+                    _UNSUPPORTED_SEEN.append(str(exc))
+                    continue
                 raise RuntimeError("execution candidate %r failed for %s/%s shape (%d,%d,%d)"
                                    % (which, family, storage_format, M, K, N)) from exc
         if not valid:
             raise RuntimeError("no correct execution candidate")
         valid = tuple(valid)
+        # One more untimed run of each, timed only to size the samples. It also lets the GPU
+        # settle: the first rounds of a race ran 2-3x slow (1.6-2.2 ms against 0.6) and,
+        # with one dispatch a sample, a 0.09 ms difference between two kernels sat inside
+        # the readback's own noise -- the 1152x768 race picked the 27%-slower route one time
+        # in six. A sample is now about _RACE_SAMPLE_S of work, so a short kernel is
+        # repeated and a long one is not; never more than `cap` runs, which bounds memory.
+        slowest = max(batch(which) for which in valid) * repeat
+        repeat = max(1, min(max(cap, 8) if m >= 128 else cap,
+                            int(round(_RACE_SAMPLE_S / max(slowest, 1e-4)))))
         # Five unanimous paired rounds are already p=1/32; more repetitions cannot make that
         # decision more necessary. What has to be settled is the WINNER against each other
         # candidate -- not how two losers rank against each other. If the winner is
@@ -4145,6 +4196,9 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
             (warm or bench)()
             ok.append(v)
         except Exception as exc:
+            if _unsupported_here(exc):           # see `_weight_execution`
+                _UNSUPPORTED_SEEN.append(str(exc))
+                continue
             raise RuntimeError("execution candidate %r failed for tune key %r"
                                % (v, key)) from exc
     if not ok:
@@ -4178,7 +4232,7 @@ def _ggml_shape_for(type_name, N, K, packed):
     to compile returns zeros without raising, and doing nothing is fast.
     """
     vals = _GGML_TYPES[type_name][2]
-    fallback = _shape_kind(N, K, vals)
+    fallback = _auto_kind(type_name, N, K)
     key = ("ggml_shape", type_name, int(N), int(K))
     if key in _TUNED:
         return _TUNED[key]
@@ -4495,8 +4549,9 @@ def use_kernel_profile(profile):
               and isinstance(v, (list, tuple)) and len(v) == 2):
             tile = tuple(int(x) for x in v)
             hd = int(parts[3])
-            if (tile in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32))
-                    and 2 * tile[0] * hd + tile[1] * hd + tile[0] * tile[1] <= 8192):
+            # Whether it fits THIS device is asked where it is used (`flash_tune`): a
+            # profile can be read before the device has said what it allows.
+            if tile in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32)):
                 _TUNED[(parts[0], int(parts[1]), int(parts[2]), hd)] = tile
                 n += 1
     for k, v in (profile.get("checked") or {}).items():
@@ -5472,6 +5527,12 @@ _FLASH_BQ = 16
 _FLASH_BK = 8
 
 
+def _flash_fits(bq, bk, hd):
+    """Whether a (bq, bk) flash tile's workgroup memory -- q and o tiles, a k/v tile and the
+    scores, as f32 -- fits this device. Not a fixed 32 KB: WebGPU guarantees 16."""
+    return (2 * bq * int(hd) + bk * int(hd) + bq * bk) * 4 <= _device_limit("maxWorkgroupStorage")
+
+
 def flash_tune(nh, nkv, hd, T=256):
     """Pick the tile shape on this device. The candidates that fit 32KB of workgroup memory
     differ by more than 2x on one machine -- (8,32) is the slowest of them and was the value
@@ -5483,13 +5544,16 @@ def flash_tune(nh, nkv, hd, T=256):
     """
     global _FLASH_BQ, _FLASH_BK
     key = ("flash_tile", int(nh), int(nkv), int(hd))
-    if key in _TUNED:
+    if key in _TUNED and _flash_fits(*_TUNED[key], hd):
         _FLASH_BQ, _FLASH_BK = _TUNED[key]
         return _TUNED[key]
+    _TUNED.pop(key, None)                # remembered from a device that allows more
     if _adam_kernel.get("platform") is None:
         return (_FLASH_BQ, _FLASH_BK)
     cand = [(bq, bk) for bq, bk in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32))
-            if 2 * bq * int(hd) + bk * int(hd) + bq * bk <= 8192]
+            if _flash_fits(bq, bk, hd)]
+    if not cand:
+        return (_FLASH_BQ, _FLASH_BK)
     q = Tensor(np.zeros((nh, T, hd), np.float32))
     k = Tensor(_empty((nkv, T, hd)))
     v = Tensor(_empty((nkv, T, hd)))
@@ -10022,7 +10086,9 @@ def _ggml_selfcheck(type_name, mode, small=_AUTO, moe=False, mrow=_AUTO):
         vals = _GGML_TYPES[type_name][2]
         for kind in ("narrow", "shortk", None):
             shape = _selfcheck_shape(kind, vals)
-            if shape is not None:
+            # A variant this device cannot build is never chosen here (`_auto_kind`), so
+            # there is nothing of it to check.
+            if shape is not None and _ggml_variant_ok(type_name, mode, kind, moe):
                 _selfcheck_one(type_name, mode, kind, moe, *shape)
         return
     if small is _AUTO:
@@ -11183,7 +11249,8 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                       and bool(gpu_features().get("f16")))
     can_dp4a = (execution in ("auto", "dp4a")
                 and eidx is None and not xper and _adam_backend_ready()
-                and type_name in ("Q4_K", "Q6_K") and m == 1)
+                and type_name in ("Q4_K", "Q6_K") and m == 1
+                and _wgsl_feature("packed_4x8_integer_dot_product"))
     if execution == "dp4a" and not can_dp4a:
         raise RuntimeError("%s shape has no packed-dot comparison path" % type_name)
     if execution == "materialized" and not can_materialize:
@@ -11590,17 +11657,55 @@ def _ggml_grid(type_name):
     return _ggml_grids[type_name]
 
 
-def _ggml_add(type_name, mode, small=None, moe=False, mrow=None):
-    plat = _adam_kernel["platform"]
+def _ggml_binds(type_name, moe):
     binds = ["read-only-storage", "read-only-storage", "storage", "read-only-storage"]
     if moe:
         binds.append("read-only-storage")               # the expert index, before the grid
     if _GGML_TYPES[type_name][4] is not None:
         binds.append("read-only-storage")
+    return binds
+
+
+def _ggml_add(type_name, mode, small=None, moe=False, mrow=None):
+    plat = _adam_kernel["platform"]
     cfg = _cfg_for(small, _GGML_TYPES[type_name][2])
     plat.addKernel(_ggml_name(type_name, mode, small=small, moe=moe, mrow=mrow),
                    {"source": _ggml_src(type_name, mode, cfg, moe=moe, mrow=mrow),
-                    "bindingTypes": binds})
+                    "bindingTypes": _ggml_binds(type_name, moe)})
+
+
+_GGML_VARIANT_OK = {}
+
+
+def _ggml_variant_ok(type_name, mode, small, moe=False, mrow=None):
+    """Whether this device can run a ggml kernel variant: its exact source and bindings,
+    checked as registering it would check them (the platform's `unsupported_reason`). For a
+    choice made without a race -- the thread shape `_shape_kind` picks -- so a variant the
+    device cannot build is never the one chosen. Cached per variant."""
+    key = (type_name, mode, small, moe, mrow)
+    if key not in _GGML_VARIANT_OK:
+        ok = True
+        if _adam_backend_ready():
+            try:
+                from wgpy_backends.webgpu.platform import unsupported_reason
+                plat = _adam_kernel["platform"]
+                src = _ggml_src(type_name, mode, _cfg_for(small, _GGML_TYPES[type_name][2]),
+                                moe=moe, mrow=mrow)
+                ok = unsupported_reason(src, _ggml_binds(type_name, moe),
+                                        plat.getDeviceInfo()) is None
+            except ImportError:
+                ok = True
+        _GGML_VARIANT_OK[key] = ok
+    return _GGML_VARIANT_OK[key]
+
+
+def _auto_kind(type_name, N, K, mode=1, moe=False):
+    """`_shape_kind`'s thread shape for this matmul where the device can run it, else the
+    default shape."""
+    kind = _shape_kind(N, K, _GGML_TYPES[type_name][2])
+    if kind is not None and not _ggml_variant_ok(type_name, mode, kind, moe):
+        return None
+    return kind
 
 
 def _ggml_name(type_name, mode, orw=None, small=None, moe=False, mrow=None):
@@ -13077,7 +13182,7 @@ def _ggml_run(xf, packed, type_name, K, N, small=_AUTO, eidx=None, eslot=0,
     M = 1 if (eidx is not None and xper) else int(xf.shape[0])
     mode = M if M <= 2 else 0
     if small is _AUTO:
-        small = _shape_kind(N, K, vals) if mode == 1 else None
+        small = _auto_kind(type_name, N, K, 1, eidx is not None) if mode == 1 else None
     moe = eidx is not None
     mrow = _ggml_mrow(vals, M) if mode == 0 else None
     # Asking for a variant nobody built is the same silent failure the self-check exists to
@@ -15038,7 +15143,10 @@ class QuantizedLinear(Module):
         # original packed GLSL path; do not enter a WebGPU-only tuner and rely on an
         # exception as backend routing.
         if execution == "auto" and _adam_backend_ready():
-            candidates = ("stored", "dp4a", "materialized")
+            candidates = (("stored",)
+                          + (("dp4a",) if _wgsl_feature("packed_4x8_integer_dot_product")
+                             else ())
+                          + ("materialized",))
             reference = [None]
 
             def correct(which):

@@ -59,6 +59,103 @@ def _fold_source(source: str) -> str:
     return source[:ent.start()] + head + params + tail + "\n" + "".join(lets) + source[ent.end():]
 
 
+class KernelUnsupported(RuntimeError):
+    """A kernel this device cannot run: a feature, language feature or limit it needs is not
+    there. Raised when the kernel is registered, before anything is dispatched -- a pipeline
+    the device rejects otherwise fails later and asynchronously, and its dispatches write
+    nothing. A caller choosing among implementations treats it as "not available here"."""
+
+
+# What WebGPU guarantees every device. A limit the device did not report is taken to be
+# this, never "unlimited": a kernel that needs more must be shown the device has more.
+_GUARANTEED = {"maxStorageBuffers": 8, "maxWorkgroupStorage": 16384, "maxInvocations": 256,
+               "maxWorkgroupSizeX": 256, "maxWorkgroupSizeY": 256, "maxWorkgroupSizeZ": 64}
+_SCALAR_BYTES = {"f32": 4, "u32": 4, "i32": 4, "f16": 2, "bool": 4}
+
+
+def _wgsl_bytes(t):
+    """Size in bytes of a WGSL type as workgroup storage, or None if not one of the plain
+    forms (scalars, vectors, matrices, atomics and fixed arrays of them)."""
+    t = t.strip()
+    if t in _SCALAR_BYTES:
+        return _SCALAR_BYTES[t]
+    m = re.match(r"atomic<\s*(\w+)\s*>$", t)
+    if m:
+        return 4
+    m = re.match(r"vec([234])<\s*(\w+)\s*>$", t)
+    if m and m.group(2) in _SCALAR_BYTES:
+        n = int(m.group(1))
+        return (4 if n == 3 else n) * _SCALAR_BYTES[m.group(2)]
+    m = re.match(r"mat([234])x([234])<\s*(\w+)\s*>$", t)
+    if m and m.group(3) in _SCALAR_BYTES:
+        rows = int(m.group(2))
+        return int(m.group(1)) * (4 if rows == 3 else rows) * _SCALAR_BYTES[m.group(3)]
+    m = re.match(r"array<\s*(.+?)\s*,\s*(\d+)u?\s*>$", t)
+    if m:
+        inner = _wgsl_bytes(m.group(1))
+        return None if inner is None else inner * int(m.group(2))
+    return None
+
+
+def kernel_requirements(source, binding_types):
+    """What a WGSL compute kernel asks of the device, read from its source and bindings."""
+    needs = {"f16": bool(re.search(r"^\s*enable\s+[^;]*\bf16\b", source, re.M)),
+             "subgroups": bool(re.search(r"^\s*enable\s+[^;]*\bsubgroups\b", source, re.M)),
+             "wgsl": [w.strip() for m in re.finditer(r"^\s*requires\s+([^;]+);", source, re.M)
+                      for w in m.group(1).split(",") if w.strip()],
+             "storage": sum(1 for b in binding_types or () if "storage" in str(b)),
+             "workgroup_bytes": 0, "invocations": None, "size": None}
+    for m in re.finditer(r"var<workgroup>\s*\w+\s*:\s*([^;]+);", source):
+        b = _wgsl_bytes(m.group(1))
+        if b is None:                       # a type this cannot size: do not guess
+            needs["workgroup_bytes"] = None
+            break
+        needs["workgroup_bytes"] += (b + 15) // 16 * 16
+    m = re.search(r"@workgroup_size\(([^)]*)\)", source)
+    if m:
+        try:
+            dims = [int(d.strip().rstrip("u")) for d in m.group(1).split(",") if d.strip()]
+        except ValueError:
+            dims = None
+        if dims:
+            dims = (dims + [1, 1])[:3]
+            needs["size"] = dims
+            needs["invocations"] = dims[0] * dims[1] * dims[2]
+    return needs
+
+
+def unsupported_reason(source, binding_types, info):
+    """Why this device cannot run the kernel, or None if it can."""
+    need = kernel_requirements(source, binding_types)
+    info = info or {}
+
+    def limit(key):
+        return int(info.get(key) or _GUARANTEED[key])
+    if need["f16"] and not info.get("f16"):
+        return "needs shader-f16, which this device does not have"
+    if need["subgroups"] and not info.get("subgroups"):
+        return "needs subgroups, which this device does not have"
+    have = set(info.get("wgsl") or ())
+    for w in need["wgsl"]:
+        if w not in have:
+            return "needs the WGSL language feature %s, which this browser does not offer" % w
+    if need["storage"] > limit("maxStorageBuffers"):
+        return "binds %d storage buffers, the device allows %d" % (
+            need["storage"], limit("maxStorageBuffers"))
+    if need["workgroup_bytes"] is not None and need["workgroup_bytes"] > limit("maxWorkgroupStorage"):
+        return "uses %d bytes of workgroup memory, the device allows %d" % (
+            need["workgroup_bytes"], limit("maxWorkgroupStorage"))
+    if need["invocations"] is not None and need["invocations"] > limit("maxInvocations"):
+        return "runs %d invocations a workgroup, the device allows %d" % (
+            need["invocations"], limit("maxInvocations"))
+    if need["size"] is not None:
+        for d, key in zip(need["size"], ("maxWorkgroupSizeX", "maxWorkgroupSizeY",
+                                          "maxWorkgroupSizeZ")):
+            if d > limit(key):
+                return "a workgroup dimension of %d exceeds the device's %d" % (d, limit(key))
+    return None
+
+
 class WebGPUPlatform:
     def __init__(self) -> None:
         self._latest_comm_buf = None
@@ -75,7 +172,9 @@ class WebGPUPlatform:
         self._gpu_live = {}         # buffer_id -> its size, so a dispose subtracts the right amount
 
     def getDeviceInfo(self) -> dict:
-        return gpu.getDeviceInfo().to_py()
+        if getattr(self, "_device_info", None) is None:
+            self._device_info = gpu.getDeviceInfo().to_py()
+        return self._device_info
 
     def createBuffer(self, buffer_id: int, byte_length: int):
         self._gpu_note(buffer_id, byte_length)
@@ -157,9 +256,16 @@ class WebGPUPlatform:
                              rows, experts, k, renormalize)
 
     def addKernel(self, name, descriptor):
+        # Checked against what this device and browser actually offer before anything is
+        # compiled: see `KernelUnsupported`.
+        d = dict(descriptor)
+        why = unsupported_reason(str(d.get("source", "")), d.get("bindingTypes"),
+                                 self.getDeviceInfo())
+        if why is not None:
+            raise KernelUnsupported("%s %s" % (name, why))
         # Kept so a dispatch that turns out not to fit can be recompiled from the same
         # source. Nothing else reads this.
-        self._kernels[name] = dict(descriptor)
+        self._kernels[name] = d
         return gpu.addKernel(name, descriptor)
 
     def runKernel(self, descriptor):

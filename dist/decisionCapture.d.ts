@@ -19,6 +19,7 @@ type BufferProxy = {
 type UploadArena = {
     prepare(bytes: number): Uint8Array;
     uploadPrepared(id: number, offset: number, bytes: number, ctor?: string): number;
+    uploadPreparedMany?(parts: Array<[number, number, number]>, ctor?: string): void;
     releasePrepared(): void;
 };
 /** Generate and upload the head mask in JS; Python only provides buffer/shape references. */
