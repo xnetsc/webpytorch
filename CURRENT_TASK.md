@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 27B decode shape race fixed ("variant ... never built"); greedy calls use the
+measured device pick:** the race registered builds under an outdated key. 0.6B greedy 137 →
+~150 tok/s. Decode step = 562 dispatches, 5.44 ms GPU + ~2 ms host; small GEMVs are
+under-parallel (one thread per 256-value block). Next: sub-block cooperative GEMV with fused
+norm/residual, fewer dispatches, per-token work out of Python.
+
 **2026-10-06 decision request 100.2 → 51.5 ms on WebGPU (MLX f16 19.1, f32 51.5):** fused
 attention (21 → 4.5 ms GPU), row LayerNorm with the residual add (8.8 → 2.3), scratch release
 after the answer (−10 ms), dense half weights race half arithmetic (matmuls 47.3 → 33.9 ms,

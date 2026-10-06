@@ -2346,8 +2346,19 @@ class CausalLM:
             return False
         mn = int(sp.get("min_new_tokens", 0) or 0)
         eos = getattr(getattr(self, "tok", None), "eos_ids", ())
-        return (getattr(self, "_greedy_execution", "device") != "full"
-                and not (mn and len(self._seen) - self._gen_start < mn and eos))
+        if mn and len(self._seen) - self._gen_start < mn and eos:
+            return False
+        if getattr(self, "_greedy_execution", "device") != "full":
+            return True
+        # "full" from a composition tuned while the model's default call SAMPLES (pick mode
+        # "full") never compared the two ways of picking a greedy token -- only full logits
+        # were a candidate. The greedy batch tuning did compare them, for exactly these
+        # calls: a chunk size above zero is device selection measured faster than the
+        # host-fed path (0.6B: 6.19 against 6.91 ms a token). Without this a greedy call on
+        # such a model read 600 KB of logits back every token although that had lost.
+        plan = getattr(self, "decode_plan", None) or {}
+        return (plan.get("pick_mode") == "full"
+                and int(getattr(self, "_greedy_chunk_size", 0) or 0) > 0)
 
     def _accept_token(self, tok, con=None, sp=None):
         """Record a selected token and apply the constraint's state transition."""

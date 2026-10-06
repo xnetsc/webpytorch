@@ -3789,7 +3789,11 @@ def _ggml_shape_for(type_name, N, K, packed):
 
     def apply(kind):
         state["kind"] = kind
-        k = (type_name, 1, kind, False)
+        # The registry's key, exactly as `_ggml_run` asks for it -- the decode kernel's last
+        # field is 0. A shorter key here built the kernel but registered it under a name
+        # nothing looks up, so the first un-built variant raced (Q4_K "narrow", on a 27B)
+        # failed as "never built".
+        k = (type_name, 1, kind, False, 0)
         if k not in _ggml_k["added"]:
             t0 = _t.perf_counter()
             _ggml_add(type_name, 1, kind, False)

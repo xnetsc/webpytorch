@@ -574,3 +574,30 @@ def test_a_deferred_ladder_measures_the_cheap_end_now_and_the_rest_when_idle(mon
     wt._DEFERRED.append(object()); wt._PROVISIONAL.add(("x",))
     wt.calibration_drop()
     assert wt._DEFERRED == [] and wt._PROVISIONAL == set()
+
+
+def test_decode_shape_race_registers_the_key_the_runner_checks(monkeypatch):
+    """`_ggml_shape_for` builds each thread-shape candidate before timing it. It must register
+    the build under the same key `_ggml_run` checks, or the first candidate nothing else had
+    built is refused as "never built" (Q4_K "narrow" on a 27B)."""
+    built, ran = [], []
+    monkeypatch.setitem(wt._adam_kernel, "platform", object())
+    monkeypatch.setattr(wt, "_ggml_add", lambda t, mode, small, moe, mrow=None: built.append(small))
+    monkeypatch.setattr(wt, "_selfcheck_one", lambda *a, **k: None)
+    monkeypatch.setattr(wt, "_contig", lambda a: a)
+    monkeypatch.setattr(wt, "_ggml_k", {"added": set()})
+    monkeypatch.setattr(wt, "_TUNED", {})
+
+    class Out(object):
+        @staticmethod
+        def get():
+            return None
+
+    def run(xf, packed, type_name, K, N, small=None, **kw):
+        assert (type_name, 1, small, False, 0) in wt._ggml_k["added"], small
+        ran.append(small)
+        return Out()
+    monkeypatch.setattr(wt, "_ggml_run", run)
+    wt._ggml_shape_for("Q4_K", 1024, 1024, packed=None)
+    assert set(ran) >= {"narrow", "balanced", "compact", "shortk", None}
+    assert set(built) == {"narrow", "balanced", "compact", "shortk", None}

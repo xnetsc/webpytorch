@@ -1,5 +1,32 @@
 # Progress
 
+## 2026-10-06 ▸ 27B "ggml kernel variant ('Q4_K', 1, 'narrow', False) was never built"; greedy calls stop reading full logits
+
+**Reported by the user:** generating with a local 27B failed in the decode GEMV's thread-shape
+race (`_ggml_shape_for`): it built each candidate and registered it under a 4-field key, while
+`_ggml_run` -- since the batched kernel's variants gained a fifth field -- checks a 5-field one.
+Any candidate no other path had already built and registered was refused; on the 0.6B every
+candidate happened to be registered by another path first, on the 27B Q4_K "narrow" was not.
+The race now registers the runner's key (`(format, 1, shape, moe, 0)`); a host test drives the
+race and fails with the old key. Local 27B after the fix: loads in 63 s, three replies at
+6.7–7.4 tok/s, no error.
+
+**Greedy on a sampling-default model:** the decode composition is tuned for the model's
+default call; Qwen3's default samples, so its only pick candidate was full logits
+(`greedy_pick: full`) -- and `_device_greedy_ok` then refused device selection for every
+greedy call too, although the greedy batch tuning had measured device selection faster for
+exactly those calls (0.6B: 6.19 against 6.91 ms a token). A greedy call now takes the
+measured greedy route when the composition never compared them. 0.6B greedy replies 137 →
+~150 tok/s (path `replay-chunk4`), text unchanged.
+
+**Measured on the way (0.6B Q4_K_M, WebGPU, M5):** one decode step is one pass of 562
+dispatches taking 5.44 ms of GPU; a token took 7.42 ms, so ~2 ms was host (inputs, 600 KB of
+logits, a Python argmax). The per-layer GEMVs reach 27–135 GB/s with weights cache-resident
+(Q6_K 1024×1024: 27 GB/s; the 127 MB head: 120 GB/s): a K-quant row at K=1024 is four
+256-value blocks and one thread decodes a whole block, so N=1024 is 4096 threads. Each
+dispatch also costs ~3.5 µs of GPU on its own (1000 dependent dispatches, timestamps).
+llama.cpp (Metal) on the same file: 6680 tok/s prefill, 233 tok/s decode.
+
 ## 2026-10-06 ▸ Decision request 100.2 → 51.5 ms (WebGPU, F16 GGUF): fused attention and norms, half arithmetic raced
 
 **Why:** an MLX reference runs the same xDecision input in 19.1 ms (f16) / 51.5 ms (f32); this
