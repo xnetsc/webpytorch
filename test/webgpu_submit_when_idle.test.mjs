@@ -25,7 +25,7 @@ test('pending dispatches are submitted as soon as the GPU has nothing in flight'
 });
 
 test('a submit counts in flight until done, then submits what accumulated', () => {
-  assert.match(ctx, /queue\.submit\(\[this\.commandEncoder\.finish\(\)\]\);\s*this\.inflight\+\+;\s*this\.device\.queue\.onSubmittedWorkDone\(\)\.then\(\(\) => \{\s*this\.inflight--;\s*this\.kick\(\);/);
+  assert.match(ctx, /queue\.submit\(\[this\.commandEncoder\.finish\(\)\]\);[\s\S]{0,200}onSubmittedWorkDone\?\.\(\);\s*if \(done && typeof done\.then === 'function'\) \{\s*this\.inflight\+\+;\s*done\.then\(\(\) => \{\s*this\.inflight--;\s*this\.kick\(\);/);
   assert.match(compute, /afterBatch\(\): void \{\s*try \{ getNNWebGPUContext\(\)\.kick\(\); \}/);
   assert.match(main, /releaseShared\(sharedGPU, e\.data\.slot\);\s*contextGPU\.afterBatch\(\);/);
 });

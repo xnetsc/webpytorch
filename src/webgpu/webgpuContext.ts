@@ -429,11 +429,15 @@ export class NNWebGPUContext {
         this.commandEncoder.copyBufferToBuffer(selectedResolve, 0, selectedRead, 0, bytes);
       }
       this.device.queue.submit([this.commandEncoder.finish()]);
-      this.inflight++;
-      this.device.queue.onSubmittedWorkDone().then(() => {
-        this.inflight--;
-        this.kick();                     // what accumulated while it worked goes now
-      }, () => { this.inflight--; });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const done = (this.device.queue as any).onSubmittedWorkDone?.();
+      if (done && typeof done.then === 'function') {
+        this.inflight++;
+        done.then(() => {
+          this.inflight--;
+          this.kick();                   // what accumulated while it worked goes now
+        }, () => { this.inflight--; });
+      }
       if (selectedQuery && selectedRead && selectedResolve) {
         const read = selectedRead, resolve = selectedResolve, names = selectedNames;
         read.mapAsync(GPUMapMode.READ).then(() => {
