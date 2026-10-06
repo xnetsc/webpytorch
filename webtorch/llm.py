@@ -4490,9 +4490,10 @@ class CausalLM:
                                                   default="composed")
         return probe if wt._TUNED[key] == "fused" else composed()
 
-    def _attn_out(self, lay, o, T):
+    def _attn_out(self, lay, o, T, rows=False):
         """Attention output -> hidden. Applies the sigmoid output gate when the query projection
-        carried one (see `_qkv`), then the output projection."""
+        carried one (see `_qkv`), then the output projection. `rows`: `o` is already
+        (T, heads * head_dim), as `causal_attention_cache` writes it."""
         # At one position the permute rearranges nothing: `o` is (nh, 1, hd) and laid out
         # exactly as (1, nh*hd) already is, because an axis of length 1 cannot interleave
         # anything. Its STRIDES say otherwise, so `reshape` cannot see that and falls back to
@@ -4504,7 +4505,7 @@ class CausalLM:
         #
         # The elements and their order are identical either way; this only declines to ask
         # for a layout that is already the one it has.
-        y = (o.reshape(T, self.NH * self.HD) if T == 1
+        y = (o if rows else o.reshape(T, self.NH * self.HD) if T == 1
              else o.permute(1, 0, 2).reshape(T, self.NH * self.HD))
         g = lay.get("_gate")
         if g is not None:
@@ -4752,6 +4753,25 @@ class CausalLM:
                     wt._sync_small(lay(x))
                 wt.calibrate_rows(probe, 512, lo=16, step=4, defer=True)
                 _load_stage("tuning", done=i + 1, total=len(ladder))
+            # Prefill attention against the cache: how far to split the keys over workgroups
+            # depends on how much context a few new rows read, so the ladder walks the
+            # context with a short new segment. Reads one layer's cache; writes nothing.
+            kv0 = next((j for j in range(len(self.layers))
+                        if not self._is_linear_layer(j)), None)
+            if self._gpu and wt.kv_f16() and kv0 is not None and getattr(self, "Kc", None):
+                K0, V0 = self.Kc[self._kv_i[kv0]], self.Vc[self._kv_i[kv0]]
+                sc0 = 1.0 / math.sqrt(self.HD)
+
+                def aprobe(m, K0=K0, V0=V0, sc0=sc0):
+                    t = min(32, int(m))
+                    q = wt.Tensor(rng.standard_normal((self.NH, t, self.HD)).astype(np.float32))
+                    o = wt.causal_attention_cache(q, K0, V0, int(m) - t, self.NH, self.NKV,
+                                                  self.HD, self.kv_cap, sc0)
+                    if o is not None:
+                        wt._sync_small(o)
+                if int(self.kv_cap) >= 64:
+                    wt.calibrate_rows(aprobe, min(4096, int(self.kv_cap)), lo=64, step=4,
+                                      defer=True)
             _warm_s = time.perf_counter() - _t0
             wt.flash_tune(self.NH, self.NKV, self.HD)
             # What this phase actually spent, broken down, so the next slow load is a table
@@ -5064,19 +5084,26 @@ class CausalLM:
                 K, V = self.Kc[self._kv_i[i]], self.Vc[self._kv_i[i]]
                 K.data = wt.kv_write(K.data, wt._contig(k).data, start, T, NKV, HD, LMAX)
                 V.data = wt.kv_write(V.data, wt._contig(v).data, start, T, NKV, HD, LMAX)
+                # Where the backend has it, attention reads the packed cache where it lies
+                # and writes the out-projection's rows: no widened copy of the span, no
+                # transpose back. None keeps the path below.
+                rows = wt.causal_attention_cache(q, K, V, start, NH, NKV, HD, LMAX, sc)
+                if rows is not None:
+                    mix = self._attn_out(lay, rows, T, rows=True)
                 # Prefill widens the span it attends over back to fp32. It was copying
                 # that span anyway, so the three prefill attention kernels never need to
                 # know how the cache is stored.
-                if wt.kv_f16() and HD % 2 == 0:
+                elif wt.kv_f16() and HD % 2 == 0:
                     Kp = wt.Tensor(wt.kv_unpack(K.data, end, NKV, HD, LMAX))
                     Vp = wt.Tensor(wt.kv_unpack(V.data, end, NKV, HD, LMAX))
                 else:
                     Kp = wt.Tensor(wt._contig(K.data[:, :end, :]))
                     Vp = wt.Tensor(wt._contig(V.data[:, :end, :]))
-                # `causal_start` instead of the mask tensor: the shape is what the mask
-                # says, so the kernel derives it and nothing seq-squared is built or sent.
-                o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc, causal_start=start)
-                mix = self._attn_out(lay, o, T)
+                if rows is None:
+                    # `causal_start` instead of the mask tensor: the shape is what the mask
+                    # says, so the kernel derives it and nothing seq-squared is built or sent.
+                    o = wt.gqa_attention(q, Kp, Vp, mask, scale=sc, causal_start=start)
+                    mix = self._attn_out(lay, o, T)
             h, post = self._add_rms(h, mix, lay["post_ln"])
             mlp = self._mlp(lay, post)
             if i + 1 < len(self.layers):

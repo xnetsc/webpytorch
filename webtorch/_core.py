@@ -3056,6 +3056,247 @@ def fused_attention(qkv, H, HD, T, scale, mask=None, window=0, B=1, cos=None, si
                              candidates=tuple(_ATTN_TILES))
     return Tensor(_attn_run(tile, *args))
 
+
+# ---- causal attention of new rows against the packed-half KV cache, where it lies -------
+#
+# A prefill's attention used to unpack the cache's live span to f32 (one copy of every key
+# and value so far, per layer), run `flash_attention` -- which measured ~0.1 TFLOPS here --
+# or the chunked form, and transpose the result back to rows (another copy). Per layer on a
+# 16-head, head_dim-128 model: 1.41 ms at 182 tokens, 8.1 ms for 64 new tokens after 2000
+# cached ones, 9.5 ms at 1024.
+#
+# Here one kernel reads q, the cache's halves and writes the out-projection's rows: 0.31,
+# 0.70 and 2.56 ms for the same three. The design is the encoder's (`_attn_src`): only the
+# probability tile in workgroup memory, q/k/v through the cache. A short prompt after a long
+# conversation has few query blocks, so the keys can be split over workgroups (wg.z) and
+# the partial softmax states merged after; how far to split is measured per device.
+
+def _cattn_src(HD, RI=4, CJ=4):
+    """8x8 threads, 8*RI queries of one head against key blocks of 8*CJ, over the key range
+    wg.z owns. Thread (tx, ty): rows ty+8i, keys tx*CJ+j, output vec4s tx+8e. Writes the
+    normalised rows (one split) or the unnormalised partial and its (max, sum)."""
+    HD4 = HD // 4
+    BQ, BK = 8 * RI, 8 * CJ
+    E = HD4 // 8
+    PS = BK // 4 + 1
+    L = []
+    a = L.append
+    a("""
+@group(0) @binding(0) var<storage,read> q4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> kc: array<vec2<u32>>;
+@group(0) @binding(2) var<storage,read> vc: array<vec2<u32>>;
+@group(0) @binding(3) var<storage,read_write> out4: array<vec4<f32>>;
+@group(0) @binding(4) var<storage,read_write> ml: array<vec2<f32>>;
+struct CMeta { T: u32, start: u32, NH: u32, rep: u32, LMAX: u32, S: u32, span: u32, scale: f32, }
+@group(0) @binding(5) var<storage,read> cm: CMeta;
+var<workgroup> pt: array<vec4<f32>, %d>;
+var<workgroup> red: array<f32, %d>;
+fn K4(base: u32, d: u32) -> vec4<f32> {
+  let w = kc[base + d]; return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y));
+}
+fn V4(base: u32, d: u32) -> vec4<f32> {
+  let w = vc[base + d]; return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y));
+}
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y;
+  let T = cm.T; let h = wg.y; let kvh = h / cm.rep;
+  let q0 = wg.x * %du;
+  let kvbase = kvh * cm.LMAX;
+  // The keys this query block sees at all end at its last row's own position.
+  let kend = cm.start + min(q0 + %du, T);
+  let ks = wg.z * cm.span;
+  let ke = min(kend, ks + cm.span);""" % (BQ * PS, BQ * 8, BQ, BQ))
+    for i in range(RI):
+        a("  let qr%d = min(q0 + ty + %du, T - 1u); let qp%d = cm.start + q0 + ty + %du;"
+          % (i, 8 * i, i, 8 * i))
+        a("  let qb%d = (h * T + qr%d) * %du;" % (i, i, HD4))
+        a("  var m%d: f32 = -3.0e38; var l%d: f32 = 0.0;" % (i, i))
+        for e in range(E):
+            a("  var o%d_%d = vec4<f32>();" % (i, e))
+    a("  for (var k0 = ks; k0 < ke; k0 = k0 + %du) {" % BK)
+    for j in range(CJ):
+        a("    let kr%d = min(k0 + tx * %du + %du, ke - 1u); let kb%d = (kvbase + kr%d) * %du;"
+          % (j, CJ, j, j, j, HD4))
+    for i in range(RI):
+        for j in range(CJ):
+            a("    var s%d_%d: f32 = 0.0;" % (i, j))
+    a("    for (var d = 0u; d < %du; d = d + 1u) {" % HD4)
+    for i in range(RI):
+        a("      let qv%d = q4[qb%d + d];" % (i, i))
+    for j in range(CJ):
+        a("      let kv%d = K4(kb%d, d);" % (j, j))
+    for i in range(RI):
+        for j in range(CJ):
+            a("      s%d_%d = s%d_%d + dot(qv%d, kv%d);" % (i, j, i, j, i, j))
+    a("    }")
+    for i in range(RI):
+        for j in range(CJ):
+            a("    { let key = k0 + tx * %du + %du;" % (CJ, j))
+            a("      s%d_%d = select(-3.0e38, s%d_%d * cm.scale, key < ke && key <= qp%d); }"
+              % (i, j, i, j, i))
+
+    def mx(names):
+        e = names[0]
+        for n in names[1:]:
+            e = "max(%s, %s)" % (e, n)
+        return e
+    for i in range(RI):
+        a("    red[(ty + %du) * 8u + tx] = %s;"
+          % (8 * i, mx(["s%d_%d" % (i, j) for j in range(CJ)])))
+    a("    workgroupBarrier();")
+    for i in range(RI):
+        a("    var bm%d = red[(ty + %du) * 8u];" % (i, 8 * i))
+        a("    for (var t = 1u; t < 8u; t = t + 1u) { bm%d = max(bm%d, red[(ty + %du) * 8u + t]); }"
+          % (i, i, 8 * i))
+        # A row that sees nothing yet keeps m at -3e38; nothing it skipped may count.
+        a("    let mn%d = max(m%d, bm%d); let al%d = select(0.0, exp(m%d - mn%d), m%d > -1.0e38);"
+          " m%d = mn%d;" % (i, i, i, i, i, i, i, i, i))
+        ps_ = []
+        for j in range(CJ):
+            a("    let p%d_%d = select(0.0, exp(s%d_%d - m%d), s%d_%d > -1.0e38);"
+              % (i, j, i, j, i, i, j))
+            ps_.append("p%d_%d" % (i, j))
+        for g in range(CJ // 4):
+            a("    pt[(ty + %du) * %du + tx * %du + %du] = vec4<f32>(%s);"
+              % (8 * i, PS, CJ // 4, g, ", ".join(ps_[4 * g:4 * g + 4])))
+        a("    l%d = l%d * al%d + %s;" % (i, i, i, " + ".join(ps_)))
+        for e in range(E):
+            a("    o%d_%d = o%d_%d * al%d;" % (i, e, i, e, i))
+    a("    workgroupBarrier();")
+    a("    for (var c = 0u; c < %du; c = c + 1u) {" % (BK // 4))
+    for i in range(RI):
+        a("      let pp%d = pt[(ty + %du) * %du + c];" % (i, 8 * i, PS))
+    for u in range(4):
+        a("      let vb%d = (kvbase + min(k0 + c * 4u + %du, ke - 1u)) * %du;" % (u, u, HD4))
+        for e in range(E):
+            a("      let v%d_%d = V4(vb%d, tx + %du);" % (u, e, u, 8 * e))
+    for i in range(RI):
+        for e in range(E):
+            a("      o%d_%d = o%d_%d + pp%d.x * v0_%d + pp%d.y * v1_%d + pp%d.z * v2_%d"
+              " + pp%d.w * v3_%d;" % (i, e, i, e, i, e, i, e, i, e, i, e))
+    a("    }")
+    a("    workgroupBarrier();")
+    a("  }")
+    for i in range(RI):
+        a("  red[(ty + %du) * 8u + tx] = l%d;" % (8 * i, i))
+    a("  workgroupBarrier();")
+    for i in range(RI):
+        a("  { var lt = 0.0; for (var t = 0u; t < 8u; t = t + 1u) {"
+          " lt = lt + red[(ty + %du) * 8u + t]; }" % (8 * i))
+        a("    let qr = q0 + ty + %du;" % (8 * i))
+        a("    if (qr < T) {")
+        a("      if (cm.S == 1u) {")
+        a("        let inv = 1.0 / lt;")
+        for e in range(E):
+            a("        out4[(qr * cm.NH + h) * %du + tx + %du] = o%d_%d * inv;" % (HD4, 8 * e, i, e))
+        a("      } else {")
+        a("        let pb = (wg.z * T + qr) * cm.NH + h;")
+        for e in range(E):
+            a("        out4[pb * %du + tx + %du] = o%d_%d;" % (HD4, 8 * e, i, e))
+        a("        if (tx == 0u) { ml[pb] = vec2<f32>(m%d, lt); }" % i)
+        a("      }")
+        a("    } }")
+    a("}")
+    return "\n".join(L)
+
+
+_CATTN_MERGE_WGSL = """
+@group(0) @binding(0) var<storage,read> part: array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read> ml: array<vec2<f32>>;
+@group(0) @binding(2) var<storage,read_write> out4: array<vec4<f32>>;
+struct MMeta { T: u32, NH: u32, HD4: u32, S: u32, }
+@group(0) @binding(3) var<storage,read> mm: MMeta;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let i = g.x;
+  if (i >= mm.T * mm.NH * mm.HD4) { return; }
+  let row = i / mm.HD4;                       // (t, h)
+  let d = i % mm.HD4;
+  var mx = -3.0e38;
+  for (var z = 0u; z < mm.S; z = z + 1u) { mx = max(mx, ml[z * mm.T * mm.NH + row].x); }
+  var acc = vec4<f32>(); var l = 0.0;
+  for (var z = 0u; z < mm.S; z = z + 1u) {
+    let e = ml[z * mm.T * mm.NH + row];
+    let w = select(0.0, exp(e.x - mx), e.x > -1.0e38);
+    acc = acc + part[(z * mm.T * mm.NH + row) * mm.HD4 + d] * w;
+    l = l + e.y * w;
+  }
+  out4[row * mm.HD4 + d] = acc / l;
+}
+"""
+_cattn_added = set()
+# How many workgroups a split aims for: "p1" never splits. Raced per device, by context.
+_CATTN_TARGETS = {"p1": 1, "p96": 96, "p192": 192, "p384": 384}
+
+
+def _cattn_split(target, T, end, NH):
+    qb = (T + 31) // 32
+    have = qb * NH
+    if target <= have:
+        return 1
+    return max(1, min((target + have - 1) // have, (end + 63) // 64))
+
+
+def _cattn_run(target, qd, kd, vd, T, start, NH, NKV, HD, LMAX, scale):
+    plat = _adam_kernel["platform"]
+    name = "cattn_%d" % HD
+    if name not in _cattn_added:
+        plat.addKernel(name, {"source": _cattn_src(HD),
+                              "bindingTypes": ["read-only-storage"] * 3
+                              + ["storage", "storage", "read-only-storage"]})
+        plat.addKernel("cattn_merge", {"source": _CATTN_MERGE_WGSL,
+                                       "bindingTypes": ["read-only-storage", "read-only-storage",
+                                                        "storage", "read-only-storage"]})
+        _cattn_added.add(name)
+    end = start + T
+    S = _cattn_split(_CATTN_TARGETS[target], T, end, NH)
+    span = ((end + S - 1) // S + 31) // 32 * 32
+    S = (end + span - 1) // span
+    if S == 1:
+        out, ml = _empty((T, NH * HD)), _empty((2,))
+    else:
+        out, ml = _empty((S * T * NH * HD,)), _empty((S * T * NH * 2,))
+    meta = _adam_kernel["make_meta"]((T, start, NH, NH // NKV, LMAX, S, span, float(scale)),
+                                     "u4,u4,u4,u4,u4,u4,u4,f4")
+    plat.runKernel({"name": name,
+                    "tensors": [qd.buffer.buffer_id, kd.buffer.buffer_id, vd.buffer.buffer_id,
+                                out.buffer.buffer_id, ml.buffer.buffer_id, meta.buffer_id],
+                    "workGroups": {"x": (T + 31) // 32, "y": NH, "z": S}})
+    if S == 1:
+        return out
+    fin = _empty((T, NH * HD))
+    mm = _adam_kernel["make_meta"]((T, NH, HD // 4, S), "u4,u4,u4,u4")
+    n = T * NH * HD // 4
+    plat.runKernel({"name": "cattn_merge",
+                    "tensors": [out.buffer.buffer_id, ml.buffer.buffer_id, fin.buffer.buffer_id,
+                                mm.buffer_id],
+                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    return fin
+
+
+def causal_attention_cache(q, kcache, vcache, start, NH, NKV, HD, LMAX, scale):
+    """Attention of T new rows at positions `start`.. against a KV cache of packed halves
+    (`kv_f16`), as (T, NH*HD) rows; keys 0..start+t for row t. `q` is (NH, T, HD), already
+    rotated; `kcache`/`vcache` are the caches (NKV, LMAX, HD/2 words) after this prompt's
+    rows were written. None where this does not apply (no WebGPU, an f32 cache, HD not a
+    multiple of 32) and the caller keeps its path."""
+    if not (_adam_backend_ready() and kv_f16()):
+        return None
+    NH, NKV, HD, LMAX, start = int(NH), int(NKV), int(HD), int(LMAX), int(start)
+    qd = _contig(q.data if isinstance(q, Tensor) else q)
+    if (HD % 32 or NH % NKV or len(qd.shape) != 3 or int(qd.shape[0]) != NH
+            or int(qd.shape[2]) != HD):
+        return None
+    T = int(qd.shape[1])
+    kd = kcache.data if isinstance(kcache, Tensor) else kcache
+    vd = vcache.data if isinstance(vcache, Tensor) else vcache
+    args = (qd, kd, vd, T, start, NH, NKV, HD, LMAX, float(scale))
+    target = _weight_execution("causal_attention", "f16kv", HD, NH, start + T,
+                               lambda which: _cattn_run(which, *args),
+                               candidates=tuple(_CATTN_TARGETS))
+    return Tensor(_cattn_run(target, *args))
+
 def gqa_attention(q, k, v, mask=None, scale=None, causal_start=None):
     """Grouped-query attention WITHOUT materializing the KV head expansion.
 

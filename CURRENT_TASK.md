@@ -13,6 +13,11 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 prefill attention reads the half KV cache in place:** per layer 3–11× faster
+(182 rows 1.41 → 0.31 ms; 64 rows after 2000 cached 8.1 → 0.70 ms); 0.6B first token at 161
+tokens 140–149 → 112 ms. Prefill is now the quantised tiled matmuls (f32, ~2 TFLOPS) -- next:
+half arithmetic there, then the decode step's dispatch count and Q6_K GEMV.
+
 **2026-10-06 27B decode shape race fixed ("variant ... never built"); greedy calls use the
 measured device pick:** the race registered builds under an outdated key. 0.6B greedy 137 →
 ~150 tok/s. Decode step = 562 dispatches, 5.44 ms GPU + ~2 ms host; small GEMVs are

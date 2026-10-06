@@ -1,5 +1,35 @@
 # Progress
 
+## 2026-10-06 ▸ Prefill attention reads the half KV cache in place: 161-token first token 140–149 → 112 ms
+
+**Why:** a 28-token prefill (after a cached prefix) spent 13.8 of its 37.4 ms of GPU in
+`flash_16_8_128` (~0.1 TFLOPS), after a copy widening the cache span to f32 and before a
+transpose back to rows.
+
+**Change:** `causal_attention_cache` -- one kernel from (NH, T, HD) queries and the packed
+(NKV, LMAX, HD/2) caches to (T, NH·HD) rows; causal by absolute position (row t sees keys
+0..start+t), GQA by head ratio, only the probability tile in workgroup memory (the encoder
+kernel's design). Few query blocks after a long context split the keys over workgroups
+(wg.z) and a merge combines the softmax states; how far to split is a raced target
+parallelism (`p1`/`p96`/`p192`/`p384`) per (head_dim, heads, context bucket), laddered at load
+over context length with a 32-row segment.
+
+| per layer (NH 16, NKV 8, HD 128) | before | after |
+|---|---|---|
+| 28 new rows after 180 | 0.638 ms | 0.228 ms |
+| 182 rows | 1.406 ms | 0.310 ms |
+| 64 new rows after 2000 | 8.081 ms | 0.703 ms |
+| 512 rows | 7.100 ms | 0.920 ms |
+| 1024 rows | 9.461 ms | 2.559 ms |
+
+Max error against a float64 reference on the cache's own halves ~1e-6, the same as before.
+0.6B Q4_K_M end to end: first token of a 161-token prompt 140–149 → 112 ms, prefill 137 →
+107 ms, same text. Prefill is now the quantised tiled matmuls (252 rows: Q4_K 99 ms, Q6_K 15 ms
+of 143 ms GPU, ~2 TFLOPS in f32) -- next.
+
+**Tests:** `test/test_causal_attention_cache.py` (host: no-GPU fallback, split rule, kernel
+shape; browser: four model shapes × every split target against float64) -- pass.
+
 ## 2026-10-06 ▸ 27B "ggml kernel variant ('Q4_K', 1, 'narrow', False) was never built"; greedy calls stop reading full logits
 
 **Reported by the user:** generating with a local 27B failed in the decode GEMV's thread-shape

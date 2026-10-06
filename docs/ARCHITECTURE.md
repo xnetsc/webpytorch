@@ -135,12 +135,17 @@ about any of this.
   A whole 28-layer prefill forced onto this kernel went 1290.8 → 670.8 ms at T=512 and
   4296.4 → 2366.0 at T=1536; per format it is 1.2× to 1.9×, biggest where the decode is
   most expensive. Unpacking still wins where it is allowed, by 1.5–2.0× rather than 5×.
-- Attention materialises the score matrix `_ATTN_CHUNK` queries at a time (above
-  `_ATTN_CHUNK_MIN_T` tokens) instead of streaming it. A flash kernel avoids writing the
-  scores down but runs at 94 GFLOPS here; the chunked form spends more memory traffic in
-  order to spend its arithmetic in the 2117-GFLOPS kernel, and wins by 3.6×. Below that
-  threshold flash still wins — it is one dispatch against dozens, and at short lengths the
-  dispatches *are* the cost — so both kernels stay, chosen by length.
+- Attention, where the cache is packed halves (WebGPU), is `causal_attention_cache`: one
+  kernel reads q, keys and values where they lie in the cache and writes the
+  out-projection's rows. Only the probability tile goes through workgroup memory; a
+  short prompt after a long conversation splits its keys over workgroups and merges the
+  softmax states after, how far measured per device by context length. Per layer of a
+  16-head, head_dim-128 model it took 1.41 → 0.31 ms at 182 tokens, 8.1 → 0.70 ms for 64 new
+  tokens after 2000, 9.5 → 2.6 ms at 1024 — against widening the span to f32, the flash or
+  chunked kernel and a transpose back. Those remain the path elsewhere: the score matrix
+  `_ATTN_CHUNK` queries at a time above `_ATTN_CHUNK_MIN_T` tokens (a flash kernel avoids
+  writing the scores down but runs at 94 GFLOPS here; the chunked form spends memory
+  traffic to spend its arithmetic in the 2117-GFLOPS kernel), flash below it.
 
 **Alignment is load-bearing, not a detail.** The backend's fp32 matmul falls off a cliff
 when the row count is not a multiple of `_MATMUL_ROW_ALIGN` (32) or the key extent not a
