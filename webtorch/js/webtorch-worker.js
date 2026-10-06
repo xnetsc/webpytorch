@@ -296,6 +296,19 @@
       await root.wgpy.initWorker();
     }
 
+    // The package's Python modules are fetched now, all at once, while Pyodide starts --
+    // not one after another once it has. Fetched in sequence after it, each was a round
+    // trip on its own: on the deployed page every one took ~300 ms, 6.7 s for the set, which
+    // was the whole of "loading webtorch…" on every start, a Release restart included.
+    const sources = moduleList(base, opts.version).then(function (names) {
+      return Promise.all(names.map(function (m) {
+        return text(base + 'webtorch/' + m, opts.version).then(
+          function (t) { return { m: m, t: t }; },
+          function (e) { return { m: m, err: e }; });
+      }));
+    });
+    sources.catch(function () {});            // awaited below; this only keeps it quiet
+
     say('starting Python…');
     // The loader too, if the host has not brought it: it has to come from the same place
     // Pyodide itself does, and a host that gets that pair out of step gets a mismatch it
@@ -328,9 +341,9 @@
     // fetch that actually failed -- and if even one module is missing the SDK is not
     // whatever the caller thinks it is anyway.
     const missing = [];
-    for (const m of await moduleList(base, opts.version)) {
-      try { pyodide.FS.writeFile('webtorch/' + m, await text(base + 'webtorch/' + m, opts.version)); }
-      catch (e) { missing.push(m + ' (' + (e && e.message || e) + ')'); }
+    for (const got of await sources) {
+      if (got.err) missing.push(got.m + ' (' + (got.err && got.err.message || got.err) + ')');
+      else pyodide.FS.writeFile('webtorch/' + got.m, got.t);
     }
     if (missing.length) {
       throw new Error('webtorch: ' + missing.length + ' module(s) could not be loaded from '

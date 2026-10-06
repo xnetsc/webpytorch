@@ -56,6 +56,22 @@ var FIXED_EXT = /\.(whl|wasm|zip|tar|data|tgz|gz|woff2?|ttf)$/i;
 // fixed no matter what the extension says.
 var OUR_WHEEL = /\/dist\/[^/]+\.whl$/i;
 
+// Our own files, stamped with their content hash (`app.js?v=327c024b76`, and the SDK's
+// modules, workers and wheels with the SDK's): a changed file is a changed URL, so the bytes
+// behind any one of these never change and the cache can answer it without asking. Treated
+// as APP -- network-first, `no-cache` -- every one cost a revalidation round trip, and the
+// SDK fetches thirty of them on each start: 6.7 s of an 8.5 s restart on the deployed page,
+// all of it 304s. Only a hash counts; `index.html` carries none and is still asked for on
+// every load, which is how a deploy's new hashes arrive.
+var STAMPED = /[?&]v=[0-9a-f]{8,}(&|$)/i;
+
+function isStamped(url) {
+  try {
+    var u = new URL(url);
+    return u.origin === self.location.origin && STAMPED.test(u.search);
+  } catch (e) { return false; }
+}
+
 function isFixed(url) {
   try {
     var u = new URL(url);
@@ -172,6 +188,13 @@ async function fromCache(req, ctx) {
   return keep(ctx, FIXED, req.url, await fetch(req));
 }
 
+// Stamped: cache, then network, kept in APP so a write still evicts its own older versions.
+async function fromStamped(req, ctx) {
+  var hit = await caches.match(req.url);
+  if (hit) return hit;
+  return keep(ctx, APP, req.url, await fetch(req));
+}
+
 // App: network, then cache. A running network always wins, so an update lands the moment it
 // exists; the cache only answers when the network cannot.
 //
@@ -203,6 +226,7 @@ webtorch.handleFetch(function (req, ctx) {
   // request pass through untouched: CacheStorage cannot store 206 responses, and attempting
   // it used to report a TypeError after every completed model chunk.
   if (req.headers && req.headers.has('range')) return fetch(req);
+  if (isStamped(req.url)) return fromStamped(req, ctx);
   return isFixed(req.url) ? fromCache(req, ctx) : fromNetwork(req, ctx);
 });
 

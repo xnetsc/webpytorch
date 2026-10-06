@@ -1,5 +1,28 @@
 # Progress
 
+## 2026-10-06 ▸ Release's runtime restart: 8.5 s on the deployed page was revalidation, not work
+
+**Why Release shows "loading webtorch…":** the page's Release closes the whole runtime
+(worker + GPU device) and starts a fresh one, because WASM memory never shrinks: measured on
+the 0.6B, releasing the model alone left WASM at 722 MB (GPU buffers 0); the restart returns
+it to 52 MB. On localhost the restart took 1.57 s.
+
+**Why it took 8.5 s on the deployed page (Pages, service worker in control):** connecting the
+GPU 0.65 s, Pyodide 0.63 s (cache-first CDN files), the backend wheel 0.54 s, then
+"loading webtorch…" **6.7 s** — the SDK's ~30 Python modules, each a `no-cache` revalidation
+round trip of ~300 ms to github.io (every one a 304), fetched one after another. The page's
+cache policy treated all of its own files as network-first, although every SDK and page file
+is requested with its content hash in `v=`, so the bytes behind any such URL never change.
+
+**Changes:** `chat/cache-sw.js` answers same-origin URLs stamped with a hash (`v=<8+ hex>`)
+from the cache first, still evicting a path's older versions on write; unstamped files —
+`index.html`, which carries the new hashes — stay network-first. The SDK worker fetches its
+module manifest and all modules in parallel, starting before Pyodide boots, instead of one
+after another afterwards (a first visit or a new version pays the network once, overlapped).
+
+Locally after the change: restart 1.1 s; all 32 stamped requests answered by the cache with
+no revalidation. Deployed-page numbers in the next entry.
+
 ## 2026-10-05 ▸ The rest of a load's route ladders runs while idle; hybrid layers are no longer missed
 
 **Measured first, on the 27B (Qwen3.8-27B UD-Q2_K_XL, WebGPU, cold):** with every ladder
