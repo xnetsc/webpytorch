@@ -225,7 +225,7 @@ def test_parallel_mlp_activation_is_measured_at_the_layer_on_both_backends():
     assert 'execution="auto"' in source
     assert 'execution not in ("auto", "separate", "fused") + fused_modes' in source
     assert 'backend_name = "webgpu" if _adam_backend_ready() else "webgl"' in source
-    assert "_measured_choice" in source
+    assert "chosen = tune(key, candidates" in source      # raced like every other route
     assert "parallel_swiglu" in inspect.getsource(llm.CausalLM._mlp)
 
 

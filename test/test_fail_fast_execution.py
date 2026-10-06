@@ -39,6 +39,15 @@ def test_gqa_tuner_failure_does_not_cache_or_change_split(monkeypatch):
     assert (wt._GQA_SPLIT, wt._GQA_SPLIT_ON) == before
 
 
+def _causes(error):
+    """Every message down an exception's cause chain: where a failure came from."""
+    out = []
+    while error is not None:
+        out.append(str(error))
+        error = error.__cause__
+    return " <- ".join(out)
+
+
 def test_kv_pair_tuner_failure_does_not_choose_separate(monkeypatch):
     key = ("kv_write_pair", 101, 64, 107, False)
     monkeypatch.delitem(wt._TUNED, key, raising=False)
@@ -46,7 +55,7 @@ def test_kv_pair_tuner_failure_does_not_choose_separate(monkeypatch):
         RuntimeError("KV upload failed"))))
     with pytest.raises(RuntimeError, match="KV pair auto candidate failed") as error:
         wt._kv_pair_auto(101, 64, 107, False)
-    assert "KV upload failed" in str(error.value.__cause__)
+    assert "KV upload failed" in _causes(error.value)
     assert key not in wt._TUNED
 
 
@@ -63,9 +72,10 @@ def test_add_rmsnorm_failed_fused_candidate_is_not_cached_as_composed(monkeypatc
         raise RuntimeError("fused kernel failed")
 
     monkeypatch.setitem(wt._adam_kernel, "platform", SimpleNamespace(addKernel=broken_kernel))
-    with pytest.raises(RuntimeError, match="add_rmsnorm candidate 'fused' failed") as error:
+    with pytest.raises(RuntimeError, match="add_rmsnorm candidate failed") as error:
         wt.add_rmsnorm(residual, update, weight, 1e-6)
-    assert "fused kernel failed" in str(error.value.__cause__)
+    assert "candidate 'fused' failed" in _causes(error.value)
+    assert "fused kernel failed" in _causes(error.value)
     assert key not in wt._TUNED
 
 

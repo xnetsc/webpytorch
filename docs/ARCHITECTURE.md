@@ -485,10 +485,25 @@ candidates differ in what the host issues as much as in GPU work.
 has used — what its warm-up, recordings and requests looked up, not every bucket a ladder
 explored — through the probes that raced them first (each ladder probe is kept per route
 prefix; each `tune` keeps its own arguments; a model registers its composite choices with
-`register_remeasure`). Each new choice takes effect when its race ends; `cancel` or the
-budget ends the race in progress without a verdict; recordings that used a changed route are
-rebuilt when idle (`on_routes_changed`). Laya: 38 routes in 2.8 s, 9 changed (five of them
-buckets the load had only borrowed from a neighbour); answers unchanged.
+`register_remeasure`, or says with `cannot_remeasure` why one cannot be). Each new choice
+takes effect when its race ends; `cancel` or the budget ends the race in progress without a
+verdict; recordings that looked up a changed route (`route_keys` around each recording) are
+rebuilt when idle (`on_routes_changed`). The routes raced longest ago go first, so a budget
+that runs out never strands the same ones, and the operator races it did not reach go on
+between calls. Laya: 38 routes in 1.2 s, answers unchanged. 0.6B: 30 in 4.2 s, decode 177 tok/s
+before and after.
+
+Every operator choice is made by one race (`tune` or `_weight_execution`): the decode thread
+shapes, flash tiles, MoE weighted sum, KV pair write, add+RMSNorm, the parallel projections
+and SwiGLU, Q/K norm+rope and the embedding row layout each had a loop of their own (host
+clock, a collect free to land in a sample, no settling, and no way to race them again). They
+are raced on inputs of their own shape made for the race and dropped after it, by the GPU's
+clock and sized to it (`tune(sized=True)`); a 27B's shape tuning went from 9.9 to 4.0 s of
+its load. What remains its own loop is a composite timed end to end: the greedy chunk (host
+clock, registered for `remeasure`) and the decode composition, which interactively is not
+searched at all — one full-model record can outlast any interactive budget — and is
+reported as such: racing it "again" applied the reference plan over a greedy session's pick
+mode and turned the chunked greedy path off (0.6B 175 → 152 tok/s).
 
 All of this is per device. `gpu_features()` reports what the device was created with —
 `shader-f16` and `subgroups` are requested whenever the adapter has them, whatever its vendor

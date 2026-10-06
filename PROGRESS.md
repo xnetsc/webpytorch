@@ -1,5 +1,30 @@
 # Progress
 
+## 2026-10-07 ▸ `remeasure` covers every operator, never strands a route, never slows a reply
+
+**Trigger:** user — a time limit must not leave some routes unmeasured for ever; at most 60 s;
+the measurement must not be fooled by the browser's clock.
+
+**Changes:**
+- The routes raced longest ago go first (kept with the kernel profile); out of time, the
+  operator races not reached go on when idle; a newer remeasure drops what an older one left.
+- Every operator choice is one race: nine sites with loops of their own (decode thread
+  shapes, flash tiles, MoE weighted sum, KV pair, add+RMSNorm, parallel projections/SwiGLU,
+  Q/K norm+rope, embedding row) now go through `tune` — GPU clock, GC-free, settled,
+  stoppable, raced again by `remeasure`; inputs made for the race and dropped after it.
+  `tune(sized=True)` sizes a sample to its clock (a decode kernel of microseconds is lost in a
+  65.5 us timestamp step otherwise).
+- Recordings note the routes they looked up even where a function reads `_TUNED` itself
+  before `tune` (`_ggml_shape_for`): the decode graphs had kept replaying old shapes.
+- The decode composition is reported as not re-raceable (it is searched only offline);
+  racing it through the interactive path turned the greedy chunk path off.
+
+**Measured:** 0.6B remeasure 30 routes in 4.2 s, decode 177.7 → 177.0 tok/s (it had been
+175 → 152 before the fix), replies identical; stopped at 400 ms, report back. Load with GPU-
+clocked shape races: 0.6B warming 1.8 → 1.1 s, 30B load 41.3 → 38.8 s (decode 41.4 → 42.7
+tok/s), 27B 36.9 → 31.5 s (shape tuner 9.9 → 4.0 s, decode unchanged); every reply
+identical. Laya remeasure 38 routes in 1.2 s; three questions 43.9 ms, answers unchanged.
+
 ## 2026-10-07 ▸ No request records any more; Q8_0 in half arithmetic; races timed by the GPU; `remeasure`
 
 **Trigger:** user — the first request is still several times slower and only gradually
@@ -34,10 +59,9 @@ three 50.0, one 17.8. 0.6B: replies identical, first token 132/85/86 → 118/80/
 Laya: 38 routes in 2.8 s, 9 changed, answers unchanged; stopped at 250 ms, the 3 finished
 kept, the race in progress dropped, the report back 12 ms after the stop.
 
-**Not done yet:** `remeasure` always starts from the first route, so a budget that runs out at
-the same place every time never reaches the last ones — next: least recently raced first,
-and what a budget leaves continues when idle. The LLM's composite choices (decode
-composition, greedy chunk) are registered but not yet verified through `remeasure`.
+**Not done yet (done in the entry above):** `remeasure` always started from the first route,
+so a budget that ran out at the same place every time never reached the last ones; the LLM's
+composite choices were registered but not yet verified through `remeasure`.
 
 ## 2026-10-06 ▸ One question runs packed too: 42–47 → 33.5–37 ms when requests are seconds apart
 

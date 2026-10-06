@@ -831,7 +831,10 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   race ends; the recordings that used a changed route are recorded again when idle.
   `cancel()` stops it at the next sample: the race in progress is dropped (that route keeps
   its previous choice), every route already raced keeps its new one. Running out of
-  `budget_s` stops it the same way. Raises when no model is loaded. The report:
+  `budget_s` stops it the same way, and the operator races it did not reach then go on when
+  idle, one at a time. Each remeasure starts with the routes raced longest ago (kept with
+  the kernel profile, so across reloads too): no route is left unraced for ever because a
+  budget keeps running out before it. Raises when no model is loaded. The report:
 
   ```python
   {"status": "complete",            # or "stopped" (cancel) or "out_of_time"
@@ -841,7 +844,9 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
                  "clock": "gpu", "ms": 141.2}, ...],
    "changed": 3,
    "discarded": {"key": ...} or None,   # the race a stop interrupted
-   "not_reached": [...], "unmeasurable": [...],   # unmeasurable: used, nothing can re-race it
+   "continuing": [...],                 # out of time: operator races that go on when idle
+   "not_reached": [...],                # stopped, or a composite: first in line next time
+   "unmeasurable": [{"key": ..., "why": "..."}],   # used, and why nothing here re-races it
    "rebuilds": [{"rebuild": "encoder pass recorded at a capacity", "rows": 256}, ...],
    "budget_ms": 60000, "elapsed_ms": 2792.1}
   ```

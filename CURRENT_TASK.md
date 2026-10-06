@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-07 `remeasure` complete:** least recently raced first (kept with the profile), out of
+time → the rest continues when idle, every operator choice raced through `tune` (GPU clock,
+GC-free, settled, stoppable), recordings track the routes they used; 0.6B remeasure 4.2 s with
+decode unchanged (177 tok/s), loads faster (27B 36.9 → 31.5 s). Next: the article the user
+asked for (design, problems, fixes, in the user's voice; HTML + Markdown).
+
 **2026-10-07 no request records any more; Q8_0 half arithmetic; GPU-timed races; `remeasure`:**
 the decision encoder is recorded per row capacity at load and replayed for the live rows (first
 requests 69.6/77.6 → 22.8/29.3 ms on the Q8_0 GGUF, seconds apart); Q8_0 gets the half tiled

@@ -4031,7 +4031,8 @@ class CausalLM:
     def _tune_embedding_row(self):
         """Choose a bit-exact row layout locally, before whole-decoder composition."""
         key = self._embedding_row_key()
-        if key in wt._TUNED:
+        if key in wt._TUNED and key not in wt._RACE_AGAIN:
+            wt._note_route(key)
             return wt._TUNED[key]
         candidates = self._embedding_row_candidates()
         self._ensure_chunk_buffers(1)
@@ -4050,27 +4051,15 @@ class CausalLM:
                 continue
         if not valid:
             raise RuntimeError("no exact Q6_K embedding-row route")
-        samples = {route: [] for route in valid}
+        cur = {}
 
-        def bench(route):
-            wt._remeasure_checkpoint()
-            with wt._quiet_timing():
-                t0 = time.perf_counter()
-                for _ in range(16):
-                    self._decode_chunk_input(slot=1, execution=route)
-                self.h_in.numpy()
-                took = (time.perf_counter() - t0) / 16.0
-            return took
-
-        for route in valid:
-            bench(route)
-        for r in range(9):
-            order = valid if not (r & 1) else list(reversed(valid))
-            for route in order:
-                samples[route].append(bench(route))
-        chosen = wt._measured_choice(samples, valid, default=valid[0])
-        wt._TUNED[key] = chosen
-        return chosen
+        def bench(n):
+            for _ in range(n):
+                self._decode_chunk_input(slot=1, execution=cur["v"])
+            self.h_in.numpy()
+        # Replayed inside the decode graphs: the GPU's work is the cost.
+        return wt.tune(key, tuple(valid), lambda v: cur.update(v=v), bench, rounds=9,
+                       default=valid[0], clock="gpu", sized=True)
 
     def _set_chunk_inputs(self, token, pos, count):
         """Start a chain of greedy chunks at `pos` from the host's `token`: two writes for
@@ -4378,7 +4367,15 @@ class CausalLM:
         """The decode composition and the greedy chunk race again with the kernel routes;
         a kernel route that changes makes the decode graphs recorded with it stale."""
         if getattr(self, "_decode_profile_key", None) is not None:
-            wt.register_remeasure(self._decode_profile_key, self._remeasure_decode)
+            # Interactively the composition search does not run at all -- one full-model
+            # record can take longer than any interactive budget (16.6 s on the 30B) -- so the
+            # load applies the original-width composition, measured only by an explicit
+            # offline call. Racing it "again" through that path measured nothing and applied
+            # the reference plan over a greedy session's pick mode: the chunked greedy path
+            # turned off and a 0.6B went from 175 to 152 tok/s.
+            wt.cannot_remeasure(self._decode_profile_key,
+                                "the decode composition is searched only offline "
+                                "(_tune_decode_composition(interactive=False))")
         if getattr(self, "_greedy_memo_key", None) is not None and self._can_chunk_greedy():
             wt.register_remeasure(self._greedy_memo_key, self._remeasure_greedy)
         wt.on_routes_changed(self._routes_changed)
@@ -4415,7 +4412,9 @@ class CausalLM:
         done = False
         try:
             tune_it()
-            done = True
+            # A tuner that ran out of its time without a verdict leaves none: that is not a
+            # new choice, and the previous one goes back below.
+            done = before is None or wt._TUNED.get(key) is not None
         finally:
             if deadline is missing:
                 self.__dict__.pop("_warm_deadline", None)
@@ -4432,22 +4431,11 @@ class CausalLM:
         wt._note_remeasured(key, comparable(before), comparable(wt._TUNED.get(key)), "host",
                             time.perf_counter() - t0)
 
-    def _remeasure_decode(self):
-        def plan(v):
-            return v.get("plan") if isinstance(v, dict) else v
-
-        def again():
-            # Within the time limit set above; the memo is gone, so it searches again.
-            self._tune_decode_composition(interactive=True)
-            # The chunks are decode steps too.
-            self._greedy_chunk_capture_ready = False
-        self._race_own_choice(self._decode_profile_key, again, plan)
-
     def _remeasure_greedy(self):
         def choice(v):
             return [v.get("count"), v.get("row")] if isinstance(v, dict) else v
-        self._race_own_choice(self._greedy_memo_key, self._tune_greedy_chunks, choice,
-                              drop=(self._embedding_row_key(),))
+        # The embedding row layout it builds on is raced as an operator, before it.
+        self._race_own_choice(self._greedy_memo_key, self._tune_greedy_chunks, choice)
 
     def _warm_decode_step(self):
         """Run one decode step here, where nothing is recording.
@@ -4660,26 +4648,17 @@ class CausalLM:
             return probe
         if route != "auto":
             raise ValueError("Q/K norm+rope execution must be auto, composed, or fused")
-        if key not in wt._TUNED:
-            candidates = ["composed"] + (["fused"] if valid_fused else [])
-            samples = {name: [] for name in candidates}
+        candidates = ("composed",) + (("fused",) if valid_fused else ())
+        cur = {}
 
-            def bench(name):
-                out = None; t0 = time.perf_counter()
-                for _ in range(8):
-                    out = fused() if name == "fused" else composed()
-                out[-1].numpy()
-                return (time.perf_counter() - t0) / 8.0
-
-            for name in candidates:
-                bench(name)
-            for r in range(9):
-                order = candidates if not (r & 1) else list(reversed(candidates))
-                for name in order:
-                    samples[name].append(bench(name))
-            wt._TUNED[key] = wt._measured_choice(samples, candidates,
-                                                  default="composed")
-        return probe if wt._TUNED[key] == "fused" else composed()
+        def bench(n):
+            out = None
+            for _ in range(n):
+                out = fused() if cur["v"] == "fused" else composed()
+            out[-1].numpy()
+        chosen = wt.tune(key, candidates, lambda v: cur.update(v=v), bench, rounds=9,
+                         default="composed", clock="gpu", sized=True)
+        return probe if chosen == "fused" else composed()
 
     def _attn_out(self, lay, o, T, rows=False):
         """Attention output -> hidden. Applies the sigmoid output gate when the query projection

@@ -61,7 +61,7 @@ def test_embedding_row_layout_is_exact_gated_locally_and_upper_overridable():
     assert "nrow*im.N+wo" in wt._Q6K_DECODE_ROW_INPUT_WGSL
     local = inspect.getsource(CausalLM._tune_embedding_row)
     assert "np.array_equal" in local
-    assert "_measured_choice" in local
+    assert "wt.tune(key, tuple(valid)" in local                # raced like every other route
     capture = inspect.signature(CausalLM._capture_greedy_chunk)
     assert "row_execution" in capture.parameters
     upper = inspect.getsource(CausalLM._tune_greedy_chunks)

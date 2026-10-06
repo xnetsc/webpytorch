@@ -58,6 +58,9 @@ def raced(monkeypatch):
     monkeypatch.setattr(wt, "_REMEASURED", [])
     monkeypatch.setattr(wt, "_RACE_AGAIN", set())
     monkeypatch.setattr(wt, "_LAST_SAMPLE_END", [0.0])
+    monkeypatch.setattr(wt, "_REMEASURE_SEQ", [0])
+    monkeypatch.setattr(wt, "_REMEASURED_AT", {})
+    monkeypatch.setattr(wt, "_DEFERRED", [])
     monkeypatch.setattr(webio, "cancel_requested", lambda: False)
     cost = {"slow": 2.0, "fast": 1.0}
     cur = {}
@@ -103,19 +106,50 @@ def test_a_stop_keeps_what_finished_and_drops_the_race_it_interrupted(raced, mon
     assert report["discarded"]["key"] == "route|2" and not report["not_reached"]
 
 
-def test_running_out_of_time_is_the_same_stop(raced):
+def test_running_out_of_time_is_the_same_stop_and_the_rest_goes_on_when_idle(raced):
+    raced["cost"].update(slow=0.5)
     report = wt.remeasure(budget_s=1e-9)
     # The time runs out inside the first race: dropped, like a stop's.
     assert report["status"] == "out_of_time" and not report["measured"]
     assert report["discarded"]["key"] == "route|1"
-    assert [r["key"] for r in report["not_reached"]] == ["route|2"]
-    assert wt._TUNED[("route", 1)] == "fast"
+    assert [r["key"] for r in report["continuing"]] == ["route|2"] and not report["not_reached"]
+    assert wt._TUNED[("route", 1)] == wt._TUNED[("route", 2)] == "fast"
+    # Between calls, the race the budget did not reach runs (`calibrate_deferred`).
+    while wt._DEFERRED:
+        wt.calibrate_deferred(0)
+    assert wt._TUNED[("route", 2)] == "slow" and wt._TUNED[("route", 1)] == "fast"
 
 
-def test_a_route_nothing_can_race_again_is_reported_not_skipped(raced):
-    wt._USED[("weight_exec", "mystery", "f32", 8, 8, 16)] = True
+def test_each_remeasure_starts_with_the_routes_raced_longest_ago(raced):
+    first = wt.remeasure(budget_s=1e-9)            # route 1 dropped, route 2 continues idle
+    while wt._DEFERRED:
+        wt.calibrate_deferred(0)                   # route 2 raced: it is the newest now
     report = wt.remeasure(budget_s=1e9)
-    assert [u["key"] for u in report["unmeasurable"]] == ["weight_exec|mystery|f32|8|8|16"]
+    assert first["discarded"]["key"] == "route|1"
+    assert [m["key"] for m in report["measured"]] == ["route|1", "route|2"]
+    # And what a remeasure reached is kept with the profile, for the next session.
+    saved = wt.kernel_profile()["remeasured"]
+    assert saved["seq"] == 2 and saved["at"] == {"route|1": 2, "route|2": 2}
+
+
+def test_a_newer_remeasure_drops_what_an_older_one_left_for_idle(raced):
+    wt.remeasure(budget_s=1e-9)
+    report = wt.remeasure(budget_s=1e9)
+    assert report["status"] == "complete"
+    calls = len(wt._REMEASURED)
+    while wt._DEFERRED:
+        wt.calibrate_deferred(0)
+    assert len(wt._REMEASURED) == calls             # the stale idle race did not run
+
+
+def test_a_route_nothing_can_race_again_is_reported_not_skipped(raced, monkeypatch):
+    monkeypatch.setattr(wt, "_CANNOT_AGAIN", {})
+    wt._USED[("weight_exec", "mystery", "f32", 8, 8, 16)] = True
+    wt.cannot_remeasure(("plan", 1), "searched only offline")
+    report = wt.remeasure(budget_s=1e9)
+    assert [(u["key"], u["why"]) for u in report["unmeasurable"]] == [
+        ("weight_exec|mystery|f32|8|8|16", "no probe that runs it was kept"),
+        ("plan|1", "searched only offline")]
 
 
 def test_what_a_model_used_goes_with_it():
@@ -133,3 +167,17 @@ def test_the_sdk_refuses_to_remeasure_with_nothing_loaded(monkeypatch):
     monkeypatch.setattr(_sdk, "_IMPL_CACHE", {})
     with pytest.raises(RuntimeError, match="needs a loaded model"):
         webtorch.remeasure()
+
+
+def test_a_route_is_raced_again_with_every_argument_it_was_first_raced_with(raced):
+    calls = []
+    cur = {}
+
+    def bench(n):
+        calls.append(n)
+        raced["clock"][0] += {"a": 1.0, "b": 2.0}[cur["v"]] * n
+    assert wt.tune(("sized", 1), ("b", "a"), lambda v: cur.update(v=v), bench,
+                   warm=lambda: None, sized=True) == "a"
+    del calls[:]
+    report = wt.remeasure(budget_s=1e9)
+    assert report["status"] == "complete" and calls          # bench(n) again, not bench()

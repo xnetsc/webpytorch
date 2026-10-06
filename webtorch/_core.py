@@ -1964,48 +1964,68 @@ def moe_weighted_sum(values, weights, k, execution="auto"):
         return composed()
     mode = execution
     if mode == "auto":
-        mode = _TUNED.get(key)
-        if mode is None:
-            # Calibrating inside a graph recording would bake the comparison's many
-            # dispatches into EVERY future decode token. Defer just this unknown bucket;
-            # the independent load-time one-row warm pass normally populates it first.
+        if key in _TUNED and key not in _RACE_AGAIN:
+            _note_route(key)
+            mode = _TUNED[key]
+        else:
+            # Racing inside a graph recording would bake the comparison's many dispatches
+            # into EVERY future decode token. Defer just this unknown bucket; the
+            # independent load-time one-row warm pass normally populates it first.
             if backend == "webgpu":
                 from wgpy_backends.webgpu import webgpu_buffer as _wb
             else:
                 from wgpy_backends.webgl import webgl_buffer as _wb
-            if getattr(_wb, "_capture_depth", 0):
+            if getattr(_wb, "_capture_depth", 0) and key not in _TUNED:
                 mode = "composed"
             else:
-                import time as _time
-                try:
-                    reference = np.asarray(composed().numpy(), np.float32)
-                    candidate = np.asarray(fused().numpy(), np.float32)
-                    scale = max(1e-6, float(np.abs(reference).max()))
-                    if (not np.all(np.isfinite(candidate))
-                            or float(np.abs(reference - candidate).max()) / scale > 2e-5):
-                        raise RuntimeError("fused MoE reduction failed its numerical gate")
-                    # A single tiny dispatch plus readback measures synchronisation
-                    # jitter more than kernel work. Batch enough identical calls for
-                    # the per-operator positive result to survive that noise, without
-                    # keeping more than one output alive at a time.
-                    repeat = 16 if rows <= 128 else 4
-                    samples = {"composed": [], "fused": []}
-                    for turn in range(9):
-                        order = (("composed", "fused") if not (turn & 1)
-                                 else ("fused", "composed"))
-                        for route in order:
-                            t0 = _time.perf_counter()
-                            for _ in range(repeat):
-                                out = composed() if route == "composed" else fused()
-                            out.numpy()
-                            samples[route].append((_time.perf_counter() - t0) / repeat)
-                    mode = _measured_choice(samples, ("composed", "fused"),
-                                            default="composed")
-                except Exception as exc:
-                    _MOE_REDUCE_REJECTED[key] = "%s: %s" % (type(exc).__name__, exc)
-                    mode = "composed"
-                _TUNED[key] = mode
+                mode = _moe_reduce_route(key, rows, k, h)
     return fused() if mode == "fused" else composed()
+
+
+def _moe_reduce_route(key, rows, k, h):
+    """`moe_weighted_sum`'s measured route for this shape: the two-operation path unless the
+    fused kernel is both correct and faster. Raced on inputs of the call's shape made for
+    the race (and dropped after it), so the race can be run again (`remeasure`)."""
+    held = {}
+
+    def inputs():
+        if not held:
+            rng = np.random.default_rng(int(rows) * 31 + int(k))
+            held["y"] = Tensor(rng.standard_normal((rows * k, h)).astype(np.float32))
+            held["w"] = Tensor(rng.random((rows * k,)).astype(np.float32))
+        return held["y"], held["w"]
+    reference = []
+
+    def check(route):
+        if route == "composed":
+            return True
+        y, w = inputs()
+        if not reference:
+            reference.append(np.asarray(
+                moe_weighted_sum(y, w, k, execution="composed").numpy(), np.float32))
+        got = np.asarray(moe_weighted_sum(y, w, k, execution=route).numpy(), np.float32)
+        scale = max(1e-6, float(np.abs(reference[0]).max()))
+        return bool(np.all(np.isfinite(got))
+                    and float(np.abs(reference[0] - got).max()) / scale <= 2e-5)
+    cur = {}
+
+    def bench(n):
+        y, w = inputs()
+        out = None
+        for _ in range(n):
+            out = moe_weighted_sum(y, w, k, execution=cur["v"])
+        out.numpy()
+    try:
+        return tune(key, ("composed", "fused"), lambda v: cur.update(v=v), bench,
+                    check=check, default="composed", clock="gpu", sized=True)
+    except RuntimeError as exc:
+        # The fused kernel failed its gate here: the two operations are the route, kept so
+        # it is not tried again on every call.
+        _MOE_REDUCE_REJECTED[key] = "%s: %s" % (type(exc).__name__, exc)
+        _TUNED[key] = "composed"
+        return "composed"
+    finally:
+        held.clear()
 
 
 def device_clear(a):
@@ -4003,6 +4023,7 @@ def calibration_drop():
     _PROBE_FOR.clear()
     _TUNE_AGAIN.clear()
     _AGAIN_FN.clear()
+    _CANNOT_AGAIN.clear()
     del _ROUTE_HOOKS[:]
     _KEYS_SEEN[0] = None
 
@@ -4024,10 +4045,16 @@ _PROBING = [0]         # inside a ladder probe: exploration, not use
 _PROBE_FOR = {}        # route key prefix -> probe(m): that operator at m rows (from ladders)
 _TUNE_AGAIN = {}       # tune key -> the arguments that race it again
 _AGAIN_FN = {}         # route key -> fn() racing a model's own composite choice again
+_CANNOT_AGAIN = {}     # route key -> why it is used but cannot be raced again here
 _RACE_AGAIN = set()    # keys a remeasure is racing again right now
 _REMEASURING = [0]
 _REMEASURE_UNTIL = [None]   # when the remeasure under way has to have stopped (perf_counter)
 _REMEASURED = []       # (key, before, after, clock, ms), as each race of a remeasure finishes
+# Which remeasure last raced each route ("|"-joined key -> its number), kept with the kernel
+# profile: each remeasure starts with the routes raced longest ago, so a budget that runs out
+# never leaves the same routes unraced for ever.
+_REMEASURE_SEQ = [0]
+_REMEASURED_AT = {}
 _ROUTE_HOOKS = []      # fn(changed keys) -> descriptions of the rebuilds it queued
 _KEYS_SEEN = [None]    # a set while `route_keys()` collects
 
@@ -4046,12 +4073,14 @@ def _commit_route(key, chosen, clock, seconds=None):
     _RACE_CLOCK[key] = clock
     if _REMEASURING[0]:
         _REMEASURED.append((key, before, chosen, clock, seconds))
+        _REMEASURED_AT["|".join(str(x) for x in key)] = _REMEASURE_SEQ[0]
 
 
 def _note_remeasured(key, before, after, clock, seconds=None):
     """A model's own choice raced again (`register_remeasure`): what it was and became."""
     if _REMEASURING[0]:
         _REMEASURED.append((key, before, after, clock, seconds))
+        _REMEASURED_AT["|".join(str(x) for x in key)] = _REMEASURE_SEQ[0]
 
 
 def remeasure_time_left():
@@ -4091,6 +4120,13 @@ def register_remeasure(key, fn):
     """A model's own composite choice, kept in `_TUNED` under `key`, that `fn()` races again
     and commits (through `_commit_route`) -- for choices not made by `tune` or a ladder."""
     _AGAIN_FN[key] = fn
+    _note_route(key)
+
+
+def cannot_remeasure(key, why):
+    """A choice the loaded model uses that `remeasure` cannot race again, and why: reported
+    as such rather than raced through a path that would not measure it."""
+    _CANNOT_AGAIN[key] = str(why)
     _note_route(key)
 
 
@@ -4138,15 +4174,19 @@ def remeasure(budget_s=60.0):
     out of `budget_s` is the same stop. Either way the recordings that depend on a changed
     route are queued to be made again (`on_routes_changed`), which happens when idle.
 
-    Each operator's routes are raced first, then a model's own composite choices
-    (`register_remeasure`) -- those are timed over the operators, so they go after them, and
-    they take what is left of the budget as their own time limit.
+    The routes raced longest ago go first (never, before any), so one budget after another
+    covers them all. Among those equally old, each operator's routes go before a model's own
+    composite choices (`register_remeasure`) -- those are timed over the operators -- and a
+    composite takes what is left of the budget as its own time limit. Operator races the budget
+    did not reach go on when idle, one at a time (`continuing` in the report); a composite it
+    did not reach goes first next time.
 
     The report: `status` ("complete", "stopped" or "out_of_time"), `measured` (each raced
     route: `key`, `before`, `after`, `changed`, `ms`, `clock` -- "gpu" timed by the device's
     timestamps, "host" by the browser's clock), `changed` (how many), `discarded` (the
-    route whose race the stop ended), `not_reached`, `unmeasurable` (used routes nothing
-    here can race again), `rebuilds` (what was queued), `budget_ms` and `elapsed_ms`."""
+    route whose race the stop ended), `continuing` (raced when idle), `not_reached`,
+    `unmeasurable` (used routes nothing here can race again), `rebuilds` (what was queued),
+    `budget_ms` and `elapsed_ms`."""
     global _OutOfTime
     from . import webio
     import time as _t
@@ -4157,7 +4197,9 @@ def remeasure(budget_s=60.0):
     # used route of its prefixes there at once.
     steps, unmeasurable, groups, composites = [], [], {}, []
     for key in list(_USED):
-        if key in _AGAIN_FN:
+        if key in _CANNOT_AGAIN:
+            unmeasurable.append(key)
+        elif key in _AGAIN_FN:
             composites.append(("fn", [key], _AGAIN_FN[key]))
         elif key in _TUNE_AGAIN:
             steps.append(("tune", [key], _TUNE_AGAIN[key]))
@@ -4170,9 +4212,16 @@ def remeasure(budget_s=60.0):
             groups[gid][1].append(key)
         else:
             unmeasurable.append(key)
-    steps += composites
+
+    def age(step):
+        return min(_REMEASURED_AT.get("|".join(str(x) for x in k), 0) for k in step[1])
+    order = {id(st): i for i, st in enumerate(steps + composites)}
+    steps = sorted(steps + composites,
+                   key=lambda st: (age(st), st[0] == "fn", order[id(st)]))
+    _REMEASURE_SEQ[0] += 1
+    seq = _REMEASURE_SEQ[0]
     del _REMEASURED[:]
-    status, discarded, not_reached = "complete", None, []
+    status, discarded, rest = "complete", None, []
     _REMEASURING[0] += 1
     _REMEASURE_UNTIL[0] = t0 + float(budget_s)
     try:
@@ -4181,28 +4230,18 @@ def remeasure(budget_s=60.0):
                     "out_of_time" if remeasure_time_left() <= 0 else None)
             if stop:
                 status = stop
-                not_reached = [k for _, ks, _ in steps[i:] for k in ks]
+                rest = steps[i:]
                 break
             done = len(_REMEASURED)
             _RACE_AGAIN.update(keys)
             try:
-                if kind == "fn":
-                    how()
-                elif kind == "tune":
-                    tune(keys[0], **how)
-                else:
-                    probe, rows = how
-                    _PROBING[0] += 1
-                    try:
-                        probe(rows)
-                    finally:
-                        _PROBING[0] -= 1
+                _run_race_step(kind, keys, how)
             except (webio.Cancelled, KeyboardInterrupt) as exc:
                 status = "out_of_time" if isinstance(exc, _OutOfTime) else "stopped"
                 raced = {r[0] for r in _REMEASURED[done:]}
                 left = [k for k in keys if k not in raced]
                 discarded = [_route_entry(k) for k in left[:1]]
-                not_reached = left[1:] + [k for _, ks, _ in steps[i + 1:] for k in ks]
+                rest = ([(kind, left[1:], how)] if left[1:] else []) + steps[i + 1:]
                 break
             finally:
                 _RACE_AGAIN.difference_update(keys)
@@ -4221,12 +4260,61 @@ def remeasure(budget_s=60.0):
         for hook in list(_ROUTE_HOOKS):
             rebuilds.extend(hook(changed_keys) or [])
     _NEAREST.clear()
+    # What the budget did not reach: an operator race is short enough to go on between calls
+    # (a call that arrives waits for at most one); a composite is not, and goes first next time.
+    continuing, not_reached = [], []
+    for kind, keys, how in rest:
+        if status == "out_of_time" and kind != "fn":
+            queue_task(lambda st=(kind, keys, how): _race_when_idle(st, seq))
+            continuing.extend(keys)
+        else:
+            not_reached.extend(keys)
     return {"status": status, "measured": measured, "changed": len(changed),
             "discarded": (discarded or [None])[0],
+            "continuing": [_route_entry(k) for k in continuing],
             "not_reached": [_route_entry(k) for k in not_reached],
-            "unmeasurable": [_route_entry(k) for k in unmeasurable],
+            "unmeasurable": [dict(_route_entry(k), why=_CANNOT_AGAIN.get(
+                k, "no probe that runs it was kept")) for k in unmeasurable],
             "rebuilds": rebuilds, "budget_ms": round(float(budget_s) * 1000),
             "elapsed_ms": round((_t.perf_counter() - t0) * 1000, 1)}
+
+
+def _run_race_step(kind, keys, how):
+    if kind == "fn":
+        how()
+    elif kind == "tune":
+        tune(keys[0], **how)
+    else:
+        probe, rows = how
+        _PROBING[0] += 1
+        try:
+            probe(rows)
+        finally:
+            _PROBING[0] -= 1
+
+
+def _race_when_idle(step, seq):
+    """One of the races a remeasure's budget left, run between calls; dropped when another
+    remeasure has started since (it plans its own) or a stop is asked for meanwhile."""
+    from . import webio
+    if seq != _REMEASURE_SEQ[0] or webio.cancel_requested():
+        return
+    kind, keys, how = step
+    done = len(_REMEASURED)
+    _REMEASURING[0] += 1
+    _RACE_AGAIN.update(keys)
+    try:
+        _run_race_step(kind, keys, how)
+    except webio.Cancelled:
+        return
+    finally:
+        _RACE_AGAIN.difference_update(keys)
+        _REMEASURING[0] -= 1
+    changed = {r[0] for r in _REMEASURED[done:] if r[1] != r[2]}
+    if changed:
+        _NEAREST.clear()
+        for hook in list(_ROUTE_HOOKS):
+            hook(changed)
 
 
 def _route_entry(key):
@@ -4681,7 +4769,7 @@ def _weight_execution(family, storage_format, K, N, M, run,
 
 
 def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm=None,
-         clock="host"):
+         clock="host", sized=False):
     """The best of `candidates` on this device, remembered under `key`.
 
     `apply(v)` installs a candidate, `bench()` runs the work once and returns only when the
@@ -4691,6 +4779,10 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
     `clock="gpu"`: timed by the GPU's own timestamps where the device has them -- for
     candidates that differ only in GPU work. The default, the host's clock, is for those
     whose host work is part of what differs (how often a loop crosses into JS, say).
+    `sized`: `bench(n)` runs the work n times, and the race picks n so a sample is about as
+    much work as its clock needs (`_RaceClock.sample_s`) -- a decode kernel of microseconds
+    is lost in the timestamps' step otherwise. Each run's output is dropped before the next,
+    so n does not pile up memory.
     """
     _note_route(key)
     if key not in _TUNE_AGAIN:
@@ -4698,7 +4790,7 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
         # of them runs the same shapes.
         _TUNE_AGAIN[key] = dict(candidates=tuple(candidates), apply=apply, bench=bench,
                                 check=check, rounds=rounds, default=default, warm=warm,
-                                clock=clock)
+                                clock=clock, sized=sized)
     if key in _TUNED and key not in _RACE_AGAIN:
         return _TUNED[key]
     _RACE_AGAIN.discard(key)
@@ -4710,7 +4802,12 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
             apply(v)
             if check is not None and not check(v):
                 raise RuntimeError("candidate failed its correctness gate")
-            (warm or bench)()
+            if warm is not None:
+                warm()
+            elif sized:
+                bench(1)
+            else:
+                bench()
             ok.append(v)
         except Exception as exc:
             if _unsupported_here(exc):           # see `_weight_execution`
@@ -4723,17 +4820,29 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
 
     timer = _RaceClock(gpu=(clock == "gpu"))
     busy = _tune_started - _LAST_SAMPLE_END[0] < _STILL_BUSY_S
+    runs = [1]
 
     def sample(v):
         apply(v)
-        return timer.time(bench)
+        if not sized:
+            return timer.time(bench)
+        n = runs[0]
+        return timer.time(lambda: bench(n)) / n
+
+    def size(per):
+        if sized:
+            limit = 8 if timer.host else _RACE_GPU_RUNS
+            runs[0] = max(1, min(limit, int(round(timer.sample_s()
+                                                  / max(max(per.values()), 1e-6)))))
+        return per
 
     # The same paired-evidence rule as the stored-weight and containing-layer tuners, with
     # candidates that can no longer win dropped as soon as the samples say so (`_race`) --
     # timed once the clock has settled (`_settle`).
     while True:
         try:
-            _settle(ok, sample, {v: sample(v) for v in ok}, busy)
+            runs[0] = 1
+            size(_settle(ok, sample, size({v: sample(v) for v in ok}), busy))
             times = _race(ok, sample, rounds)
             break
         except _ClockChanged:
@@ -4759,7 +4868,8 @@ def _ggml_shape_for(type_name, N, K, packed):
     vals = _GGML_TYPES[type_name][2]
     fallback = _auto_kind(type_name, N, K)
     key = ("ggml_shape", type_name, int(N), int(K))
-    if key in _TUNED:
+    if key in _TUNED and key not in _RACE_AGAIN:
+        _note_route(key)            # a recording that takes this shape depends on it
         return _TUNED[key]
     if _adam_kernel.get("platform") is None:
         return fallback
@@ -4821,22 +4931,17 @@ def _ggml_shape_for(type_name, N, K, packed):
             _CHECKED[ck] = True
         return True
 
-    # Many dispatches per sync. A readback costs 1-2ms on this stack and one decode matmul
-    # costs tens of microseconds, so timing them one at a time measures the readback and
-    # ranks the candidates by noise -- which is exactly what happened: the first version of
-    # this picked a mix of shapes that took a 0.6B from 104 tok/s to 64.
-    #
-    # Sizing this per shape instead of fixing it at 24 was tried and REVERTED: timing one
-    # dispatch to choose the count costs a dispatch of its own, and the first dispatch of a
-    # variant is where this stack compiles it (75-363ms, see below). Measured on a 27B, that
-    # took the warming phase from 48.9s to 109.1s -- more than twice as slow, for a change
-    # meant to make it faster. The cost of finding out how expensive a shape is was larger
-    # than what knowing it saved.
-    REP = 24
-
-    def bench():
+    # Many dispatches per sample, timed by the GPU's own timestamps. A readback costs 1-2 ms
+    # on this stack and one decode matmul tens of microseconds: timed by the host's clock,
+    # even 24 at a time, the race ranked the readback's noise -- the first version of this
+    # took a 0.6B from 104 tok/s to 64, and a remeasure by that clock moved three shapes and
+    # took one from 172 to 150. The GPU's clock counts the dispatches alone; how many make
+    # a sample is sized from one run (`tune(sized=True)`), after `warm` has compiled the
+    # variant -- sizing before that had timed the compile (75-363 ms), and took a 27B's
+    # warming from 48.9 s to 109.1 s.
+    def bench(n):
         o = None
-        for _ in range(REP):
+        for _ in range(n):
             o = _ggml_run(xd, packed, type_name, int(K), int(N), small=state["kind"])
         o.get()
 
@@ -4847,7 +4952,7 @@ def _ggml_shape_for(type_name, N, K, packed):
     try:
         return tune(key, ("narrow", "balanced", "compact", "shortk", None),
                     apply, bench, check=check,
-                    default=fallback, warm=warm)
+                    default=fallback, warm=warm, clock="gpu", sized=True)
     finally:
         _TUNE_COST["tune_s"] += _t.perf_counter() - _t0
         _TUNE_COST["shapes"] += 1
@@ -4944,6 +5049,7 @@ def kernel_profile():
         "checked": {"|".join(str(x) for x in k): bool(v) for k, v in _CHECKED.items()},
         "dequant_ok": dict(_DEQ_OK),
         "calibrated": sorted("|".join(str(x) for x in k) for k in _CALIBRATED),
+        "remeasured": {"seq": _REMEASURE_SEQ[0], "at": dict(_REMEASURED_AT)},
     }
 
 
@@ -5102,6 +5208,13 @@ def use_kernel_profile(profile):
             if all(x > 0 for x in key):
                 _GQA_TUNED[key] = v
                 n += 1
+    # Where `remeasure` got to, so the next one goes on from the routes raced longest ago.
+    seen = profile.get("remeasured")
+    if isinstance(seen, dict) and type(seen.get("seq")) is int and isinstance(seen.get("at"), dict):
+        _REMEASURE_SEQ[0] = max(_REMEASURE_SEQ[0], seen["seq"])
+        for k, v in seen["at"].items():
+            if isinstance(k, str) and type(v) is int:
+                _REMEASURED_AT[k] = max(_REMEASURED_AT.get(k, 0), v)
     return n
 
 
@@ -5700,55 +5813,59 @@ def _kv_write_pair_fused(kcache, vcache, ksrc, vsrc, pos, T, nkv, hd, lmax,
 def _kv_pair_auto(nkv, hd, lmax, packed):
     """Device-local exactness gate and paired timing for the KV layer operation."""
     key = ("kv_write_pair", int(nkv), int(hd), int(lmax), bool(packed))
-    if key in _TUNED:
+    if key in _TUNED and key not in _RACE_AGAIN:
+        _note_route(key)
         return _TUNED[key]
-    import time as _t
-    try:
-        width = int(hd) // 2 if packed else int(hd)
-        shape = (int(nkv), int(lmax), width)
-        src_shape = (int(nkv), 1, int(hd))
-        # Deterministic non-special values exercise both half packing lanes as well as sign.
-        base = (np.arange(np.prod(src_shape), dtype=np.float32).reshape(src_shape) % 37
-                - 18.0) / 11.0
-        ks = xp.asarray(base); vs = xp.asarray(base * np.float32(-0.625) + np.float32(0.125))
+    width = int(hd) // 2 if packed else int(hd)
+    shape = (int(nkv), int(lmax), width)
+    src_shape = (int(nkv), 1, int(hd))
+    # Made for the race and dropped after it (a remeasure makes them again).
+    held = {}
 
-        def fresh():
-            return xp.asarray(np.zeros(shape, np.float32)), xp.asarray(np.zeros(shape, np.float32))
+    def sources():
+        if not held:
+            # Deterministic non-special values exercise both half packing lanes and sign.
+            base = (np.arange(np.prod(src_shape), dtype=np.float32).reshape(src_shape) % 37
+                    - 18.0) / 11.0
+            held["k"] = xp.asarray(base)
+            held["v"] = xp.asarray(base * np.float32(-0.625) + np.float32(0.125))
+            held["ck"], held["cv"] = fresh()
+        return held["k"], held["v"]
 
+    def fresh():
+        return xp.asarray(np.zeros(shape, np.float32)), xp.asarray(np.zeros(shape, np.float32))
+
+    def write(name, ck, cv):
+        ks, vs = sources()
+        if name == "fused":
+            _kv_write_pair_fused(ck, cv, ks, vs, 3, 1, nkv, hd, lmax)
+        else:
+            kv_write(ck, ks, 3, 1, nkv, hd, lmax)
+            kv_write(cv, vs, 3, 1, nkv, hd, lmax)
+
+    def check(name):
+        if name == "separate":
+            return True
         ak, av = fresh(); bk, bv = fresh()
-        kv_write(ak, ks, 3, 1, nkv, hd, lmax)
-        kv_write(av, vs, 3, 1, nkv, hd, lmax)
-        _kv_write_pair_fused(bk, bv, ks, vs, 3, 1, nkv, hd, lmax)
+        write("separate", ak, av); write("fused", bk, bv)
         aa, ab = np.asarray(ak.get()), np.asarray(av.get())
         ba, bb = np.asarray(bk.get()), np.asarray(bv.get())
-        if not (np.array_equal(aa.view(np.uint32), ba.view(np.uint32)) and
-                np.array_equal(ab.view(np.uint32), bb.view(np.uint32))):
-            raise RuntimeError("fused KV pair differs from the separate reference for %r" % (key,))
+        return bool(np.array_equal(aa.view(np.uint32), ba.view(np.uint32))
+                    and np.array_equal(ab.view(np.uint32), bb.view(np.uint32)))
+    cur = {}
 
-        candidates = ("separate", "fused")
-        samples = {name: [] for name in candidates}
-
-        def bench(name):
-            ck, cv = fresh(); t0 = _t.perf_counter()
-            for _ in range(16):
-                if name == "fused":
-                    _kv_write_pair_fused(ck, cv, ks, vs, 3, 1, nkv, hd, lmax)
-                else:
-                    kv_write(ck, ks, 3, 1, nkv, hd, lmax)
-                    kv_write(cv, vs, 3, 1, nkv, hd, lmax)
-            cv.get()
-            return (_t.perf_counter() - t0) / 16.0
-
-        bench("separate"); bench("fused")
-        for r in range(9):
-            order = candidates if not (r & 1) else tuple(reversed(candidates))
-            for name in order:
-                samples[name].append(bench(name))
-        chosen = _measured_choice(samples, candidates, default="separate")
+    def bench(n):
+        sources()
+        for _ in range(n):
+            write(cur["v"], held["ck"], held["cv"])
+        held["cv"].get()
+    try:
+        return tune(key, ("separate", "fused"), lambda v: cur.update(v=v), bench,
+                    check=check, default="separate", clock="gpu", sized=True)
     except Exception as exc:
         raise RuntimeError("KV pair auto candidate failed for %r" % (key,)) from exc
-    _TUNED[key] = chosen
-    return chosen
+    finally:
+        held.clear()
 
 
 def kv_write_pair(kcache, vcache, ksrc, vsrc, pos, T, nkv, hd, lmax, ctl=None,
@@ -6069,7 +6186,8 @@ def flash_tune(nh, nkv, hd, T=256):
     """
     global _FLASH_BQ, _FLASH_BK
     key = ("flash_tile", int(nh), int(nkv), int(hd))
-    if key in _TUNED and _flash_fits(*_TUNED[key], hd):
+    if key in _TUNED and key not in _RACE_AGAIN and _flash_fits(*_TUNED[key], hd):
+        _note_route(key)
         _FLASH_BQ, _FLASH_BK = _TUNED[key]
         return _TUNED[key]
     _TUNED.pop(key, None)                # remembered from a device that allows more
@@ -6079,19 +6197,31 @@ def flash_tune(nh, nkv, hd, T=256):
             if _flash_fits(bq, bk, hd)]
     if not cand:
         return (_FLASH_BQ, _FLASH_BK)
-    q = Tensor(np.zeros((nh, T, hd), np.float32))
-    k = Tensor(_empty((nkv, T, hd)))
-    v = Tensor(_empty((nkv, T, hd)))
+    # Made for the race and dropped after it; a remeasure makes them again.
+    held = {}
+
+    def qkv():
+        if not held:
+            held.update(q=Tensor(np.zeros((nh, T, hd), np.float32)),
+                        k=Tensor(_empty((nkv, T, hd))), v=Tensor(_empty((nkv, T, hd))))
+        return held["q"], held["k"], held["v"]
     was = (_FLASH_BQ, _FLASH_BK)
 
     def apply(p):
         global _FLASH_BQ, _FLASH_BK
         _FLASH_BQ, _FLASH_BK = p
 
-    def bench():
-        _contig(flash_attention(q, k, v, start=0, scale=1.0).data[:1, :1, :1]).get()
+    def bench(n):
+        q, k, v = qkv()
+        o = None
+        for _ in range(n):
+            o = flash_attention(q, k, v, start=0, scale=1.0)
+        _contig(o.data[:1, :1, :1]).get()
 
-    best = tune(key, cand, apply, bench, default=was)
+    try:
+        best = tune(key, cand, apply, bench, default=was, clock="gpu", sized=True)
+    finally:
+        held.clear()
     _FLASH_BQ, _FLASH_BK = best
     return best
 
@@ -6937,6 +7067,54 @@ def _wgpu_ln_rows(xd, yd, gd, bd, eps):
     return (ssum if yd is not None else None), out
 
 
+def _add_rmsnorm_route(shape, H, wd, eps):
+    """`add_rmsnorm`'s measured route for a shape: fused unless the two operations are proven
+    faster, both checked against each other first. Raced on inputs of that shape made for the
+    race and dropped after it, so the race can be run again (`remeasure`)."""
+    T = 1
+    for d in shape[:-1]:
+        T *= int(d)
+    key = ("add_rmsnorm", int(T), int(H))
+    if key in _TUNED and key not in _RACE_AGAIN:
+        _note_route(key)
+        return _TUNED[key]
+    held = {}
+    w = Tensor(wd)
+
+    def inputs():
+        if not held:
+            rng = np.random.default_rng(int(T))
+            held["r"] = Tensor(rng.standard_normal(shape).astype(np.float32))
+            held["u"] = Tensor(rng.standard_normal(shape).astype(np.float32))
+        return held["r"], held["u"]
+
+    def run(q):
+        r, u = inputs()
+        return add_rmsnorm(r, u, w, eps, execution=q)
+    reference = []
+
+    def check(q):
+        pair = run(q)
+        got = (np.asarray(pair[0].data.get()), np.asarray(pair[1].data.get()))
+        if not reference:
+            reference.append(got)
+        return all(np.allclose(a, b, rtol=2e-5, atol=2e-5) for a, b in zip(got, reference[0]))
+    cur = {}
+
+    def bench(n):
+        pair = None
+        for _ in range(n):
+            pair = run(cur["v"])
+        pair[1].data.get()
+    try:
+        return tune(key, ("fused", "composed"), lambda v: cur.update(v=v), bench,
+                    check=check, default="fused", clock="gpu", sized=True)
+    except Exception as exc:
+        raise RuntimeError("add_rmsnorm candidate failed for shape %r" % (shape,)) from exc
+    finally:
+        held.clear()
+
+
 def add_layernorm(x, y, gamma, beta, eps=1e-5):
     """`s = x + y` and `layernorm(s)`, both returned: the residual stream and the next block's
     input. One dispatch on WebGPU; elsewhere, or with a gradient, the two operations."""
@@ -7554,43 +7732,9 @@ def add_rmsnorm(residual, update, w, eps, execution="auto"):
     if not _adam_backend_ready():
         return composed()
     if execution == "auto":
-        key = ("add_rmsnorm", int(T), int(H))
-        execution = _TUNED.get(key)
-        if execution is None:
-            # The common-layer API owns this choice: callers that stop here still get the
-            # best complete add+norm implementation for their device and shape.
-            import time as _t
-            candidates = ("fused", "composed")
-            samples = {q: [] for q in candidates}
-
-            def candidate(q):
-                return add_rmsnorm(Tensor(rd), Tensor(ud), Tensor(wd), eps, execution=q)
-
-            valid = []
-            reference = None
-            for q in candidates:
-                try:
-                    pair = candidate(q)
-                    got = (np.asarray(pair[0].data.get()), np.asarray(pair[1].data.get()))
-                    if reference is None:
-                        reference = got
-                    if not all(np.allclose(a, b, rtol=2e-5, atol=2e-5)
-                               for a, b in zip(got, reference)):
-                        raise RuntimeError("candidate differs from its reference")
-                    valid.append(q)
-                except Exception as exc:
-                    raise RuntimeError("add_rmsnorm candidate %r failed for shape %r"
-                                       % (q, shape)) from exc
-            for r in range(9):
-                order = valid if not (r & 1) else list(reversed(valid))
-                for q in order:
-                    t0 = _t.perf_counter(); pair = None
-                    for _ in range(8):
-                        pair = candidate(q)
-                    pair[1].data.get()
-                    samples[q].append((_t.perf_counter() - t0) / 8.0)
-            execution = _measured_choice(samples, valid, default=valid[0])
-            _TUNED[key] = execution
+        # The common-layer API owns this choice: callers that stop here still get the best
+        # complete add+norm implementation for their device and shape.
+        execution = _add_rmsnorm_route(shape, H, wd, eps)
     if execution == "composed":
         return composed()
     plat = _adam_kernel["platform"]
@@ -12035,29 +12179,21 @@ def parallel_linear(linears, x, execution="auto"):
     def best_fused_kind():
         key = ("parallel_fused_kind", linears[0].type_name,
                int(linears[0].Kt), ns)
-        if key in _TUNED:
+        if key in _TUNED and key not in _RACE_AGAIN:
+            _note_route(key)
             return _TUNED[key]
-        valid = [kind for kind in kinds if correct_fused(kind)]
+        valid = tuple(kind for kind in kinds if correct_fused(kind))
         if not valid:
             raise RuntimeError("no fused stored-format projection passed validation")
-        samples = {kind: [] for kind in valid}
+        cur = {}
 
-        def bench(kind):
-            out = None; t0 = time.perf_counter()
-            for _ in range(4):
-                out = fused_kind(kind)
+        def bench(n):
+            out = None
+            for _ in range(n):
+                out = fused_kind(cur["v"])
             out[-1].numpy()
-            return (time.perf_counter() - t0) / 4.0
-
-        for kind in valid:
-            bench(kind)
-        for r in range(9):
-            order = valid if not (r & 1) else list(reversed(valid))
-            for kind in order:
-                samples[kind].append(bench(kind))
-        chosen = _measured_choice(samples, valid, default=None)
-        _TUNED[key] = chosen
-        return chosen
+        return tune(key, valid, lambda v: cur.update(v=v), bench, rounds=9, default=None,
+                    clock="gpu", sized=True)
 
     def fused():
         return fused_kind(best_fused_kind())
@@ -12074,27 +12210,21 @@ def parallel_linear(linears, x, execution="auto"):
 
     key = ("parallel_linear", linears[0].type_name, int(linears[0].Kt),
            tuple(int(l.Nt) for l in linears))
-    chosen = _TUNED.get(key)
-    if chosen is None:
-        candidates = ["separate"] + (["fused"] if any(correct_fused(k) for k in kinds)
-                                      else [])
-        samples = {c: [] for c in candidates}
+    if key in _TUNED and key not in _RACE_AGAIN:
+        _note_route(key)
+        chosen = _TUNED[key]
+    else:
+        candidates = ("separate",) + (("fused",) if any(correct_fused(k) for k in kinds)
+                                      else ())
+        cur = {}
 
-        def bench(which):
-            out = None; t0 = time.perf_counter()
-            for _ in range(4):
-                out = fused() if which == "fused" else separate()
+        def bench(n):
+            out = None
+            for _ in range(n):
+                out = fused() if cur["v"] == "fused" else separate()
             out[-1].numpy()                # queue order completes every sibling projection
-            return (time.perf_counter() - t0) / 4.0
-
-        for c in candidates:
-            bench(c)
-        for r in range(9):
-            order = candidates if not (r & 1) else list(reversed(candidates))
-            for c in order:
-                samples[c].append(bench(c))
-        chosen = _measured_choice(samples, candidates, default="separate")
-        _TUNED[key] = chosen
+        chosen = tune(key, candidates, lambda v: cur.update(v=v), bench, rounds=9,
+                      default="separate", clock="gpu", sized=True)
     return fused() if chosen == "fused" else separate()
 
 
@@ -12169,26 +12299,21 @@ def parallel_swiglu(linears, x, execution="auto"):
 
     key = ("parallel_swiglu", backend_name, linears[0].type_name,
            int(linears[0].Kt), int(linears[0].Nt))
-    chosen = _TUNED.get(key)
-    if chosen is None:
-        candidates = ["separate"] + (["fused"] if correct_fused() else [])
-        samples = {c: [] for c in candidates}
+    if key in _TUNED and key not in _RACE_AGAIN:
+        _note_route(key)
+        chosen = _TUNED[key]
+    else:
+        candidates = ("separate",) + (("fused",) if correct_fused() else ())
+        cur = {}
 
-        def bench(which):
-            out = None; t0 = time.perf_counter()
-            for _ in range(4):
-                out = fused() if which == "fused" else separate()
+        def bench(n):
+            out = None
+            for _ in range(n):
+                out = fused() if cur["v"] == "fused" else separate()
             out.numpy()
-            return (time.perf_counter() - t0) / 4.0
-
-        for c in candidates:
-            bench(c)
-        for r in range(9):
-            order = candidates if not (r & 1) else list(reversed(candidates))
-            for c in order:
-                samples[c].append(bench(c))
-        chosen = _measured_choice(samples, candidates, default="separate")
-        _TUNED[key] = chosen
+        chosen = tune(key, candidates, lambda v: cur.update(v=v), bench, rounds=9,
+                      default="separate", clock="gpu" if _adam_backend_ready() else "host",
+                      sized=True)
     return fused() if chosen == "fused" else separate()
 
 
