@@ -1,5 +1,44 @@
 # Progress
 
+## 2026-10-07 ▸ No request records any more; Q8_0 in half arithmetic; races timed by the GPU; `remeasure`
+
+**Trigger:** user — the first request is still several times slower and only gradually
+reaches 30–40 ms; the Q8_0 GGUF takes 90+ ms first and 70–80 steady; route races must not be
+fooled by the GPU's state or the browser's clock; an interface to race the routes again, on
+the loaded model's operators only, stoppable, keeping what finished, within 60 s.
+
+**Like for like first (M5, same requests):** MLX F16 one question 7.6 ms back to back, 35.8 ms
+two seconds apart; three questions 19.0 / 48.2. MLX Q8 the same (7.6 / 36.6, 19.0 / 49.9). Ours
+before this: one question 15.4 / 36–40, three 44 / 66 (F16 folder).
+
+**Changes:**
+- Q8_0 had no half-arithmetic tiled candidate: the template that gives every other format one
+  never had a Q8_0 entry (its f32 kernel is hand-written). With it the Q8_0 GEMMs run 13–25%
+  faster; Q8 three questions back to back 61.6 → 49.3 ms, one question's GPU 17.6 → 15.2 ms.
+  Same gate as the other formats' half routes (1e-2 of the output scale; phase two).
+- The packed decision encoder is recorded once per row capacity (128/256/512 at load) and
+  replayed for the live rows, segments and longest sequence (`wt.elastic`, `_dyn`, JS
+  `replay(name, live)`); prefix uploads into capacity-sized buffers. Checked bit for bit at
+  record time; encoder output identical to the bucketed and padded paths.
+- Race samples: no garbage collection inside; GPU timestamps where the device has them
+  (requested whenever the adapter has `timestamp-query`); sample size from the timestamps'
+  step; settling after idle; the eager decision head keeps the host clock.
+- `remeasure(budget_s=60)` / `wt.remeasure({budgetMs})` (see docs/API.md).
+
+**Measured:** Laya folder seconds apart, first two requests 25.6/62.7 → 17.7/28.1 ms, then
+37–42 (unchanged), three 64–70, no recording on any request; back to back 43.9 ms three, 15.6
+one. Q8_0 seconds apart, without waiting for the load's ladders: first two 69.6/77.6 →
+22.8/29.3, one question 42–48 → 38.5–42.5, three 85 → 71–73, two 65 → 53–55; back to back
+three 50.0, one 17.8. 0.6B: replies identical, first token 132/85/86 → 118/80/82 ms, decode
+139/171 → 144/174 tok/s, load stages unchanged (warming 1.8 s, tuning 0.3 s). `remeasure` on
+Laya: 38 routes in 2.8 s, 9 changed, answers unchanged; stopped at 250 ms, the 3 finished
+kept, the race in progress dropped, the report back 12 ms after the stop.
+
+**Not done yet:** `remeasure` always starts from the first route, so a budget that runs out at
+the same place every time never reaches the last ones — next: least recently raced first,
+and what a budget leaves continues when idle. The LLM's composite choices (decode
+composition, greedy chunk) are registered but not yet verified through `remeasure`.
+
 ## 2026-10-06 ▸ One question runs packed too: 42–47 → 33.5–37 ms when requests are seconds apart
 
 A single question still took the padded path, whose staging read the embedding rows back to

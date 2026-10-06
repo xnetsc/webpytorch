@@ -1285,10 +1285,13 @@ def _mm_half(xd, wd, M, K, N):
         _mm_half_added["v"] = True
     out = _empty((M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, 1), "u4,u4,u4,u4")
-    plat.runKernel({"name": "mm_half",
-                    "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
-                                out.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": 1}})
+    desc = {"name": "mm_half",
+            "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
+                        out.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": 1}}
+    if _elastic_rows(M):
+        _dyn(desc, y=("rows", 1, 32))
+    plat.runKernel(desc)
     return out
 
 
@@ -1345,17 +1348,24 @@ def matmul_f16w(x, wpacked, K, N, execution="auto"):
     G = _mm_split_groups(M, N)
     part = _empty((G * M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, G), "u4,u4,u4,u4")
-    plat.runKernel({"name": "mm_f16w",
-                    "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
-                                part.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": G}})
+    elastic_rows = _elastic_rows(M)
+    desc = {"name": "mm_f16w",
+            "tensors": [xd.buffer.buffer_id, wd.buffer.buffer_id,
+                        part.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": N // 64, "y": (M + 31) // 32, "z": G}}
+    if elastic_rows:
+        _dyn(desc, y=("rows", 1, 32))
+    plat.runKernel(desc)
     if G == 1:
         return Tensor(part.reshape(*(lead + (N,))))
     out = _empty((M, N))
     rmeta = _adam_kernel["make_meta"]((M * N, G), "u4,u4")
-    plat.runKernel({"name": "mm_f16w_reduce",
-                    "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
-                    "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}})
+    desc = {"name": "mm_f16w_reduce",
+            "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
+            "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}}
+    if elastic_rows:
+        _dyn(desc, x=("rows", N, 64))
+    plat.runKernel(desc)
     return Tensor(out.reshape(*(lead + (N,))))
 
 
@@ -1458,9 +1468,12 @@ def geglu_split(x, half):
     out = _empty((rows, int(half)))
     meta = _adam_kernel["make_meta"]((rows, int(half)), "u4,u4")
     n = rows * int(half)
-    plat.runKernel({"name": "geglu",
-                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}})
+    desc = {"name": "geglu",
+            "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": (n + 63) // 64, "y": 1, "z": 1}}
+    if _elastic_rows(rows):
+        _dyn(desc, x=("rows", int(half), 64))
+    plat.runKernel(desc)
     shape = tuple(xd.shape[:-1]) + (int(half),)
     return Tensor(out.reshape(*shape))
 
@@ -2911,11 +2924,14 @@ def rope_qk_pos(qkv, cos, sin, pos, H, HD):
     out = _empty((rows, 2 * H * HD))
     n = rows * H * (HD // 4)
     meta = _adam_kernel["make_meta"]((rows, int(cd.shape[0]), H, HD // 4), "u4,u4,u4,u4")
-    plat.runKernel({"name": "rope_qk_pos",
-                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, cd.buffer.buffer_id,
-                                sd.buffer.buffer_id, meta.buffer_id, pd.buffer.buffer_id],
-                    "workGroups": {"x": min((n + 63) // 64, 65535),
-                                   "y": (n + 64 * 65535 - 1) // (64 * 65535), "z": 1}})
+    desc = {"name": "rope_qk_pos",
+            "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, cd.buffer.buffer_id,
+                        sd.buffer.buffer_id, meta.buffer_id, pd.buffer.buffer_id],
+            "workGroups": {"x": min((n + 63) // 64, 65535),
+                           "y": (n + 64 * 65535 - 1) // (64 * 65535), "z": 1}}
+    if _elastic_rows(rows) and desc["workGroups"]["y"] == 1:
+        _dyn(desc, x=("rows", H * (HD // 4), 64))
+    plat.runKernel(desc)
     return Tensor(out)
 
 
@@ -3121,10 +3137,17 @@ def _attn_run(tile, src_qk, src_v, md, H, HD, T, B, scale, window, group, qs, qo
     meta = _adam_kernel["make_meta"](
         (T, H, group, int(window), float(scale), qs, qo, ko, vs, vo),
         "u4,u4,u4,u4,f4,u4,u4,u4,u4,u4")
-    plat.runKernel({"name": name,
-                    "tensors": [src_qk.buffer.buffer_id, src_v.buffer.buffer_id,
-                                md.buffer.buffer_id, out.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": (T + 8 * RI - 1) // (8 * RI), "y": B * H, "z": 1}})
+    desc = {"name": name,
+            "tensors": [src_qk.buffer.buffer_id, src_v.buffer.buffer_id,
+                        md.buffer.buffer_id, out.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": (T + 8 * RI - 1) // (8 * RI), "y": B * H, "z": 1}}
+    cap = _ELASTIC[0]
+    if (packed and cap is not None and int(rows) == cap["rows"] and int(B) == cap["segments"]
+            and int(T) == cap["longest"]):
+        # A workgroup is (query block, sequence * H + head): the replay issues the blocks of
+        # the longest live sequence for the live sequences only.
+        _dyn(desc, x=("longest", 1, 8 * RI), y=("segments", H, 1))
+    plat.runKernel(desc)
     return out
 
 
@@ -3880,8 +3903,15 @@ class _Ladder(object):
 
     def run(self, m):
         del _CALIB_TOUCHED[:]
-        with _calibrating():
-            self.probe(m)
+        _PROBING[0] += 1
+        try:
+            with _calibrating():
+                self.probe(m)
+        finally:
+            _PROBING[0] -= 1
+        # The probe is how a route of this prefix is raced again later (`remeasure`).
+        for k in _CALIB_TOUCHED:
+            _PROBE_FOR.setdefault(k[:-1], self.probe)
         self.seen[m] = {k[:-1]: _TUNED[k] for k in _CALIB_TOUCHED if k in _TUNED}
         del _CALIB_TOUCHED[:]
 
@@ -3964,10 +3994,334 @@ def calibrate_deferred(budget_s=0.5):
 
 
 def calibration_drop():
-    """Forget queued ladders -- their probes hold the model being released."""
+    """Forget queued ladders -- their probes hold the model being released -- and what that
+    model used and how to race it again."""
     del _DEFERRED[:]
     _PROVISIONAL.clear()
     _NEAREST.clear()
+    _USED.clear()
+    _PROBE_FOR.clear()
+    _TUNE_AGAIN.clear()
+    _AGAIN_FN.clear()
+    del _ROUTE_HOOKS[:]
+    _KEYS_SEEN[0] = None
+
+
+# ---- racing the routes again, on request --------------------------------------------------
+#
+# A route is raced once and kept -- across reloads too, through the kernel profile. A race can
+# still be measured wrong (a collect inside a sample, a GPU still clocking up) and a device
+# can change (a driver, its temperature), so `remeasure` races again, on request, the routes
+# the loaded model uses: each race that finishes takes effect at once; a stop
+# (`webio.cancel`) ends the race in progress without a verdict, so that route keeps the
+# choice it had; and the caller gets back what was measured, what changed and what was not.
+#
+# "Used" is what this model's own work has looked up since it loaded -- its warm-up, its
+# recordings, its requests -- not every row bucket a load-time ladder explored and not
+# routes other models measured: racing those costs time for nothing this model runs.
+_USED = {}             # route key -> True, in the order first used
+_PROBING = [0]         # inside a ladder probe: exploration, not use
+_PROBE_FOR = {}        # route key prefix -> probe(m): that operator at m rows (from ladders)
+_TUNE_AGAIN = {}       # tune key -> the arguments that race it again
+_AGAIN_FN = {}         # route key -> fn() racing a model's own composite choice again
+_RACE_AGAIN = set()    # keys a remeasure is racing again right now
+_REMEASURING = [0]
+_REMEASURE_UNTIL = [None]   # when the remeasure under way has to have stopped (perf_counter)
+_REMEASURED = []       # (key, before, after, clock, ms), as each race of a remeasure finishes
+_ROUTE_HOOKS = []      # fn(changed keys) -> descriptions of the rebuilds it queued
+_KEYS_SEEN = [None]    # a set while `route_keys()` collects
+
+
+def _note_route(key):
+    if not _PROBING[0]:
+        _USED[key] = True
+    seen = _KEYS_SEEN[0]
+    if seen is not None:
+        seen.add(key)
+
+
+def _commit_route(key, chosen, clock, seconds=None):
+    before = _TUNED.get(key)
+    _TUNED[key] = chosen
+    _RACE_CLOCK[key] = clock
+    if _REMEASURING[0]:
+        _REMEASURED.append((key, before, chosen, clock, seconds))
+
+
+def _note_remeasured(key, before, after, clock, seconds=None):
+    """A model's own choice raced again (`register_remeasure`): what it was and became."""
+    if _REMEASURING[0]:
+        _REMEASURED.append((key, before, after, clock, seconds))
+
+
+def remeasure_time_left():
+    """Seconds the remeasure under way has left; None outside one. A model's own tuner,
+    raced again (`register_remeasure`), takes this as its time limit."""
+    until = _REMEASURE_UNTIL[0]
+    if until is None:
+        return None
+    import time as _t
+    return max(0.0, until - _t.perf_counter())
+
+
+class route_keys(object):
+    """Collect the route keys looked up inside -- what a recording depends on."""
+
+    def __enter__(self):
+        self.prev = _KEYS_SEEN[0]
+        self.keys = set()
+        _KEYS_SEEN[0] = self.keys
+        return self
+
+    def __exit__(self, *exc):
+        _KEYS_SEEN[0] = self.prev
+        if self.prev is not None:
+            self.prev.update(self.keys)
+        return False
+
+
+def on_routes_changed(fn):
+    """`fn(keys)` runs when `remeasure` has changed the routes in `keys`; it queues what
+    must be rebuilt for them (`queue_task`) and returns a description of each rebuild.
+    Dropped with the model (`calibration_drop`)."""
+    _ROUTE_HOOKS.append(fn)
+
+
+def register_remeasure(key, fn):
+    """A model's own composite choice, kept in `_TUNED` under `key`, that `fn()` races again
+    and commits (through `_commit_route`) -- for choices not made by `tune` or a ladder."""
+    _AGAIN_FN[key] = fn
+    _note_route(key)
+
+
+def queue_task(fn):
+    """Run `fn` when idle, after whatever is queued already (`calibrate_deferred`)."""
+    _DEFERRED.append(_Task(fn))
+
+
+def _remeasure_checkpoint():
+    if _REMEASURING[0]:
+        from . import webio
+        if webio.cancel_requested():
+            raise webio.Cancelled("remeasure stopped")
+        left = remeasure_time_left()
+        if left is not None and left <= 0:
+            raise _OutOfTime("remeasure ran out of its time")
+
+
+def _out_of_time_class():
+    from . import webio
+
+    class OutOfTime(webio.Cancelled):
+        """A remeasure's time ran out: a stop that nobody asked for, handled as one."""
+    return OutOfTime
+
+
+_OutOfTime = None
+
+
+def _route_label(key):
+    k = list(key)
+    if k and k[0] == "weight_exec" and len(k) == 6:
+        return {"op": k[1], "storage": k[2], "shape": [k[3], k[4]], "rows": k[5]}
+    return {"op": str(k[0]), "shape": [x for x in k[1:]]}
+
+
+def remeasure(budget_s=60.0):
+    """Race again every route the loaded model has used, in at most `budget_s` seconds;
+    return what happened.
+
+    Each route is raced as at load -- correct candidates only, paired samples on a settled
+    clock (`_settle`, `_RaceClock`) -- and its new choice takes effect as soon as its race
+    ends. A stop (`webio.cancel`) ends the race in progress: that route keeps its previous
+    choice, every route already raced keeps its new one, and the rest are not raced. Running
+    out of `budget_s` is the same stop. Either way the recordings that depend on a changed
+    route are queued to be made again (`on_routes_changed`), which happens when idle.
+
+    Each operator's routes are raced first, then a model's own composite choices
+    (`register_remeasure`) -- those are timed over the operators, so they go after them, and
+    they take what is left of the budget as their own time limit.
+
+    The report: `status` ("complete", "stopped" or "out_of_time"), `measured` (each raced
+    route: `key`, `before`, `after`, `changed`, `ms`, `clock` -- "gpu" timed by the device's
+    timestamps, "host" by the browser's clock), `changed` (how many), `discarded` (the
+    route whose race the stop ended), `not_reached`, `unmeasurable` (used routes nothing
+    here can race again), `rebuilds` (what was queued), `budget_ms` and `elapsed_ms`."""
+    global _OutOfTime
+    from . import webio
+    import time as _t
+    if _OutOfTime is None:
+        _OutOfTime = _out_of_time_class()
+    t0 = _t.perf_counter()
+    # Group the used routes by how they are raced: a ladder probe at a row count races every
+    # used route of its prefixes there at once.
+    steps, unmeasurable, groups, composites = [], [], {}, []
+    for key in list(_USED):
+        if key in _AGAIN_FN:
+            composites.append(("fn", [key], _AGAIN_FN[key]))
+        elif key in _TUNE_AGAIN:
+            steps.append(("tune", [key], _TUNE_AGAIN[key]))
+        elif key[0] == "weight_exec" and key[:-1] in _PROBE_FOR:
+            probe = _PROBE_FOR[key[:-1]]
+            gid = (id(probe), key[-1])
+            if gid not in groups:
+                groups[gid] = ("probe", [], (probe, key[-1]))
+                steps.append(groups[gid])
+            groups[gid][1].append(key)
+        else:
+            unmeasurable.append(key)
+    steps += composites
+    del _REMEASURED[:]
+    status, discarded, not_reached = "complete", None, []
+    _REMEASURING[0] += 1
+    _REMEASURE_UNTIL[0] = t0 + float(budget_s)
+    try:
+        for i, (kind, keys, how) in enumerate(steps):
+            stop = ("stopped" if webio.cancel_requested() else
+                    "out_of_time" if remeasure_time_left() <= 0 else None)
+            if stop:
+                status = stop
+                not_reached = [k for _, ks, _ in steps[i:] for k in ks]
+                break
+            done = len(_REMEASURED)
+            _RACE_AGAIN.update(keys)
+            try:
+                if kind == "fn":
+                    how()
+                elif kind == "tune":
+                    tune(keys[0], **how)
+                else:
+                    probe, rows = how
+                    _PROBING[0] += 1
+                    try:
+                        probe(rows)
+                    finally:
+                        _PROBING[0] -= 1
+            except (webio.Cancelled, KeyboardInterrupt) as exc:
+                status = "out_of_time" if isinstance(exc, _OutOfTime) else "stopped"
+                raced = {r[0] for r in _REMEASURED[done:]}
+                left = [k for k in keys if k not in raced]
+                discarded = [_route_entry(k) for k in left[:1]]
+                not_reached = left[1:] + [k for _, ks, _ in steps[i + 1:] for k in ks]
+                break
+            finally:
+                _RACE_AGAIN.difference_update(keys)
+    finally:
+        _REMEASURING[0] -= 1
+        _REMEASURE_UNTIL[0] = None
+        _RACE_AGAIN.clear()
+    measured = [dict(_route_entry(key), before=before, after=after,
+                     changed=before != after, clock=clock,
+                     ms=None if sec is None else round(sec * 1000, 1))
+                for key, before, after, clock, sec in _REMEASURED]
+    changed = [m["key"] for m in measured if m["changed"]]
+    rebuilds = []
+    if changed:
+        changed_keys = {key for key, before, after, _, _ in _REMEASURED if before != after}
+        for hook in list(_ROUTE_HOOKS):
+            rebuilds.extend(hook(changed_keys) or [])
+    _NEAREST.clear()
+    return {"status": status, "measured": measured, "changed": len(changed),
+            "discarded": (discarded or [None])[0],
+            "not_reached": [_route_entry(k) for k in not_reached],
+            "unmeasurable": [_route_entry(k) for k in unmeasurable],
+            "rebuilds": rebuilds, "budget_ms": round(float(budget_s) * 1000),
+            "elapsed_ms": round((_t.perf_counter() - t0) * 1000, 1)}
+
+
+def _route_entry(key):
+    return dict(_route_label(key), key="|".join(str(x) for x in key))
+
+
+class _Task(object):
+    """A step for `calibrate_deferred` that is not a ladder: run once, after every ladder
+    queued before it."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def advance(self):
+        fn, self.fn = self.fn, None
+        if fn is not None:
+            fn()
+        return False
+
+    def prefixes(self):
+        return set()
+
+
+def defer_task(fn):
+    """Run `fn` when idle, after the route ladders queued so far -- for work those ladders
+    can change, such as a recording made while some routes were still borrowed. False, and
+    nothing queued, when no ladder is pending: what is chosen now is final."""
+    if not _DEFERRED:
+        return False
+    _DEFERRED.append(_Task(fn))
+    return True
+
+
+# ---- recordings made at a capacity ---------------------------------------------------------
+#
+# JS reissues a recording one dispatch at a time, so a replay can issue a dispatch with fewer
+# workgroups than it was recorded with. A pass recorded at a row CAPACITY then serves any row
+# count up to it: each row-wise dispatch is issued for the rows the call has
+# (`WebGPUPlatform.replay(name, live)`) and the rows past them are neither computed nor read.
+# One recording per capacity instead of one per length: the decision encoder met a length it
+# had not recorded on most requests, and each one paid an eager pass, then a recording, before
+# it was ever replayed -- 15-25 ms each on top of the replay's 35-40.
+#
+# Which dispatches are row-wise is said by the launchers, each for its own workgroup formula:
+# while `elastic(...)` is open, a launcher over the recording's row capacity attaches the rule
+# (`_dyn`), checked there against the count it computed. A dispatch without one is issued as
+# recorded -- every row up to the capacity: correct, only slower. Rows a kernel then reads
+# past the live ones (the rest of a 32-row tile) hold whatever an earlier call left; every
+# kernel here computes a row from that row alone, and attention reads only its segments.
+_ELASTIC = [None]
+
+
+class elastic(object):
+    """While recording: a dispatch over `rows` rows (the capacity) is replayed for the live
+    quantity "rows"; packed attention over `segments` sequences of at most `rows` rows for
+    "segments" and "longest"."""
+
+    def __init__(self, rows, segments):
+        self.cap = {"rows": int(rows), "segments": int(segments), "longest": int(rows)}
+
+    def __enter__(self):
+        if _ELASTIC[0] is not None:
+            raise RuntimeError("elastic recordings do not nest")
+        _ELASTIC[0] = self.cap
+        return self
+
+    def __exit__(self, *exc):
+        _ELASTIC[0] = None
+        return False
+
+
+def _elastic_rows(M):
+    """Whether a dispatch over M rows is over the elastic recording's row capacity."""
+    cap = _ELASTIC[0]
+    return cap is not None and int(M) == cap["rows"]
+
+
+def _dyn(desc, **axes):
+    """Give `desc` its replay rules, axis=(quantity, mul, div): the count is
+    ceil(live * mul / div). Each must give, at the capacity, the count the launcher computed --
+    a rule that does not is a launcher bug, and stops here. None attached past the dispatch
+    limit, where the platform folds the grid (the dispatch then replays as recorded)."""
+    cap = _ELASTIC[0]
+    wg = desc["workGroups"]
+    rules = {}
+    for ax, (q, mul, div) in axes.items():
+        at_cap = -(-cap[q] * int(mul) // int(div))
+        if at_cap != int(wg.get(ax, 1) or 1):
+            raise RuntimeError("elastic rule %s.%s gives %d at the capacity; the launcher "
+                               "computed %s" % (desc["name"], ax, at_cap, wg.get(ax)))
+        if at_cap > 65535:
+            return desc
+        rules[ax] = [q, int(mul), int(div)]
+    desc["dyn"] = rules
+    return desc
 
 
 def _sync_small(a):
@@ -4055,6 +4409,7 @@ def _race(valid, sample, rounds, early_from=None):
     live = list(valid)
     times = {c: [] for c in live}
     for r in range(max(1, int(rounds))):
+        _remeasure_checkpoint()
         order = live if not (r & 1) else list(reversed(live))
         for c in order:
             times[c].append(sample(c))
@@ -4071,6 +4426,127 @@ def _race(valid, sample, rounds, early_from=None):
     return {c: times[c] for c in live}
 
 
+# Which clock each remembered race was timed by ("gpu" or "host"), for the record.
+_RACE_CLOCK = {}
+# Most runs in one GPU-timed sample: a short kernel needs many to stand clear of the
+# timestamps' step; each run's output is recycled before the next, so memory does not grow.
+_RACE_GPU_RUNS = 128
+# Most rounds `_settle` runs before timing starts anyway.
+_SETTLE_ROUNDS = 8
+# When the last timed race sample ended (perf_counter), and how recent that has to be for
+# the GPU to count as still busy: races back to back -- a load's -- keep its clock up, and
+# settling each of them again cost a 0.6B's first load two seconds for nothing.
+_LAST_SAMPLE_END = [0.0]
+_STILL_BUSY_S = 0.05
+
+
+class _RaceClock(object):
+    """How a race sample is timed. The GPU's own timestamps where the device has them
+    (`timingBegin`/`timingEnd`): the length of the sample's passes, summed -- not the
+    browser's clock, which is coarsened and jittered on purpose and which also counts the
+    host issuing the work and the readback that waits for it. The host's clock otherwise,
+    and from the first sample the GPU could not time whole: one race is on one clock.
+    Either way nothing is collected inside the timing (`_quiet_timing`)."""
+
+    def __init__(self, gpu=True):
+        self.plat = None
+        if gpu and _adam_backend_ready() and gpu_features().get("timestamps"):
+            plat = _adam_kernel["platform"]
+            if hasattr(plat, "timingBegin") and hasattr(plat, "timingEnd"):
+                self.plat = plat
+        self.started = None
+
+    @property
+    def host(self):
+        return self.plat is None
+
+    def sample_s(self):
+        """How much work one sample should be by this clock (see `_RACE_SAMPLE_S`)."""
+        if self.plat is None:
+            return _RACE_SAMPLE_S
+        step = float(getattr(self.plat, "timestamp_step_ns", 0.0) or 0.0) * 1e-9
+        return max(_RACE_SAMPLE_GPU_S, _RACE_STEPS * step)
+
+    @property
+    def name(self):
+        return "host" if self.plat is None else "gpu"
+
+    def time(self, work):
+        """Seconds `work()` took, by this race's clock. `work` returns what it computed."""
+        import time as _t
+        with _quiet_timing():
+            if self.plat is not None:
+                self.plat.timingBegin()
+                work()
+                ms = self.plat.timingEnd()
+                if ms >= 0:
+                    self.started = True
+                    _LAST_SAMPLE_END[0] = _t.perf_counter()
+                    return ms / 1000.0
+                # More passes than a span holds: this race moves to the host's clock, and one
+                # that already has samples on the GPU's starts over.
+                self.plat = None
+                if self.started:
+                    raise _ClockChanged()
+            self.started = True
+            t0 = _t.perf_counter()
+            _sync_small(work())
+            took = _t.perf_counter() - t0
+            _LAST_SAMPLE_END[0] = _t.perf_counter()
+            return took
+
+
+class _ClockChanged(Exception):
+    """A race's samples would mix two clocks."""
+
+
+def _settle(valid, sample, per, busy=False):
+    """Rounds of every candidate until the device's clock has stopped rising: until a round
+    is no faster than the round before it. Returns the last per-candidate times.
+
+    An idle GPU runs slow and speeds up under load -- a kernel that settles at 0.77 ms took
+    3.6, 2.4, 2.0, 1.5, 1.2, 0.98 ms over its first runs from idle on an M5, ~15-20 ms of work
+    before the clock stopped rising. Paired, alternating rounds cancel a clock that drifts
+    slowly; they do not cancel one that climbs between the two samples of a pair. `busy`:
+    another race's samples ended just before this one started, so the clock is up already
+    and nothing is run."""
+    if busy:
+        return per
+    prev = sum(per.values())
+    for _ in range(_SETTLE_ROUNDS):
+        _remeasure_checkpoint()
+        cur = {c: sample(c) for c in valid}
+        total = sum(cur.values())
+        if total >= prev:
+            return cur
+        prev, per = total, cur
+    return per
+
+
+def _quiet_timing():
+    """What a timed race sample runs inside: no garbage collection -- the backend's reap on
+    the allocation path and Python's own -- until the timing is over (`paused_reaping`)."""
+    try:
+        from wgpy_backends.webgpu.webgpu_buffer import paused_reaping
+        return paused_reaping()
+    except Exception:
+        return _GcPaused()
+
+
+class _GcPaused(object):
+    def __enter__(self):
+        import gc
+        self._gc = gc.isenabled()
+        gc.disable()
+        return self
+
+    def __exit__(self, *exc):
+        import gc
+        if self._gc:
+            gc.enable()
+        return False
+
+
 def _route_names():
     """Every value a `_weight_execution` race can record, for accepting a saved profile. Taken
     from the candidate tables themselves, so a new route is kept across reloads the day it
@@ -4081,13 +4557,18 @@ def _route_names():
             | set(_ATTN_TILES) | set(_CATTN_TARGETS))
 
 # What one race sample should cost (see `_weight_execution`): enough work that the readback's
-# own noise is small against the difference being measured.
+# own noise is small against the difference being measured. By the GPU's own timestamps there
+# is no readback noise in the reading, only the timestamps' step (65.5 us in Chrome without
+# developer flags): a sample is then `_RACE_STEPS` steps of GPU work, and never under
+# `_RACE_SAMPLE_GPU_S`.
 _RACE_SAMPLE_S = 0.006
+_RACE_SAMPLE_GPU_S = 0.0005
+_RACE_STEPS = 30
 
 
 def _weight_execution(family, storage_format, K, N, M, run,
                       candidates=("stored", "materialized"), check=None, rounds=9,
-                      repeat=4):
+                      repeat=4, clock="gpu"):
     """Choose a correct implementation from device-local paired measurements.
 
     The key contains only operator facts, never a model/repository name.  Nearby batch
@@ -4098,18 +4579,27 @@ def _weight_execution(family, storage_format, K, N, M, run,
     latency win is retained.  If the samples do not prove a winner, the earlier candidate
     wins; callers therefore order candidates by memory cost, with the original stored
     representation first.
+
+    `clock` is what the candidates are timed by (`_RaceClock`): "gpu", the device's own
+    timestamps, for an operator whose cost in use is its GPU work -- one replayed from a
+    recording, or a GPU-bound one; "host", the browser's clock around the work and its
+    readback, for a composite issued op by op from Python, whose candidates differ in how
+    many operations the host issues as much as in what the GPU does.
     """
     m = int(M)
     bucket = 1 << (m - 1).bit_length()
     key = ("weight_exec", str(family), str(storage_format), int(K), int(N), bucket)
+    _note_route(key)
     if _CALIBRATING[0]:
         _CALIB_TOUCHED.append(key)
-    if key in _TUNED:
+    again = key in _RACE_AGAIN
+    if key in _TUNED and not again:
         return _TUNED[key]
-    if not _CALIBRATING[0]:
+    if not _CALIBRATING[0] and not again:
         near = _nearest_tuned(key)
         if near is not None:
             return near
+    _RACE_AGAIN.discard(key)
     import time as _t
     _tune_started = _t.perf_counter()
     candidates = tuple(candidates)
@@ -4120,14 +4610,16 @@ def _weight_execution(family, storage_format, K, N, M, run,
     # but size each sample to the operator's work rather than a fixed repetition count.
     cap = max(1, int(repeat))
     repeat = max(1, min(cap, 1 if m >= 128 else 2 if m >= 32 else 4))
+    clock = _RaceClock(gpu=(clock == "gpu"))
+    busy = _tune_started - _LAST_SAMPLE_END[0] < _STILL_BUSY_S
 
     def batch(which):
-        out = None
-        t0 = _t.perf_counter()
-        for _ in range(repeat):
-            out = run(which)
-        _sync_small(out)
-        return (_t.perf_counter() - t0) / repeat
+        def work():
+            out = None
+            for _ in range(repeat):
+                out = run(which)
+            return out
+        return clock.time(work) / repeat
 
     try:
         valid = []
@@ -4148,25 +4640,37 @@ def _weight_execution(family, storage_format, K, N, M, run,
         if not valid:
             raise RuntimeError("no correct execution candidate")
         valid = tuple(valid)
-        # One more untimed run of each, timed only to size the samples. It also lets the GPU
-        # settle: the first rounds of a race ran 2-3x slow (1.6-2.2 ms against 0.6) and,
-        # with one dispatch a sample, a 0.09 ms difference between two kernels sat inside
-        # the readback's own noise -- the 1152x768 race picked the 27%-slower route one time
-        # in six. A sample is now about _RACE_SAMPLE_S of work, so a short kernel is
-        # repeated and a long one is not; never more than `cap` runs, which bounds memory.
-        slowest = max(batch(which) for which in valid) * repeat
-        repeat = max(1, min(max(cap, 8) if m >= 128 else cap,
-                            int(round(_RACE_SAMPLE_S / max(slowest, 1e-4)))))
+        # One more run of each, timed only to size the samples: with one dispatch a sample,
+        # a 0.09 ms difference between two kernels sat inside the readback's own noise -- the
+        # 1152x768 race picked the 27%-slower route one time in six. A sample is about
+        # _RACE_SAMPLE_S of work, so a short kernel is repeated and a long one is not. By the
+        # host's clock never more than `cap` runs, which bounds memory; by the GPU's, each
+        # run's output is recycled before the next, and a short kernel needs many runs to
+        # stand clear of the timestamps' own step (65.5 us in Chrome without flags).
+        def size(per):
+            limit = (max(cap, 8) if m >= 128 else cap) if clock.host else _RACE_GPU_RUNS
+            return max(1, min(limit, int(round(clock.sample_s()
+                                               / max(max(per.values()), 1e-6)))))
+        while True:
+            try:
+                per = {which: batch(which) for which in valid}
+                repeat = size(per)
+                # Then the clock: an idle GPU's rises over its first 15-20 ms of work, and a
+                # race on that slope times each candidate on a different clock (`_settle`).
+                repeat = size(_settle(valid, batch, per, busy))
+                times = _race(valid, batch, max(5, int(rounds)), early_from=5)
+                break
+            except _ClockChanged:
+                clock.started = False
         # Five unanimous paired rounds are already p=1/32; more repetitions cannot make that
         # decision more necessary. What has to be settled is the WINNER against each other
         # candidate -- not how two losers rank against each other. If the winner is
         # inconclusive against anything, measuring goes on through the requested rounds
         # instead of dropping a local win; a candidate that has lost every round to it by
-        # complete separation stops being measured (`_race`).
-        times = _race(valid, batch, max(5, int(rounds)), early_from=5)
+        # complete separation stops being measured (`_race`, above).
         live = tuple(w for w in valid if w in times)
         chosen = _measured_choice(times, live, default=live[0])
-        _TUNED[key] = chosen
+        _commit_route(key, chosen, clock.name, _t.perf_counter() - _tune_started)
     finally:
         # Aggregate even failed calibration; a failed candidate must never be cached as
         # the first (possibly wrong) route, but its work still belongs in load diagnostics.
@@ -4176,17 +4680,30 @@ def _weight_execution(family, storage_format, K, N, M, run,
     return chosen
 
 
-def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm=None):
+def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm=None,
+         clock="host"):
     """The best of `candidates` on this device, remembered under `key`.
 
     `apply(v)` installs a candidate, `bench()` runs the work once and returns only when the
     GPU has, `check(v)` (optional) returns True if the candidate is correct. `warm()`
     (optional) is the least work that builds and proves a candidate runnable before timing
     -- one dispatch rather than a whole timed batch; without it, `bench()` serves.
+    `clock="gpu"`: timed by the GPU's own timestamps where the device has them -- for
+    candidates that differ only in GPU work. The default, the host's clock, is for those
+    whose host work is part of what differs (how often a loop crosses into JS, say).
     """
-    if key in _TUNED:
+    _note_route(key)
+    if key not in _TUNE_AGAIN:
+        # How to race this one again (`remeasure`). The first caller's closures serve: any
+        # of them runs the same shapes.
+        _TUNE_AGAIN[key] = dict(candidates=tuple(candidates), apply=apply, bench=bench,
+                                check=check, rounds=rounds, default=default, warm=warm,
+                                clock=clock)
+    if key in _TUNED and key not in _RACE_AGAIN:
         return _TUNED[key]
+    _RACE_AGAIN.discard(key)
     import time as _t
+    _tune_started = _t.perf_counter()
     ok = []
     for v in candidates:
         try:
@@ -4204,19 +4721,27 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
     if not ok:
         raise RuntimeError("no execution candidates for tune key %r" % (key,))
 
+    timer = _RaceClock(gpu=(clock == "gpu"))
+    busy = _tune_started - _LAST_SAMPLE_END[0] < _STILL_BUSY_S
+
     def sample(v):
         apply(v)
-        t0 = _t.perf_counter()
-        bench()
-        return _t.perf_counter() - t0
+        return timer.time(bench)
 
     # The same paired-evidence rule as the stored-weight and containing-layer tuners, with
-    # candidates that can no longer win dropped as soon as the samples say so (`_race`).
-    times = _race(ok, sample, rounds)
+    # candidates that can no longer win dropped as soon as the samples say so (`_race`) --
+    # timed once the clock has settled (`_settle`).
+    while True:
+        try:
+            _settle(ok, sample, {v: sample(v) for v in ok}, busy)
+            times = _race(ok, sample, rounds)
+            break
+        except _ClockChanged:
+            timer.started = False
     live = [v for v in ok if v in times]
     chosen = _measured_choice(times, live,
                               default=(default if default in live else live[0]))
-    _TUNED[key] = chosen
+    _commit_route(key, chosen, timer.name, _t.perf_counter() - _tune_started)
     return chosen
 
 
@@ -6401,11 +6926,14 @@ def _wgpu_ln_rows(xd, yd, gd, bd, eps):
         ssum = _ln_rows_sink["sink"]
     meta = _adam_kernel["make_meta"]((rows, W4, 1 if yd is not None else 0, float(eps)),
                                      "u4,u4,u4,f4")
-    plat.runKernel({"name": name,
-                    "tensors": [xd.buffer.buffer_id, (yd if yd is not None else xd).buffer.buffer_id,
-                                gd.buffer.buffer_id, bd.buffer.buffer_id, ssum.buffer.buffer_id,
-                                out.buffer.buffer_id, meta.buffer_id],
-                    "workGroups": {"x": min(rows, 65535), "y": (rows + 65534) // 65535, "z": 1}})
+    desc = {"name": name,
+            "tensors": [xd.buffer.buffer_id, (yd if yd is not None else xd).buffer.buffer_id,
+                        gd.buffer.buffer_id, bd.buffer.buffer_id, ssum.buffer.buffer_id,
+                        out.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": min(rows, 65535), "y": (rows + 65534) // 65535, "z": 1}}
+    if _elastic_rows(rows) and rows <= 65535:
+        _dyn(desc, x=("rows", 1, 1))
+    plat.runKernel(desc)
     return (ssum if yd is not None else None), out
 
 
@@ -10555,6 +11083,16 @@ fn BIT16(w: vec4<u32>, b: u32) -> vec4<f32> {
   return vec4<f32>((w >> vec4<u32>(b)) & vec4<u32>(1u)) * 16.0;
 }
 """
+_TILED_Q8_0 = """
+fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
+  let w = B4V(b * 34u + 2u + kl, c4);
+  return mat4x4<f32>(vec4<f32>(vec4<i32>(w << vec4<u32>(24u)) >> vec4<u32>(24u)),
+                     vec4<f32>(vec4<i32>(w << vec4<u32>(16u)) >> vec4<u32>(24u)),
+                     vec4<f32>(vec4<i32>(w << vec4<u32>(8u)) >> vec4<u32>(24u)),
+                     vec4<f32>(vec4<i32>(w) >> vec4<u32>(24u)));
+}
+fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> { return F16V(b * 34u, c4); }
+"""
 _TILED_Q4_0 = """
 fn QV(b: u32, kl: u32, c4: u32) -> mat4x4<f32> {
   let w = B4V(b * 18u + 2u + (kl & 15u), c4); let sh = select(0u, 4u, kl >= 16u);
@@ -10842,6 +11380,7 @@ fn QA(b: u32, s: u32, c4: u32) -> vec4<f32> {
 """
 # name: (sub-block values, has an offset, functions)
 _TILED_FORMATS = {
+    "Q8_0": (32, False, _TILED_Q8_0),
     "Q4_0": (32, False, _TILED_Q4_0), "Q4_1": (32, True, _TILED_Q4_1),
     "Q5_0": (32, False, _TILED_Q5_0), "Q5_1": (32, True, _TILED_Q5_1),
     "Q4_K": (32, True, _TILED_Q4_K), "Q5_K": (32, True, _TILED_Q5_K),
@@ -11104,8 +11643,12 @@ def _ggml_tiled_half_src(type_name):
 
 
 # Formats with a tiled kernel. Adding one is adding its decode, not a branch elsewhere.
-_GGML_TILED = {"Q8_0": _GGML_TILED_Q8_0_WGSL}
-_GGML_TILED.update({name: _ggml_tiled_src(name) for name in _TILED_FORMATS})
+# Q8_0 keeps its own f32 kernel (`_GGML_TILED_Q8_0_WGSL`: its 34-byte blocks read without
+# the generic unaligned helper); its template entry is what gives it the half-arithmetic
+# twin and the grouped expert kernels. Without it a Q8_0 weight had no half route at all:
+# the xDecision Q8_0 encoder's GEMMs ran at 2.4-2.6 TFLOPS where its F16 twin's ran at 3.3-4.
+_GGML_TILED = {name: _ggml_tiled_src(name) for name in _TILED_FORMATS}
+_GGML_TILED["Q8_0"] = _GGML_TILED_Q8_0_WGSL
 _ggml_tiled_k = {"added": set()}
 
 
@@ -11161,18 +11704,25 @@ def _ggml_tiled_matmul(xf, packed, type_name, K, N, split=None, half=False):
     G = int(split) if split else _ggml_tiled_split(M, N)
     part = _empty((G * M, N))
     meta = _adam_kernel["make_meta"]((M, N, K, words, G), "u4,u4,u4,u4,u4")
-    plat.runKernel({"name": name,
-                    "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
-                                part.buffer.buffer_id, meta.buffer_id]
-                               + ([grid.buffer.buffer_id] if grid is not None else []),
-                    "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": G}})
+    elastic_rows = _elastic_rows(M)
+    desc = {"name": name,
+            "tensors": [xf.buffer.buffer_id, packed.buffer.buffer_id,
+                        part.buffer.buffer_id, meta.buffer_id]
+                       + ([grid.buffer.buffer_id] if grid is not None else []),
+            "workGroups": {"x": (N + 63) // 64, "y": (M + 31) // 32, "z": G}}
+    if elastic_rows:
+        _dyn(desc, y=("rows", 1, 32))
+    plat.runKernel(desc)
     if G == 1:
         return part
     out = _empty((M, N))
     rmeta = _adam_kernel["make_meta"]((M * N, G), "u4,u4")
-    plat.runKernel({"name": "ggml_tiled_reduce",
-                    "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
-                    "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}})
+    desc = {"name": "ggml_tiled_reduce",
+            "tensors": [out.buffer.buffer_id, part.buffer.buffer_id, rmeta.buffer_id],
+            "workGroups": {"x": (M * N + 63) // 64, "y": 1, "z": 1}}
+    if elastic_rows:
+        _dyn(desc, x=("rows", N, 64))
+    plat.runKernel(desc)
     return out
 
 
@@ -14852,7 +15402,7 @@ def _ggml_tiled_moe_src(type_name, half):
     `expert * estride` and its rows read through the permutation: a token's row directly
     for the first projection (no k-fold copy of the activations), a slot's row for the
     second. Each row is written to its slot."""
-    src = _ggml_tiled_half_src(type_name) if half else _GGML_TILED[type_name]
+    src = _ggml_tiled_half_src(type_name) if half else _ggml_tiled_src(type_name)
     gbind = 5 if "binding(4) var<storage,read> gr" in src else 4
     subs = [
         ("struct QMeta { M: u32, N: u32, K: u32, RW: u32, G: u32, }",
@@ -15583,10 +16133,13 @@ def gather_rows_at(x, index, count):
         _gather_rows_added["gpu"] = True
     out = _empty((count, width))
     meta = _adam_kernel["make_meta"]((count, width), "u4,u4")
-    plat.runKernel({"name": "gather_rows",
-        "tensors": [source.buffer.buffer_id, idx.buffer.buffer_id,
-                    out.buffer.buffer_id, meta.buffer_id],
-        "workGroups": {"x": (count * width + 63) // 64, "y": 1, "z": 1}})
+    desc = {"name": "gather_rows",
+            "tensors": [source.buffer.buffer_id, idx.buffer.buffer_id,
+                        out.buffer.buffer_id, meta.buffer_id],
+            "workGroups": {"x": (count * width + 63) // 64, "y": 1, "z": 1}}
+    if _elastic_rows(count):
+        _dyn(desc, x=("rows", width, 64))
+    plat.runKernel(desc)
     return Tensor(out)
 
 

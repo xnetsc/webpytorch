@@ -3135,6 +3135,7 @@ class CausalLM:
                 self._greedy_chunk_capture_ready = False
                 self.decode_plan["greedy_chunk"] = 0
                 self.decode_plan["greedy_chunk_budget_skipped"] = True
+            self._offer_remeasure()
         elif wt._webgl_ready():
             # WebGL has no command capture, but it still owns an independent complete-API
             # choice (most visibly full-vocabulary readback versus its fragment argmax).
@@ -3358,6 +3359,7 @@ class CausalLM:
             qindex = {shape: i for i, shape in enumerate(qshapes)}
             profile_key = CausalLM._decode_composition_key(
                 self, stored_linears, qshapes, pick_mode)
+            self._decode_profile_key = profile_key
             # Exhaust every per-shape combination while it is tractable.  More shapes use
             # the lower layer's own auto vector plus the two uniform overrides; this keeps
             # load time bounded without collapsing all shapes into one global vote.
@@ -3436,6 +3438,7 @@ class CausalLM:
 
             def captured_sample(plan, steps):
                 """Time the real upper API route, including its active sampler."""
+                wt._remeasure_checkpoint()
                 reset_probe_sampling()
                 select(plan); self._reset_linear_state(); self._set_inputs(0, 0)
                 plat.beginCapture("decode")
@@ -3446,12 +3449,14 @@ class CausalLM:
                 plat.endCapture()
                 nxt = (self._accept_token(self._token_from_device(token))
                        if token is not None else CausalLM._pick_tensor(self, logits))
-                t0 = time.perf_counter()
-                for pos in range(1, steps + 1):
-                    self._set_inputs(nxt, pos); plat.replay("decode")
-                    nxt = (self._accept_token(self._token_from_device(token))
-                           if token is not None else CausalLM._pick_tensor(self, logits))
-                return (time.perf_counter() - t0) / steps
+                with wt._quiet_timing():
+                    t0 = time.perf_counter()
+                    for pos in range(1, steps + 1):
+                        self._set_inputs(nxt, pos); plat.replay("decode")
+                        nxt = (self._accept_token(self._token_from_device(token))
+                               if token is not None else CausalLM._pick_tensor(self, logits))
+                    took = (time.perf_counter() - t0) / steps
+                return took
 
             # Correctness is judged against the exact original-width composition, never
             # against whichever candidate happens to be enumerated first.  In particular,
@@ -4048,11 +4053,14 @@ class CausalLM:
         samples = {route: [] for route in valid}
 
         def bench(route):
-            t0 = time.perf_counter()
-            for _ in range(16):
-                self._decode_chunk_input(slot=1, execution=route)
-            self.h_in.numpy()
-            return (time.perf_counter() - t0) / 16.0
+            wt._remeasure_checkpoint()
+            with wt._quiet_timing():
+                t0 = time.perf_counter()
+                for _ in range(16):
+                    self._decode_chunk_input(slot=1, execution=route)
+                self.h_in.numpy()
+                took = (time.perf_counter() - t0) / 16.0
+            return took
 
         for route in valid:
             bench(route)
@@ -4080,18 +4088,20 @@ class CausalLM:
         """Record and execute `count` chained exact-input greedy steps."""
         plat = wt._adam_kernel["platform"]
         count = int(count)
-        plat.beginCapture(name)
-        try:
-            for i in range(count):
-                # Step 0 starts from the slot the last step of the chunk before wrote.
-                self._decode_chunk_input(slot=(i if i else count), execution=row_execution)
-                logits = self._decode_fwd()
-                wt.vocab_argmax(logits.data, self._chunk_tokens, i + 1)
-            values = np.asarray(self._chunk_tokens.get(), np.int32).copy()
-        finally:
-            plat.endCapture()
+        with wt.route_keys() as used:
+            plat.beginCapture(name)
+            try:
+                for i in range(count):
+                    # Step 0 starts from the slot the last step of the chunk before wrote.
+                    self._decode_chunk_input(slot=(i if i else count), execution=row_execution)
+                    logits = self._decode_fwd()
+                    wt.vocab_argmax(logits.data, self._chunk_tokens, i + 1)
+                values = np.asarray(self._chunk_tokens.get(), np.int32).copy()
+            finally:
+                plat.endCapture()
         if name == "decode_chunk":
             self._greedy_chunk_capture_ready = True
+            self._greedy_graph_routes = used.keys
         return values
 
     def _greedy_chunks(self, token, pos, chunk, budget, graph="decode_chunk",
@@ -4191,6 +4201,7 @@ class CausalLM:
                 memo_key = ("greedy_chunk_v2",) + tuple(plan_key[1:])
         except Exception:
             memo_key = None
+        self._greedy_memo_key = memo_key
         recorded = []
         try:
             self._set_sampling(temperature=0, do_sample=False, prompt_ids=[])
@@ -4274,23 +4285,26 @@ class CausalLM:
             samples = {c: [] for c in valid}
 
             def bench(candidate):
+                wt._remeasure_checkpoint()
                 which, row_route = candidate
                 graph = cname(which, row_route)
                 token = 0; pos = 64
                 # Long enough for a chunk of four to overlap the next one at all.
                 steps = 8 if hasattr(self, "_warm_deadline") else 16
-                t0 = time.perf_counter()
-                if which == 0:
-                    for _ in range(steps):
-                        self._set_inputs(token, pos)
-                        plat.replay(graph)
-                        token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
-                        pos += 1
-                else:
-                    # The way generation runs it: pipelined, one call per chunk.
-                    for _got in self._greedy_chunks(token, pos, which, steps, graph=graph):
-                        pass
-                return (time.perf_counter() - t0) / steps
+                with wt._quiet_timing():
+                    t0 = time.perf_counter()
+                    if which == 0:
+                        for _ in range(steps):
+                            self._set_inputs(token, pos)
+                            plat.replay(graph)
+                            token = int(np.asarray(self._chunk_tokens.get()).reshape(-1)[1])
+                            pos += 1
+                    else:
+                        # The way generation runs it: pipelined, one call per chunk.
+                        for _got in self._greedy_chunks(token, pos, which, steps, graph=graph):
+                            pass
+                    took = (time.perf_counter() - t0) / steps
+                return took
 
             for r in range(5 if hasattr(self, "_warm_deadline") else 15):
                 order = valid if not (r & 1) else list(reversed(valid))
@@ -4358,6 +4372,82 @@ class CausalLM:
             # Replacing only this named graph releases its pins without touching
             # the active decode graph. A later greedy call records it lazily.
             CausalLM._release_idle_greedy_capture(self, plat, active_pick_mode)
+
+    # ---- this model's own choices, raced again on request (`wt.remeasure`) -------------
+    def _offer_remeasure(self):
+        """The decode composition and the greedy chunk race again with the kernel routes;
+        a kernel route that changes makes the decode graphs recorded with it stale."""
+        if getattr(self, "_decode_profile_key", None) is not None:
+            wt.register_remeasure(self._decode_profile_key, self._remeasure_decode)
+        if getattr(self, "_greedy_memo_key", None) is not None and self._can_chunk_greedy():
+            wt.register_remeasure(self._greedy_memo_key, self._remeasure_greedy)
+        wt.on_routes_changed(self._routes_changed)
+
+    def _routes_changed(self, keys):
+        keys = set(keys)
+        out = []
+        if keys & set(getattr(self, "_decode_graph_routes", ()) or ()):
+            self.capture_ready = False
+            self._decode_graph_signature = None
+            self._decode_graph_logits = None
+            self._decode_graph_token = None
+            out.append({"rebuild": "decode step graph", "when": "next reply"})
+        if keys & set(getattr(self, "_greedy_graph_routes", ()) or ()):
+            self._greedy_chunk_capture_ready = False
+            out.append({"rebuild": "greedy chunk graph", "when": "next greedy reply"})
+        return out
+
+    def _race_own_choice(self, key, tune_it, comparable, drop=()):
+        """Race one of this model's own choices again, through its own tuner, with the load's
+        time limit lifted. Stopped part way, its previous verdict goes back -- the candidate
+        left in place passed the same correctness check, it is just not proven fastest --
+        and is put back in force when idle. Its timing wrote rows of the cache, so the next
+        reply prefills from the start."""
+        before = wt._TUNED.pop(key, None)
+        dropped = {k: wt._TUNED.pop(k) for k in drop if k in wt._TUNED}
+        missing = object()
+        deadline = self.__dict__.get("_warm_deadline", missing)
+        # The load's own limit for these searches, never past what the remeasure has left:
+        # an unlimited one walked the whole combinatorial space for more than ten minutes.
+        left = wt.remeasure_time_left()
+        self._warm_deadline = time.perf_counter() + min(8.0, 8.0 if left is None else left)
+        t0 = time.perf_counter()
+        done = False
+        try:
+            tune_it()
+            done = True
+        finally:
+            if deadline is missing:
+                self.__dict__.pop("_warm_deadline", None)
+            else:
+                self._warm_deadline = deadline
+            CausalLM._kv_drop(self)
+            self._reset_linear_state()
+            if not done:
+                if before is not None:
+                    wt._TUNED[key] = before
+                for k, v in dropped.items():
+                    wt._TUNED.setdefault(k, v)
+                wt.queue_task(tune_it)
+        wt._note_remeasured(key, comparable(before), comparable(wt._TUNED.get(key)), "host",
+                            time.perf_counter() - t0)
+
+    def _remeasure_decode(self):
+        def plan(v):
+            return v.get("plan") if isinstance(v, dict) else v
+
+        def again():
+            # Within the time limit set above; the memo is gone, so it searches again.
+            self._tune_decode_composition(interactive=True)
+            # The chunks are decode steps too.
+            self._greedy_chunk_capture_ready = False
+        self._race_own_choice(self._decode_profile_key, again, plan)
+
+    def _remeasure_greedy(self):
+        def choice(v):
+            return [v.get("count"), v.get("row")] if isinstance(v, dict) else v
+        self._race_own_choice(self._greedy_memo_key, self._tune_greedy_chunks, choice,
+                              drop=(self._embedding_row_key(),))
 
     def _warm_decode_step(self):
         """Run one decode step here, where nothing is recording.
@@ -5351,17 +5441,19 @@ class CausalLM:
                 picked = self._token_from_device(token)
             return self._decode_graph_logits, token, picked
 
-        plat.beginCapture("decode")
-        try:
-            logits = self._decode_fwd()
-            token = picked = None
-            if self._device_greedy_ok():
-                token, picked = self._prepare_device_greedy(logits)
-            if token is None:
-                logits.numpy()
-        finally:
-            plat.endCapture()
+        with wt.route_keys() as used:
+            plat.beginCapture("decode")
+            try:
+                logits = self._decode_fwd()
+                token = picked = None
+                if self._device_greedy_ok():
+                    token, picked = self._prepare_device_greedy(logits)
+                if token is None:
+                    logits.numpy()
+            finally:
+                plat.endCapture()
         self.capture_ready = True
+        self._decode_graph_routes = used.keys
         key = CausalLM._decode_graph_key(self, split)
         self._decode_graph_signature = key
         self._decode_graph_logits = logits if key is not None else None

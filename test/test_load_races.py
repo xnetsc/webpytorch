@@ -67,8 +67,9 @@ def test_a_winner_proven_against_every_survivor_ends_the_race_early():
 def test_tune_warms_each_candidate_with_its_warm_not_its_bench(monkeypatch):
     import time
     monkeypatch.setattr(wt, "_TUNED", {})
-    clock = [0.0]
+    clock = [100.0]
     monkeypatch.setattr(time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(wt, "_LAST_SAMPLE_END", [0.0])       # the GPU has been idle
     benches, warms = [], []
     cur = {}
 
@@ -78,8 +79,14 @@ def test_tune_warms_each_candidate_with_its_warm_not_its_bench(monkeypatch):
     choice = wt.tune(("t", 1), ("y", "x"), lambda v: cur.update(v=v), bench,
                      warm=lambda: warms.append(cur["v"]))
     assert warms == ["y", "x"]
-    # Three rounds separate y (2.0 every time) from x (1.0): six timed runs, not ten.
-    assert len(benches) == 6 and choice == "x"
+    # One round sizes, one round finds the clock already settled (no faster than the first),
+    # then three rounds separate y (2.0 every time) from x (1.0): ten runs, not fourteen.
+    assert len(benches) == 10 and choice == "x"
+    # Straight after another race the clock is up already: no settling round.
+    del benches[:]
+    choice = wt.tune(("t", 2), ("y", "x"), lambda v: cur.update(v=v), bench,
+                     warm=lambda: warms.append(cur["v"]))
+    assert len(benches) == 8 and choice == "x"
 
 
 def test_route_race_warms_each_candidate_with_one_run(monkeypatch):
@@ -88,10 +95,11 @@ def test_route_race_warms_each_candidate_with_one_run(monkeypatch):
     runs = []
     wt._weight_execution("unit", "f32", 8, 8, 4, lambda w: runs.append(w) or w,
                          candidates=("stored", "other"), rounds=5, repeat=4)
-    # One warm-up run each; then one untimed batch each that sizes the samples; then at
-    # most nine rounds of batches no longer than the cap (four here).
+    # One warm-up run each; then one batch each that sizes the samples; at most
+    # _SETTLE_ROUNDS rounds until the clock is settled; then at most nine rounds of
+    # batches no longer than the cap (four here).
     assert runs[:2] == ["stored", "other"]
-    assert len(runs) <= 2 + 2 * 4 + 9 * 2 * 4
+    assert len(runs) <= 2 + 2 * 4 + wt._SETTLE_ROUNDS * 2 * 4 + 9 * 2 * 4
 
 
 def test_an_explicitly_raced_short_k_variant_is_checked_at_the_small_shape():

@@ -19,7 +19,7 @@ type BufferProxy = {
 type UploadArena = {
     prepare(bytes: number): Uint8Array;
     uploadPrepared(id: number, offset: number, bytes: number, ctor?: string): number;
-    uploadPreparedMany?(parts: Array<[number, number, number]>, ctor?: string): void;
+    uploadPreparedMany?(parts: Array<[number, number, number] | [number, number, number, number]>, ctor?: string): void;
     releasePrepared(): void;
 };
 /** Generate and upload the head mask in JS; Python only provides buffer/shape references. */
@@ -41,6 +41,8 @@ export declare function stageDecisionCapture(backend: 'gl' | 'gpu', flush: () =>
  */
 export declare function fillDecisionPacked(embed: Float32Array | null, tok: Float32Array | null, seg: Uint32Array, pos: Uint32Array, gather: Float32Array, table: DecisionSource | null, tableType: 'f16' | 'f32', ids: DecisionSource, lengths: DecisionSource, indexBytes: 4 | 8, batch: number, length: number, rows: number, hidden: number, vocab: number, padId: number): void;
 /** `fillDecisionPacked` into the upload arena, then one upload per target. `xId` (embedding
- * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. */
-export declare function stageDecisionPacked(backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena, xId: number, tokId: number, segId: number, posId: number, gatherId: number, idsArg: BufferProxy, lengthsArg: BufferProxy, tableArg: BufferProxy | null, tableType: 'f16' | 'f32', batch: number, length: number, rows: number, hidden: number, vocab: number, padId: number, gatherLen?: number): void;
+ * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. `prefix`:
+ * the targets were allocated at a capacity and `rows`, `batch` and `gatherLen` are what this
+ * call has -- each is written at its target's start and the rest of it left as it was. */
+export declare function stageDecisionPacked(backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena, xId: number, tokId: number, segId: number, posId: number, gatherId: number, idsArg: BufferProxy, lengthsArg: BufferProxy, tableArg: BufferProxy | null, tableType: 'f16' | 'f32', batch: number, length: number, rows: number, hidden: number, vocab: number, padId: number, gatherLen?: number, prefix?: boolean): void;
 export {};

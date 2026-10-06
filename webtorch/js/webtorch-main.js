@@ -464,6 +464,18 @@
         return call('decide', { state: state, questions: questions,
                                 profile: !!(options && options.profile) });
       },
+      /**
+       * Race again every route (kernel, tile, thread shape) the loaded model uses, and
+       * resolve with the report: `status` ('complete' | 'stopped' | 'out_of_time'), `measured`
+       * (each route: `key`, `op`, `shape`, `rows`, `before`, `after`, `changed`, `ms`, `clock` -- 'gpu' when timed
+       * by the device's own timestamps), `changed`, `discarded`, `not_reached`,
+       * `unmeasurable`, `rebuilds`, `budget_ms`, `elapsed_ms`. `cancel()` stops it, and so
+       * does running out of `budgetMs` (default 60000, status 'out_of_time'); the report
+       * still comes back, with what finished in effect. Rejects when no model is loaded.
+       */
+      remeasure: function (o) {
+        return call('remeasure', { budgetMs: o && o.budgetMs != null ? o.budgetMs : undefined });
+      },
       /** Fit decision probabilities on separate labelled held-out examples. */
       calibrate: function (examples, o) {
         o = o || {};

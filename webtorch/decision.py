@@ -805,10 +805,12 @@ class DecisionModel(wt.Module):
             # length the load-time calibration did not visit takes the nearest one it did.
             # What is saved is the dead rows' work, T - len(rows), so T is what matters;
             # the option count is not part of the key.
+            # Issued op by op from here, never replayed: what a candidate costs includes
+            # what the host issues for it, so it is timed by the host's clock.
             mode = wt._weight_execution("decision_head_" + backend, "selected_rows",
                                         0, 0, int(h.shape[0]), run,
                                         candidates=("full", "selected_full", "selected_q"),
-                                        check=correct, repeat=1)
+                                        check=correct, repeat=1, clock="host")
         self._head_execution = mode
         raw = run(mode)
         packed = np.asarray(raw.get() if hasattr(raw, "get") else raw).reshape(-1)
@@ -1528,12 +1530,19 @@ def _calibrate_routes(model, webio):
 def _warm_decision(model, dec_cfg, webio):
     webio.load_stage("warm")
     # Measured, not borrowed: this pass creates every projection and is the one place the
-    # small row counts a short question uses are raced.
+    # small row counts a short question uses are raced. Two questions as well: the batched
+    # head's kernels are built here, not in front of the first multi-question request.
     with wt._calibrating():
-        model.decide("ready", {"_warm": {"type": dec_cfg.qtypes[0],
-                                           "instructions": "warm up",
-                                           "criteria": ["a", "b"]}})
+        warm = {"type": dec_cfg.qtypes[0], "instructions": "warm up", "criteria": ["a", "b"]}
+        model.decide("ready", {"_warm": warm})
+        model.decide("ready", {"_warm": warm, "_warm2": dict(warm, instructions="warm up two")})
     _calibrate_routes(model, webio)
+    # The encoder's packed pass recorded at the capacities a request meets, so that none
+    # records in front of a person (`TextEncoder.prepare_tiers`).
+    enc = getattr(getattr(model, "impl", model), "enc", None)
+    if callable(getattr(enc, "prepare_tiers", None)):
+        webio.load_stage("recording")
+        enc.prepare_tiers()
 
 
 async def _from_gguf(src, **kw):

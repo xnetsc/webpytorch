@@ -363,8 +363,29 @@ class WebGPUPlatform:
         release_capture_pin(name)
         return result
 
-    def replay(self, name):
+    def replay(self, name, live=None):
+        """Issue recording `name` again. `live` ({quantity: number}): the quantities a
+        recording made at a capacity has this time -- every dispatch recorded with a `dyn`
+        rule is issued for them (never past what it was recorded with); the rest as recorded."""
+        if live:
+            import json
+            return gpu.replay(name, json.dumps({str(k): int(v) for k, v in live.items()}))
         return gpu.replay(name)
+
+    def timingBegin(self):
+        """Time the GPU work issued from here to `timingEnd` with the device's timestamps."""
+        return gpu.timingBegin()
+
+    timestamp_step_ns = 0.0
+
+    def timingEnd(self):
+        """Milliseconds of GPU time since `timingBegin` (its passes summed), after waiting
+        for that work; -1 where it could not be timed whole. `timestamp_step_ns` is then the
+        step the device's timestamps came in (a browser may coarsen them on purpose)."""
+        got = gpu.timingEnd()
+        ms, step = float(got[0]), float(got[1])
+        WebGPUPlatform.timestamp_step_ns = step
+        return ms
 
     def clearBuffer(self, buffer_id):
         """Zero a buffer where it lives, in command order. No host data crosses."""

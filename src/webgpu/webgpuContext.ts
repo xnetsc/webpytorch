@@ -84,6 +84,19 @@ export class NNWebGPUContext {
   private selectedQuery: GPUQuerySet | null = null;
   private selectedNames: string[] = [];
   private readonly flushThreshold: number;
+  // A timed span (`spanBegin`/`spanEnd`): every pass begun inside it writes its own begin
+  // and end timestamps into `spanQuery`, and nothing is submitted early, so the span's
+  // dispatches run back to back. The sum of the pass lengths is the GPU's own time for
+  // that work -- not the browser's clock, which is coarsened and jittered on purpose and
+  // which also counts the host issuing and the readback around it.
+  private spanQuery: GPUQuerySet | null = null;
+  private span: { pairs: number; overflow: boolean } | null = null;
+  private static readonly SPAN_PAIRS = 512;
+  // The step the device's timestamps come in, in ns, as the readings themselves show it: the
+  // largest power of two dividing every one of them. A browser may coarsen them on purpose --
+  // Chrome without developer flags reports multiples of 65536 ns -- and a caller timing
+  // short work needs to know, to time enough of it.
+  timestampStepNs = 0;
 
   constructor() {
     if (
@@ -136,7 +149,9 @@ export class NNWebGPUContext {
       }
     }
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    const requiredFeatures: GPUFeatureName[] = (PROFILE_GPU && adapter!.features.has('timestamp-query'))
+    // Timestamps whenever the adapter has them: route races time candidates with the GPU's
+    // own clock (`spanBegin`). Where it has not, they fall back to the host's clock.
+    const requiredFeatures: GPUFeatureName[] = adapter!.features.has('timestamp-query')
       ? ['timestamp-query'] : [];
     // Standard optional features, asked for whenever THIS adapter has them, whatever GPU it
     // is: half-precision arithmetic (`shader-f16`) and subgroup operations (`subgroups`).
@@ -329,6 +344,16 @@ export class NNWebGPUContext {
           : request.pipelineName);
       }
     }
+    if (!this.passEncoder && this.span && !selected) {
+      if (this.span.pairs < NNWebGPUContext.SPAN_PAIRS) {
+        const q = this.span.pairs++ * 2;
+        this.passEncoder = this.commandEncoder.beginComputePass({ timestampWrites: {
+          querySet: this.spanQuery!, beginningOfPassWriteIndex: q, endOfPassWriteIndex: q + 1,
+        } } as any);
+      } else {
+        this.span.overflow = true;
+      }
+    }
     if (!this.passEncoder) {
       if (!selected && PROFILE_GPU && ((globalThis as any).__wgpyProfileNextPass === true
           || (globalThis as any).__wgpyProfileAllPasses === true)
@@ -380,7 +405,73 @@ export class NNWebGPUContext {
   /** Submit what is pending if the GPU has nothing to do; called after each batch of
    * commands the producer sends. A diagnostic pass being timed is left whole. */
   kick(): void {
-    if (this.inflight === 0 && this.pendingCount > 0 && !this.diagnosticQuery) this.flush();
+    if (this.inflight === 0 && this.pendingCount > 0 && !this.diagnosticQuery && !this.span) {
+      this.flush();
+    }
+  }
+
+  /** Whether `spanBegin` can time anything here: the device has timestamp queries. */
+  hasTimestamps(): boolean {
+    return !!this.device && this.device.features.has('timestamp-query');
+  }
+
+  /** Start timing the GPU work issued from now to `spanEnd`. False where the device cannot
+   * (no timestamp queries) or a span is already open; the caller then times another way. */
+  spanBegin(): boolean {
+    this.assertAlive();
+    if (this.span || !this.hasTimestamps()) return false;
+    this.flush();                      // what came before is not this span's work
+    if (!this.spanQuery) {
+      this.spanQuery = this.device.createQuerySet({
+        type: 'timestamp', count: 2 * NNWebGPUContext.SPAN_PAIRS });
+    }
+    this.span = { pairs: 0, overflow: false };
+    return true;
+  }
+
+  /** Milliseconds of GPU time the span's passes took, summed; -1 when it could not be
+   * timed whole (more passes than it has room to time). Waits for that work to finish. */
+  async spanEnd(): Promise<number> {
+    const span = this.span;
+    this.span = null;
+    if (!span) return -1;
+    if (this.passEncoder) { this.passEncoder.end(); this.passEncoder = null; }
+    if (span.pairs === 0 || span.overflow) {
+      this.flush();
+      return span.overflow ? -1 : 0;
+    }
+    if (!this.commandEncoder) this.commandEncoder = this.device.createCommandEncoder();
+    const bytes = span.pairs * 16;
+    const resolve = this.device.createBuffer({
+      size: bytes, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const read = this.device.createBuffer({
+      size: bytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      this.commandEncoder.resolveQuerySet(this.spanQuery!, 0, span.pairs * 2, resolve, 0);
+      this.commandEncoder.copyBufferToBuffer(resolve, 0, read, 0, bytes);
+      this.flush();
+      await read.mapAsync(GPUMapMode.READ);
+      const t = new BigUint64Array(read.getMappedRange());
+      let ns = 0;
+      let zeros = 24;
+      const low = BigInt(0xffffffff);
+      for (let i = 0; i < span.pairs; i++) {
+        // Each pass's length fits a double exactly; the absolute ticks may not.
+        if (t[2 * i + 1] > t[2 * i]) ns += Number(t[2 * i + 1] - t[2 * i]);
+        // The step: the fewest trailing zero bits of any reading (a step past 2^24 ns is not
+        // a clock anyone times with; the low 32 bits decide everything below it).
+        for (let j = 2 * i; j < 2 * i + 2; j++) {
+          const v = Number(t[j] & low) >>> 0;
+          if (v !== 0) zeros = Math.min(zeros, 31 - Math.clz32(v & -v));
+        }
+      }
+      read.unmap();
+      this.timestampStepNs = 2 ** zeros;
+      return ns / 1e6;
+    } finally {
+      read.destroy();
+      resolve.destroy();
+    }
   }
 
   // Submit all accumulated dispatches in one queue.submit, then safely destroy

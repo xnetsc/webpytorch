@@ -38,7 +38,7 @@ from ._core import kernel_profile, use_kernel_profile  # what this device decide
 from ._core import calibrate_deferred  # the rest of a load's route ladders, run when idle
 
 # ---- high-level SDK surface (transformers/torch style) ----
-from ._sdk import (install_torch, load, Model, release, loaded_models, release_all, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
+from ._sdk import (install_torch, load, Model, release, loaded_models, release_all, remeasure, AutoTokenizer, AutoModelForCausalLM, Quantizer, pipeline,
                    register_pipeline, register_task, list_pipelines, OnnxModel)
 
 # ---- generic LM engine + samplers (CausalLM + MoE series) ----
@@ -101,7 +101,7 @@ __all__ = [
     "set_download_progress", "get_download_progress",
     "cancel_requested", "set_cancel_probe", "trim_partial", "trim_stopped",
     "backend_reason",
-    "kernel_profile", "use_kernel_profile", "calibrate_deferred",
+    "kernel_profile", "use_kernel_profile", "calibrate_deferred", "remeasure",
     "set_read_progress", "get_read_progress",
     "set_load_progress", "get_load_progress",
     "export_model", "import_model", "model_groups",

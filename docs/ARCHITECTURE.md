@@ -446,6 +446,50 @@ packed shape runs eagerly in that layout, so its races settle before anything is
 racing inside a recording records every candidate, and the first version replayed 62
 attention dispatches a pass instead of 22.
 
+**Recorded at a capacity, replayed for the rows a call has.** Per (questions, 32-row bucket),
+almost every request met a shape it had not recorded: seconds apart, its first sight ran
+eagerly (52–75 ms against 36–40 replayed) and its second recorded (60–88 ms) — a first
+request several times slower and a steady state reached only gradually. A recording is
+reissued by JS one dispatch at a time, so a replay can issue a dispatch with fewer workgroups
+than it was recorded with: while `wt.elastic(rows, segments)` is open, each row-wise launcher
+(the tiled and half matmuls and their reductions, row LayerNorm, GEGLU, positioned RoPE, the
+row gather) attaches the rule its own workgroup formula follows, and packed attention its
+(longest sequence, sequences) rule; `_dyn` checks each against the count computed at the
+capacity. `replay(name, {rows, segments, longest})` then issues every ruled dispatch for the
+live quantities, never past what was recorded. Every kernel here computes a row from that row
+alone and attention reads only its segments, so the rows past the live ones (the rest of a
+32-row tile) are harmless. The encoder records its packed pass at 128, 256 and 512 rows while
+the model loads (`prepare_tiers`, ~51 KB pinned a row), larger capacities the first time a
+call needs one; each recording is checked bit for bit against its own recording run at a row
+count that is not a whole tile before it is used. Laya seconds apart: first request 25.6 →
+17.7 ms, no request records any more; the Q8_0 GGUF's first two 69.6/77.6 → 22.8/29.3 ms.
+
+**Which kernel wins is measured by the GPU's own clock.** A race sample that a collect landed
+in measured the collect: every 1.4–2.1 ms sample of a 0.5–0.7 ms kernel had a young collect
+and a reap inside it, and two of them made a 30%-faster kernel's win unprovable (7 of 9
+paired wins, p = 0.09), so the slower one stayed — 10 ms on every three-question request.
+Samples now run with no collection inside (`paused_reaping`); where the device has
+`timestamp-query` they are the summed length of their passes, from the device's timestamps
+(`timingBegin`/`timingEnd`), with nothing submitted early so a sample's dispatches run back
+to back — not the browser's clock, which is coarsened and jittered on purpose and counts the
+host and the readback too. Chrome without developer flags reports timestamps in steps of
+65.5 µs, so a sample is 30 steps of GPU work (0.5 ms where the step is finer), sized from the
+step the readings themselves show. An idle GPU clocks up over its first 15–20 ms of work
+(a 0.77 ms kernel ran 3.6, 2.4, 2.0, 1.5, 1.2, 0.98 ms from idle), so a race that starts
+after idle runs rounds until one is no faster than the last (`_settle`) before it times
+anything; one that follows another race directly does not. A composite issued op by op from
+Python (the decision head's row selection) is still timed by the browser's clock: its
+candidates differ in what the host issues as much as in GPU work.
+
+**Racing again, on request.** `remeasure(budget_s)` races again the routes the loaded model
+has used — what its warm-up, recordings and requests looked up, not every bucket a ladder
+explored — through the probes that raced them first (each ladder probe is kept per route
+prefix; each `tune` keeps its own arguments; a model registers its composite choices with
+`register_remeasure`). Each new choice takes effect when its race ends; `cancel` or the
+budget ends the race in progress without a verdict; recordings that used a changed route are
+rebuilt when idle (`on_routes_changed`). Laya: 38 routes in 2.8 s, 9 changed (five of them
+buckets the load had only borrowed from a neighbour); answers unchanged.
+
 All of this is per device. `gpu_features()` reports what the device was created with —
 `shader-f16` and `subgroups` are requested whenever the adapter has them, whatever its vendor
 — and a kernel that needs a feature is offered only where it is present; which eligible kernel

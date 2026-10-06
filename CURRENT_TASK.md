@@ -13,6 +13,14 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-07 no request records any more; Q8_0 half arithmetic; GPU-timed races; `remeasure`:**
+the decision encoder is recorded per row capacity at load and replayed for the live rows (first
+requests 69.6/77.6 → 22.8/29.3 ms on the Q8_0 GGUF, seconds apart); Q8_0 gets the half tiled
+kernel every other format had (three questions 61.6 → 50.0 ms back to back); race samples are
+GC-free and timed by GPU timestamps; `remeasure(budget)` races the loaded model's routes again,
+stoppable, keeping what finished. Next: `remeasure` rotation (least recently raced first, the
+rest continued when idle), the LLM composites through it, then the article the user asked for.
+
 **2026-10-06 decision latency as the user sees it:** back to back one question 16 ms / three
 43 ms; two seconds apart 42–47 / 63–85 — the M5's clocks after idle (GPU 2.6x, CPU 3-4x,
 measured outside the SDK). Ours to fix: graph recording on new lengths (60–68 ms) and the

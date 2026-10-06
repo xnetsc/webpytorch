@@ -463,7 +463,7 @@ def test_webgl_fused_swiglu_does_not_read_a_split_q8_weight_as_words():
 
 def test_every_templated_tiled_kernel_is_complete_and_reads_only_the_stored_buffer():
     for name, (sb, hasb, _funcs) in wt._TILED_FORMATS.items():
-        src = wt._GGML_TILED[name]
+        src = wt._ggml_tiled_src(name)
         assert name in wt._GGML_TYPES
         for token in ("HELP", "FUNCS", "VALSu", "NSUBu", "SB4u", "SBu", "HASB_"):
             assert token not in src, (name, token)
@@ -472,6 +472,9 @@ def test_every_templated_tiled_kernel_is_complete_and_reads_only_the_stored_buff
         assert ("s00 = s00 - e0 * r0" in src) == hasb, name     # offset term only if it has one
         assert "fn QV(" in src and "fn QA(" in src and (("fn QB(" in src) == hasb)
         assert wt._ggml_tiled_ok(name, 1024, 768)
+        # What runs is the template's kernel, except Q8_0's own f32 one (its half twin and
+        # grouped expert kernels come from the template).
+        assert wt._GGML_TILED[name] == (wt._GGML_TILED_Q8_0_WGSL if name == "Q8_0" else src)
 
 
 def test_tiled_kernels_match_the_stored_kernel_in_the_browser():
@@ -479,7 +482,7 @@ def test_tiled_kernels_match_the_stored_kernel_in_the_browser():
     valid blocks (the scale halves set to sane values), and against the host dequantizer."""
     if not wt._adam_backend_ready():
         pytest.skip("requires the WebGPU browser backend")
-    halves = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
+    halves = {"Q8_0": (0,), "Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
               "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82),
               "IQ4_NL": (0,), "IQ4_XS": (0,), "IQ2_XXS": (0,), "IQ2_XS": (0,), "IQ2_S": (0,),
               "IQ3_XXS": (0,), "IQ3_S": (0,), "IQ1_S": (0,)}
@@ -622,7 +625,7 @@ def test_half_tiled_kernels_stay_within_their_bound_in_the_browser():
         pytest.skip("requires the WebGPU browser backend")
     if not wt.gpu_features().get("f16"):
         pytest.skip("this device has no shader-f16")
-    halves = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
+    halves = {"Q8_0": (0,), "Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q4_K": (0, 2),
               "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "Q2_K": (80, 82),
               "IQ4_NL": (0,), "IQ4_XS": (0,), "IQ2_XXS": (0,), "IQ2_XS": (0,), "IQ2_S": (0,),
               "IQ3_XXS": (0,), "IQ3_S": (0,), "IQ1_S": (0,)}

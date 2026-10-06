@@ -139,6 +139,8 @@ class TextEncoder(wt.Module):
         self._cap = {}
         self._cap_seen = set()
         self._cap_off = False
+        # Packed passes recorded at a row capacity (`_record_tier`), by capacity.
+        self._tiers = {}
         missing = [n for n in (prefix + "embeddings.tok_embeddings.weight",
                                prefix + "final_norm.weight") if n not in self.have]
         if missing:
@@ -156,7 +158,7 @@ class TextEncoder(wt.Module):
         the backend only lets go of those when the release reaches it.
         """
         self.__dict__.update(_ten={}, _src={}, _emb_host=None, _rope={}, _cap={},
-                             _cap_seen=set())
+                             _cap_seen=set(), _tiers={}, _tier_hook=False)
         self.__dict__["_released"] = True
         return self
 
@@ -785,6 +787,9 @@ class TextEncoder(wt.Module):
         if self.cfg.max_positions and T > self.cfg.max_positions:
             return _NOT_PACKED
         total = int(lengths.sum())
+        C = self._tier_for(total, B)
+        if C is not None:
+            return self._replayed_tier(C, ids, T, B, lengths)
         rows = int(((total + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
         key = ("packed", B, rows)
         slot = self._cap.get(key)
@@ -828,6 +833,119 @@ class TextEncoder(wt.Module):
                                      "packed_rows": rows}
         return out
 
+    # ---- packed passes recorded at a row capacity -----------------------------------------
+    #
+    # Recorded once per row CAPACITY and replayed for the rows a call has (`wt.elastic`): any
+    # lengths and any number of questions whose rows fit. Before, a pass was recorded per
+    # (questions, 32-row bucket), and on the Laya model two seconds apart a shape met for the
+    # first time ran eagerly (52-75 ms against 36-40 replayed) and the second time recorded
+    # (60-88 ms) -- "the first request several times slower, then gradually steady". Every
+    # row-wise dispatch is issued for the live rows, so a capacity costs the GPU no more than
+    # the bucket did; it costs memory: a recording pins ~51 KB a row on Laya (26 MB at 512).
+    # Capacities are powers of two from _TIER_MIN; those up to _TIER_LOAD are recorded while
+    # the model loads (`prepare_tiers`), a larger one the first time a call needs it. Past
+    # _TIER_MAX the bucketed recordings above take over.
+    _TIER_MIN = 128
+    _TIER_LOAD = 512
+    _TIER_MAX = 2048
+    _TIER_ROWS_PER_SEQ = 8          # a capacity of C rows takes C / 8 sequences
+
+    def _tier_for(self, total, B):
+        C = self._TIER_MIN
+        while C < total or C // self._TIER_ROWS_PER_SEQ < B:
+            C *= 2
+        return C if C <= self._TIER_MAX else None
+
+    def _replayed_tier(self, C, ids, T, B, lengths):
+        slot = self._tiers.get(C)
+        if slot is None:
+            slot = self._record_tier(C)
+        total = int(lengths.sum())
+        stage_start = time.perf_counter()
+        self._cap_write_packed(slot, ids, T, B, lengths, live=True)
+        write_ms = (time.perf_counter() - stage_start) * 1000
+        stage_start = time.perf_counter()
+        self._capture_platform().replay(slot["name"], {"rows": total, "segments": B,
+                                                       "longest": int(lengths.max())})
+        submit_ms = (time.perf_counter() - stage_start) * 1000
+        stage_start = time.perf_counter()
+        out = wt.gather_rows_at(slot["out"], slot["gather"], B * T)
+        self._last_capture_timing = {"write_ms": round(write_ms, 3),
+                                     "submit_ms": round(submit_ms, 3),
+                                     "trim_ms": round((time.perf_counter() - stage_start) * 1000, 3),
+                                     "packed_rows": total, "capacity": C}
+        return out
+
+    def _record_tier(self, C):
+        """Record the packed pass at capacity C. One eager pass first, which settles every route
+        it takes -- a race met inside a recording would be recorded with it. Then a check that
+        a replay for fewer rows than C gives, bit for bit, what the recording run computed for
+        them: a launcher whose rule is wrong stops the load here instead of an answer later."""
+        S = C // self._TIER_ROWS_PER_SEQ
+        slot = self._cap_make_packed(S, C, register=False)
+        slot["name"] = "encq%d_%d" % (id(self) & 0xffff, C)
+        # About half the capacity, in three sequences, none of them whole 32-row tiles.
+        lens = np.asarray([C // 4 + 3, C // 4 - 5, 7], np.int64)
+        B, T, total = len(lens), int(lens.max()), int(lens.sum())
+        rng = np.random.default_rng(C)
+        ids = np.full((B, T), self.cfg.pad_id or 0, np.int64)
+        for b, n in enumerate(lens):
+            ids[b, :n] = rng.integers(1, max(2, int(self.cfg.vocab)), int(n))
+        # The recording run reads every segment it has room for; those past these are empty.
+        wt.device_clear(slot["seg"])
+        self._cap_write_packed(slot, ids.reshape(-1), T, B, lens, live=True)
+        with wt.route_keys() as used:
+            self._layers(self._packed_input(slot), None, S, packed=slot)
+            plat = self._capture_platform()
+            plat.beginCapture(slot["name"])
+            try:
+                with wt.elastic(C, S):
+                    slot["out"] = self._layers(self._packed_input(slot), None, S, packed=slot)
+            finally:
+                plat.endCapture()
+        slot["recorded"] = True
+        # The routes this recording took: one of them raced again to a different choice
+        # (`wt.remeasure`) makes it stale, and it is recorded again.
+        slot["routes"] = used.keys
+        if not getattr(self, "_tier_hook", False):
+            wt.on_routes_changed(self._tiers_stale)
+            self._tier_hook = True
+        want = np.asarray(slot["out"].numpy()).reshape(C, -1)[:total].copy()
+        plat.replay(slot["name"], {"rows": total, "segments": B, "longest": T})
+        got = np.asarray(slot["out"].numpy()).reshape(C, -1)[:total]
+        if not np.array_equal(want, got):
+            raise RuntimeError("the packed pass recorded at %d rows, replayed for %d, differs "
+                               "from its recording run by up to %g" % (
+                                   C, total, float(np.nanmax(np.abs(want - got)))))
+        self._tiers[C] = slot
+        return slot
+
+    def _tiers_stale(self, keys):
+        """Queue each capacity recorded with a route in `keys` to be recorded again."""
+        out = []
+        for C, slot in sorted(self._tiers.items()):
+            if slot.get("routes", set()) & set(keys):
+                wt.queue_task(lambda C=C: self._record_tier(C) if C in self._tiers else None)
+                out.append({"rebuild": "encoder pass recorded at a capacity", "rows": C})
+        return out
+
+    def prepare_tiers(self):
+        """Record the packed pass at every capacity up to _TIER_LOAD, so that no request has
+        to. Where route ladders are still queued (a first load on this device), they may
+        replace a borrowed route, so each is recorded again once they have run."""
+        if not (wt._adam_backend_ready() and self._capture_ok() and self._packed_ok()):
+            return []
+        done = []
+        C = self._TIER_MIN
+        while C <= self._TIER_LOAD:
+            if C not in self._tiers:
+                self._record_tier(C)
+            done.append(C)
+            C *= 2
+        for C in done:
+            wt.defer_task(lambda C=C: self._record_tier(C) if C in self._tiers else None)
+        return done
+
     def _packed_input(self, slot):
         """The pass's input rows: looked up on the device from the staged tokens, or the
         staged rows themselves when the vocabulary is kept on the host."""
@@ -854,11 +972,13 @@ class TextEncoder(wt.Module):
             self._cap[("packed", B, rows)] = slot
         return slot
 
-    def _cap_write_packed(self, slot, ids, T, B, lengths):
+    def _cap_write_packed(self, slot, ids, T, B, lengths, live=False):
         """Everything the recorded pass reads, staged by JS in one call: token rows (or
-        embedding rows), segments, positions and the gather back to the head's layout."""
+        embedding rows), segments, positions and the gather back to the head's layout.
+        `live`: the slot is a capacity (`_record_tier`); only this call's rows are written."""
         import js
         table = None if slot["tok"] is not None else self._emb_host
+        rows = int(np.sum(lengths)) if live else slot["rows"]
         js.gpu.stageDecisionPacked(
             -1 if slot["x"] is None else int(slot["x"].data.buffer.buffer_id),
             -1 if slot["tok"] is None else int(slot["tok"].buffer.buffer_id),
@@ -868,8 +988,8 @@ class TextEncoder(wt.Module):
             np.asarray(lengths, dtype=np.int64).view(np.uint8),
             None if table is None else table.view(np.uint8),
             "f16" if table is not None and table.dtype == np.float16 else "f32",
-            B, T, slot["rows"], self.cfg.hidden, self.cfg.vocab, self.cfg.pad_id or 0,
-            B * slot["rows"])
+            B, T, rows, self.cfg.hidden, self.cfg.vocab, self.cfg.pad_id or 0,
+            B * T if live else B * slot["rows"], bool(live))
 
     def _embed_rows(self, ids):
         """The embedding rows for `ids`, as a host array."""

@@ -120,7 +120,8 @@ type BufferProxy = {
 type UploadArena = {
   prepare(bytes: number): Uint8Array;
   uploadPrepared(id: number, offset: number, bytes: number, ctor?: string): number;
-  uploadPreparedMany?(parts: Array<[number, number, number]>, ctor?: string): void;
+  uploadPreparedMany?(parts: Array<[number, number, number] | [number, number, number, number]>,
+                      ctor?: string): void;
   releasePrepared(): void;
 };
 
@@ -296,13 +297,16 @@ export function fillDecisionPacked(
 }
 
 /** `fillDecisionPacked` into the upload arena, then one upload per target. `xId` (embedding
- * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. */
+ * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. `prefix`:
+ * the targets were allocated at a capacity and `rows`, `batch` and `gatherLen` are what this
+ * call has -- each is written at its target's start and the rest of it left as it was. */
 export function stageDecisionPacked(
   backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena,
   xId: number, tokId: number, segId: number, posId: number, gatherId: number,
   idsArg: BufferProxy, lengthsArg: BufferProxy, tableArg: BufferProxy | null,
   tableType: 'f16' | 'f32', batch: number, length: number, rows: number,
   hidden: number, vocab: number, padId: number, gatherLen: number = batch * length,
+  prefix = false,
 ): void {
   let ids: ReturnType<BufferProxy['getBuffer']> | undefined;
   let lengths: ReturnType<BufferProxy['getBuffer']> | undefined;
@@ -342,7 +346,11 @@ export function stageDecisionPacked(
     const parts = ([
       [xId, 0, embedBytes], [tokId, o1, tokBytes], [segId, o2, segBytes],
       [posId, o3, posBytes], [gatherId, o4, gatherBytes]] as Array<[number, number, number]>)
-      .filter(([id, , bytes]) => id >= 0 && bytes > 0);
+      .filter(([id, , bytes]) => id >= 0 && bytes > 0)
+      .map((part) => (prefix ? [...part, 1] : part) as [number, number, number]);
+    if (prefix && !uploader.uploadPreparedMany) {
+      throw new Error('prefix uploads need the batched shared upload');
+    }
     if (uploader.uploadPreparedMany) {
       // One message for all of them, and no wait: the pass is queued behind it.
       uploader.uploadPreparedMany(parts, ctor);

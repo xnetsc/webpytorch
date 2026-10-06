@@ -821,6 +821,35 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   the Python SDK directly, call it when you are idle, then save `kernel_profile()` again;
   not calling it is also correct, only the large row counts keep the borrowed choice.
 
+- `webtorch.remeasure(budget_s=60.0)` → a report of racing again every route the loaded
+  model uses. A route (which kernel, tile and thread shape an operator runs with) is raced
+  once and kept; this measures again, only what this model has used — its warm-up, its
+  recordings, its requests — not every route the SDK supports. Each race is timed by the
+  device's own timestamps where it has them (`features()["timestamps"]`; the browser's clock
+  otherwise, and for composites issued op by op from Python), on a clock that has settled,
+  with no garbage collection inside a sample. A route's new choice takes effect the moment its
+  race ends; the recordings that used a changed route are recorded again when idle.
+  `cancel()` stops it at the next sample: the race in progress is dropped (that route keeps
+  its previous choice), every route already raced keeps its new one. Running out of
+  `budget_s` stops it the same way. Raises when no model is loaded. The report:
+
+  ```python
+  {"status": "complete",            # or "stopped" (cancel) or "out_of_time"
+   "measured": [{"key": "weight_exec|dense_half|f16|768|2304|512", "op": "dense_half",
+                 "storage": "f16", "shape": [768, 2304], "rows": 512,
+                 "before": "f32", "after": "f16", "changed": True,
+                 "clock": "gpu", "ms": 141.2}, ...],
+   "changed": 3,
+   "discarded": {"key": ...} or None,   # the race a stop interrupted
+   "not_reached": [...], "unmeasurable": [...],   # unmeasurable: used, nothing can re-race it
+   "rebuilds": [{"rebuild": "encoder pass recorded at a capacity", "rows": 256}, ...],
+   "budget_ms": 60000, "elapsed_ms": 2792.1}
+  ```
+
+  In a `webtorch.start()` host: `await wt.remeasure({ budgetMs })` resolves with the same
+  report (also after `wt.cancel()`), keeps what changed in the kernel profile, and rebuilds
+  the stale recordings between calls.
+
 - `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
   nothing is. Reading this is the supported way to find out why a machine that should be
   fast is not — the reason is recorded where the failure happened, which is the only way to
@@ -933,7 +962,7 @@ Call `close()` when finished with that runtime to reclaim both. It is idempotent
 outstanding calls, and makes further calls on that instance fail. Recreate it with `start()`;
 disk-backed File handles must be selected or registered again in the new worker.
 
-Also on it: `stopLoading()`, `decide(state, questions)`,
+Also on it: `stopLoading()`, `decide(state, questions)`, `remeasure({ budgetMs })`,
 `calibrate(heldOutExamples, { byOptions, minSamples })`, `splitReasoning(text)`,
 `stats()`, `tools.{supported,calls,result,suggest,round,render}` and
 `cache.{list,delete,clear,export,import,migrate,watch}`.

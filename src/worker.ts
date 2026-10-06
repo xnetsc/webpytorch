@@ -290,10 +290,10 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
       xId: number, tokId: number, segId: number, posId: number, gatherId: number,
       ids: any, lengths: any, table: any, tableType: 'f16' | 'f32', batch: number,
       length: number, rows: number, hidden: number, vocab: number, padId: number,
-      gatherLen: number,
+      gatherLen: number, prefix?: boolean,
     ) => stageDecisionPacked('gpu', () => commands.flush(), uploader, xId, tokId, segId, posId,
                              gatherId, ids, lengths, table ?? null, tableType, batch, length,
-                             rows, hidden, vocab, padId, gatherLen),
+                             rows, hidden, vocab, padId, gatherLen, !!prefix),
     isAvailable: () => {
       return gpuAvailable;
     },
@@ -494,8 +494,9 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     endCapture: () => {
       commands.enqueue({ method: 'gpu.endCapture' });
     },
-    replay: (name: string) => {
-      commands.enqueue({ method: 'gpu.replay', name });
+    /** `live`: the quantities of a recording made at a capacity (a JSON object string). */
+    replay: (name: string, live?: string | null) => {
+      commands.enqueue({ method: 'gpu.replay', name, live: live ? JSON.parse(live) : null });
     },
     resetCaptures: () => {
       commands.enqueue({ method: 'gpu.resetCaptures' });
@@ -506,6 +507,25 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     /** Zero a buffer where it lives, in command order: no host data crosses. */
     clearBuffer: (id: number) => {
       commands.enqueue({ method: 'gpu.clearBuffer', id });
+    },
+    /** Time the GPU work issued from here to `timingEnd` with the device's own timestamps
+     * (where `features().timestamps`). */
+    timingBegin: () => {
+      commands.enqueue({ method: 'gpu.timingBegin' });
+    },
+    /** [milliseconds of GPU time since `timingBegin`, its passes summed; the timestamps'
+     * step in ns]. Waits for that work. -1 ms where it could not be timed (no timestamps, or
+     * more passes than a span holds). */
+    timingEnd: (): number[] => {
+      const { memory, status, binding } = readback.begin(16);
+      commands.flush();
+      postToMain({ method: 'gpu.timingEnd', ...binding });
+      Atomics.wait(status, 0, 0);
+      if (Atomics.load(status, 0) < 0) {
+        throw new Error('WebGPU timing failed: ' + (readback.errorMessage() || 'unknown GPU error'));
+      }
+      const view = new DataView(memory);
+      return [view.getFloat64(0, true), view.getFloat64(8, true)];
     },
     /** One crossing per round of a pipelined loop. Queue a replay of `name` (if given) and
      * a staged read of the first `byteLength` bytes of buffer `id` into `stageSlot` (if

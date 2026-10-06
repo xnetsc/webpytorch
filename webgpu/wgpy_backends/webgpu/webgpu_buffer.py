@@ -273,9 +273,37 @@ def reap_now():
     _reap_budget = max(_REAP_FLOOR, int(base * _REAP_FRACTION))
 
 
+# Nonzero while something is being timed (`paused_reaping`): a collect that lands inside a
+# timing is measured as if it were the work. In a route race it was -- every sample that
+# took 1.4-2.1 ms instead of 0.5-0.7 had a young collect and a reap inside it, and two such
+# samples were enough to make a 30%-faster kernel's win unprovable, so the slower one stayed.
+_reap_paused = [0]
+
+
+class paused_reaping(object):
+    """No collection while inside -- neither this allocation path's nor Python's own. What
+    became due meanwhile is collected on the way out, outside whatever was being timed."""
+
+    def __enter__(self):
+        import gc
+        self._gc = gc.isenabled()
+        gc.disable()
+        _reap_paused[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        import gc
+        _reap_paused[0] -= 1
+        if self._gc:
+            gc.enable()
+        if not _reap_paused[0]:
+            _maybe_reap()
+        return False
+
+
 def _maybe_reap():
     global _bytes_since_reap
-    if _bytes_since_reap < _reap_budget:
+    if _reap_paused[0] or _bytes_since_reap < _reap_budget:
         return
     # The cycles a burst of allocation leaves behind are young, and a collect of the two
     # younger generations finds them without walking the whole heap -- the full walk was

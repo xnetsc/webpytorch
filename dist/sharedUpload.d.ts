@@ -10,6 +10,11 @@ export declare function sharedUploader(backend: 'gl' | 'gpu', send: (message: Re
         number,
         number,
         number
+    ] | [
+        number,
+        number,
+        number,
+        number
     ]>, ctorType?: string) => void;
     settle: () => void;
     releasePrepared: () => void;

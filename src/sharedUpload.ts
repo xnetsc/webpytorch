@@ -60,7 +60,8 @@ export function sharedUploader(
   /** Several regions of the prepared staging memory into several buffers, in one message
    * and without waiting: the next use of the staging memory waits for the acknowledgement
    * instead. Commands sent after this run after it on the GPU thread (one FIFO channel). */
-  function uploadPreparedMany(parts: Array<[number, number, number]>, ctorType?: string): void {
+  function uploadPreparedMany(parts: Array<[number, number, number] | [number, number, number, number]>,
+                              ctorType?: string): void {
     settle();
     for (const [, byteOffset, byteLength] of parts) {
       if (!memory || byteOffset < 0 || byteLength < 0 || byteOffset + byteLength > capacity) {

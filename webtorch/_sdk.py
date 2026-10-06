@@ -298,6 +298,26 @@ def loaded_models():
     return dict(_LOADED)
 
 
+def remeasure(budget_s=60.0):
+    """Race again every route the loaded model uses, within `budget_s` seconds, and report
+    what happened.
+
+    What a load chose -- which kernel, tile and thread shape each operator runs with -- was
+    measured once, and kept. `remeasure` measures again: only the routes this model has used
+    (its warm-up, its recordings, its requests), each new choice taking effect as soon as
+    its race ends, and the recordings that depend on a changed one queued to be made again.
+    `cancel()` stops it: the race in progress is dropped -- that route keeps its previous
+    choice -- and the routes already raced keep their new one. The report says which was
+    which (`_core.remeasure`); running out of `budget_s` stops it the same way. A model has
+    to be loaded: without one there is nothing it uses, and nothing to race."""
+    if not _LOADED and not _IMPL_CACHE:
+        raise RuntimeError("remeasure needs a loaded model: it races the routes that model uses")
+    if not float(budget_s) > 0:
+        raise ValueError("remeasure needs a time budget above zero")
+    from . import _core as _c
+    return _c.remeasure(float(budget_s))
+
+
 def release_all():
     """Release every cached model (frees their weights). Returns how many were released."""
     from . import _core as _c

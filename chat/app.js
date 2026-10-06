@@ -406,6 +406,7 @@ function onLoadStage(m) {
       'warm-step': 'warming one decode step',
       'warm-greedy': 'settling token selection',
       tuning:   'checking and timing complete decode paths',
+      recording: 'recording the encoder pass for every request size',
       checking: 'checking the weights against the file',
       proving:  'running one forward pass to prove it works',
       ready:    '',

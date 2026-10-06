@@ -41,6 +41,10 @@ export declare class NNWebGPUContext {
     private selectedQuery;
     private selectedNames;
     private readonly flushThreshold;
+    private spanQuery;
+    private span;
+    private static readonly SPAN_PAIRS;
+    timestampStepNs: number;
     constructor();
     initialize(): Promise<void>;
     assertAlive(): void;
@@ -55,6 +59,14 @@ export declare class NNWebGPUContext {
     /** Submit what is pending if the GPU has nothing to do; called after each batch of
      * commands the producer sends. A diagnostic pass being timed is left whole. */
     kick(): void;
+    /** Whether `spanBegin` can time anything here: the device has timestamp queries. */
+    hasTimestamps(): boolean;
+    /** Start timing the GPU work issued from now to `spanEnd`. False where the device cannot
+     * (no timestamp queries) or a span is already open; the caller then times another way. */
+    spanBegin(): boolean;
+    /** Milliseconds of GPU time the span's passes took, summed; -1 when it could not be
+     * timed whole (more passes than it has room to time). Waits for that work to finish. */
+    spanEnd(): Promise<number>;
     flush(): void;
     /** Copy `byteLength` bytes of `src` into `dst` behind every dispatch encoded so far, in
      * the same command buffer, and submit it. The copy sees those dispatches' results with no

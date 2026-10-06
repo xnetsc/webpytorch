@@ -624,6 +624,39 @@ json.dumps({"answer": _out, "new_tuning": _tuning_after != _tuning_before})
       }
     },
 
+    /**
+     * Race again every route the loaded model uses (`webtorch.remeasure`). A stop (`cancel`)
+     * ends it at the next sample: the race in progress is dropped, the ones finished keep
+     * their new choice, and the report comes back either way -- so this is not raced against
+     * the stop the way a reply is. What it changed is kept for the next load, and the
+     * recordings it made stale are made again when idle.
+     */
+    async remeasure(a) {
+      if (!ready) throw new Error('no runtime');
+      const budget = a && a.budgetMs != null ? Number(a.budgetMs) : 60000;
+      if (!(budget > 0)) throw new Error('remeasure needs a time budget above zero');
+      if (tasks) tasks.begin();    // a stop left over from an earlier call must not end this one
+      const out = await pyJSON(`
+import json, webtorch
+webtorch.cancel(False)
+if _MODEL["m"] is None:
+    raise RuntimeError("load a model first: remeasure races the routes that model uses")
+json.dumps(webtorch.remeasure(${budget} / 1000.0))
+`);
+      if (remember && out.measured && out.measured.length) {
+        try {
+          const kpk = await kpKey();
+          if (kpk) await kpPut(kpk, JSON.parse(await py(
+            'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
+        } catch (e) {
+          out.kept = false;
+          report('tuning', 'could not keep what remeasure chose: ' + ((e && e.message) || e));
+        }
+      }
+      calibrateWhenIdle();         // the stale recordings, rebuilt between calls
+      return out;
+    },
+
     async calibrate(a) {
       if (!ready) throw new Error('no runtime');
       root.__calibrate_in = JSON.stringify({ examples: a.examples || [],

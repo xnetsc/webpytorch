@@ -7,6 +7,11 @@ export interface GPUKernelRunDescriptor {
     workGroups: {
         [key in WorkGroupDim]: number;
     };
+    /** Recorded at a capacity, reissued for what a replay has: axis -> (live quantity, mul,
+     * div), the count being ceil(live * mul / div). See `replay`. */
+    dyn?: {
+        [key in WorkGroupDim]?: [string, number, number];
+    };
 }
 export interface ComputeContextGPUMessageCreateBuffer {
     method: 'gpu.createBuffer';
@@ -85,9 +90,20 @@ export interface ComputeContextGPUMessageBeginCapture {
 export interface ComputeContextGPUMessageEndCapture {
     method: 'gpu.endCapture';
 }
+export interface ComputeContextGPUMessageTimingBegin {
+    method: 'gpu.timingBegin';
+}
+export interface ComputeContextGPUMessageTimingEnd {
+    method: 'gpu.timingEnd';
+    data?: SharedArrayBuffer;
+    notify?: SharedArrayBuffer;
+    error?: SharedArrayBuffer;
+}
 export interface ComputeContextGPUMessageReplay {
     method: 'gpu.replay';
     name: string;
+    /** The live quantities of a recording made at a capacity (`GPUKernelRunDescriptor.dyn`). */
+    live?: Record<string, number> | null;
 }
 export interface ComputeContextGPUMessageResetCaptures {
     method: 'gpu.resetCaptures';
@@ -98,7 +114,7 @@ export interface ComputeContextGPUMessageReleaseCapture {
 }
 export interface ComputeContextGPUMessageSharedUploadMany {
     method: 'gpu.sharedUploadMany';
-    parts: Array<[number, number, number]>;
+    parts: Array<[number, number, number] | [number, number, number, number]>;
     ctorType?: string;
 }
 export interface ComputeContextGPUMessageClearBuffer {
@@ -119,7 +135,7 @@ export interface ComputeContextGPUMessageStageRead {
     slot: number;
     seq: number;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer | ComputeContextGPUMessageSharedUploadMany;
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageTimingBegin | ComputeContextGPUMessageTimingEnd | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer | ComputeContextGPUMessageSharedUploadMany;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;
@@ -140,8 +156,11 @@ export declare class ComputeContextGPU {
     endCapture(): void;
     releaseCapture(name: string): void;
     resetCaptures(): void;
-    replay(name: string): void;
-    setData(id: number, data: Uint8Array): void | Promise<void>;
+    /** Issue a recording again. With `live`, a dispatch recorded with `dyn` rules is issued
+     * for the quantities this call has -- a pass recorded at a row capacity serves any row
+     * count up to it -- and never with more workgroups than it was recorded with. */
+    replay(name: string, live?: Record<string, number> | null): void;
+    setData(id: number, data: Uint8Array, prefix?: boolean): void | Promise<void>;
     getData(id: number): Promise<Uint8Array>;
     private stageTarget;
     private stageFree;

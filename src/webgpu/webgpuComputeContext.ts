@@ -13,6 +13,9 @@ export interface GPUKernelRunDescriptor {
   name: string;
   tensors: number[];
   workGroups: { [key in WorkGroupDim]: number };
+  /** Recorded at a capacity, reissued for what a replay has: axis -> (live quantity, mul,
+   * div), the count being ceil(live * mul / div). See `replay`. */
+  dyn?: { [key in WorkGroupDim]?: [string, number, number] };
 }
 
 export interface ComputeContextGPUMessageCreateBuffer {
@@ -103,9 +106,22 @@ export interface ComputeContextGPUMessageEndCapture {
   method: 'gpu.endCapture';
 }
 
+export interface ComputeContextGPUMessageTimingBegin {
+  method: 'gpu.timingBegin';
+}
+
+export interface ComputeContextGPUMessageTimingEnd {
+  method: 'gpu.timingEnd';
+  data?: SharedArrayBuffer;
+  notify?: SharedArrayBuffer;
+  error?: SharedArrayBuffer;
+}
+
 export interface ComputeContextGPUMessageReplay {
   method: 'gpu.replay';
   name: string;
+  /** The live quantities of a recording made at a capacity (`GPUKernelRunDescriptor.dyn`). */
+  live?: Record<string, number> | null;
 }
 
 export interface ComputeContextGPUMessageResetCaptures {
@@ -119,7 +135,8 @@ export interface ComputeContextGPUMessageReleaseCapture {
 
 export interface ComputeContextGPUMessageSharedUploadMany {
   method: 'gpu.sharedUploadMany';
-  parts: Array<[number, number, number]>;     // (buffer id, staging offset, bytes)
+  // (buffer id, staging offset, bytes[, 1: the bytes are a prefix of a larger buffer])
+  parts: Array<[number, number, number] | [number, number, number, number]>;
   ctorType?: string;
 }
 
@@ -160,6 +177,8 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageBeginCapture
   | ComputeContextGPUMessageEndCapture
   | ComputeContextGPUMessageReplay
+  | ComputeContextGPUMessageTimingBegin
+  | ComputeContextGPUMessageTimingEnd
   | ComputeContextGPUMessageResetCaptures
   | ComputeContextGPUMessageReleaseCapture
   | ComputeContextGPUMessageStageArena
@@ -185,6 +204,8 @@ export class ComputeContextGPU {
       const dev = ctx.device;
       return {
         f16: !!dev?.features?.has('shader-f16'),
+        // The GPU's own clock for timing (`timingBegin`/`timingEnd`); without it, the host's.
+        timestamps: !!dev?.features?.has('timestamp-query'),
         subgroups: !!dev?.features?.has('subgroups'),
         subgroupMinSize: ctx.adapterFacts.subgroupMinSize,
         subgroupMaxSize: ctx.adapterFacts.subgroupMaxSize,
@@ -298,23 +319,47 @@ export class ComputeContextGPU {
     this.pinned.clear();
   }
 
-  replay(name: string) {
+  /** Issue a recording again. With `live`, a dispatch recorded with `dyn` rules is issued
+   * for the quantities this call has -- a pass recorded at a row capacity serves any row
+   * count up to it -- and never with more workgroups than it was recorded with. */
+  replay(name: string, live?: Record<string, number> | null) {
     const seq = this.captures.get(name);
     if (!seq) {
       throw new Error(`capture '${name}' not found`);
     }
     for (let i = 0; i < seq.length; i++) {
-      this.runKernel(seq[i]);
+      const d = seq[i];
+      if (!live || !d.dyn) {
+        this.runKernel(d);
+        continue;
+      }
+      const wg = { x: d.workGroups.x, y: d.workGroups.y, z: d.workGroups.z };
+      let none = false;
+      for (const ax of ['x', 'y', 'z'] as WorkGroupDim[]) {
+        const rule = d.dyn[ax];
+        if (!rule) continue;
+        const v = live[rule[0]];
+        if (typeof v !== 'number' || !(v >= 0)) {
+          throw new Error(`replay of '${name}' needs the live quantity '${rule[0]}'`);
+        }
+        const n = Math.ceil((v * rule[1]) / rule[2]);
+        if (n > d.workGroups[ax]) {
+          throw new Error(`replay of '${name}': ${rule[0]}=${v} is past the capacity '${d.name}' was recorded at`);
+        }
+        wg[ax] = n;
+        if (n === 0) none = true;
+      }
+      if (!none) this.runKernel({ name: d.name, tensors: d.tensors, workGroups: wg });
     }
   }
 
-  setData(id: number, data: Uint8Array): void | Promise<void> {
+  setData(id: number, data: Uint8Array, prefix = false): void | Promise<void> {
     if (this.commandError) throw this.commandError;
     const tb = this.tensorBuffers.get(id);
     if (!tb) {
       throw new Error(`WebGPU upload target ${id} was not created`);
     }
-    return tb.setDataRaw(data);
+    return tb.setDataRaw(data, prefix);
   }
 
   getData(id: number): Promise<Uint8Array> {
@@ -467,6 +512,30 @@ export class ComputeContextGPU {
             Atomics.notify(this.mnotify!, 0);
           });
         break;
+      case 'gpu.timingBegin':
+        getNNWebGPUContext().spanBegin();
+        break;
+      case 'gpu.timingEnd': {
+        if (message.data) this.mdata = message.data;
+        if (message.notify) this.mnotify = new Int32Array(message.notify);
+        if (message.error) this.merror = message.error;
+        const notify = this.mnotify!;
+        const data = this.mdata!;
+        void Promise.resolve().then(() => getNNWebGPUContext().spanEnd())
+          .then((ms) => {
+            new DataView(data).setFloat64(0, ms, true);
+            new DataView(data).setFloat64(8, getNNWebGPUContext().timestampStepNs, true);
+            notify[0] = 1;
+            Atomics.notify(notify, 0);
+          })
+          .catch(reason => {
+            console.error(reason);
+            writeSharedReadbackError(this.merror, reason);
+            notify[0] = -1;
+            Atomics.notify(notify, 0);
+          });
+        break;
+      }
       case 'gpu.sampleLogitsDevice': {
         if (message.data) this.mdata = message.data;
         if (message.notify) this.mnotify = new Int32Array(message.notify);
@@ -532,11 +601,12 @@ export class ComputeContextGPU {
         };
         try {
           const pendings: Promise<void>[] = [];
-          for (const [id, offset, byteLength] of message.parts) {
+          for (const [id, offset, byteLength, prefix] of message.parts) {
             if (!this.uploadMemory || offset < 0 || offset + byteLength > this.uploadMemory.byteLength) {
               throw new Error('WebGPU shared upload size exceeds staging memory');
             }
-            const pending = this.setData(id, new Uint8Array(this.uploadMemory, offset, byteLength));
+            const pending = this.setData(id, new Uint8Array(this.uploadMemory, offset, byteLength),
+                                         prefix === 1);
             if (pending) pendings.push(pending);
           }
           if (pendings.length) void Promise.all(pendings).then(() => finish(1), r => finish(-1, r));
@@ -597,7 +667,7 @@ export class ComputeContextGPU {
         this.endCapture();
         break;
       case 'gpu.replay':
-        this.replay((message as any).name);
+        this.replay((message as any).name, (message as any).live || null);
         break;
       case 'gpu.resetCaptures':
         this.resetCaptures();
