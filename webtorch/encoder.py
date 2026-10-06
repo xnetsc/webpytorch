@@ -39,6 +39,10 @@ _ACT = {
 }
 
 
+
+# `_replayed_packed`: this batch cannot be laid end to end; the padded pass takes it.
+_NOT_PACKED = object()
+
 class EncoderConfig(object):
     """An HF `config.json`, read into the shapes this engine needs.
 
@@ -315,10 +319,20 @@ class TextEncoder(wt.Module):
             out[b * h:(b + 1) * h] = mb
         return out
 
-    def _attn(self, x, layer, kind, mask, B=1):
+    def _attn(self, x, layer, kind, mask, B=1, packed=None):
         h, hd = self.cfg.heads, self.cfg.head_dim
-        T = x.shape[0] // B
         p = "%slayers.%d.attn." % (self.p, layer)
+        if packed is not None:
+            rows = int(x.shape[0])
+            cos, sin = self._rope_tables(rows, kind)
+            o = wt.fused_attention_packed(
+                self._lin(x, p + "Wqkv"), h, hd, packed["seg"], rows, 1.0 / (hd ** 0.5),
+                self.cfg.window if kind == "sliding_attention" else 0, cos, sin,
+                positions=packed["pos"])
+            if o is None:
+                raise RuntimeError("packed attention is unavailable for this encoder")
+            return self._lin(o, p + "Wo" if self._has(p + "Wo.weight") else p + "o_proj")
+        T = x.shape[0] // B
         cos, sin = self._rope_tables(T, kind)
         if self._has(p + "Wqkv.weight"):
             # One projection holding q, k and v back to back. The reference views it as
@@ -396,6 +410,31 @@ class TextEncoder(wt.Module):
         else:
             o = o.reshape(B, h, T, hd).permute(0, 2, 1, 3).reshape(B * T, h * hd)
         return self._lin(o, p + "Wo" if self._has(p + "Wo.weight") else p + "o_proj")
+
+    def packed_attention_probe(self, kind):
+        """`probe(m)`: one `kind` layer's packed attention over m rows holding three
+        sequences, for the load-time route ladder; None where a batch is not run packed."""
+        if not self._packed_ok():
+            return None
+        h, hd = self.cfg.heads, self.cfg.head_dim
+        window = self.cfg.window if kind == "sliding_attention" else 0
+        rng = np.random.default_rng(0)
+
+        def probe(m):
+            rows = int(m)
+            n = [rows // 3, rows // 3, rows - 2 * (rows // 3)]
+            if min(n) < 1:
+                return
+            off = np.cumsum([0] + n[:-1])
+            seg = wt.xp.asarray(np.stack([off, n], 1).reshape(-1).astype(np.int32))
+            pos = wt.xp.asarray(np.concatenate([np.arange(k) for k in n]).astype(np.int32))
+            qkv = Tensor(rng.standard_normal((rows, 3 * h * hd)).astype(np.float32))
+            cos, sin = self._rope_tables(rows, kind)
+            o = wt.fused_attention_packed(qkv, h, hd, seg, rows, 1.0 / (hd ** 0.5), window,
+                                          cos, sin, positions=pos)
+            if o is not None:
+                wt._sync_small(o)
+        return probe
 
     def attention_probe(self, kind):
         """`probe(m)`: one `kind` layer's attention at m tokens, for the load-time route
@@ -579,6 +618,10 @@ class TextEncoder(wt.Module):
         self._last_capture_timing = None
         if not self._capture_ok():
             return None
+        if B > 1 and self._packed_ok():
+            got = self._replayed_packed(ids, T, B, valid)
+            if got is not _NOT_PACKED:
+                return got                  # the result, or None: seen once, run it eagerly
         Tb = int(((T + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
         if self.cfg.max_positions and Tb > self.cfg.max_positions:
             return None
@@ -705,6 +748,125 @@ class TextEncoder(wt.Module):
             m.data.buffer.set_data(
                 np.ascontiguousarray(built, dtype=np.float32).reshape(-1))
 
+    # ---- several sequences end to end ---------------------------------------------------
+    #
+    # Padded, a batch of questions runs every one of them at the longest one's length and
+    # then rounds that up: 160, 153 and 173 tokens became 3 x 192 = 576 rows for 486 real
+    # ones, and every projection, norm and MLP ran over the 90 that are padding. Laid end to
+    # end, the rows are the real tokens rounded once, on the TOTAL (512 here), and attention
+    # reads each sequence alone at its own length (`wt.fused_attention_packed`) -- the sum of
+    # the squares of the real lengths, not of the padded one. Every row's arithmetic is the
+    # padded layout's, in the same order: the answers are bit-identical.
+
+    def _packed_ok(self):
+        """A batch can run end to end here: WebGPU, the fused q/k/v projection the packed
+        attention reads in every layer, and a head dimension that kernel takes."""
+        if getattr(self, "_packed_off", False) or not wt._adam_backend_ready():
+            return False
+        if self.cfg.head_dim % 32:
+            return False
+        return all(self._has("%slayers.%d.attn.Wqkv.weight" % (self.p, i))
+                   for i in range(self.cfg.layers))
+
+    def _replayed_packed(self, ids, T, B, valid):
+        """`_replayed` for a batch laid end to end. `_NOT_PACKED` where this batch cannot be
+        (a sequence whose real tokens are not a prefix); None the first time a shape is seen,
+        so the caller runs it once eagerly, as `_replayed` does."""
+        v = (np.ones((B, T), np.int64) if valid is None
+             else np.asarray(valid, dtype=np.int64).reshape(B, T))
+        lengths = v.sum(1)
+        if np.any(lengths < 1) or not np.array_equal(
+                v != 0, np.arange(T)[None, :] < lengths[:, None]):
+            return _NOT_PACKED
+        if self.cfg.max_positions and T > self.cfg.max_positions:
+            return _NOT_PACKED
+        total = int(lengths.sum())
+        rows = int(((total + self._BUCKET - 1) // self._BUCKET) * self._BUCKET)
+        key = ("packed", B, rows)
+        slot = self._cap.get(key)
+        if slot is None and key not in self._cap_seen:
+            # Seen once: run it eagerly in this layout, without taking one of the recorded
+            # slots. Eagerly matters -- a route race met for the first time inside a
+            # recording would be recorded with it, every candidate replayed on every call.
+            self._cap_seen.add(key)
+            slot = self._cap_make_packed(B, rows, register=False)
+            self._cap_write_packed(slot, ids, T, B, lengths)
+            out = self._layers(self._packed_input(slot), None, B, packed=slot)
+            return wt.gather_rows_at(out, slot["gather"], B * T)
+        if slot is None:
+            if len(self._cap) >= self._CAP_MAX:
+                old_key = next(iter(self._cap))
+                self._capture_platform().releaseCapture(self._cap[old_key]["name"])
+                del self._cap[old_key]
+            slot = self._cap_make_packed(B, rows)
+        else:
+            self._cap.pop(key)
+            self._cap[key] = slot
+        stage_start = time.perf_counter()
+        self._cap_write_packed(slot, ids, T, B, lengths)
+        write_ms = (time.perf_counter() - stage_start) * 1000
+        plat = self._capture_platform()
+        stage_start = time.perf_counter()
+        if slot["recorded"]:
+            plat.replay(slot["name"])
+        else:
+            plat.beginCapture(slot["name"])
+            slot["out"] = self._layers(self._packed_input(slot), None, B, packed=slot)
+            plat.endCapture()
+            slot["recorded"] = True
+        submit_ms = (time.perf_counter() - stage_start) * 1000
+        # Back to the (B, T) rows the head reads: one gather, as the padded pass's trim was.
+        stage_start = time.perf_counter()
+        out = wt.gather_rows_at(slot["out"], slot["gather"], B * T)
+        self._last_capture_timing = {"write_ms": round(write_ms, 3),
+                                     "submit_ms": round(submit_ms, 3),
+                                     "trim_ms": round((time.perf_counter() - stage_start) * 1000, 3),
+                                     "packed_rows": rows}
+        return out
+
+    def _packed_input(self, slot):
+        """The pass's input rows: looked up on the device from the staged tokens, or the
+        staged rows themselves when the vocabulary is kept on the host."""
+        if slot["tok"] is None:
+            return slot["x"]
+        return wt.gather_rows_at(self._t(self.p + "embeddings.tok_embeddings.weight"),
+                                 slot["tok"], slot["rows"])
+
+    def _cap_make_packed(self, B, rows, register=True):
+        """A packed shape's buffers. The vocabulary on the device: each row's token is staged
+        and the lookup is the pass's first dispatch. On the host: the rows themselves."""
+        self._host_embedding_rows(np.zeros((1,), np.int64))   # settles where the table lives
+        on_device = self._emb_host is None
+        if not on_device and self._emb_host.dtype not in (np.float16, np.float32):
+            on_device = True
+        slot = {"tok": wt.xp.empty((rows,), np.float32) if on_device else None,
+                "x": None if on_device else Tensor(wt._empty((rows, self.cfg.hidden))),
+                "seg": wt.xp.empty((2 * B,), np.int32),
+                "pos": wt.xp.empty((rows,), np.int32),
+                "gather": wt.xp.empty((B * rows,), np.float32),
+                "out": None, "recorded": False, "rows": rows, "B": B,
+                "name": "encp%d_%d_%d" % (id(self) & 0xffff, B, rows)}
+        if register:
+            self._cap[("packed", B, rows)] = slot
+        return slot
+
+    def _cap_write_packed(self, slot, ids, T, B, lengths):
+        """Everything the recorded pass reads, staged by JS in one call: token rows (or
+        embedding rows), segments, positions and the gather back to the head's layout."""
+        import js
+        table = None if slot["tok"] is not None else self._emb_host
+        js.gpu.stageDecisionPacked(
+            -1 if slot["x"] is None else int(slot["x"].data.buffer.buffer_id),
+            -1 if slot["tok"] is None else int(slot["tok"].buffer.buffer_id),
+            int(slot["seg"].buffer.buffer_id), int(slot["pos"].buffer.buffer_id),
+            int(slot["gather"].buffer.buffer_id),
+            np.asarray(ids, dtype=np.int64).view(np.uint8),
+            np.asarray(lengths, dtype=np.int64).view(np.uint8),
+            None if table is None else table.view(np.uint8),
+            "f16" if table is not None and table.dtype == np.float16 else "f32",
+            B, T, slot["rows"], self.cfg.hidden, self.cfg.vocab, self.cfg.pad_id or 0,
+            B * slot["rows"])
+
     def _embed_rows(self, ids):
         """The embedding rows for `ids`, as a host array."""
         gathered = self._host_embedding_rows(ids)
@@ -713,10 +875,11 @@ class TextEncoder(wt.Module):
         t = self._embed(ids)
         return np.asarray(t.numpy()) if hasattr(t, "numpy") else np.asarray(t.data)
 
-    def _layers(self, x, masks, B):
+    def _layers(self, x, masks, B, packed=None):
         """The stack, from embeddings to the final norm. Separate from `_run` because this
         part is the same dispatches every time for a given length -- which is what makes it
-        capturable."""
+        capturable. `packed`: the sequences lie end to end (`_replayed_packed`); attention
+        reads the slot's segments and positions instead of masks."""
         x = self._norm(x, self.p + "embeddings.norm")
         L = self.cfg.layers
         if not L:
@@ -729,7 +892,8 @@ class TextEncoder(wt.Module):
         xa = self._norm(x, attn_norm(0)) if self._has(attn_norm(0) + ".weight") else x
         for i in range(L):
             kind = self.cfg.layer_types[i]
-            x, h = self._add_norm(x, self._attn(xa, i, kind, masks[kind], B),
+            x, h = self._add_norm(x, self._attn(xa, i, kind, None if masks is None
+                                                else masks[kind], B, packed=packed),
                                   "%slayers.%d.mlp_norm" % (self.p, i))
             m = self._mlp(h, i)
             nxt = attn_norm(i + 1) if i + 1 < L else self.p + "final_norm"

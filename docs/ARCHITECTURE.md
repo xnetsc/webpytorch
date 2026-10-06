@@ -400,6 +400,7 @@ same input takes 19.1 ms in f16 and 51.5 in f32. What closed most of the distanc
 | LayerNorm a workgroup per row, the residual add folded in (`add_layernorm`) | 8.8 → 2.3 ms | 79.2 → 75.5 ms |
 | the per-request scratch release moved after the answer, to idle time | — (host) | 75.5 → 65.1 ms |
 | dense half weights race half arithmetic (`_mm_half_src`) against f32 | 47.3 → 33.9 ms | 65.1 → 51.5 ms |
+| the questions end to end instead of padded to the longest (`_replayed_packed`) | 44.1 → 39.7 ms | 49.8 → 44.5 ms (same-session A/B) |
 
 Answers were bit-identical through the first three. The last one changes them in the third
 or fourth decimal (billing 0.8936 → 0.8935, duplicate charge 0.8755 → 0.8794, urgency 1.7199
@@ -410,10 +411,12 @@ or fourth decimal (billing 0.8936 → 0.8935, duplicate charge 0.8755 → 0.8794
 What sets the ceiling is the arithmetic the device exposes to standard WebGPU, measured with
 timestamp queries on an Apple M5 (Chrome 154, no flags): **3.2 TFLOPS f32 and 6.2 f16 FMA**,
 and no dual issue — f32 and f16 work mixed in one kernel take the sum of their times, and so
-does integer arithmetic. MLX reaches 12 TFLOPS on the same GPU because it uses matrix units
-that WebGPU reaches only through `chromium-experimental-subgroup-matrix`, which this Chrome
-exposes behind `--enable-unsafe-webgpu` and not otherwise. So the encoder's matmuls cannot
-match MLX on this GPU through default WebGPU; they can get to the FMA peak.
+does integer arithmetic. MLX reaches 12 TFLOPS on the same GPU through Apple's own matrix
+path, which WebGPU does not reach at all: `chromium-experimental-subgroup-matrix`, exposed only
+behind `--enable-unsafe-webgpu`, offers f32→f32 and f16→f16 8×8×8 here and runs at 3.9 TFLOPS
+(f16) and 3.8 (f32) on independent multiply-accumulate chains — the ordinary ALUs, no faster
+than the half kernel below. So the encoder's matmuls cannot match MLX on this GPU through
+WebGPU, flags or not; they can get to the FMA peak.
 
 The half kernel gets to about 65% of it (4.0 TFLOPS at 519×768×2304, 1.35× `mm_f16w`, which
 is itself at 91% of the f32 peak). Two things made the difference and several did not:
@@ -425,7 +428,23 @@ is itself at 91% of the f32 peak). Two things made the difference and several di
   the loads at all the same FMAs run at 6.0 TFLOPS, so what remains is the loads and the
   staging, not the arithmetic.
 - No help: activations already in half (−3%), larger tiles, 8 rows a thread, double-buffered
-  staging (slower — registers), wider workgroups, re-mapping threads so shared reads coalesce.
+  staging (slower — registers), wider workgroups, re-mapping threads so shared reads coalesce,
+  and weights paired along K so every FMA is `vec2<f16> × vec2<f16>` with no scalar splatted
+  (3.2–3.6 TFLOPS against 3.6–4.0: the splat of a scalar of A costs nothing on this GPU).
+
+**Padding was the other cost.** A batch of questions ran each one at the longest one's length,
+rounded up: 160, 153 and 173 tokens became 3 × 192 = 576 rows for 486 real ones. Laid end to
+end (`_replayed_packed`), the total is rounded once (512 rows), projections, norms and MLPs run
+over the real tokens, and attention reads each question alone at its own length
+(`fused_attention_packed`: per sequence an offset and a length, the padding and the window
+computed in the kernel, no mask tensor; RoPE at each row's own position, `rope_qk_pos`). The
+JS side stages token rows, segments, positions and the gather back to the head's layout in one
+call; the vocabulary lookup is the pass's first dispatch. Per query the arithmetic and its
+order are the padded layout's: with the same routes the answers are identical, and different
+row counts can only change which tile or width a race picks per bucket. The first sight of a
+packed shape runs eagerly in that layout, so its races settle before anything is recorded —
+racing inside a recording records every candidate, and the first version replayed 62
+attention dispatches a pass instead of 22.
 
 All of this is per device. `gpu_features()` reports what the device was created with —
 `shader-f16` and `subgroups` are requested whenever the adapter has them, whatever its vendor

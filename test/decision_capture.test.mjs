@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fillDecisionEmbeddings, fillDecisionMask, fillDecisionKeyMask,
-  fillDecisionKeyMaskCpu, stageDecisionCapture, stageDecisionKeyMask } from '../src/decisionCapture.ts';
+  fillDecisionKeyMaskCpu, fillDecisionPacked, stageDecisionCapture, stageDecisionKeyMask }
+  from '../src/decisionCapture.ts';
 
 const view = a => new DataView(a.buffer, a.byteOffset, a.byteLength);
 
@@ -153,4 +154,36 @@ test('failed JS capture staging releases every borrowed WASM view', () => {
     ids, valid, table, 'f32', 1, 2, 2, 1, 3, 0, 1, 0), /outside vocabulary/);
   assert.deepEqual(released, ['arena', 'ids view', 'valid view', 'table view',
     'ids proxy', 'valid proxy', 'table proxy']);
+});
+
+
+test('packed staging lays sequences end to end with their segments, positions and gather', () => {
+  // [1, 2], [3, 4], [5, 6], [7, 8] as binary16; token 0 is the pad.
+  const table = Uint16Array.of(0x3c00, 0x4000, 0x4200, 0x4400,
+    0x4500, 0x4600, 0x4700, 0x4800);
+  const ids = BigInt64Array.of(1n, 2n, 3n, 2n, 0n, 0n);        // (2, 3): lengths 3 and 1
+  const lengths = BigInt64Array.of(3n, 1n);
+  const rows = 6;
+  const embed = new Float32Array(rows * 2), tok = new Float32Array(rows);
+  const seg = new Uint32Array(4), pos = new Uint32Array(rows);
+  const gather = new Float32Array(2 * rows).fill(9);
+  fillDecisionPacked(embed, tok, seg, pos, gather, view(table), 'f16', view(ids), view(lengths),
+                     8, 2, 3, rows, 2, 4, 0);
+  assert.deepEqual([...seg], [0, 3, 3, 1]);
+  assert.deepEqual([...tok], [1, 2, 3, 2, 0, 0]);              // the total, rounded with pads
+  assert.deepEqual([...pos], [0, 1, 2, 0, 0, 0]);              // each from its own position 0
+  assert.deepEqual([...embed.slice(0, 8)], [3, 4, 5, 6, 7, 8, 5, 6]);
+  // The head's (2, 3) layout: sequence 1's padding reads its own first row; the rest zero.
+  assert.deepEqual([...gather], [0, 1, 2, 3, 3, 3, 0, 0, 0, 0, 0, 0]);
+  // Tokens only, for a vocabulary on the device: no table needed.
+  const tok2 = new Float32Array(rows);
+  fillDecisionPacked(null, tok2, seg, pos, gather, null, 'f32', view(ids), view(lengths),
+                     8, 2, 3, rows, 2, 4, 0);
+  assert.deepEqual([...tok2], [1, 2, 3, 2, 0, 0]);
+  assert.throws(() => fillDecisionPacked(null, tok2, seg, pos, gather, null, 'f32', view(ids),
+                                         view(BigInt64Array.of(3n, 4n)), 8, 2, 3, rows, 2, 4, 0),
+                /outside 1\.\.3/);
+  assert.throws(() => fillDecisionPacked(null, new Float32Array(3), seg, new Uint32Array(3),
+                                         gather, null, 'f32', view(ids), view(lengths),
+                                         8, 2, 3, 3, 2, 4, 0), /overflow/);
 });

@@ -174,6 +174,10 @@ class _FakeEncoder(object):
         return True
 
     @staticmethod
+    def _packed_ok():
+        return False                 # the padded pass, which these tests are about
+
+    @staticmethod
     def _capture_platform():
         return wt._adam_kernel["platform"]
 
@@ -1249,3 +1253,24 @@ def test_the_answer_keys_downstream_reads_are_unchanged():
     assert render_options(cfg.shape_of("noul"), None) == (
         ["false", "true"], ["false: no, the statement does not hold",
                             "true: yes, the statement holds"])
+
+
+
+def test_a_batch_runs_end_to_end_only_when_every_question_is_a_prefix_of_real_tokens():
+    class Packed(_FakeEncoder):
+        _replayed_packed = TextEncoder._replayed_packed
+
+        @staticmethod
+        def _packed_ok():
+            return True
+
+    enc = Packed()
+    plat = _FakePlatform()
+    before = _with_platform(plat)
+    try:
+        holed = np.ones((2, 5), np.int64)
+        holed[0, 2] = 0                          # a gap inside a question: not packable
+        from webtorch.encoder import _NOT_PACKED
+        assert enc._replayed_packed(np.zeros(10, np.int64), 5, 2, holed) is _NOT_PACKED
+    finally:
+        wt._adam_kernel["platform"] = before

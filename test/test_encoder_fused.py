@@ -214,6 +214,64 @@ def test_fused_attention_matches_the_reference_in_the_browser():
             assert np.abs(got - want).max() < 1e-4 * max(1.0, np.abs(want).max()), (B, T, HD, tile)
 
 
+
+def test_packed_attention_equals_the_padded_layout_bit_for_bit_in_the_browser():
+    """Sequences laid end to end, each attending only to itself (and its window), give
+    exactly the padded layout's rows: same arithmetic, same order, per query."""
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    rng = np.random.default_rng(13)
+    H, HD, lengths = 12, 64, (160, 153, 173)
+    B, Tb = len(lengths), 192
+    rows = 512
+    c, s_ = wt.rope_tables(rows, HD, 10000.0)
+    cos, sin = np.asarray(c, np.float32), np.asarray(s_, np.float32)
+    for window in (0, 64):
+        padded = rng.standard_normal((B * Tb, 3 * H * HD)).astype(np.float32)
+        mask = np.full((B, Tb, Tb), -1e9, np.float32)
+        packed = np.zeros((rows, 3 * H * HD), np.float32)
+        pos = np.zeros((rows,), np.uint32)
+        seg = []
+        off = 0
+        for b, n in enumerate(lengths):
+            packed[off:off + n] = padded[b * Tb:b * Tb + n]
+            pos[off:off + n] = np.arange(n)
+            for q in range(Tb):
+                lo = max(0, q - window) if window else 0
+                hi = min(n, q + window + 1) if window else n
+                mask[b, q, lo:hi] = 0.0
+            seg += [off, n]
+            off += n
+        segd = wt.xp.asarray(np.asarray(seg, np.uint32).view(np.int32))
+        posd = wt.xp.asarray(pos.view(np.int32))
+        for tile in wt._ATTN_TILES:              # the same tile on both sides: same order
+            wt._TUNED[("weight_exec", "attention", "f32", HD, 1 if window else 0,
+                       1 << (Tb - 1).bit_length())] = tile
+            wt._TUNED[("weight_exec", "attention_packed", "f32", HD, 1 if window else 0,
+                       1 << (rows - 1).bit_length())] = tile
+            want = np.asarray(wt.fused_attention(
+                wt.Tensor(padded), H, HD, Tb, 0.125, mask=wt.Tensor(mask), window=window, B=B,
+                cos=wt.Tensor(cos[:Tb]), sin=wt.Tensor(sin[:Tb])).numpy())
+            got = np.asarray(wt.fused_attention_packed(
+                wt.Tensor(packed), H, HD, segd, rows, 0.125, window=window,
+                cos=wt.Tensor(cos), sin=wt.Tensor(sin), positions=posd).numpy())
+            off = 0
+            for b, n in enumerate(lengths):
+                assert np.array_equal(got[off:off + n], want[b * Tb:b * Tb + n]), (window, tile, b)
+                off += n
+
+
+def test_device_index_gather_is_an_embedding_lookup_in_the_browser():
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    rng = np.random.default_rng(14)
+    table = rng.standard_normal((50, 24)).astype(np.float32)
+    ids = np.asarray([3, 49, 0, 3, 17], np.float32)
+    got = wt.gather_rows_at(wt.Tensor(table), wt.xp.asarray(np.concatenate([ids, [7, 7]])
+                                                             .astype(np.float32)), 5)
+    assert np.array_equal(np.asarray(got.numpy()), table[ids.astype(np.int64)])
+    assert wt.gather_rows_at(wt.Tensor(table), wt.xp.asarray(ids), 6) is None
+
 def test_row_layernorm_matches_numpy_in_the_browser():
     if not wt._adam_backend_ready():
         pytest.skip("requires the WebGPU browser backend")

@@ -1511,6 +1511,10 @@ def _calibrate_routes(model, webio):
             probe = enc.attention_probe(kind)
             if probe is not None:
                 wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
+            # And laid end to end, as a batch of questions runs (`_replayed_packed`).
+            probe = getattr(enc, "packed_attention_probe", lambda k: None)(kind)
+            if probe is not None:
+                wt.calibrate_rows(probe, _CALIBRATE_TOP, lo=_CALIBRATE_LO, step=4, defer=True)
     if getattr(impl, "n_head_layers", 0) and callable(getattr(impl, "_score", None)):
         hidden = int(enc.cfg.hidden)
 

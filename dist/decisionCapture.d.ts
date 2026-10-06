@@ -27,4 +27,19 @@ export declare function stageDecisionKeyMask(backend: 'gl' | 'gpu', flush: () =>
 export declare function fillDecisionKeyMaskCpu(targetArg: BufferProxy, lengthsArg: BufferProxy, batch: number, heads: number, padded: number): void;
 /** Stage all mutable inputs for one captured batch without a Python data round-trip. */
 export declare function stageDecisionCapture(backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena, xId: number, maskIds: Record<string, number>, idsArg: BufferProxy, validArg: BufferProxy, tableArg: BufferProxy, tableType: 'f16' | 'f32', batch: number, length: number, padded: number, hidden: number, vocab: number, padId: number, heads: number, window: number): void;
+/** Packed-layout inputs for one captured batch, all from one staging area.
+ *
+ * The sequences go end to end -- no row is spent padding a short question up to the longest
+ * one -- and the total is rounded to `rows` with the pad token. Per packed row: its token
+ * as an f32 row number (`tok`, for a vocabulary table on the device) or its embedding row
+ * (`embed`, for one kept on the host); its position inside its sequence (`pos`). Per
+ * sequence: (first row, length) (`seg`). For every (sequence, position) of the head's
+ * (batch, length) layout: the packed row it reads (`gather`); a position past a sequence's
+ * end reads that sequence's first row, which the head masks. `ids` is (batch, length),
+ * padded; `lengths` holds each real length.
+ */
+export declare function fillDecisionPacked(embed: Float32Array | null, tok: Float32Array | null, seg: Uint32Array, pos: Uint32Array, gather: Float32Array, table: DecisionSource | null, tableType: 'f16' | 'f32', ids: DecisionSource, lengths: DecisionSource, indexBytes: 4 | 8, batch: number, length: number, rows: number, hidden: number, vocab: number, padId: number): void;
+/** `fillDecisionPacked` into the upload arena, then one upload per target. `xId` (embedding
+ * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. */
+export declare function stageDecisionPacked(backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena, xId: number, tokId: number, segId: number, posId: number, gatherId: number, idsArg: BufferProxy, lengthsArg: BufferProxy, tableArg: BufferProxy | null, tableType: 'f16' | 'f32', batch: number, length: number, rows: number, hidden: number, vocab: number, padId: number, gatherLen?: number): void;
 export {};

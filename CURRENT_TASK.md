@@ -13,6 +13,12 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-06 decision request 49.8 → 44.5 ms (questions end to end, not padded):** answers
+identical with the same routes. The GEMMs are at the browser's ceiling on this GPU (4 TFLOPS of
+a 6.2 FMA peak; subgroup matrices measured 3.9, flag-only) — MLX's 19 ms f16 uses matrix units
+WebGPU cannot reach. Left: host work before the GPU starts (~2.6 ms: tokenize, stage), the
+head's eager queueing, LN/GEGLU fusion.
+
 **2026-10-06 cached models load without probing hubs:** the page asked every hub for 1 MB
 before each load even when the cache had the whole model (the user's CORS rows); now the cache
 listing picks the source and nothing goes out. Next: the decision speed gap to MLX.

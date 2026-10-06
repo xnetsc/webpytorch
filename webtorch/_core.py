@@ -2845,6 +2845,48 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 """
 _rope_qk_kernel = {"added": False}
 
+# The same rotation with each row's position read from `pos` rather than taken as the row's
+# index modulo T: rows of several sequences packed end to end, each from position 0.
+_ROPE_QK_POS_WGSL = _ROPE_QK_WGSL.replace(
+    "@group(0) @binding(4) var<storage,read> rm: RMeta;",
+    "@group(0) @binding(4) var<storage,read> rm: RMeta;\n"
+    "@group(0) @binding(5) var<storage,read> pos: array<u32>;").replace(
+    "  let t = row % rm.T;", "  let t = pos[row];")
+if _ROPE_QK_POS_WGSL.count("pos[row]") != 1 or "binding(5)" not in _ROPE_QK_POS_WGSL:
+    raise RuntimeError("positioned rope derivation did not match")
+_rope_qk_pos_kernel = {"added": False}
+
+
+def rope_qk_pos(qkv, cos, sin, pos, H, HD):
+    """`rope_qk` for packed rows: row r rotated at position `pos[r]` (a u32 device array, one
+    per row) of the (P, HD) tables. None without WebGPU or for a shape this does not take."""
+    if not _adam_backend_ready():
+        return None
+    H, HD = int(H), int(HD)
+    xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
+    cd = _contig(cos.data if isinstance(cos, Tensor) else cos)
+    sd = _contig(sin.data if isinstance(sin, Tensor) else sin)
+    pd = pos.data if isinstance(pos, Tensor) else pos
+    rows = int(xd.shape[0])
+    if (len(xd.shape) != 2 or int(xd.shape[1]) != 3 * H * HD or HD % 8
+            or len(cd.shape) != 2 or int(cd.shape[1]) != HD
+            or tuple(sd.shape) != tuple(cd.shape) or int(pd.size) != rows):
+        return None
+    plat = _adam_kernel["platform"]
+    if not _rope_qk_pos_kernel["added"]:
+        plat.addKernel("rope_qk_pos", {"source": _ROPE_QK_POS_WGSL,
+                                       "bindingTypes": ["storage"] + ["read-only-storage"] * 5})
+        _rope_qk_pos_kernel["added"] = True
+    out = _empty((rows, 2 * H * HD))
+    n = rows * H * (HD // 4)
+    meta = _adam_kernel["make_meta"]((rows, int(cd.shape[0]), H, HD // 4), "u4,u4,u4,u4")
+    plat.runKernel({"name": "rope_qk_pos",
+                    "tensors": [out.buffer.buffer_id, xd.buffer.buffer_id, cd.buffer.buffer_id,
+                                sd.buffer.buffer_id, meta.buffer_id, pd.buffer.buffer_id],
+                    "workGroups": {"x": min((n + 63) // 64, 65535),
+                                   "y": (n + 64 * 65535 - 1) // (64 * 65535), "z": 1}})
+    return Tensor(out)
+
 
 def rope_qk(qkv, cos, sin, H, HD, T, B=1):
     """q and k of a packed (B*T, 3*H*HD) projection, rotated, as one (B*T, 2*H*HD) tensor.
@@ -2877,8 +2919,13 @@ def rope_qk(qkv, cos, sin, H, HD, T, B=1):
     return Tensor(out)
 
 
-def _attn_src(HD, RI, CJ):
+def _attn_src(HD, RI, CJ, packed=False):
     """WGSL for one (sequence, head) and 8*RI queries against key blocks of 8*CJ.
+
+    `packed`: the sequences lie end to end, sequence b at rows seg[b].x .. + seg[b].y, and no
+    mask is read. A key past its sequence's end, or outside |i - j| <= window when there is
+    one, is what the mask would have excluded; a workgroup past its sequence's queries does
+    nothing. Per query, the same arithmetic in the same order as the padded layout.
 
     8 x 8 threads. Thread (tx, ty) owns query rows ty + 8i (i < RI); for the scores, keys
     tx*CJ .. tx*CJ+CJ-1 of the block; for the output, head-dim vec4s tx + 8e. A row's softmax
@@ -2890,12 +2937,13 @@ def _attn_src(HD, RI, CJ):
     BQ, BK = 8 * RI, 8 * CJ
     E = HD4 // 8
     PS = BK // 4 + 1                   # padded vec4 stride of a probability row
+    rb = "so" if packed else "b * T"   # where sequence b's rows start
     L = []
     a = L.append
     a("""
 @group(0) @binding(0) var<storage,read> qks: array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read> vsrc: array<vec4<f32>>;
-@group(0) @binding(2) var<storage,read> mask: array<f32>;
+@group(0) @binding(2) var<storage,read> %s;
 @group(0) @binding(3) var<storage,read_write> out: array<vec4<f32>>;
 struct AMeta { T: u32, H: u32, group: u32, window: u32, scale: f32,
                qs: u32, qo: u32, ko: u32, vs: u32, vo: u32, }
@@ -2905,17 +2953,23 @@ var<workgroup> red: array<f32, %d>;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let tx = lid.x; let ty = lid.y;
-  let T = am.T; let H = am.H;
+  let H = am.H;
   let bh = wg.y; let b = bh / H; let h = bh %% H;
   let q0 = wg.x * %du;
   let DO = H * %du;
-  let masked = am.group > 0u;
-  let mbase = select(0u, (bh / max(am.group, 1u)) * T * T, masked);
   let qcol = am.qo + h * %du; let kcol = am.ko + h * %du; let vcol = am.vo + h * %du;""" % (
+        "seg: array<vec2<u32>>" if packed else "mask: array<f32>",
         BQ * PS, BQ * 8, BQ, HD4, HD4, HD4, HD4))
+    if packed:
+        a("  let sgm = seg[b]; let so = sgm.x; let T = sgm.y;")
+        a("  if (q0 >= T) { return; }")
+    else:
+        a("  let T = am.T;")
+        a("  let masked = am.group > 0u;")
+        a("  let mbase = select(0u, (bh / max(am.group, 1u)) * T * T, masked);")
     for i in range(RI):
-        a("  let qr%d = min(q0 + ty + %du, T - 1u); let qb%d = (b * T + qr%d) * am.qs + qcol;"
-          % (i, 8 * i, i, i))
+        a("  let qr%d = min(q0 + ty + %du, T - 1u); let qb%d = (%s + qr%d) * am.qs + qcol;"
+          % (i, 8 * i, i, rb, i))
         a("  var m%d: f32 = -3.0e38; var l%d: f32 = 0.0;" % (i, i))
         for e in range(E):
             a("  var o%d_%d = vec4<f32>();" % (i, e))
@@ -2930,8 +2984,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   for (var kb = kb0; kb < kb1; kb = kb + 1u) {
     let k0 = kb * %(BK)du;""" % dict(BK=BK, BQ=BQ))
     for j in range(CJ):
-        a("    let kr%d = min(k0 + tx * %du + %du, T - 1u); let kp%d = (b * T + kr%d) * am.qs + kcol;"
-          % (j, CJ, j, j, j))
+        a("    let kr%d = min(k0 + tx * %du + %du, T - 1u); let kp%d = (%s + kr%d) * am.qs + kcol;"
+          % (j, CJ, j, j, rb, j))
     for i in range(RI):
         for j in range(CJ):
             a("    var s%d_%d: f32 = 0.0;" % (i, j))
@@ -2947,10 +3001,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for i in range(RI):
         for j in range(CJ):
             a("    { let key = k0 + tx * %du + %du;" % (CJ, j))
-            a("      if (key >= T) { s%d_%d = -3.0e38; } else if (masked) {"
-              " s%d_%d = s%d_%d * am.scale + mask[mbase + qr%d * T + key]; }"
-              " else { s%d_%d = s%d_%d * am.scale; } }"
-              % (i, j, i, j, i, j, i, i, j, i, j))
+            if packed:
+                # What the mask said, from the sequence's own length and the window.
+                a("      if (key >= T || (am.window > 0u && (key + am.window < qr%d"
+                  " || key > qr%d + am.window))) { s%d_%d = -3.0e38; }"
+                  " else { s%d_%d = s%d_%d * am.scale; } }"
+                  % (i, i, i, j, i, j, i, j))
+            else:
+                a("      if (key >= T) { s%d_%d = -3.0e38; } else if (masked) {"
+                  " s%d_%d = s%d_%d * am.scale + mask[mbase + qr%d * T + key]; }"
+                  " else { s%d_%d = s%d_%d * am.scale; } }"
+                  % (i, j, i, j, i, j, i, i, j, i, j))
 
     def mx(names):
         e = names[0]
@@ -2981,7 +3042,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for i in range(RI):
         a("      let pp%d = pt[(ty + %du) * %du + c];" % (i, 8 * i, PS))
     for u in range(4):
-        a("      let vr%d = (b * T + min(k0 + c * 4u + %du, T - 1u)) * am.vs + vcol;" % (u, u))
+        a("      let vr%d = (%s + min(k0 + c * 4u + %du, T - 1u)) * am.vs + vcol;" % (u, rb, u))
         for e in range(E):
             a("      let v%d_%d = vsrc[vr%d + tx + %du];" % (u, e, u, 8 * e))
     for i in range(RI):
@@ -3000,8 +3061,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         a("    let qr = q0 + ty + %du;" % (8 * i))
         a("    if (qr < T) { let inv = 1.0 / lt;")
         for e in range(E):
-            a("      out[(b * T + qr) * DO + h * %du + tx + %du] = o%d_%d * inv;"
-              % (HD4, 8 * e, i, e))
+            a("      out[(%s + qr) * DO + h * %du + tx + %du] = o%d_%d * inv;"
+              % (rb, HD4, 8 * e, i, e))
         a("    } }")
     a("}")
     return "\n".join(L)
@@ -3012,16 +3073,20 @@ _ATTN_TILES = {"4x4": (4, 4), "2x8": (2, 8)}
 _attn_added = set()
 
 
-def _attn_run(tile, src_qk, src_v, md, H, HD, T, B, scale, window, group, qs, qo, ko, vs, vo):
+def _attn_run(tile, src_qk, src_v, md, H, HD, T, B, scale, window, group, qs, qo, ko, vs, vo,
+              rows=None):
+    """`rows` given: the packed layout (`_attn_src(packed=True)`) -- `md` is the (B, 2) u32
+    segments, `T` a bound on any one sequence's length, and the output `rows` long."""
     RI, CJ = _ATTN_TILES[tile]
-    name = "attn_%d_%s" % (HD, tile)
+    packed = rows is not None
+    name = "attn_%d_%s%s" % (HD, tile, "_packed" if packed else "")
     plat = _adam_kernel["platform"]
     if name not in _attn_added:
-        plat.addKernel(name, {"source": _attn_src(HD, RI, CJ),
+        plat.addKernel(name, {"source": _attn_src(HD, RI, CJ, packed=packed),
                               "bindingTypes": ["read-only-storage"] * 3
                               + ["storage", "read-only-storage"]})
         _attn_added.add(name)
-    out = _empty((B * T, H * HD))
+    out = _empty((int(rows) if packed else B * T, H * HD))
     meta = _adam_kernel["make_meta"](
         (T, H, group, int(window), float(scale), qs, qo, ko, vs, vo),
         "u4,u4,u4,u4,f4,u4,u4,u4,u4,u4")
@@ -3075,6 +3140,44 @@ def fused_attention(qkv, H, HD, T, scale, mask=None, window=0, B=1, cos=None, si
                              lambda which: _attn_run(which, *args),
                              candidates=tuple(_ATTN_TILES))
     return Tensor(_attn_run(tile, *args))
+
+
+def fused_attention_packed(qkv, H, HD, segments, longest, scale, window=0, cos=None,
+                           sin=None, positions=None):
+    """`fused_attention` for sequences packed end to end in one (rows, 3*H*HD) projection.
+
+    `segments` is a (B, 2) u32 device array of (first row, length) per sequence; `longest`
+    bounds any one length and sizes the dispatch. Padding is only what rounds the total, not
+    every sequence up to the longest: the projections, norms and MLPs run over the real
+    tokens, and attention costs the sum of the squares of the real lengths. With `cos`/`sin`
+    and `positions` (u32 per row), q and k are rotated at each row's own position first.
+    Rows outside every segment are left unwritten. None where `fused_attention` would be."""
+    if not _adam_backend_ready() or getattr(qkv, "requires_grad", False):
+        return None
+    H, HD = int(H), int(HD)
+    xd = _contig(qkv.data if isinstance(qkv, Tensor) else qkv)
+    sd = segments.data if isinstance(segments, Tensor) else segments
+    rows = int(xd.shape[0])
+    B = int(sd.size) // 2
+    if len(xd.shape) != 2 or int(xd.shape[1]) != 3 * H * HD or HD % 32 or B < 1:
+        return None
+    HD4 = HD // 4
+    if cos is not None and sin is not None:
+        if positions is None:
+            return None
+        qk = rope_qk_pos(xd, cos, sin, positions, H, HD)
+        if qk is None:
+            return None
+        src_qk, qs, qo, ko = qk.data, 2 * H * HD4, 0, H * HD4
+    else:
+        src_qk, qs, qo, ko = xd, 3 * H * HD4, 0, H * HD4
+    T = max(1, int(longest))
+    args = (src_qk, xd, sd, H, HD, T, B, float(scale), int(window), 0,
+            qs, qo, ko, 3 * H * HD4, 2 * H * HD4)
+    tile = _weight_execution("attention_packed", "f32", HD, 1 if window else 0, T,
+                             lambda which: _attn_run(which, *args, rows=rows),
+                             candidates=tuple(_ATTN_TILES))
+    return Tensor(_attn_run(tile, *args, rows=rows))
 
 
 # ---- causal attention of new rows against the packed-half KV cache, where it lies -------
@@ -15350,6 +15453,33 @@ void main(){int i=int(gl_FragCoord.x)+int(gl_FragCoord.y)*_ka_tex_output_texture
 }
 """
 _gather_rows_added = {"gpu": False, "gl": False}
+
+
+def gather_rows_at(x, index, count):
+    """`gather_rows` with the row numbers already on the device: the first `count` f32
+    entries of `index`. For a captured pass whose rows change per call, `index` is a buffer
+    the call rewrites; an embedding lookup is the same gather from the vocabulary table.
+    WebGPU only; None elsewhere."""
+    if not _adam_backend_ready() or not isinstance(x, Tensor) or x.ndim != 2:
+        return None
+    source = _contig(x.data)
+    idx = index.data if isinstance(index, Tensor) else index
+    count, width = int(count), int(x.shape[1])
+    if count < 1 or int(idx.size) < count:
+        return None
+    plat = _adam_kernel["platform"]
+    if not _gather_rows_added["gpu"]:
+        plat.addKernel("gather_rows", {"source": _GATHER_ROWS_WGSL,
+            "bindingTypes": ["read-only-storage", "read-only-storage",
+                             "storage", "read-only-storage"]})
+        _gather_rows_added["gpu"] = True
+    out = _empty((count, width))
+    meta = _adam_kernel["make_meta"]((count, width), "u4,u4")
+    plat.runKernel({"name": "gather_rows",
+        "tensors": [source.buffer.buffer_id, idx.buffer.buffer_id,
+                    out.buffer.buffer_id, meta.buffer_id],
+        "workGroups": {"x": (count * width + 63) // 64, "y": 1, "z": 1}})
+    return Tensor(out)
 
 
 def gather_rows(x, rows):

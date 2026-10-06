@@ -1,5 +1,40 @@
 # Progress
 
+## 2026-10-06 ▸ Decision request: questions end to end, not padded (49.8 → 44.5 ms); the GEMM ceiling measured
+
+**Trigger:** user — MLX answers the Laya/xDecision request in ~20 ms; WebGPU took several
+times that. Continue until it is solved.
+
+**Where the remaining time is** (F16 GGUF, 3 questions, M5): GPU 44.1 ms, of which the dense
+matmuls 31.2 at 3.9–4.2 TFLOPS against a 6.2 TFLOPS f16 FMA peak. Measured ways past that —
+none faster than the current kernel: ten tile/thread variants; weights paired along K so no
+scalar is splatted (3.2–3.6 TFLOPS); Chrome's experimental subgroup matrices (behind
+`--enable-unsafe-webgpu` only): 3.9 TFLOPS f16, 3.8 f32 — ordinary ALUs, not the matrix units
+MLX reaches through Apple's own path. **So MLX's 19 ms f16 is out of reach of WebGPU on this
+GPU; what can still go is work that is not arithmetic.**
+
+**Change:** the three questions were padded to the longest (173) and rounded (192): 576 rows
+for 486 tokens. Now they run end to end, rounded once on the total (512 rows):
+`fused_attention_packed` (per-sequence offset and length; padding and window decided in the
+kernel, no mask tensor), `rope_qk_pos` (each row's own position), `gather_rows_at` (device
+indices: the vocabulary lookup and the gather back to the head's layout), JS
+`stageDecisionPacked` (tokens, segments, positions, gather in one call — and no embedding
+readback and re-upload, which the padded path did for a vocabulary kept on the GPU). The first
+sight of a shape runs eagerly in this layout so its races settle before recording (recorded,
+the race's candidates were replayed every call: 62 attention dispatches instead of 22); packed
+attention is on the load-time ladder.
+
+**Measured:** same-session A/B, 48 requests each: 44.5 ms packed against 49.8 padded; GPU 39.7
+against 44.1 (matmuls 28.0 against 31.2). With the same routes pinned on both sides the
+answers are identical (billing 0.8935, 0.8794, 1.7194); left to race, the row-count bucket can
+pick another attention tile, which moves them by ~5e-4 (half activations amplify a reduction-
+order difference). Laya folder 51 → 46.5 ms, billing 1 / 0.9939 / 1.9202 (1.9205 before).
+
+**Tests:** browser — packed attention bit-identical to the padded layout per tile, global and
+windowed; the device-index gather equals the table rows; JS — staging of segments, positions,
+token rows, gather and pad rows; host — a question with a gap in its real tokens keeps the
+padded pass.
+
 ## 2026-10-06 ▸ A cached model is loaded without probing the hubs (the CORS errors, user-reported)
 
 **Trigger:** user — loading Qwen3-0.6B, cached in the browser, still showed requests from the

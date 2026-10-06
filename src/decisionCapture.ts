@@ -236,3 +236,121 @@ export function stageDecisionCapture(
     idsArg.destroy(); validArg.destroy(); tableArg.destroy();
   }
 }
+
+/** Packed-layout inputs for one captured batch, all from one staging area.
+ *
+ * The sequences go end to end -- no row is spent padding a short question up to the longest
+ * one -- and the total is rounded to `rows` with the pad token. Per packed row: its token
+ * as an f32 row number (`tok`, for a vocabulary table on the device) or its embedding row
+ * (`embed`, for one kept on the host); its position inside its sequence (`pos`). Per
+ * sequence: (first row, length) (`seg`). For every (sequence, position) of the head's
+ * (batch, length) layout: the packed row it reads (`gather`); a position past a sequence's
+ * end reads that sequence's first row, which the head masks. `ids` is (batch, length),
+ * padded; `lengths` holds each real length.
+ */
+export function fillDecisionPacked(
+  embed: Float32Array | null, tok: Float32Array | null, seg: Uint32Array, pos: Uint32Array,
+  gather: Float32Array, table: DecisionSource | null, tableType: 'f16' | 'f32',
+  ids: DecisionSource, lengths: DecisionSource, indexBytes: 4 | 8, batch: number,
+  length: number, rows: number, hidden: number, vocab: number, padId: number,
+): void {
+  if ((embed && embed.length !== rows * hidden) || (tok && tok.length !== rows)
+      || seg.length !== 2 * batch || pos.length !== rows || gather.length < batch * length) {
+    throw new Error('packed decision target shape mismatch');
+  }
+  if (embed && (!table || table.byteLength < vocab * hidden * (tableType === 'f16' ? 2 : 4))) {
+    throw new Error('embedding table is shorter than its declared shape');
+  }
+  const values = embed && tableType === 'f16' ? halfValues() : null;
+  const put = (r: number, id: number) => {
+    if (!Number.isInteger(id) || id < 0 || id >= vocab) {
+      throw new Error(`embedding token ${id} is outside vocabulary ${vocab}`);
+    }
+    if (tok) tok[r] = id;
+    if (!embed || !table) return;
+    const src = id * hidden, dst = r * hidden;
+    if (values) {
+      for (let d = 0; d < hidden; d++) embed[dst + d] = values[table.getUint16((src + d) * 2, true)];
+    } else {
+      for (let d = 0; d < hidden; d++) embed[dst + d] = table.getFloat32((src + d) * 4, true);
+    }
+  };
+  gather.fill(0);              // the buffer is uploaded whole; entries past batch*length unused
+  let off = 0;
+  for (let b = 0; b < batch; b++) {
+    const n = numberAt(lengths, b, indexBytes);
+    if (!Number.isInteger(n) || n < 1 || n > length) {
+      throw new Error(`decision length ${n} is outside 1..${length}`);
+    }
+    if (off + n > rows) throw new Error('packed decision rows overflow');
+    seg[2 * b] = off; seg[2 * b + 1] = n;
+    for (let t = 0; t < n; t++) {
+      put(off + t, numberAt(ids, b * length + t, indexBytes));
+      pos[off + t] = t;
+    }
+    for (let t = 0; t < length; t++) gather[b * length + t] = off + (t < n ? t : 0);
+    off += n;
+  }
+  for (let r = off; r < rows; r++) { put(r, padId); pos[r] = 0; }
+}
+
+/** `fillDecisionPacked` into the upload arena, then one upload per target. `xId` (embedding
+ * rows; needs `table`) or `tokId` (token row numbers) may be -1 when not wanted. */
+export function stageDecisionPacked(
+  backend: 'gl' | 'gpu', flush: () => void, uploader: UploadArena,
+  xId: number, tokId: number, segId: number, posId: number, gatherId: number,
+  idsArg: BufferProxy, lengthsArg: BufferProxy, tableArg: BufferProxy | null,
+  tableType: 'f16' | 'f32', batch: number, length: number, rows: number,
+  hidden: number, vocab: number, padId: number, gatherLen: number = batch * length,
+): void {
+  let ids: ReturnType<BufferProxy['getBuffer']> | undefined;
+  let lengths: ReturnType<BufferProxy['getBuffer']> | undefined;
+  let table: ReturnType<BufferProxy['getBuffer']> | undefined;
+  try {
+    ids = idsArg.getBuffer();
+    lengths = lengthsArg.getBuffer();
+    if (gatherLen < batch * length) throw new Error('packed decision gather buffer is too small');
+    if (xId >= 0) {
+      if (!tableArg) throw new Error('packed decision embeddings need the host table');
+      table = tableArg.getBuffer();
+    }
+    const indexBytes = ids.data.byteLength / (batch * length);
+    if ((indexBytes !== 4 && indexBytes !== 8)
+        || lengths.data.byteLength !== batch * indexBytes) {
+      throw new Error('packed decision needs matching int32/int64 tokens and lengths');
+    }
+    const embedBytes = xId >= 0 ? rows * hidden * 4 : 0;
+    const tokBytes = tokId >= 0 ? rows * 4 : 0;
+    const segBytes = batch * 2 * 4, posBytes = rows * 4, gatherBytes = gatherLen * 4;
+    const staging = uploader.prepare(embedBytes + tokBytes + segBytes + posBytes + gatherBytes);
+    const o1 = embedBytes, o2 = o1 + tokBytes, o3 = o2 + segBytes, o4 = o3 + posBytes;
+    const at = (o: number) => staging.byteOffset + o;
+    fillDecisionPacked(
+      xId >= 0 ? new Float32Array(staging.buffer, at(0), rows * hidden) : null,
+      tokId >= 0 ? new Float32Array(staging.buffer, at(o1), rows) : null,
+      new Uint32Array(staging.buffer, at(o2), batch * 2),
+      new Uint32Array(staging.buffer, at(o3), rows),
+      new Float32Array(staging.buffer, at(o4), gatherLen),
+      table ? new DataView(table.data.buffer, table.data.byteOffset, table.data.byteLength) : null,
+      tableType,
+      new DataView(ids.data.buffer, ids.data.byteOffset, ids.data.byteLength),
+      new DataView(lengths.data.buffer, lengths.data.byteOffset, lengths.data.byteLength),
+      indexBytes, batch, length, rows, hidden, vocab, padId);
+    flush();
+    const ctor = backend === 'gl' ? 'Float32Array' : undefined;
+    const parts: Array<[number, number, number]> = [
+      [xId, 0, embedBytes], [tokId, o1, tokBytes], [segId, o2, segBytes],
+      [posId, o3, posBytes], [gatherId, o4, gatherBytes]];
+    for (const [id, offset, bytes] of parts) {
+      if (id < 0 || !bytes) continue;
+      if (uploader.uploadPrepared(id, offset, bytes, ctor) < 0) {
+        throw new Error('packed decision upload failed');
+      }
+    }
+  } finally {
+    uploader.releasePrepared();
+    ids?.release(); lengths?.release(); table?.release();
+    idsArg.destroy(); lengthsArg.destroy();
+    if (tableArg && typeof tableArg.destroy === 'function') tableArg.destroy();
+  }
+}

@@ -8,7 +8,7 @@ import { sampleLogits, SamplingOptions } from './sampleLogits';
 import { routeTopKInto } from './routeTopK';
 import { sharedReadbackArena } from './sharedReadback';
 import { stagedReadArena } from './stagedRead';
-import { fillDecisionKeyMaskCpu, stageDecisionCapture,
+import { fillDecisionKeyMaskCpu, stageDecisionCapture, stageDecisionPacked,
          stageDecisionKeyMask } from './decisionCapture';
 
 export interface WgpyInitWorkerResult {
@@ -286,6 +286,14 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
         if (typeof maskIds.destroy === 'function') maskIds.destroy();
       }
     },
+    stageDecisionPacked: (
+      xId: number, tokId: number, segId: number, posId: number, gatherId: number,
+      ids: any, lengths: any, table: any, tableType: 'f16' | 'f32', batch: number,
+      length: number, rows: number, hidden: number, vocab: number, padId: number,
+      gatherLen: number,
+    ) => stageDecisionPacked('gpu', () => commands.flush(), uploader, xId, tokId, segId, posId,
+                             gatherId, ids, lengths, table ?? null, tableType, batch, length,
+                             rows, hidden, vocab, padId, gatherLen),
     isAvailable: () => {
       return gpuAvailable;
     },
