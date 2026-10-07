@@ -11,29 +11,31 @@ node serve-coi.mjs . 8119
 
 部署到 Pages 后的地址是 `https://xnetsc.github.io/webpytorch/tetris/`。
 
-## 用的是哪个模型
+## 用的是哪个模型，从哪里下载
 
-就是 Pages 聊天应用里列出的那个 xDecision（`chat/models.json`）：
+就是 Pages 聊天应用里列出的那个 xDecision（`chat/models.json`）：仓库 `mccoysc/xDecision`，文件
+`models/gguf/xDecision-Q8_0.gguf`（402,546,752 字节）。页面上只有一个“加载”按钮，模型和下载源都不用选。
 
-| | |
-|---|---|
-| 仓库 | `mccoysc/xDecision` |
-| 文件 | `models/gguf/xDecision-Q8_0.gguf`（402,546,752 字节） |
-| 来源 | 默认从 ModelScope 读取（`webtorch.modelscope_read()`，.cn 和 .ai 两个站点都会试），也可以选 Hugging Face |
+下载和缓存都用 SDK 现成的接口，页面自己不写这套逻辑：
 
-加载和提问的写法和聊天应用一样：
+- **`webtorch.mirrored_read()`**：同时从 Hugging Face、ModelScope .cn、ModelScope .ai 读，每一块都从当时
+  答得最快的那个站取，某个站变慢或断了就换下一个。混着读之前先核对各站的文件是同一个（优先比各站公布的
+  哈希，拿不到就比长度和抽样的几块），没有这个文件的站自然被排除。
+- **缓存**：读取器默认把下载的块存进浏览器（IndexedDB），中断了下次接着下；页面再装上
+  `set_io_write(webtorch.default_io_write)`。下完之后再打开页面，模型直接从缓存读，按钮会显示
+  “从缓存加载 xDecision”（用 `wt.cache.list()` 判断缓存里有没有完整的一份）。
 
 ```js
 const wt = await webtorch.start({ baseURL: '../' });
 await wt.run(`import webtorch
-webtorch.set_io_read(webtorch.modelscope_read())
+webtorch.set_io_read(webtorch.mirrored_read())
 webtorch.set_io_write(webtorch.default_io_write)`);
-const info = await wt.load('mccoysc/xDecision', { file: 'models/gguf/xDecision-Q8_0.gguf' });
+const info = await wt.load('mccoysc/xDecision/models/gguf/xDecision-Q8_0.gguf');
 const res  = await wt.decide(state, { move: question });   // res.answers.move.choice
 ```
 
-模型下载一次之后保存在浏览器缓存里，下次打开不用重新下载。手里已经有这个文件的话，也可以从自己的服务器
-加载：`/tetris/?model=/models/gguf/xDecision-Q8_0.gguf`（同源，或者对方允许跨域）。
+手里已经有这个文件的话，也可以从自己的服务器加载：`/tetris/?model=/models/gguf/xDecision-Q8_0.gguf`
+（同源，或者对方允许跨域）。
 
 ## 每一步怎么决定
 

@@ -26,17 +26,13 @@
   const MODEL = { repo: 'mccoysc/xDecision', file: 'models/gguf/xDecision-Q8_0.gguf',
                   size: 402546752 };
 
-  // Where the bytes come from is this page's decision, not the SDK's (it installs no reader
-  // of its own). xDecision is published on ModelScope; `modelscope_read()` tries both of
-  // its origins, because .cn and .ai do not carry the same repos.
-  const READERS = {
-    modelscope: 'webtorch.set_io_read(webtorch.modelscope_read())',
-    hf: 'webtorch.set_io_read(webtorch.hf_read())',
-    // `?model=<url>`: the same GGUF from your own server (same origin, or one that sends
-    // CORS headers), e.g. ?model=/models/gguf/xDecision-Q8_0.gguf for a local copy.
-    url: 'webtorch.use_default_io()',
-  };
+  // Where the bytes come from is this page's decision, not the SDK's; the SDK carries the
+  // readers. `mirrored_read()` reads from Hugging Face and both ModelScope origins at once,
+  // each block from whichever host is answering fastest, a host that cannot prove it holds
+  // the same file left out -- and caches as it goes. `?model=<url>` loads the same GGUF from
+  // your own server instead (same origin, or one that sends CORS headers).
   const ownURL = new URLSearchParams(location.search).get('model');
+  const READER = ownURL ? 'webtorch.use_default_io()' : 'webtorch.set_io_read(webtorch.mirrored_read())';
 
   const S = {
     wt: null,              // the SDK runtime, once started
@@ -64,26 +60,43 @@
 
   webtorch.onError((e) => { say(e.scope + ': ' + e.message); });
 
-  const ready = webtorch.start({ baseURL: '../', onStatus: say }).then(async (wt) => {
-    S.wt = wt;
-    await wt.run('import webtorch\nwebtorch.set_io_write(webtorch.default_io_write)\n');
-    say('运行时就绪（' + wt.backend + (wt.reason ? '：' + wt.reason : '') + '）。'
-        + '点“加载 xDecision”下载模型，下载过的直接从浏览器缓存读取。');
-    $('#load').disabled = false;
-    return wt;
-  }).catch((e) => { say('运行时启动失败：' + e.message); throw e; });
+  // Started at page load: booting Python takes seconds, and the person is reading the page.
+  let ready = null;
+  function startRuntime() {
+    $('#load').disabled = true;
+    ready = webtorch.start({ baseURL: '../', onStatus: say }).then(async (wt) => {
+      S.wt = wt;
+      // Keeping what was downloaded is this page's policy: the SDK keeps nothing unless a
+      // writer is installed. With it, the second visit reads the model from the cache.
+      await wt.run('import webtorch\n' + READER
+                   + '\nwebtorch.set_io_write(webtorch.default_io_write)\n');
+      const listing = await wt.cache.list().catch(() => ({}));
+      const hit = !ownURL && (listing.items || []).some(item => item.complete
+        && item.key.endsWith('/' + MODEL.repo + '/resolve/main/' + MODEL.file));
+      $('#load').textContent = hit ? '从缓存加载 xDecision' : '加载 xDecision（402 MB）';
+      say('运行时就绪（' + wt.backend + (wt.reason ? '：' + wt.reason : '') + '）。'
+          + (hit ? 'xDecision 已在浏览器缓存里，加载不用下载。'
+                 : '加载时自动选最快的模型站下载，下载过的保存在浏览器缓存里。'));
+      $('#load').disabled = false;
+      return wt;
+    }).catch((e) => { say('运行时启动失败：' + e.message); throw e; });
+    return ready;
+  }
+  startRuntime();
 
   async function loadModel() {
     $('#load').disabled = true;
-    $('#source').disabled = true;
+    // A cache the browser may evict is not much of a cache for 400 MB. Asked on the click,
+    // because browsers decide on a user gesture; a refusal changes nothing else.
+    try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); }
+    catch (e) { /* not offered here */ }
     try {
       const wt = await ready;
-      const source = $('#source').value;
-      await wt.run('import webtorch\n' + READERS[source] + '\n');
-      const info = await wt.load(source === 'url' ? new URL(ownURL, location.href).href : MODEL.repo, {
-        file: source === 'url' ? undefined : MODEL.file,
-        onProgress: (p) => say('下载 xDecision：' + (p.bytes / 1e6).toFixed(0) + ' / '
-                               + ((p.total || MODEL.size) / 1e6).toFixed(0) + ' MB'),
+      const target = ownURL ? new URL(ownURL, location.href).href : MODEL.repo + '/' + MODEL.file;
+      const info = await wt.load(target, {
+        onProgress: (p) => say('读取 xDecision：' + (p.bytes / 1e6).toFixed(0) + ' / '
+                               + ((p.total || MODEL.size) / 1e6).toFixed(0) + ' MB'
+                               + (p.dlRate ? ' · ' + (p.dlRate / 1e6).toFixed(1) + ' MB/s' : '')),
         onStage: (s) => say('加载中：' + s.stage + '…'),
       });
       if (info.kind !== 'decision') throw new Error('加载到的不是决策模型（kind=' + info.kind + '）');
@@ -98,9 +111,14 @@
       $('#mode').value = 'model';
       syncButtons();
     } catch (e) {
-      say('加载失败：' + e.message);
-      $('#load').disabled = false;
-      $('#source').disabled = false;
+      // A failed load can leave a half-filled heap and GPU buffers behind; the chat page
+      // replaces the whole runtime before another attempt, and so does this. What was
+      // already downloaded stays in the cache and is not fetched again.
+      const message = (e && e.message) || String(e);
+      try { if (S.wt) S.wt.close(); } catch (err) { /* already gone */ }
+      S.wt = null;
+      await startRuntime().catch(() => {});
+      say('加载失败：' + message.split('\n').filter(Boolean).slice(-1)[0] + '。可以再点一次重试。');
     }
   }
 
@@ -308,13 +326,6 @@
 
   $('#rule').textContent = P.INSTRUCTIONS;
 
-  if (ownURL) {
-    const o = document.createElement('option');
-    o.value = 'url';
-    o.textContent = '网址：' + ownURL;
-    $('#source').appendChild(o);
-    $('#source').value = 'url';
-  }
   $('#load').onclick = loadModel;
   $('#ai').onclick = () => setRunning(!S.on);
   $('#mode').onchange = () => { if (S.on && opt.mode() === 'model' && !S.choiceType) setRunning(false); syncButtons(); };
