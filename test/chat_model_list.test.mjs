@@ -397,6 +397,21 @@ test('a model complete in the cache loads from its source without probing any hu
   const repo = await context.pick(repoSpec);
   assert.equal(repo.id, 'huggingface');
   assert.deepEqual(probes, []);
+  // In the browser the listing keeps the scheme: that is the form a page actually sees.
+  context.chosenModelSources.clear();
+  listing.groups = [];
+  listing.items = [{ key: 'https://huggingface.co/org/Model-GGUF/resolve/main/model-Q4_K_M.gguf',
+                     complete: true, size: 397, total: 397 }];
+  const browserItem = await context.pick(spec);
+  assert.equal(browserItem.id, 'huggingface');
+  assert.equal(browserItem.cached, true);
+  assert.deepEqual(probes, []);
+  listing.items = [];
+  listing.groups = [{ name: 'https://modelscope.ai/models/org/Model/resolve/master',
+                      complete: true, size: 1000, total: 1000 }];
+  const browserGroup = await context.pick(repoSpec);
+  assert.equal(browserGroup.id, 'modelscope-ai');
+  assert.deepEqual(probes, []);
   // The cache key is the URL the reader asks for: the same expression in both places.
   assert.match(appSource, /\(s\.kind === 'modelscope' \? s\.endpoint \+ '\/models\/' : s\.endpoint \+ '\/'\)\s*\+ ' \+ repo \+ ' \+ JSON\.stringify\('\/resolve\/' \+ s\.revision \+ '\/'\) \+ ' \+ path'/);
 });

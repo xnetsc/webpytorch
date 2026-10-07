@@ -1658,7 +1658,13 @@ async function cachedModelSource(spec) {
   try { listing = await (await sdk).cache.list(); } catch { return null; }
   const items = new Map((listing.items || []).map(item => [item.key, item]));
   const groups = new Map((listing.groups || []).map(group => [group.name, group]));
+  // A key is the URL the reader stored the file under. The browser's own storage keeps that
+  // URL as asked for, scheme and all ("https://huggingface.co/…"); a cache on disk lists it
+  // without the scheme. Looking up only the bare form missed every browser entry, so a model
+  // complete in the cache was raced across the hubs before every load. Both forms name the
+  // same file, as the SDK's own lookup also takes them.
   const bare = (u) => u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  const lookup = (map, u) => map.get(u) || map.get(bare(u));
   const candidates = [];
   const direct = directSource(url, probePath);
   if (direct) candidates.push(direct);
@@ -1667,15 +1673,15 @@ async function cachedModelSource(spec) {
     const baseUrl = sourceBase(source, repo);
     if (file || source.kind === 'direct') {
       // One file is the model: it is there or it is not.
-      const item = items.get(bare(readerUrl({ ...source, baseUrl }, repo, file || probePath,
-                                            probePath)));
+      const item = lookup(items, readerUrl({ ...source, baseUrl }, repo, file || probePath,
+                                           probePath));
       if (item && item.complete) {
         return { ...source, baseUrl, cached: true, total: item.total || item.size,
                  latency: 0, sampled: 0, measured: false, rate: 0, alternates: [] };
       }
     } else {
       // A repository: everything this source's copy holds, complete.
-      const group = groups.get(bare(readerUrl(source, repo, '', probePath)).replace(/\/$/, ''));
+      const group = lookup(groups, readerUrl(source, repo, '', probePath).replace(/\/$/, ''));
       if (group && group.complete) {
         return { ...source, baseUrl, cached: true, total: group.total || group.size,
                  latency: 0, sampled: 0, measured: false, rate: 0, alternates: [] };
