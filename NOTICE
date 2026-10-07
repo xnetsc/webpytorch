@@ -22,3 +22,9 @@ tools/, docs/) is original work in this repository and is also MIT-licensed.
 from the laya-vision browser demo:
   https://github.com/r33drichards/laya-vision
 Copyright its contributors, licensed under the Apache License 2.0.
+
+`tetris/vendor/tetris.js` is copied unmodified from vanilla-js-tetris by Maryele Trzaskos
+Gruber, and `tetris/style.css` follows its stylesheet:
+  https://github.com/trzaskos/vanilla-js-tetris (commit f09e736e95e055f533ee72319837d1fad0d0f11e)
+Its README states that it is licensed under the MIT License; the repository carries no
+separate LICENSE file at that commit.
