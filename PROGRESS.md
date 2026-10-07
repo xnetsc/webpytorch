@@ -1,5 +1,51 @@
 # Progress
 
+## 2026-10-07 ▸ Remeasure within its budget; two sets of routes; an accuracy gate that does not pass by luck; README rebuilt
+
+**Trigger:** user: a 27B remeasure ran 60.26 s of a 60 s budget, its decode search never got
+anywhere, and decode was slower after it (7.2 → 6.2 tok/s); the remeasure must not slow replies;
+keep the routes it replaced and say when the new ones run slower, switching only on request;
+the load picks routes by itself, no idle-time testing added; the README as an advertisement in
+English and Chinese with a bar chart against native MLX; the article in the user's own voice.
+
+**Changes:**
+- Budget as a limit: a race starts only when the duration of the race that last decided it
+  (`_RACE_SECONDS`) fits in what is left after a reserve for stopping (`_REMEASURE_RESERVE_S`);
+  checkpoints inside a race ask for room for the next round (`_remeasure_checkpoint(need_s)`).
+- Decode composition local search: stopped part way it keeps every adoption and starts the
+  next search at the challenger it dropped (`decode_search_v1` kept with the profile); stopped
+  before one comparison finished it puts the plan in force back exactly (`_decode_selection`)
+  and is reported as discarded; each piece (trace, record, sample) starts only with room for
+  the longest it has taken; the remeasure's status says when a search was cut short.
+- Approximate routes (`tiled_half`, `dp4a`) are admitted per weight only if they also hold
+  their bound on two fixed hard inputs (`_approx_holds`); one that misses is left out of the
+  race (`_GATE_EXCLUDED`, in the report as `excluded`) instead of failing it. The kernel
+  profile's stamp covers the gates.
+- Two sets of routes: a remeasure that changes routes puts its own in use and keeps the set
+  that was in use as the set not in use (the set not in use is pushed out); `switch_routes()` /
+  `wt.switchRoutes()`, `route_sets()` / `wt.routeSets()`; speeds per set from the replies and
+  requests themselves (`note_speed`), compared once the device has rested as long as the
+  remeasure ran; `on_routes_slower(fn)` / `routesSlower` event, nothing switched by the SDK.
+  Composite choices are put back in force through `register_route_apply`.
+- README rebuilt as the project's pitch in English and Chinese (`README.zh.md`), with the
+  decision model against native MLX (`images/vs-mlx-{en,zh}.svg`, `scripts/readme_charts.py`);
+  the article in Chinese and English under `docs/articles/`.
+
+**Measured (M5 MacBook Air, fanless):** 27B remeasure 59.1 s of 60, twice; the decode search
+went (0,0) → (1,2) → (2,2) over two remeasures, three challengers each. Decode after a remeasure
+was slower because the chip was: the same stored GEMV took 1.06 ms of GPU time cool, 1.72 ms
+after a minute of ordinary replies (no remeasure) and 1.48 to 1.80 ms right after a remeasure;
+decode 8.0 → 4.0 tok/s, back after a minute idle; 12 MB read from swap and 93 MB decompressed
+over those replies. The old and new route sets run alternately (ABBA, 15 s apart): 7.92 and
+7.92 tok/s, replies identical, no false `routesSlower`. 0.6B: 12 routes changed, the two sets
+148.6 and 151.6 tok/s alternately, replies identical. `tiled_half` left out of one 27B weight
+(Q4_K 6144×5120: 1.15% of the output scale on the hard inputs against a 1% bound; 0.3% to
+1.6% across random inputs before). Summing the half kernel in f32 instead: 0.02% to 0.16%,
+but only 0% to 30% faster than the f32 kernel against 30% to 120% for the half sum.
+
+**Not done:** the decode composition is still not searched at load (the user's decision);
+idle-time ladder calibration is kept (the user's decision).
+
 ## 2026-10-07 ▸ `remeasure` covers every operator, never strands a route, never slows a reply
 
 **Trigger:** user — a time limit must not leave some routes unmeasured for ever; at most 60 s;

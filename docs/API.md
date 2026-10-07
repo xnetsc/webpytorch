@@ -830,17 +830,44 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   with no garbage collection inside a sample. A route's new choice takes effect the moment its
   race ends; the recordings that used a changed route are recorded again when idle.
   `cancel()` stops it at the next sample: the race in progress is dropped (that route keeps
-  its previous choice), every route already raced keeps its new one. Running out of
-  `budget_s` stops it the same way, and the operator races it did not reach then go on when
-  idle, one at a time. Each remeasure starts with the routes raced longest ago (kept with
-  the kernel profile, so across reloads too): no route is left unraced for ever because a
-  budget keeps running out before it. Raises when no model is loaded. The report:
+  its previous choice), every route already raced keeps its new one. The choice in use is
+  the one to beat: a challenger replaces it only when paired samples prove it faster, and an
+  inconclusive race changes nothing. `budget_s` is a limit, not a target: a race is started
+  only when it fits in what is left, judged by how long it took last time, and a little is
+  kept back for stopping, so `elapsed_ms` stays within `budget_ms`. Running out of it stops
+  the remeasure the same way as `cancel()`, and the operator races it did not reach then go
+  on when idle, one at a time. Each remeasure starts with the routes raced longest ago (kept
+  with the kernel profile, so across reloads too): no route is left unraced for ever because
+  a budget keeps running out before it.
+
+  An LLM's decode composition (which fused or separate form each part of a decode step takes,
+  per shape) is raced again as a local search from the plan in force: one axis, one value at
+  a time, each challenger checked against the original-width oracle and then timed against
+  the plan in force on its own recording; it is adopted only when proven faster, and at once.
+  A stop keeps every adoption already made and drops the comparison in progress; the next
+  search starts at that challenger (kept with the kernel profile). Stopped before a single
+  comparison finished, it changes nothing and is reported as `discarded`; stopped later, the
+  remeasure's `status` says so and what came after it is handled as after any other stop.
+  The decode composition is not searched at load: a load applies the exact original-width
+  plan, or the plan an earlier search kept in the profile. Its entry in `measured` carries a
+  `detail`:
+
+  ```python
+  {"tried": 18, "adopted": 1, "axes_covered": "12/12",
+   "started_at_axis": 0, "started_at_value": 0,   # where this search began
+   "next_axis": 0, "next_value": 0,               # where the next one begins
+   "stopped": "out_of_time",                      # only when it was stopped part way
+   "discarded": "qkv=fused:compact"}              # the comparison that stop dropped
+  ```
+
+  Raises when no model is loaded. The report:
 
   ```python
   {"status": "complete",            # or "stopped" (cancel) or "out_of_time"
    "measured": [{"key": "weight_exec|dense_half|f16|768|2304|512", "op": "dense_half",
                  "storage": "f16", "shape": [768, 2304], "rows": 512,
                  "before": "f32", "after": "f16", "changed": True,
+                 "borrowed": False,   # True: "before" was a neighbouring bucket's verdict
                  "clock": "gpu", "ms": 141.2}, ...],
    "changed": 3,
    "discarded": {"key": ...} or None,   # the race a stop interrupted
@@ -854,6 +881,36 @@ existed. `chat/worker.js` is a worked example — IndexedDB, keyed as above.
   In a `webtorch.start()` host: `await wt.remeasure({ budgetMs })` resolves with the same
   report (also after `wt.cancel()`), keeps what changed in the kernel profile, and rebuilds
   the stale recordings between calls.
+
+- `webtorch.route_sets()`, `webtorch.switch_routes()`, `webtorch.on_routes_slower(fn)`: the
+  two sets of routes. A remeasure that changes routes puts what it made in use and keeps the
+  set that was in use as the set not in use; `switch_routes()` swaps them, so a caller can go
+  back and forth, and returns `{"in_use": id, "unused": id, "changed": n, "rebuilds": [...]}`.
+  When a later remeasure changes routes, the set not in use is the one pushed out. A set's id
+  is the number of the remeasure that made it (0: the load's). Only the set in use keeps
+  recordings; a swap rebuilds the ones that used a route that changes. Both sets and which is
+  in use are kept with the kernel profile.
+
+  How the set in use runs is recorded from the replies and requests themselves: decode
+  seconds per token for each reply of eight tokens or more (by decode path), seconds per
+  decision request (by input size to a power of two), the last three of each kind per set.
+  When each of the last three in use is slower than each of the set not in use's last three,
+  `fn(info)` is told, once per set and kind: `{"kind": "decode:replay-chunk1", "in_use": 1,
+  "unused": 0, "in_use_s": [...], "unused_s": [...], "routes_differ": 7}`. Nothing is switched
+  by the SDK. A remeasure leaves the device hot, and a hot device runs slower whatever its
+  routes, so samples count only once as long as the remeasure ran has passed since it ended.
+
+  ```python
+  webtorch.on_routes_slower(lambda info: print("slower:", info))
+  report = webtorch.remeasure()
+  ...                                   # replies, requests
+  if webtorch.route_sets()["unused"]:
+      webtorch.switch_routes()          # the set that was in use before the remeasure
+  ```
+
+  In a `webtorch.start()` host: `wt.routeSets()`, `wt.switchRoutes()` (what is in use is kept
+  for the next load), and the `routesSlower` event (`onRoutesSlower` in `start()`, or
+  `wt.on('routesSlower', fn)`).
 
 - `webtorch.backend_reason()` → what is stopping the GPU path, as a sentence, or `None` when
   nothing is. Reading this is the supported way to find out why a machine that should be
@@ -968,6 +1025,7 @@ outstanding calls, and makes further calls on that instance fail. Recreate it wi
 disk-backed File handles must be selected or registered again in the new worker.
 
 Also on it: `stopLoading()`, `decide(state, questions)`, `remeasure({ budgetMs })`,
+`routeSets()`, `switchRoutes()`,
 `calibrate(heldOutExamples, { byOptions, minSamples })`, `splitReasoning(text)`,
 `stats()`, `tools.{supported,calls,result,suggest,round,render}` and
 `cache.{list,delete,clear,export,import,migrate,watch}`.

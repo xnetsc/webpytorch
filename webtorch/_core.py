@@ -4024,7 +4024,11 @@ def calibration_drop():
     _TUNE_AGAIN.clear()
     _AGAIN_FN.clear()
     _CANNOT_AGAIN.clear()
+    _REMEASURE_DETAIL.clear()
     del _ROUTE_HOOKS[:]
+    _APPLY_FN.clear()
+    _SPEED.clear()
+    _SLOWER_TOLD.clear()
     _KEYS_SEEN[0] = None
 
 
@@ -4049,13 +4053,14 @@ _CANNOT_AGAIN = {}     # route key -> why it is used but cannot be raced again h
 _RACE_AGAIN = set()    # keys a remeasure is racing again right now
 _REMEASURING = [0]
 _REMEASURE_UNTIL = [None]   # when the remeasure under way has to have stopped (perf_counter)
-_REMEASURED = []       # (key, before, after, clock, ms), as each race of a remeasure finishes
+_REMEASURED = []       # (key, before, after, clock, s, borrowed) as each race of a remeasure ends
 # Which remeasure last raced each route ("|"-joined key -> its number), kept with the kernel
 # profile: each remeasure starts with the routes raced longest ago, so a budget that runs out
 # never leaves the same routes unraced for ever.
 _REMEASURE_SEQ = [0]
 _REMEASURED_AT = {}
 _ROUTE_HOOKS = []      # fn(changed keys) -> descriptions of the rebuilds it queued
+_RACE_SECONDS = {}     # route key -> how long the race that last decided it took
 _KEYS_SEEN = [None]    # a set while `route_keys()` collects
 
 
@@ -4067,20 +4072,174 @@ def _note_route(key):
         seen.add(key)
 
 
-def _commit_route(key, chosen, clock, seconds=None):
-    before = _TUNED.get(key)
+def _commit_route(key, chosen, clock, seconds=None, ran=None):
+    """Keep `chosen` for `key`. `ran`: what had been running in a bucket with no verdict of
+    its own (a neighbour's, borrowed), the honest "before" of a remeasure's report."""
+    borrowed = key not in _TUNED and ran is not None
+    before = ran if borrowed else _TUNED.get(key)
     _TUNED[key] = chosen
     _RACE_CLOCK[key] = clock
+    if seconds is not None:
+        _RACE_SECONDS[key] = float(seconds)
     if _REMEASURING[0]:
-        _REMEASURED.append((key, before, chosen, clock, seconds))
+        # A route that had no choice of its own before keeps the new one in both sets.
+        if before is not None and before != chosen:
+            _note_replaced(key, before)
+        _REMEASURED.append((key, before, chosen, clock, seconds, borrowed))
         _REMEASURED_AT["|".join(str(x) for x in key)] = _REMEASURE_SEQ[0]
 
 
-def _note_remeasured(key, before, after, clock, seconds=None):
-    """A model's own choice raced again (`register_remeasure`): what it was and became."""
+_REMEASURE_DETAIL = {}     # route key -> what a model's own search reports about itself
+
+
+def _note_remeasured(key, before, after, clock, seconds=None, detail=None):
+    """A model's own choice raced again (`register_remeasure`): what it was and became, and
+    `detail`: how far its own search got, say."""
+    if detail is not None:
+        _REMEASURE_DETAIL[key] = detail
     if _REMEASURING[0]:
-        _REMEASURED.append((key, before, after, clock, seconds))
+        _REMEASURED.append((key, before, after, clock, seconds, False))
         _REMEASURED_AT["|".join(str(x) for x in key)] = _REMEASURE_SEQ[0]
+
+
+# ---- two sets of routes: the one in use and the one not in use ------------------------------
+#
+# A remeasure that changes routes puts what it made in use at once, and keeps the set that was
+# in use as the set not in use. From then on there are two, and `switch_routes` swaps them, so
+# a caller can go back and forth. When the next remeasure changes routes, the set not in use
+# is the one pushed out: what it made goes in use, the set that was in use becomes the one
+# not in use. Each set is known by an id, the number of the remeasure that made it (0: the
+# load's). Only the set in use has recordings; a switch rebuilds the ones that used a route
+# that changes (`on_routes_changed`), and the replaced recordings are released with them.
+#
+# How each set runs in use is recorded as it is used (`note_speed`): the last three replies
+# or requests of each kind. The set in use is compared with the set not in use: when each of
+# its last three is slower than each of the other's last three, the `on_routes_slower`
+# callbacks are told, once per set and kind. Nothing is switched here: that is the caller's.
+# A remeasure works the device flat out, and a device that has just done that runs slower
+# for a while whatever its routes: after a minute of it an M5's GPU took 1.6x as long for
+# the same kernel, and was back after a minute idle; a minute of ordinary replies does the
+# same. So a sample counts only once as long as the remeasure ran has passed since it ended.
+_ROUTE_ALT = {}            # route key -> its value in the set not in use, where they differ
+_ROUTE_IDS = {"in_use": 0, "unused": None}
+_SPEED = {}                # set id -> kind -> [(seconds, perf_counter)], the last three
+_SAMPLE_AFTER = [0.0]      # perf_counter before which a sample does not count
+_SLOWER_TOLD = set()       # (set id, kind) already told
+_SLOWER_HOOKS = []         # fn(info), from `on_routes_slower`
+_APPLY_FN = {}             # route key -> fn() putting a model's own composite choice in force
+
+
+def _note_replaced(key, before):
+    """`key`'s choice changed in a remeasure; what it was belongs to the set that was in use."""
+    seq = _REMEASURE_SEQ[0]
+    if _ROUTE_IDS["in_use"] != seq:
+        # This remeasure's first change: what it makes goes in use, the set that was in use
+        # becomes the set not in use, and the set not in use is pushed out with its samples.
+        gone = _ROUTE_IDS["unused"]
+        if gone is not None and gone != _ROUTE_IDS["in_use"]:
+            _SPEED.pop(gone, None)
+        _ROUTE_IDS["unused"] = _ROUTE_IDS["in_use"]
+        _ROUTE_IDS["in_use"] = seq
+        _ROUTE_ALT.clear()
+        _SLOWER_TOLD.clear()
+    _ROUTE_ALT.setdefault(key, before)
+
+
+def register_route_apply(key, fn):
+    """A model's own composite choice under `key` (`register_remeasure`) is put in force by
+    `fn()` from what `_TUNED` holds for it. `switch_routes` calls it when it swaps."""
+    _APPLY_FN[key] = fn
+
+
+def on_routes_slower(fn):
+    """`fn(info)` is told when the routes in use run slower than the set not in use did:
+    each of the last three replies or requests of a kind slower than each of the other
+    set's last three. `info`: `kind`, `in_use` and `unused` (the sets' ids), the seconds of
+    each (`in_use_s`, `unused_s`: per token for a reply, per request for a decision) and how
+    many routes differ. Told once per set and kind; `switch_routes` is how to change sets.
+    `None` removes every callback."""
+    if fn is None:
+        del _SLOWER_HOOKS[:]
+    else:
+        _SLOWER_HOOKS.append(fn)
+
+
+def note_speed(kind, seconds):
+    """What one reply or request of `kind` cost in use, in seconds (per token for a reply):
+    kept, the last three, for the set of routes in use."""
+    import time as _t
+    now = _t.perf_counter()
+    if now < _SAMPLE_AFTER[0] or not (seconds > 0):
+        return
+    kind = str(kind)
+    used, spare = _ROUTE_IDS["in_use"], _ROUTE_IDS["unused"]
+    got = _SPEED.setdefault(used, {}).setdefault(kind, [])
+    got.append((float(seconds), now))
+    del got[:-3]
+    if spare is None or not _ROUTE_ALT or (used, kind) in _SLOWER_TOLD:
+        return
+    then = _SPEED.get(spare, {}).get(kind, [])
+    if len(got) == 3 and len(then) == 3 and min(x for x, _ in got) > max(x for x, _ in then):
+        _SLOWER_TOLD.add((used, kind))
+        info = {"kind": kind, "in_use": used, "unused": spare,
+                "in_use_s": [round(x, 6) for x, _ in got],
+                "unused_s": [round(x, 6) for x, _ in then],
+                "routes_differ": sum(1 for k, v in _ROUTE_ALT.items() if _TUNED.get(k) != v)}
+        for fn in list(_SLOWER_HOOKS):
+            try:
+                fn(info)
+            except Exception as exc:          # a caller's callback must not break a reply
+                _UNSUPPORTED_SEEN.append("on_routes_slower callback failed: %s" % exc)
+
+
+def route_sets():
+    """The sets of routes kept: the one in use and, once a remeasure has changed routes, the
+    one not in use, each with its id and the last three samples of each kind it ran in use
+    (seconds); and which routes differ between them."""
+    differ = sorted("|".join(str(x) for x in k) for k, v in _ROUTE_ALT.items()
+                    if _TUNED.get(k) != v)
+
+    def side(set_id):
+        return {"id": set_id,
+                "speeds": {kind: [round(x, 6) for x, _ in got]
+                           for kind, got in (_SPEED.get(set_id) or {}).items()}}
+    spare = _ROUTE_IDS["unused"]
+    return {"in_use": side(_ROUTE_IDS["in_use"]),
+            "unused": side(spare) if spare is not None and differ else None,
+            "differ": differ}
+
+
+def switch_routes():
+    """Put the set of routes not in use in use, and keep the one that was: two calls are a
+    round trip. The recordings that used a route that changes are rebuilt
+    (`on_routes_changed`); a model's own composite choices are put in force at once.
+    Returns the ids now in use and not in use, how many routes changed and what was rebuilt.
+    Raises when there is one set."""
+    if _ROUTE_IDS["unused"] is None or not any(_TUNED.get(k) != v
+                                               for k, v in _ROUTE_ALT.items()):
+        raise RuntimeError("there is one set of routes: no remeasure has changed any")
+    changed = set()
+    for key, value in list(_ROUTE_ALT.items()):
+        now = _TUNED.get(key)
+        if value is None:
+            _TUNED.pop(key, None)
+        else:
+            _TUNED[key] = value
+        _ROUTE_ALT[key] = now
+        if now != value:
+            changed.add(key)
+    _ROUTE_IDS["in_use"], _ROUTE_IDS["unused"] = _ROUTE_IDS["unused"], _ROUTE_IDS["in_use"]
+    _NEAREST.clear()
+    rebuilds = []
+    for key in sorted(changed, key=str):
+        fn = _APPLY_FN.get(key)
+        if fn is not None:
+            fn()
+            rebuilds.append({"rebuild": "%s put in force" % key[0], "when": "now"})
+    for hook in list(_ROUTE_HOOKS):
+        rebuilds.extend(hook(changed) or [])
+    return {"in_use": _ROUTE_IDS["in_use"], "unused": _ROUTE_IDS["unused"],
+            "changed": len(changed), "rebuilds": rebuilds}
 
 
 def remeasure_time_left():
@@ -4135,13 +4294,23 @@ def queue_task(fn):
     _DEFERRED.append(_Task(fn))
 
 
-def _remeasure_checkpoint():
+# What a remeasure keeps back from its budget for stopping: the race in progress is put
+# back, its recordings released, the report built. A piece of work is started only when
+# it fits in what is left after that.
+_REMEASURE_RESERVE_S = 0.3
+_LAST_WIND_DOWN = [None]   # seconds from the last remeasure's stop to its return
+
+
+def _remeasure_checkpoint(need_s=0.0):
+    """Inside a remeasure: raise if a stop was asked for, or if the next piece of work does
+    not fit in what is left of the budget. `need_s` is that piece's length in seconds, the
+    caller's estimate from what the same piece took before."""
     if _REMEASURING[0]:
         from . import webio
         if webio.cancel_requested():
             raise webio.Cancelled("remeasure stopped")
         left = remeasure_time_left()
-        if left is not None and left <= 0:
+        if left is not None and left <= float(need_s) + _REMEASURE_RESERVE_S:
             raise _OutOfTime("remeasure ran out of its time")
 
 
@@ -4222,21 +4391,31 @@ def remeasure(budget_s=60.0):
     seq = _REMEASURE_SEQ[0]
     del _REMEASURED[:]
     status, discarded, rest = "complete", None, []
+    stopped_at = None
+    excluded_from = len(_GATE_EXCLUDED)
     _REMEASURING[0] += 1
     _REMEASURE_UNTIL[0] = t0 + float(budget_s)
     try:
         for i, (kind, keys, how) in enumerate(steps):
+            # A race is started only when it fits in what is left, judged by how long it
+            # took last time; one that does not goes on when idle, or first next time. A
+            # model's own composite search fits its pieces to the budget itself.
+            need = (0.0 if kind == "fn" else
+                    sum(_RACE_SECONDS.get(k, 0.0) for k in keys))
             stop = ("stopped" if webio.cancel_requested() else
-                    "out_of_time" if remeasure_time_left() <= 0 else None)
+                    "out_of_time" if remeasure_time_left() <= need + _REMEASURE_RESERVE_S
+                    else None)
             if stop:
                 status = stop
                 rest = steps[i:]
+                stopped_at = _t.perf_counter()
                 break
             done = len(_REMEASURED)
             _RACE_AGAIN.update(keys)
             try:
                 _run_race_step(kind, keys, how)
             except (webio.Cancelled, KeyboardInterrupt) as exc:
+                stopped_at = _t.perf_counter()
                 status = "out_of_time" if isinstance(exc, _OutOfTime) else "stopped"
                 raced = {r[0] for r in _REMEASURED[done:]}
                 left = [k for k in keys if k not in raced]
@@ -4245,18 +4424,29 @@ def remeasure(budget_s=60.0):
                 break
             finally:
                 _RACE_AGAIN.difference_update(keys)
+            # A model's own search that the budget or a stop ended part way kept what it
+            # finished and reported where it stopped; the remeasure stops there with it.
+            cut = [(_REMEASURE_DETAIL.get(k) or {}).get("stopped") for k in keys]
+            cut = next((c for c in cut if c), None)
+            if cut:
+                status = cut
+                stopped_at = _t.perf_counter()
+                rest = steps[i + 1:]
+                break
     finally:
         _REMEASURING[0] -= 1
         _REMEASURE_UNTIL[0] = None
         _RACE_AGAIN.clear()
     measured = [dict(_route_entry(key), before=before, after=after,
-                     changed=before != after, clock=clock,
-                     ms=None if sec is None else round(sec * 1000, 1))
-                for key, before, after, clock, sec in _REMEASURED]
+                     changed=before != after, clock=clock, borrowed=borrowed,
+                     ms=None if sec is None else round(sec * 1000, 1),
+                     **({"detail": _REMEASURE_DETAIL.pop(key)}
+                        if key in _REMEASURE_DETAIL else {}))
+                for key, before, after, clock, sec, borrowed in _REMEASURED]
     changed = [m["key"] for m in measured if m["changed"]]
     rebuilds = []
     if changed:
-        changed_keys = {key for key, before, after, _, _ in _REMEASURED if before != after}
+        changed_keys = {r[0] for r in _REMEASURED if r[1] != r[2]}
         for hook in list(_ROUTE_HOOKS):
             rebuilds.extend(hook(changed_keys) or [])
     _NEAREST.clear()
@@ -4269,14 +4459,19 @@ def remeasure(budget_s=60.0):
             continuing.extend(keys)
         else:
             not_reached.extend(keys)
+    end = _t.perf_counter()
+    _LAST_WIND_DOWN[0] = None if stopped_at is None else end - stopped_at
+    _SAMPLE_AFTER[0] = end + (end - t0)
     return {"status": status, "measured": measured, "changed": len(changed),
             "discarded": (discarded or [None])[0],
             "continuing": [_route_entry(k) for k in continuing],
             "not_reached": [_route_entry(k) for k in not_reached],
             "unmeasurable": [dict(_route_entry(k), why=_CANNOT_AGAIN.get(
                 k, "no probe that runs it was kept")) for k in unmeasurable],
+            "excluded": [dict(_route_entry(k), candidate=w)
+                         for k, w in _GATE_EXCLUDED[excluded_from:]],
             "rebuilds": rebuilds, "budget_ms": round(float(budget_s) * 1000),
-            "elapsed_ms": round((_t.perf_counter() - t0) * 1000, 1)}
+            "elapsed_ms": round((end - t0) * 1000, 1)}
 
 
 def _run_race_step(kind, keys, how):
@@ -4478,6 +4673,23 @@ def _measured_choice(samples, candidates, default=None):
 
 
 
+def _anchored_choice(times, live, incumbent, default):
+    """A race's verdict. Raced again (`remeasure`), the choice in use is the one to beat: it
+    stays unless a challenger is proven faster than it, and an inconclusive race changes
+    nothing. It had been falling back to the static default, replacing a proven choice
+    with no evidence and rebuilding every recording that used it. One the race dropped by
+    complete separation (each of its samples slower than each of the leader's) was beaten
+    outright, and the leader takes its place. Raced for the first time, an inconclusive race
+    keeps `default`, the candidate that costs the least memory."""
+    import statistics as _s
+    live = tuple(live)
+    if incumbent is not None:
+        anchor = (incumbent if incumbent in live
+                  else min(live, key=lambda c: _s.median(times[c])))
+        return _measured_choice(times, live, default=anchor)
+    return _measured_choice(times, live, default=default if default in live else live[0])
+
+
 def _race(valid, sample, rounds, early_from=None):
     """Interleaved rounds of `sample(c)` -> seconds over `valid`, the order alternating so no
     candidate always follows another. Returns {candidate: samples} for the candidates still
@@ -4494,13 +4706,17 @@ def _race(valid, sample, rounds, early_from=None):
     - From round `early_from` (if given), measuring stops once the fastest has a repeatable
       paired win over every candidate still in."""
     import statistics as _s
+    import time as _t
     live = list(valid)
     times = {c: [] for c in live}
+    took = 0.0
     for r in range(max(1, int(rounds))):
-        _remeasure_checkpoint()
+        _remeasure_checkpoint(took)
         order = live if not (r & 1) else list(reversed(live))
+        t0 = _t.perf_counter()
         for c in order:
             times[c].append(sample(c))
+        took = _t.perf_counter() - t0
         if r >= 2 and len(live) > 1:
             lead = min(live, key=lambda c: _s.median(times[c]))
             top = max(times[lead])
@@ -4600,10 +4816,14 @@ def _settle(valid, sample, per, busy=False):
     and nothing is run."""
     if busy:
         return per
+    import time as _t
     prev = sum(per.values())
+    took = 0.0
     for _ in range(_SETTLE_ROUNDS):
-        _remeasure_checkpoint()
+        _remeasure_checkpoint(took)
+        t0 = _t.perf_counter()
         cur = {c: sample(c) for c in valid}
+        took = _t.perf_counter() - t0
         total = sum(cur.values())
         if total >= prev:
             return cur
@@ -4654,9 +4874,12 @@ _RACE_SAMPLE_GPU_S = 0.0005
 _RACE_STEPS = 30
 
 
+_GATE_EXCLUDED = []    # (key, candidate): approximations left out because they failed their bound
+
+
 def _weight_execution(family, storage_format, K, N, M, run,
                       candidates=("stored", "materialized"), check=None, rounds=9,
-                      repeat=4, clock="gpu"):
+                      repeat=4, clock="gpu", approximate=()):
     """Choose a correct implementation from device-local paired measurements.
 
     The key contains only operator facts, never a model/repository name.  Nearby batch
@@ -4673,6 +4896,10 @@ def _weight_execution(family, storage_format, K, N, M, run,
     recording, or a GPU-bound one; "host", the browser's clock around the work and its
     readback, for a composite issued op by op from Python, whose candidates differ in how
     many operations the host issues as much as in what the GPU does.
+
+    `approximate`: candidates that compute in less than the stored width. Failing `check`,
+    one of those is left out of this race (`_GATE_EXCLUDED`): its bound is what admits
+    it. Any other candidate failing it is a bug, and raises.
     """
     m = int(M)
     bucket = 1 << (m - 1).bit_length()
@@ -4687,6 +4914,9 @@ def _weight_execution(family, storage_format, K, N, M, run,
         near = _nearest_tuned(key)
         if near is not None:
             return near
+    # Raced again: what has been running is the one to beat, this bucket's own verdict or
+    # the neighbour's it borrowed.
+    incumbent = (_TUNED[key] if key in _TUNED else _nearest_tuned(key)) if again else None
     _RACE_AGAIN.discard(key)
     import time as _t
     _tune_started = _t.perf_counter()
@@ -4714,6 +4944,9 @@ def _weight_execution(family, storage_format, K, N, M, run,
         for which in candidates:
             try:
                 if check is not None and not check(which):
+                    if which in approximate:
+                        _GATE_EXCLUDED.append((key, which))
+                        continue
                     raise RuntimeError("%s failed the correctness gate" % which)
                 _sync_small(run(which))          # build and warm once before timing
                 valid.append(which)
@@ -4757,8 +4990,9 @@ def _weight_execution(family, storage_format, K, N, M, run,
         # instead of dropping a local win; a candidate that has lost every round to it by
         # complete separation stops being measured (`_race`, above).
         live = tuple(w for w in valid if w in times)
-        chosen = _measured_choice(times, live, default=live[0])
-        _commit_route(key, chosen, clock.name, _t.perf_counter() - _tune_started)
+        chosen = _anchored_choice(times, live, incumbent, live[0])
+        _commit_route(key, chosen, clock.name, _t.perf_counter() - _tune_started,
+                      ran=incumbent)
     finally:
         # Aggregate even failed calibration; a failed candidate must never be cached as
         # the first (possibly wrong) route, but its work still belongs in load diagnostics.
@@ -4793,6 +5027,7 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
                                 clock=clock, sized=sized)
     if key in _TUNED and key not in _RACE_AGAIN:
         return _TUNED[key]
+    incumbent = _TUNED.get(key) if key in _RACE_AGAIN else None
     _RACE_AGAIN.discard(key)
     import time as _t
     _tune_started = _t.perf_counter()
@@ -4848,8 +5083,7 @@ def tune(key, candidates, apply, bench, check=None, rounds=5, default=None, warm
         except _ClockChanged:
             timer.started = False
     live = [v for v in ok if v in times]
-    chosen = _measured_choice(times, live,
-                              default=(default if default in live else live[0]))
+    chosen = _anchored_choice(times, live, incumbent, default)
     _commit_route(key, chosen, timer.name, _t.perf_counter() - _tune_started)
     return chosen
 
@@ -4985,8 +5219,10 @@ def _kernel_build():
     import hashlib
     import inspect
     h = hashlib.sha1()
+    # And the gates: a verdict is "fastest of the candidates this check admitted", so a
+    # profile made under a looser check asserts routes the current one would refuse.
     for fn in (_ggml_src, _ggml_name, _cfg_for, _ggml_parallel_src,
-               _ggml_src_gl, _ggml_name_gl):
+               _ggml_src_gl, _ggml_name_gl, ggml_matmul, _approx_holds):
         try:
             h.update(inspect.getsource(fn).encode())
         except Exception:
@@ -5050,22 +5286,18 @@ def kernel_profile():
         "dequant_ok": dict(_DEQ_OK),
         "calibrated": sorted("|".join(str(x) for x in k) for k in _CALIBRATED),
         "remeasured": {"seq": _REMEASURE_SEQ[0], "at": dict(_REMEASURED_AT)},
+        # The set of routes not in use (`switch_routes`), where it differs, and the ids.
+        "alternate": {"|".join(str(x) for x in k): v for k, v in _ROUTE_ALT.items()
+                      if v is not None and _TUNED.get(k) != v},
+        "route_ids": dict(_ROUTE_IDS),
     }
 
 
-def use_kernel_profile(profile):
-    """Take back what `kernel_profile` returned. Returns how many entries were accepted.
-
-    A profile from another build is ignored entirely rather than partially: a kernel changes
-    with the code that generates it, and half-trusting one is how a stale verdict outlives
-    the shader it was about.
-    """
-    if not isinstance(profile, dict):
-        return 0
-    if str(profile.get("build")) != _kernel_build():
-        return 0
+def _accept_tuned(entries, into):
+    """The `tuned` entries of a kernel profile that this build can trust, into `into`;
+    how many. Each kind of route key is read back with its own checks."""
     n = 0
-    for k, v in (profile.get("tuned") or {}).items():
+    for k, v in (entries or {}).items():
         parts = k.split("|")
         if (len(parts) == 3 and parts[0] == ("decode_plan_v3" if parts[1] == "webgpu"
                                                else "decode_plan_v1")
@@ -5080,7 +5312,7 @@ def use_kernel_profile(profile):
                 if (valid_ms and isinstance(plan, (list, tuple)) and len(plan) == 2
                         and plan[0] in ("auto", "separate", "fused")
                         and plan[1] in ("full", "device")):
-                    _TUNED[(parts[0], parts[1], parts[2])] = {
+                    into[(parts[0], parts[1], parts[2])] = {
                         "plan": list(plan), "median_ms": ms}
                     n += 1
                 continue
@@ -5101,18 +5333,28 @@ def use_kernel_profile(profile):
                           and all(route in ("auto", "balanced", "compact", "narrow")
                                   for route in plan[8])))):
                 if valid_ms:
-                    _TUNED[(parts[0], parts[1], parts[2])] = {
+                    into[(parts[0], parts[1], parts[2])] = {
                         "plan": [plan[0], list(plan[1]), *plan[2:]],
                         "median_ms": ms,
                     }
                     n += 1
             continue
         if len(parts) == 4 and parts[0] == "ggml_shape":
-            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]))] = v
+            into[(parts[0], parts[1], int(parts[2]), int(parts[3]))] = v
             n += 1
         elif (len(parts) == 3 and parts[0] == "add_rmsnorm"
               and v in ("fused", "composed")):
-            _TUNED[(parts[0], int(parts[1]), int(parts[2]))] = v
+            into[(parts[0], int(parts[1]), int(parts[2]))] = v
+            n += 1
+        # Where a decode composition's local search stopped (`CausalLM._tune_decode_
+        # composition`): the next one starts there, in this session or the next.
+        elif (len(parts) == 3 and parts[0] == "decode_search_v1" and parts[1] == "webgpu"
+              and len(parts[2]) == 24 and all(c in "0123456789abcdef" for c in parts[2])
+              and isinstance(v, dict) and type(v.get("next_axis")) is int
+              and type(v.get("next_value", 0)) is int
+              and 0 <= v["next_axis"] < 256 and 0 <= v.get("next_value", 0) < 256):
+            into[(parts[0], parts[1], parts[2])] = {
+                "next_axis": int(v["next_axis"]), "next_value": int(v.get("next_value", 0))}
             n += 1
         # v2: chunks timed pipelined (`CausalLM._greedy_chunks`); a v1 verdict timed them one
         # synchronised chunk at a time and does not describe how they run now.
@@ -5120,28 +5362,28 @@ def use_kernel_profile(profile):
               and len(parts[2]) == 24 and all(c in "0123456789abcdef" for c in parts[2])
               and isinstance(v, dict) and v.get("count") in (0, 1, 2, 4)
               and isinstance(v.get("row", ""), str)):
-            _TUNED[(parts[0], parts[1], parts[2])] = {
+            into[(parts[0], parts[1], parts[2])] = {
                 "count": int(v["count"]), "row": str(v.get("row") or "host"),
                 "median_ms": v.get("median_ms")}
             n += 1
         elif (len(parts) == 3 and parts[0] == "vocab_sample_full"
               and parts[2] == "webgpu" and v in ("js", "gpu")
               and parts[1].isdigit() and 0 < int(parts[1]) <= 1 << 24):
-            _TUNED[(parts[0], int(parts[1]), parts[2])] = v
+            into[(parts[0], int(parts[1]), parts[2])] = v
             n += 1
         elif (len(parts) == 6 and parts[:2] == ["weight_exec", "repeat_rows"]
               and parts[2] in ("webgpu", "webgl") and v in ("host", "device")):
-            _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
+            into[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
             n += 1
         elif (len(parts) == 6 and parts[0] == "weight_exec" and v in _route_names()):
-            _TUNED[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
+            into[(parts[0], parts[1], parts[2], int(parts[3]), int(parts[4]),
                     int(parts[5]))] = v
             n += 1
         elif (len(parts) == 8 and parts[0] in ("moe_prefill_route", "moe_prefill_route_js_v2", "moe_prefill_route_js_v3")
               and parts[1] in ("webgpu", "webgl")
               and parts[7] in ("cold", "warm") and v in ("host", "device")):
-            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+            into[(parts[0], parts[1], int(parts[2]), int(parts[3]),
                     int(parts[4]), parts[5], parts[6], parts[7])] = v
             n += 1
         elif (len(parts) == 5 and parts[0] in ("moe_prefill_api_v1", "moe_prefill_api_v2", "moe_prefill_api_v3")
@@ -5153,27 +5395,27 @@ def use_kernel_profile(profile):
             except ValueError:
                 continue
             if bucket > 1 and bucket <= 1 << 20 and bucket & (bucket - 1) == 0:
-                _TUNED[(parts[0], parts[1], parts[2], bucket, parts[4])] = v
+                into[(parts[0], parts[1], parts[2], bucket, parts[4])] = v
                 n += 1
         elif (len(parts) == 5 and parts[0] == "moe_reduce"
               and parts[1] in ("webgpu", "webgl")
               and v in ("composed", "fused")):
-            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+            into[(parts[0], parts[1], int(parts[2]), int(parts[3]),
                     int(parts[4]))] = v
             n += 1
         elif (len(parts) == 5 and parts[0] == "qk_norm_rope"
               and v in ("composed", "fused")):
-            _TUNED[(parts[0], *(int(x) for x in parts[1:]))] = v
+            into[(parts[0], *(int(x) for x in parts[1:]))] = v
             n += 1
         elif (len(parts) == 5 and parts[0] == "kv_write_pair"
               and parts[4] in ("True", "False")
               and v in ("separate", "fused")):
-            _TUNED[(parts[0], int(parts[1]), int(parts[2]), int(parts[3]),
+            into[(parts[0], int(parts[1]), int(parts[2]), int(parts[3]),
                     parts[4] == "True")] = v
             n += 1
         elif (len(parts) == 5 and parts[0] == "embedding_row"
               and v in ("transposed", "compact")):
-            _TUNED[(parts[0], parts[1], int(parts[2]), int(parts[3]),
+            into[(parts[0], parts[1], int(parts[2]), int(parts[3]),
                     int(parts[4]))] = v
             n += 1
         elif (len(parts) == 4 and parts[0] == "flash_tile"
@@ -5183,8 +5425,33 @@ def use_kernel_profile(profile):
             # Whether it fits THIS device is asked where it is used (`flash_tune`): a
             # profile can be read before the device has said what it allows.
             if tile in ((16, 8), (8, 16), (16, 16), (24, 8), (8, 32)):
-                _TUNED[(parts[0], int(parts[1]), int(parts[2]), hd)] = tile
+                into[(parts[0], int(parts[1]), int(parts[2]), hd)] = tile
                 n += 1
+    return n
+
+
+def use_kernel_profile(profile):
+    """Take back what `kernel_profile` returned. Returns how many entries were accepted.
+
+    A profile from another build is ignored entirely rather than partially: a kernel changes
+    with the code that generates it, and half-trusting one is how a stale verdict outlives
+    the shader it was about.
+    """
+    if not isinstance(profile, dict):
+        return 0
+    if str(profile.get("build")) != _kernel_build():
+        return 0
+    n = _accept_tuned(profile.get("tuned"), _TUNED)
+    # The set of routes not in use, kept beside the one in use (`switch_routes`).
+    alternate = {}
+    _accept_tuned(profile.get("alternate"), alternate)
+    _ROUTE_ALT.clear()
+    _ROUTE_ALT.update({k: v for k, v in alternate.items() if k in _TUNED and _TUNED[k] != v})
+    ids = profile.get("route_ids")
+    if (isinstance(ids, dict) and type(ids.get("in_use")) is int
+            and (ids.get("unused") is None or type(ids.get("unused")) is int)):
+        _ROUTE_IDS["in_use"] = ids["in_use"]
+        _ROUTE_IDS["unused"] = ids["unused"] if _ROUTE_ALT else None
     for k, v in (profile.get("checked") or {}).items():
         parts = k.split("|")
         if len(parts) == 4:
@@ -11786,6 +12053,56 @@ def _ggml_tiled_half_src(type_name):
     return src
 
 
+# Candidates of `ggml_matmul` that compute in less than the stored width: each is admitted
+# for a weight only under its bound, and leaving it out when it fails is the gate working.
+_APPROXIMATE = ("tiled_half", "dp4a")
+_APPROX_HOLDS = {}     # (candidate, format, K, N) -> its worst error on the inputs below
+
+
+def _approx_holds(which, type_name, K, N, packed, limit):
+    """Whether approximate candidate `which` keeps its bound on this weight for inputs with
+    outliers, as a model's activations have. Checked once per weight.
+
+    The race's own check runs on whatever input reaches it first: a ladder's random rows at
+    load, a prompt's activations later. The half kernel sums each 32-deep stage in half, and
+    its error depends on the input: on a 27B's 6144x5120 Q4_K weight, 0.3% to 1.6% of the
+    output scale from one input to the next against a bound of 1%. The load's draw passed; a
+    remeasure's failed. So the check that admits an approximation is made on fixed inputs
+    that are hard for it (a few large values among small ones, and a few very large ones
+    among ordinary ones), and the route is left out of every race for this weight if it
+    does not hold there."""
+    key = (which, type_name, int(K), int(N))
+    if key not in _APPROX_HOLDS:
+        rng = np.random.default_rng(1729)
+        rows = 1 if which == "dp4a" else 32
+        worst = 0.0
+        for kind in ("outliers", "massive"):
+            x = rng.standard_normal((rows, int(K))).astype(np.float32)
+            if kind == "outliers":
+                x *= 0.05
+                x[:, rng.integers(0, int(K), 8)] = 20.0
+            else:
+                x[:, rng.integers(0, int(K), 4)] = 300.0
+            xf = Tensor(x).data
+            ref = np.asarray(ggml_matmul(xf, packed, type_name, K, N, execution="stored").get(),
+                             np.float32)
+            got = np.asarray(ggml_matmul(xf, packed, type_name, K, N, execution=which).get(),
+                             np.float32)
+            err = (float(np.abs(got - ref).max()) / max(1e-6, float(np.abs(ref).max()))
+                   if np.all(np.isfinite(got)) else float("inf"))
+            worst = max(worst, err)
+        _APPROX_HOLDS[key] = worst
+        if worst >= limit:
+            try:
+                import js
+                js.console.log("route: %s left out for %s %dx%d: %.2f%% of the output "
+                               "scale on inputs with outliers, bound %.0f%%"
+                               % (which, type_name, int(K), int(N), worst * 100, limit * 100))
+            except Exception:
+                pass
+    return _APPROX_HOLDS[key] < limit
+
+
 # Formats with a tiled kernel. Adding one is adding its decode, not a branch elsewhere.
 # Q8_0 keeps its own f32 kernel (`_GGML_TILED_Q8_0_WGSL`: its 34-byte blocks read without
 # the generic unaligned helper); its template entry is what gives it the half-arithmetic
@@ -11983,10 +12300,16 @@ def ggml_matmul(xf, packed, type_name, K, N, eidx=None, eslot=0, estride=0,
                 # Half arithmetic: ~1e-3 of the output scale measured, bounded at 1e-2.
                 limit = (0.03 if which == "dp4a" else 1e-2 if which == "tiled_half"
                          else 1e-3)
-                return float(np.abs(got - reference[0]).max()) / scale < limit
+                if float(np.abs(got - reference[0]).max()) / scale >= limit:
+                    return False
+                # An approximation has to hold its bound for this WEIGHT, not for the one
+                # input that happened to come first: `_approx_holds`.
+                return which not in _APPROXIMATE or _approx_holds(
+                    which, type_name, K, N, packed, limit)
 
             execution = _weight_execution(
-                "ggml", type_name, K, N, m, run, candidates=candidates, check=correct)
+                "ggml", type_name, K, N, m, run, candidates=candidates, check=correct,
+                approximate=_APPROXIMATE)
         else:
             execution = "stored"
     if execution in ("tiled", "tiled_half"):

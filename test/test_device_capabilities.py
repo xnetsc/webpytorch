@@ -12,7 +12,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from webtorch import _core as wt
 
@@ -100,6 +102,41 @@ def test_a_race_leaves_out_what_the_device_cannot_run_and_still_fails_on_a_bug(m
     monkeypatch.setattr(wt, "_TUNED", {})
     with pytest.raises(RuntimeError, match="execution candidate 'fancy' failed"):
         wt._weight_execution("unit", "f32", 8, 16, 4, broken, candidates=("plain", "fancy"))
+
+
+def test_an_approximation_that_misses_its_bound_is_left_out_and_an_exact_one_raises(
+        monkeypatch):
+    monkeypatch.setattr(wt, "_TUNED", {})
+    monkeypatch.setattr(wt, "_GATE_EXCLUDED", [])
+    monkeypatch.setattr(wt, "_sync_small", lambda a: None)
+    run = lambda which: which
+    # The half route's bound is what admits it: missing it, it is not in the race.
+    assert wt._weight_execution("unit", "f32", 8, 8, 4, run, candidates=("plain", "half"),
+                                check=lambda w: w != "half", approximate=("half",)) == "plain"
+    assert wt._GATE_EXCLUDED == [(("weight_exec", "unit", "f32", 8, 8, 4), "half")]
+    # A route that computes the same values and does not match them is a bug.
+    with pytest.raises(RuntimeError, match="execution candidate 'tiled' failed"):
+        wt._weight_execution("unit", "f32", 8, 16, 4, run, candidates=("plain", "tiled"),
+                             check=lambda w: w != "tiled", approximate=("half",))
+
+
+def test_an_approximation_is_admitted_per_weight_on_inputs_with_outliers(monkeypatch):
+    calls = []
+
+    def matmul(xf, packed, type_name, K, N, execution="stored", **kw):
+        calls.append(execution)
+        out = np.ones((xf.shape[0], N), np.float32)
+        if execution == "tiled_half":
+            out[0, 0] = 1.02                     # 2% of the output scale: past a 1% bound
+        return SimpleNamespace(get=lambda: out)
+    monkeypatch.setattr(wt, "ggml_matmul", matmul)
+    monkeypatch.setattr(wt, "Tensor", lambda x: SimpleNamespace(data=x))
+    monkeypatch.setattr(wt, "_APPROX_HOLDS", {})
+    assert not wt._approx_holds("tiled_half", "Q4_K", 64, 8, object(), 1e-2)
+    assert wt._APPROX_HOLDS[("tiled_half", "Q4_K", 64, 8)] == pytest.approx(0.02, rel=1e-3)
+    n = len(calls)
+    assert not wt._approx_holds("tiled_half", "Q4_K", 64, 8, object(), 1e-2)
+    assert len(calls) == n                      # once per weight
 
 
 def test_choices_made_without_a_race_ask_the_device_first(monkeypatch):

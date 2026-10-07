@@ -150,6 +150,16 @@ about any of this.
   32-deep stage is summed in half and added into f32. A phase-two cross-width route
   (`_PHASE2_CROSS_WIDTH`), raced with a 1e-2 output gate: ~1e-3 of the output scale,
   1.4–1.6× the f32 kernel at 0.6B prefill shapes; a 161-token first token 112 → 94 ms.
+  The half sum's error depends on the input. On a 27B's 6144×5120 Q4_K weight it was 0.3%
+  to 1.6% of the output scale from one input to the next, so a gate run on whichever input
+  came first admitted it at load and refused it at a remeasure. An approximation
+  (`_APPROXIMATE`: `tiled_half`, `dp4a`) is now admitted per weight only if it also holds
+  its bound on two fixed inputs that are hard for it: a few large values among small ones,
+  and a few very large ones among ordinary ones (`_approx_holds`, once per weight). One
+  that misses its bound is left out of the race (`_GATE_EXCLUDED`) rather than failing it;
+  an exact candidate that misses still raises. Summing in f32 instead keeps the error at
+  0.02–0.16% but gives back most of the speed (0–30% over the f32 kernel against 30–120%),
+  so the half sum stays where it holds. The profile's build stamp covers these gates.
 - The quantised kernel it falls back to was bound by decoding the same weight again for
   every output row. One thread owned four rows, so a decoded value fed four multiplies; it
   now owns twelve (`_GGML_MROW`), and the per-row guard that put eleven branches in the
@@ -493,6 +503,31 @@ that runs out never strands the same ones, and the operator races it did not rea
 between calls. Laya: 38 routes in 1.2 s, answers unchanged. 0.6B: 30 in 4.2 s, decode 177 tok/s
 before and after.
 
+Raced again, the choice in use is the one to beat (`_anchored_choice`): a challenger replaces
+it only on paired evidence, and an inconclusive race changes nothing. The budget is a limit:
+a race starts only when the duration of the race that last decided it (`_RACE_SECONDS`) fits
+in what is left after a reserve for stopping (`_REMEASURE_RESERVE_S`), and a checkpoint inside
+a race asks for room for its next round. A 27B's remeasure: 59.1 s of 60, twice.
+
+**Two sets of routes.** A remeasure that changes routes puts what it made in use and keeps
+the set that was in use as the set not in use (`_ROUTE_ALT`: its value for each route that
+differs; `_ROUTE_IDS`); `switch_routes` swaps them and the next changing remeasure pushes out
+the set not in use. A swap writes the other values into `_TUNED`, puts a model's own composite
+choices back in force through what it registered (`register_route_apply`: the decode plan as
+a load applies a kept one, the greedy chunk from its kept verdict; nothing is raced), and
+rebuilds the recordings that used a route that changed. Each set's speed in use is the last
+three replies (decode seconds per token, per decode path) or decision requests (by input size)
+it served (`note_speed`); when each of the last three in use is slower than each of the other
+set's last three, `on_routes_slower` callbacks are told and nothing is switched.
+
+The samples wait out the remeasure's heat. On the M5 the same stored GEMV of a 27B's largest
+weight took 1.06 ms of GPU time cool and 1.72 ms after a minute of ordinary replies (no
+remeasure) or 1.48-1.80 ms right after a remeasure; decode went 8.0 → 4.0 tok/s, and was back
+after a minute idle. Paging was not it: 12 MB read back from swap and 93 MB decompressed over
+those replies. So a sample counts only once as long as the remeasure ran has passed since it
+ended, and comparing a set's speed before and after a remeasure without alternating them is
+not evidence either way: two such comparisons on the 27B came out +7% and -12%.
+
 Every operator choice is made by one race (`tune` or `_weight_execution`): the decode thread
 shapes, flash tiles, MoE weighted sum, KV pair write, add+RMSNorm, the parallel projections
 and SwiGLU, Q/K norm+rope and the embedding row layout each had a loop of their own (host
@@ -500,10 +535,21 @@ clock, a collect free to land in a sample, no settling, and no way to race them 
 are raced on inputs of their own shape made for the race and dropped after it, by the GPU's
 clock and sized to it (`tune(sized=True)`); a 27B's shape tuning went from 9.9 to 4.0 s of
 its load. What remains its own loop is a composite timed end to end: the greedy chunk (host
-clock, registered for `remeasure`) and the decode composition, which interactively is not
-searched at all — one full-model record can outlast any interactive budget — and is
-reported as such: racing it "again" applied the reference plan over a greedy session's pick
-mode and turned the chunked greedy path off (0.6B 175 → 152 tok/s).
+clock, registered for `remeasure`) and the decode composition. A load does not search the
+decode composition: one full-model record can outlast any load budget, so a load applies the
+exact original-width plan, or the plan a search kept in the profile. `remeasure` searches it
+locally from the plan in force: one axis and one value at a time, each challenger checked
+against the original-width oracle and raced against the plan in force on its own recording,
+replayed alternately; adopted only when proven faster, and at once. The full product of the
+axes (147 plans in one tournament) runs only offline. The plan in force is held before the
+search (`_decode_selection`) and put back exactly on a stop before anything was proven, or
+when nothing was. Each indivisible piece (trace, record, timed sample) starts only when the
+budget has room for the longest that piece has taken on this model. Where a search stopped
+is kept with the profile (`decode_search_v1`) and the next starts there: a 27B fits three
+challengers in a remeasure, and walks the axes over successive ones. 30B: 18 tried, 1 adopted,
+34 s, decode 41.3 → 42.1 tok/s. An earlier version raced it "again" through the load's path,
+which applied the reference plan over a greedy session's pick mode and turned the chunked
+greedy path off (0.6B 175 → 152 tok/s).
 
 All of this is per device. `gpu_features()` reports what the device was created with —
 `shader-f16` and `subgroups` are requested whenever the adapter has them, whatever its vendor

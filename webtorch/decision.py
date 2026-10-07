@@ -1063,7 +1063,7 @@ class DecisionModel(wt.Module):
         a caller that wants to act on "0.51 versus 0.49" has to be able to see it.
         """
         out = {}
-        stage_start = time.perf_counter()
+        stage_start = request_start = time.perf_counter()
         built, total = self._prepare_questions(state, questions)
         prepare_ms = (time.perf_counter() - stage_start) * 1000
         execution = {"_profile": True} if profile else {}
@@ -1100,6 +1100,11 @@ class DecisionModel(wt.Module):
         if profile:
             usage.update({"prepare_ms": round(prepare_ms, 3),
                           "answer_ms": round(max(0.0, answer_ms), 3)})
+        else:
+            # What a request cost in use, for the set of routes in force: requests of a
+            # size compared with requests of the same size (input tokens to a power of two).
+            wt.note_speed("decide:%d" % (1 << (max(1, int(total)) - 1).bit_length()),
+                          time.perf_counter() - request_start)
         return {"answers": out, "usage": usage}
 
     @staticmethod

@@ -3296,16 +3296,34 @@ class CausalLM:
             self.decode_plan["active_sampler_route"] = sampler_route
             self.decode_plan["mode_profile_missing"] = True
 
-    def _tune_decode_composition(self, *, interactive=None):
+    def _tune_decode_composition(self, *, interactive=None, local=False, pick=None):
         """Choose the fastest correct complete decode composition for this model instance.
 
         Lower APIs retain their own ``auto`` routes.  This layer is allowed to override
         them because candidates that win alone can lose when adjacent commands share GPU
         occupancy or enter a captured graph.  Timing therefore replays the entire captured
         trunk+head and the winning plan is exposed as ``decode_plan``.
+
+        ``local``: start from the plan in use and race only the plans one change away from
+        it (`local_search` below), until the time limit (`_warm_deadline`): what a
+        remeasure can afford, where the full search is a product of every axis.
+
+        ``pick``: (pick mode, sampler route) of the plan being put back in force
+        (`_apply_decode_verdict`), rather than what the last call's sampling implies.
         """
         pick_mode = CausalLM._decode_pick_mode(self)
         sampler_route = CausalLM._decode_sampler_route(self, pick_mode)
+        if pick is not None and pick[0] in ("device", "full"):
+            pick_mode = pick[0]
+            sampler_route = pick[1] or CausalLM._decode_sampler_route(self, pick_mode)
+        was_plan = getattr(self, "decode_plan", None)
+        if (local and isinstance(was_plan, dict)
+                and was_plan.get("pick_mode") in ("device", "full")):
+            # The plan in use was made for the model's default call; the last call's
+            # sampling settings are not that, and a pick mode taken from them had switched
+            # the chunked greedy path off.
+            pick_mode = was_plan["pick_mode"]
+            sampler_route = was_plan.get("sampler_route", sampler_route)
         _missing = object()
         _pick_fields = ("_sampling", "_seen", "_gen_start", "_con_text", "_con_dec",
                         "_js_sampler_initialized", "_con_end", "_con_after",
@@ -3326,14 +3344,19 @@ class CausalLM:
             CausalLM._set_sampling(self, seed=1729, prompt_ids=[], **options)
 
         incumbent = getattr(self, "decode_plan", None)
+        # A local search changes nothing it has not proven: the plan in force as it stands,
+        # put back exactly on a stop before anything is won and when nothing is.
+        held = CausalLM._decode_selection(self) if local else None
         self.capture_ready = False
         self._decode_graph_signature = None
         self._decode_graph_logits = None
         self._decode_graph_token = None
         if interactive is None:
             interactive = hasattr(self, "_warm_deadline")
+        if local:
+            interactive = False
         deadline = (getattr(self, "_warm_deadline", float("inf"))
-                    if interactive else float("inf"))
+                    if interactive or local else float("inf"))
         self._add_rms_execution = "auto"
         self._greedy_execution = "device"
         self.decode_plan = {"add_rmsnorm": "auto", "q4_decode": "auto",
@@ -3547,7 +3570,30 @@ class CausalLM:
             # explicit offline tuning remains available with interactive=False.
             if interactive:
                 raise _WarmLimit()
-            reference_trace = semantic_trace(reference_plan, original_width=True)
+            # A local search runs inside a remeasure's budget, and the budget is a limit:
+            # each indivisible piece (a trace, a record, a timed sample) is started only
+            # when what is left has room for it, judged by the longest the same piece has
+            # taken on this model (kept with it), or before that from one eager step at load.
+            cost = self.__dict__.setdefault("_decode_search_cost", {})
+            eager = sum(float((getattr(self, "_warm_step_profile", None) or {}).get(k, 0.0))
+                        for k in ("second_dispatch_s", "second_sync_s")) or 0.5
+            guess = {"trace": 6 * eager, "record": 2 * eager, "sample": 4 * eager}
+
+            def room(piece):
+                need = cost.get(piece, guess[piece])
+                wt._remeasure_checkpoint(need)
+                if time.perf_counter() + need >= deadline:
+                    raise _WarmLimit()
+
+            def timed(piece, fn, *args, **kw):
+                room(piece)
+                t0 = time.perf_counter()
+                try:
+                    return fn(*args, **kw)
+                finally:
+                    cost[piece] = max(cost.get(piece, 0.0), time.perf_counter() - t0)
+            reference_trace = (timed("trace", semantic_trace, reference_plan, original_width=True)
+                               if local else semantic_trace(reference_plan, original_width=True))
             if any(not np.all(np.isfinite(logits)) for logits, _ in reference_trace):
                 raise RuntimeError("exact stored decode produced non-finite logits")
             _load_stage("warm-search")
@@ -3570,8 +3616,9 @@ class CausalLM:
                     check_budget()
                     approximate = any(route in ("auto", "dp4a") for route in plan[1])
                     limit = 0.03 if approximate else 2e-5
+                    trace = timed("trace", semantic_trace, plan) if local else semantic_trace(plan)
                     for (reference, reference_pick), (got, picked) in zip(
-                            reference_trace, semantic_trace(plan)):
+                            reference_trace, trace):
                         if not np.all(np.isfinite(got)):
                             semantic_cache[plan] = False
                             return False
@@ -3629,14 +3676,7 @@ class CausalLM:
                 last_good = chosen
                 return chosen, samples
 
-            # First settle the lower auto routes plus residual/pick/Q4 interaction.  Then
-            # measure the layer-level parallel projection overrides at that whole-decode
-            # point, and finally re-run every first-stage candidate under the winning
-            # projection pair.  This is the upward pass the API needs: local winners remain
-            # callable, while a peer combination can replace them only at this layer.
-            _load_stage("tuning", done=0, total=8)
-            initial, _ = tournament(plans)
-            _load_stage("tuning", done=1, total=8)
+            # The addressable values of every axis past the first three, for both searches.
             # The fused projection layer has its own locally measured workgroup shape, but
             # the complete decoder may prefer another one once QKV, MLP and head commands
             # share a graph.  Keep those physical routes addressable so this upper layer can
@@ -3668,6 +3708,219 @@ class CausalLM:
                         else ("composed",))
             kv_modes = (("auto", "separate", "fused")
                         if attention_layers else ("separate",))
+            head_modes = (("auto", None, "balanced", "compact", "narrow", "shortk")
+                          if self.head and all(isinstance(x, wt.GGMLLinear)
+                                               for x in self.head) else ("auto",))
+            o_modes = (("auto", "balanced", "compact", "narrow")
+                       if any(isinstance(lay.get("o"), wt.GGMLLinear)
+                              for lay in self.layers) else ("auto",))
+            down_modes = (("auto", "balanced", "compact", "narrow")
+                          if any(isinstance(lay.get("down"), wt.GGMLLinear)
+                                 for lay in self.layers) else ("auto",))
+
+            def commit(plan, ms=None, **extra):
+                """Put `plan` in force and keep it as this model's verdict."""
+                select(plan)
+                self.decode_plan = {"add_rmsnorm": plan[0],
+                                    "q4_decode": {"%dx%d" % shape: plan[1][i]
+                                                  for i, shape in enumerate(qshapes)},
+                                    "qkv": plan[3], "gate_up": plan[4],
+                                    "qk_norm_rope": plan[5], "kv_write": plan[6],
+                                    "head_shape": plan[7],
+                                    "projection_shapes": dict(zip(("o", "down"), plan[8])),
+                                    "greedy_pick": plan[2], "pick_mode": pick_mode,
+                                    "sampler_route": sampler_route, "median_ms": ms}
+                self.decode_plan.update(extra)
+                if profile_key is not None:
+                    wt._TUNED[profile_key] = {"plan": [plan[0], list(plan[1]), *plan[2:]],
+                                              "median_ms": ms}
+                return self.decode_plan
+
+            def local_search():
+                """The plan in force, against the plans one change away from it: an axis
+                at a time, a value at a time. A challenger must reproduce the original-width
+                oracle (`correct`), then beat the plan in force on its own recording,
+                replayed alternately in five paired rounds (`wt._paired_faster`; three lost
+                outright end it); only then is it adopted, put in force and kept at once.
+
+                A stop, or the remeasure's budget, ends the search between two pieces of
+                work (`room`): the comparison in progress is dropped, every adoption already
+                made stays, and the next search starts at the challenger that was dropped.
+                The position is kept with the device profile, so a budget that always runs
+                out part way still reaches every axis over successive remeasures. Stopped
+                before one comparison finished, it changes nothing and the stop goes on up.
+
+                The full search below races a product of every axis (147 plans in one of
+                its tournaments) and runs only offline; this is what a remeasure can
+                afford."""
+                nonlocal last_good, held
+                from . import webio
+                current = tuple(prior_plan if prior_plan is not None else reference_plan)
+                if len(current) == 8:
+                    current += (("auto", "auto"),)
+                last_good = current
+                q4_values = ("auto", "stored") + (
+                    ("dp4a",) if wt._wgsl_feature("packed_4x8_integer_dot_product") else ())
+                axes = ([("add_rmsnorm", 0, ("composed", "fused"))]
+                        + [("q4:%dx%d" % shape, ("q", i), q4_values)
+                           for i, shape in enumerate(qshapes)]
+                        + [("greedy_pick", 2, pick_routes), ("qkv", 3, qkv_modes),
+                           ("gate_up", 4, gate_modes), ("qk_norm_rope", 5, qk_modes),
+                           ("kv_write", 6, kv_modes), ("head_shape", 7, head_modes),
+                           ("o_shape", ("p", 0), o_modes), ("down_shape", ("p", 1), down_modes)])
+
+                def value_of(plan, where):
+                    if isinstance(where, tuple):
+                        return plan[1][where[1]] if where[0] == "q" else plan[8][where[1]]
+                    return plan[where]
+
+                def changed(plan, where, value):
+                    p = list(plan)
+                    if isinstance(where, tuple) and where[0] == "q":
+                        q = list(p[1]); q[where[1]] = value; p[1] = tuple(q)
+                    elif isinstance(where, tuple):
+                        sh = list(p[8]); sh[where[1]] = value; p[8] = tuple(sh)
+                    else:
+                        p[where] = value
+                    return tuple(p)
+                steps = 4
+                recorded = {}
+
+                def record(name, plan):
+                    """`plan` recorded as `name`; None: the plan in force, exactly as held."""
+                    reset_probe_sampling()
+                    if plan is None:
+                        CausalLM._restore_decode_selection(self, held)
+                    else:
+                        select(plan)
+                    self._reset_linear_state(); self._set_inputs(0, 0)
+                    plat.beginCapture(name)
+                    try:
+                        logits = self._decode_fwd()
+                        token = (wt.vocab_argmax(logits.data)
+                                 if (plan or current)[2] == "device" and pick_mode == "device"
+                                 else None)
+                        (token.get() if token is not None else logits.numpy())
+                    finally:
+                        plat.endCapture()
+                    recorded[name] = (logits, token)
+
+                def sample(name):
+                    """Seconds a step of recording `name` takes, picking as the API does."""
+                    room("sample")
+                    t_piece = time.perf_counter()
+                    logits, token = recorded[name]
+                    reset_probe_sampling()
+
+                    def pick():
+                        return (self._accept_token(self._token_from_device(token))
+                                if token is not None else CausalLM._pick_tensor(self, logits))
+                    nxt = pick()
+                    with wt._quiet_timing():
+                        t0 = time.perf_counter()
+                        for pos in range(1, steps + 1):
+                            self._set_inputs(nxt, pos)
+                            plat.replay(name)
+                            nxt = pick()
+                        took = (time.perf_counter() - t0) / steps
+                    cost["sample"] = max(cost.get("sample", 0.0), time.perf_counter() - t_piece)
+                    return took
+
+                def faster(challenger):
+                    timed("record", record, "decode_local_b", challenger)
+                    pair = ("decode_local_a", "decode_local_b")
+                    wt._settle(pair, sample, {n: sample(n) for n in pair})
+                    times = {n: [] for n in pair}
+                    for r in range(5):
+                        for n in (pair if not (r & 1) else pair[::-1]):
+                            times[n].append(sample(n))
+                        if r >= 2 and min(times[pair[1]]) > max(times[pair[0]]):
+                            return False, times
+                    return wt._paired_faster(times, pair[1], pair[0]), times
+
+                # Where the last search stopped is where this one starts: the challenger it
+                # dropped, at its axis and value.
+                cursor_key = (("decode_search_v1",) + tuple(profile_key[1:])
+                              if profile_key is not None else None)
+                memo = wt._TUNED.get(cursor_key) if cursor_key is not None else None
+                begin, begin_value = 0, 0
+                if isinstance(memo, dict):
+                    begin = int(memo.get("next_axis", 0)) % len(axes)
+                    begin_value = int(memo.get("next_value", 0))
+                if isinstance(getattr(self, "_decode_axis_from", None), int):
+                    begin, begin_value = self._decode_axis_from % len(axes), 0
+                at = (begin, begin_value)
+                ms = None
+                tried = adopted = compared = covered = 0
+                stop = None
+                try:
+                    timed("record", record, "decode_local_a", None)
+                    for n in range(len(axes)):
+                        ai = (begin + n) % len(axes)
+                        _label, where, values = axes[ai]
+                        for vi in range(begin_value if n == 0 else 0, len(values)):
+                            at = (ai, vi)
+                            value = values[vi]
+                            if value == value_of(current, where):
+                                continue
+                            challenger = changed(current, where, value)
+                            if not correct(challenger):
+                                continue
+                            tried += 1
+                            won, times = faster(challenger)
+                            compared += 1
+                            if won:
+                                current = challenger
+                                adopted += 1
+                                ms = round(_stats.median(times["decode_local_b"]) * 1000, 4)
+                                commit(current, ms, local_search=True)
+                                # What a later stop or failure puts back is this, now.
+                                held = CausalLM._decode_selection(self)
+                                last_good = current
+                                timed("record", record, "decode_local_a", current)
+                            elif ms is None:
+                                ms = round(_stats.median(times["decode_local_a"]) * 1000, 4)
+                        covered += 1
+                    at = (begin, 0)
+                except (_WarmLimit, webio.Cancelled) as exc:
+                    stop = exc
+                finally:
+                    for name in ("decode_local_a", "decode_local_b"):
+                        plat.beginCapture(name); plat.endCapture()
+                if stop is not None and not compared:
+                    raise stop
+                if cursor_key is not None:
+                    wt._TUNED[cursor_key] = {"next_axis": at[0], "next_value": at[1]}
+                if adopted:
+                    plan_in_force = commit(current, ms, local_search=True,
+                                           tested_candidates=tried, adopted_changes=adopted,
+                                           axes_covered="%d/%d" % (covered, len(axes)))
+                else:
+                    CausalLM._restore_decode_selection(self, held)
+                    plan_in_force = self.decode_plan
+                detail = {"tried": tried, "adopted": adopted,
+                          "axes_covered": "%d/%d" % (covered, len(axes)),
+                          "started_at_axis": begin, "started_at_value": begin_value,
+                          "next_axis": at[0], "next_value": at[1]}
+                if stop is not None:
+                    out = isinstance(stop, _WarmLimit) or (
+                        wt._OutOfTime is not None and isinstance(stop, wt._OutOfTime))
+                    detail["stopped"] = "out_of_time" if out else "stopped"
+                    detail["discarded"] = "%s=%s" % (axes[at[0]][0], axes[at[0]][2][at[1]])
+                self._decode_search_detail = detail
+                return plan_in_force
+
+            if local:
+                return local_search()
+
+            # First settle the lower auto routes plus residual/pick/Q4 interaction.  Then
+            # measure the layer-level parallel projection overrides at that whole-decode
+            # point, and finally re-run every first-stage candidate under the winning
+            # projection pair.  This is the upward pass the API needs: local winners remain
+            # callable, while a peer combination can replace them only at this layer.
+            _load_stage("tuning", done=0, total=8)
+            initial, _ = tournament(plans)
+            _load_stage("tuning", done=1, total=8)
             group_plans = [initial + (q, g, r, "auto")
                            for q in qkv_modes for g in gate_modes for r in qk_modes]
             grouped, _ = tournament(group_plans)
@@ -3685,9 +3938,6 @@ class CausalLM:
             composed, _ = tournament([
                 regrouped[:6] + (route,) for route in kv_modes])
             _load_stage("tuning", done=4, total=8)
-            head_modes = (("auto", None, "balanced", "compact", "narrow", "shortk")
-                          if self.head and all(isinstance(x, wt.GGMLLinear)
-                                               for x in self.head) else ("auto",))
             headed, _ = tournament([composed + (route,) for route in head_modes])
             _load_stage("tuning", done=5, total=8)
             # The vocabulary projection is adjacent to every candidate above in the
@@ -3729,12 +3979,6 @@ class CausalLM:
             # Compare the complete decode API with both groups independently and together,
             # then revisit the adjacent residual/QKV composition under the winning pair.
             # No model identity or fixed percentage threshold enters this choice.
-            o_modes = (("auto", "balanced", "compact", "narrow")
-                       if any(isinstance(lay.get("o"), wt.GGMLLinear)
-                              for lay in self.layers) else ("auto",))
-            down_modes = (("auto", "balanced", "compact", "narrow")
-                          if any(isinstance(lay.get("down"), wt.GGMLLinear)
-                                 for lay in self.layers) else ("auto",))
             shape_pairs = list(_it.product(o_modes, down_modes))
             base = chosen[:8]
             shaped, _ = tournament([base + (pair,) for pair in shape_pairs])
@@ -3766,6 +4010,12 @@ class CausalLM:
                 }
             return self.decode_plan
         except _WarmLimit:
+            if local:
+                # No room for the oracle, or for the first comparison: nothing was proven,
+                # nothing changes, and the remeasure hears that its time ran out.
+                CausalLM._restore_decode_selection(self, held)
+                from . import webio
+                raise (wt._OutOfTime or webio.Cancelled)("no time left for the decode search")
             # A candidate is never selected merely because the budget ran out: use the
             # last fully checked and measured composition, or the exact original-width
             # oracle if the search never completed a tournament.
@@ -3790,6 +4040,9 @@ class CausalLM:
                 }
             return self.decode_plan
         except Exception as exc:
+            if local:
+                CausalLM._restore_decode_selection(self, held)
+                raise RuntimeError("decode composition local search failed: %s" % exc) from exc
             self._add_rms_execution = "auto"
             self._greedy_execution = "device"
             self._qkv_execution = "auto"
@@ -3809,6 +4062,11 @@ class CausalLM:
                 lin.decode_execution = None
             self.decode_plan["error"] = "%s: %s" % (type(exc).__name__, exc)
             raise RuntimeError("decode composition tuning failed: %s" % exc) from exc
+        except BaseException:
+            # A stop: a local search has already put back what it had not won.
+            if local:
+                CausalLM._restore_decode_selection(self, held)
+            raise
         finally:
             # Semantic traces and candidate timing write synthetic token rows into the
             # live KV buffers.  A later chat must not treat the pre-tuning `_kv_ids` as
@@ -4313,6 +4571,13 @@ class CausalLM:
             baseline = (0, "host")
             ranked = sorted(valid, key=lambda c: _stats.median(samples[c]))
             chosen = baseline
+            # Raced again (`wt.remeasure`): the choice in use is the one to beat, and an
+            # inconclusive race leaves it in place.
+            was = getattr(self, "_greedy_incumbent", None)
+            if isinstance(was, dict) and (was.get("count"), was.get("row")) in valid:
+                chosen = (was.get("count"), was.get("row"))
+            elif isinstance(was, dict) and was.get("count") == 0:
+                chosen = baseline
             for candidate in ranked:
                 if candidate != chosen and wt._paired_faster(samples, candidate, chosen):
                     chosen = candidate
@@ -4367,18 +4632,35 @@ class CausalLM:
         """The decode composition and the greedy chunk race again with the kernel routes;
         a kernel route that changes makes the decode graphs recorded with it stale."""
         if getattr(self, "_decode_profile_key", None) is not None:
-            # Interactively the composition search does not run at all -- one full-model
-            # record can take longer than any interactive budget (16.6 s on the 30B) -- so the
-            # load applies the original-width composition, measured only by an explicit
-            # offline call. Racing it "again" through that path measured nothing and applied
-            # the reference plan over a greedy session's pick mode: the chunked greedy path
-            # turned off and a 0.6B went from 175 to 152 tok/s.
-            wt.cannot_remeasure(self._decode_profile_key,
-                                "the decode composition is searched only offline "
-                                "(_tune_decode_composition(interactive=False))")
+            # Raced again as a local search from the plan in use (`local=True`): the full
+            # search is a product of every axis and runs only offline, and the interactive
+            # load does not search at all: one full-model record can outlast its budget.
+            wt.register_remeasure(self._decode_profile_key, self._remeasure_decode)
+            wt.register_route_apply(self._decode_profile_key, self._apply_decode_verdict)
         if getattr(self, "_greedy_memo_key", None) is not None and self._can_chunk_greedy():
             wt.register_remeasure(self._greedy_memo_key, self._remeasure_greedy)
+            wt.register_route_apply(self._greedy_memo_key, self._apply_greedy_verdict)
         wt.on_routes_changed(self._routes_changed)
+
+    def _apply_decode_verdict(self):
+        """The decode plan kept under this model's key, put in force as a load puts it: the
+        plan a search kept, or with none kept the exact original-width plan. Nothing is
+        raced."""
+        plan = getattr(self, "decode_plan", None) or {}
+        self._tune_decode_composition(interactive=True,
+                                      pick=(plan.get("pick_mode"), plan.get("sampler_route")))
+        self._greedy_chunk_capture_ready = False
+
+    def _apply_greedy_verdict(self):
+        """The greedy chunk kept under this model's key, put in force; with none kept, the
+        one-token path a load takes when it has not raced the chunks. Nothing is raced."""
+        if isinstance(wt._TUNED.get(getattr(self, "_greedy_memo_key", None)), dict):
+            self._tune_greedy_chunks()           # a kept verdict is applied, not raced
+        else:
+            self._greedy_chunk_size = 0
+            self._greedy_chunk_capture_ready = False
+            if getattr(self, "decode_plan", None) is not None:
+                self.decode_plan["greedy_chunk"] = 0
 
     def _routes_changed(self, keys):
         keys = set(keys)
@@ -4394,20 +4676,24 @@ class CausalLM:
             out.append({"rebuild": "greedy chunk graph", "when": "next greedy reply"})
         return out
 
-    def _race_own_choice(self, key, tune_it, comparable, drop=()):
+    def _race_own_choice(self, key, tune_it, comparable, drop=(), reapply=None, limit=8.0,
+                         before_value=None, after_value=None):
         """Race one of this model's own choices again, through its own tuner, with the load's
         time limit lifted. Stopped part way, its previous verdict goes back -- the candidate
         left in place passed the same correctness check, it is just not proven fastest --
-        and is put back in force when idle. Its timing wrote rows of the cache, so the next
-        reply prefills from the start."""
+        and is put back in force when idle (`reapply`, or the tuner again; False: the tuner
+        puts the choice in force back itself). Its timing wrote rows of the cache, so the
+        next reply prefills from the start. `before_value`/`after_value()`: what is reported
+        as in force before and after, where that is not the verdict kept under `key`."""
         before = wt._TUNED.pop(key, None)
         dropped = {k: wt._TUNED.pop(k) for k in drop if k in wt._TUNED}
         missing = object()
         deadline = self.__dict__.get("_warm_deadline", missing)
-        # The load's own limit for these searches, never past what the remeasure has left:
-        # an unlimited one walked the whole combinatorial space for more than ten minutes.
+        # A limit for the search, never past what the remeasure has left: an unlimited one
+        # walked the whole combinatorial space for more than ten minutes.
         left = wt.remeasure_time_left()
-        self._warm_deadline = time.perf_counter() + min(8.0, 8.0 if left is None else left)
+        span = [x for x in (limit, left) if x is not None]
+        self._warm_deadline = time.perf_counter() + (min(span) if span else 8.0)
         t0 = time.perf_counter()
         done = False
         try:
@@ -4423,19 +4709,100 @@ class CausalLM:
             CausalLM._kv_drop(self)
             self._reset_linear_state()
             if not done:
-                if before is not None:
+                # Stopped: what it had already won and kept stays; otherwise the previous
+                # verdict goes back. Either way it is put in force again when idle.
+                if before is not None and key not in wt._TUNED:
                     wt._TUNED[key] = before
                 for k, v in dropped.items():
                     wt._TUNED.setdefault(k, v)
-                wt.queue_task(tune_it)
-        wt._note_remeasured(key, comparable(before), comparable(wt._TUNED.get(key)), "host",
-                            time.perf_counter() - t0)
+                if reapply is not False:
+                    wt.queue_task(reapply or tune_it)
+        if wt._REMEASURING[0] and comparable(wt._TUNED.get(key)) != comparable(before):
+            wt._note_replaced(key, before)
+        was = comparable(before) if before_value is None else before_value
+        now = comparable(wt._TUNED.get(key)) if after_value is None else after_value()
+        detail = self.__dict__.pop("_decode_search_detail", None)
+        wt._note_remeasured(key, was, now, "host", time.perf_counter() - t0, detail=detail)
+
+    def _remeasure_decode(self):
+        import json
+
+        def in_force():
+            """The plan in force, in the shape of a kept verdict's `plan`."""
+            p = getattr(self, "decode_plan", None) or {}
+            if not (isinstance(p, dict) and p.get("add_rmsnorm") in ("fused", "composed")):
+                return None
+            routes = p.get("q4_decode")
+            routes = (list(routes.values()) if isinstance(routes, dict)
+                      else list(routes) if isinstance(routes, (list, tuple)) else routes)
+            shapes = p.get("projection_shapes") or {}
+            return json.loads(json.dumps(
+                [p.get("add_rmsnorm"), routes, p.get("greedy_pick"), p.get("qkv"),
+                 p.get("gate_up"), p.get("qk_norm_rope"), p.get("kv_write"),
+                 p.get("head_shape"), [shapes.get("o", "auto"), shapes.get("down", "auto")]]))
+
+        def plan(v):
+            v = v.get("plan") if isinstance(v, dict) else v
+            return json.loads(json.dumps(v))           # one shape for tuples and lists
+
+        def again():
+            self._tune_decode_composition(local=True)
+            # The chunks are decode steps too.
+            self._greedy_chunk_capture_ready = False
+        # The whole of what is left of the budget: the oracle is one full-model recording,
+        # and each challenger one more. Stopped before it proved anything, the search has
+        # put the plan in force back itself; nothing is queued.
+        was = in_force()
+        self._race_own_choice(self._decode_profile_key, again, plan, reapply=False,
+                              limit=None, before_value=was,
+                              after_value=in_force if was is not None else None)
+
+    _DECODE_SELECTION = ("_add_rms_execution", "_greedy_execution", "_qkv_execution",
+                         "_gate_up_execution", "_qk_norm_rope_execution",
+                         "_kv_write_execution", "_head_shape_execution")
+
+    def _decode_selection(self):
+        """What a decode plan sets on this model, as it stands now, put back exactly by
+        `_restore_decode_selection`, whatever was selected in between."""
+        missing = object()
+        blocks = [b for b in (getattr(self, "head", None) or ())
+                  if isinstance(b, wt.GGMLLinear)]
+        for lay in getattr(self, "layers", None) or ():
+            for name in ("o", "down"):
+                block = lay.get(name)
+                if isinstance(block, wt.GGMLLinear):
+                    blocks.append(block)
+        return {"missing": missing,
+                "attrs": {n: self.__dict__.get(n, missing) for n in self._DECODE_SELECTION},
+                "shapes": [(b, b.decode_shape) for b in blocks],
+                "executions": [(lin, lin.decode_execution) for lin in self._stored_linears()],
+                "plan": getattr(self, "decode_plan", None)}
+
+    def _restore_decode_selection(self, held):
+        for name, value in held["attrs"].items():
+            if value is held["missing"]:
+                self.__dict__.pop(name, None)
+            else:
+                self.__dict__[name] = value
+        for block, shape in held["shapes"]:
+            block.decode_shape = shape
+        for lin, execution in held["executions"]:
+            lin.decode_execution = execution
+        self.decode_plan = held["plan"]
 
     def _remeasure_greedy(self):
         def choice(v):
             return [v.get("count"), v.get("row")] if isinstance(v, dict) else v
+
+        def again():
+            self._greedy_incumbent = wt._TUNED.get(self._greedy_memo_key) or saved
+            try:
+                self._tune_greedy_chunks()
+            finally:
+                self.__dict__.pop("_greedy_incumbent", None)
+        saved = wt._TUNED.get(self._greedy_memo_key)
         # The embedding row layout it builds on is raced as an operator, before it.
-        self._race_own_choice(self._greedy_memo_key, self._tune_greedy_chunks, choice)
+        self._race_own_choice(self._greedy_memo_key, again, choice)
 
     def _warm_decode_step(self):
         """Run one decode step here, where nothing is recording.
@@ -5917,6 +6284,10 @@ class CausalLM:
                 out["prefill_d"] = int(span.get("prefill_d") or 0)
                 out["prefill_tune_s"] = round(float(span.get("prefill_tune_s") or 0.0), 3)
                 out["prefill_tune_calls"] = int(span.get("prefill_tune_calls") or 0)
+            # What a token cost in use, for the set of routes in force (`wt.note_speed`):
+            # replies of one path compared with replies of the same path.
+            if steps >= 8 and out["tok_s"]:
+                wt.note_speed("decode:%s" % span["path"], 1.0 / float(out["tok_s"]))
             self.last_stream = out
             return out
 

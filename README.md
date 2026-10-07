@@ -2,29 +2,57 @@
 
 # webtorch
 
-### Run a 30-billion-parameter model in a browser tab.
+### Large language models in a browser tab. No install, no drivers, any GPU.
 
-**No server. No install. No native runtime.**
-PyTorch-compatible, on the GPU, in Python — inside the page.
+On a fanless **M5 MacBook Air**, in Chrome: **Qwen3-0.6B at 175+ tokens/s** · **a 30B MoE at 42 tokens/s** · **a 22-layer decision model in 15 ms**
 
-## ▶ [Try it now — it runs in your browser](https://xnetsc.github.io/webpytorch/chat/)
+## ▶ [Try it now: it runs in your browser](https://xnetsc.github.io/webpytorch/chat/)
 
 <sub>Nothing to install and nothing uploaded: the weights go to your browser's own cache and
 the model runs on your GPU. Start with <b>Qwen3-0.6B (0.4 GB)</b> and you are chatting in
-under a minute; the multi-gigabyte models are the same page, just a longer download. Needs
-WebGPU for the fast path — WebGL is a working fallback, not a broken state.</sub>
+under a minute; the multi-gigabyte models are the same page, just a longer download.</sub>
 
 <img src="images/chat-desktop.png" alt="webtorch chat: a 30B MoE answering in the browser, with typeset LaTeX and highlighted code" width="900">
 
-<sub>Qwen3-30B-A3B answering in a tab — 13.8 GB of weights, 32 tok/s, nothing installed.</sub>
+<sub>Qwen3-30B-A3B answering in a tab: 13.8 GB of weights, nothing installed.</sub>
 
-[**Live demo**](https://xnetsc.github.io/webpytorch/chat/) · [Quickstart](#quickstart) ·
-[What it does](#what-it-does) · [Speed](#speed) · [The chat app](#the-chat-app) ·
-[Docs](docs/API.md)
+**English** · [中文](README.zh.md) · [Live demo](https://xnetsc.github.io/webpytorch/chat/) ·
+[Quickstart](#quickstart) · [Speed](#speed) · [Docs](docs/API.md) ·
+How it was built: [English](docs/articles/webtorch-share.en.md) · [中文](docs/articles/webtorch-share.zh.md)
 
 </div>
 
 ---
+
+## Why webtorch
+
+**Nothing to set up.** No CUDA, no ROCm, no driver versions to match, no Python environment,
+no build. Open a page and the model runs. The browser turns one WGSL source into Metal, Vulkan
+or D3D12, so GPU vendors and driver versions are the browser's problem, not yours.
+
+**Every GPU.** Apple, NVIDIA, AMD and Intel, integrated or discrete, through WebGPU, with WebGL2
+where WebGPU is missing. Nothing about the device is assumed: each kernel's features, buffers and
+workgroup memory are checked against what the device reports before it is used, so a model that
+loads on one laptop loads on the next.
+
+**The fastest path on your machine, picked by itself.** At load, every operator's candidate
+kernels, tiles and thread shapes are raced on your GPU, timed by its own timestamps, and the
+winner is kept for that GPU, so the next load starts at full speed. There is no tuning table for
+one vendor and nothing to call. Weights compute in the format they are stored in (Q4_K is decoded
+as Q4_K inside the shader); a faster lower-precision route is taken only on the weights where it
+passes an accuracy check.
+
+**Stays fast.** `remeasure()` races the loaded model's choices again within a time budget,
+stoppable at any moment without losing what finished. The set of routes it replaced is kept:
+`switchRoutes()` goes back and forth between the two, and `onRoutesSlower` tells you if the set
+in use runs slower than the other one did.
+
+**Private by construction.** Weights live in the browser's cache and prompts never leave the
+machine. The compute is the user's own, so there is no per-request server bill.
+
+**PyTorch, in Python, in the page.** CPython compiled to WebAssembly runs in a worker, and
+`import torch` resolves to webtorch: `Tensor` with autograd, `nn`, `optim`, GGUF, GPTQ and HF
+weights, twenty-eight quantisation formats.
 
 ```python
 # ── this is running inside the browser tab ──
@@ -35,20 +63,36 @@ lm = await webtorch.AutoModelForCausalLM.from_pretrained("/models/qwen3-30b-a3b.
 print(lm.generate("Why is this surprising?", max_new=64))
 ```
 
-Nothing was downloaded to the machine. Nothing was installed. The weights were read
-by range straight from disk or a hub, the layers ran on the GPU through WebGPU, and the
-whole thing was CPython — compiled to WebAssembly — executing in a worker.
+## Speed
 
-## What it does
+In the tab, not on a server: a fanless M5 MacBook Air, Chrome, WebGPU, greedy decoding.
+
+| Model | On disk | In the browser |
+|---|---:|---:|
+| Qwen3-0.6B · Q4_K_M | 0.4 GB | **175+ tokens/s** |
+| Qwen3-30B-A3B · MoE · UD-Q3_K_XL | 13.8 GB | **42 tokens/s** |
+| Qwen3.8-27B · hybrid SSM · UD-Q2_K_XL | 9.8 GB | **7 to 8 tokens/s** |
+| 22-layer decision model · F16 | 0.7 GB | **15.6 ms** a question |
+
+Against native MLX on the same machine, with the same requests:
+
+<img src="images/vs-mlx-en.svg" alt="Decision model latency, webtorch in Chrome against native MLX on the same M5 MacBook Air: one question two seconds apart 32 to 38 ms against 35.8 ms" width="860">
+
+Asked the way people ask, one question every couple of seconds, the browser matches native MLX.
+
+## What else it does
+
+**LLMs by config, not by a supported-model list.** `AutoModelForCausalLM.from_pretrained`
+reads the model's own config and runs the CausalLM family (Qwen2/Qwen3/Llama-shaped), the MoE
+family and hybrid recurrent models, from an AutoGPTQ directory, a **GGUF** file, or a plain
+**fp16/bf16 HF** folder. Twenty-eight quantisation formats, from `Q4_K` to the 2-bit i-quants.
 
 **Drop-in PyTorch.** `install_torch()` and `import torch` resolves here. `Tensor` with
 autograd, `nn.{Linear, Conv1d/2d/3d, LayerNorm, RMSNorm, MultiheadAttention, …}`,
 `optim.{SGD, Adam, AdamW}`. Trains real GPT/CNN/Transformer models on WebGPU **and** WebGL.
 
-**LLMs by config, not by a supported-model list.** `AutoModelForCausalLM.from_pretrained`
-reads the model's own config and runs the CausalLM family (Qwen2/Qwen3/Llama-shaped) and the
-MoE family, from an AutoGPTQ directory, a **GGUF** file, or a plain **fp16/bf16 HF** folder —
-at int4, int8, or fp16. Twenty-eight quantisation formats, from `Q4_K` to the 2-bit i-quants.
+**Decisions, typed.** `decide(state, questions)` answers structured questions (a choice, a
+yes or no, a score) with the whole distribution for each, from a decision model's own config.
 
 **Streaming quantisation.** Turn an fp16 model into int4/int8 without ever holding it in RAM:
 weights stream in and quantised shards stream out through your own async IO callbacks. The
@@ -63,7 +107,7 @@ vision-language (Qwen2.5-VL).
 continuations are still valid, so `generate(..., constraint="json")` cannot emit malformed
 JSON. Constraints are a callback, not a fixed list: yours is asked for the allowed set at
 every step, and may also say *take this and stop*, or *stop asking me*. That machinery is
-what makes **tool calling** work on small models — `tools=[...]`, and the call is parsed out
+what makes **tool calling** work on small models: `tools=[...]`, and the call is parsed out
 of whatever delimiters the model's own template uses, with `require_known_tools=True` making
 an invented tool name unrepresentable rather than merely unlikely.
 
@@ -75,65 +119,14 @@ accumulation instead of silently widening the stored tensors to floating point.
 "object-detection" | "image-to-text" | …)`. The built-in names are *pre-registered* loaders;
 register your own task without touching the SDK.
 
-**Bring your own IO — and you must.** The core does no IO itself. The callback you install
-decides where bytes come from: `use_default_io()` for your own files, `hf_read()` /
-`modelscope_read()` for a hub repo id, or your own `set_io_read` / `set_io_write` for any
-storage at all. Reads are cached, resumable, and persist across reloads.
-
-## Speed
-
-These are the models running *in the tab*, not a server. Apple silicon (`metal-3`),
-end-to-end tok/s from a clean load, same prompt and same warm-up on both backends, each
-figure the middle of three or four runs:
-
-| Model | Size on disk | WebGPU | WebGL |
-|---|---:|---:|---:|
-| Qwen3-0.6B · Q4_K_M | 0.4 GB | **108.0** | 19.8 |
-| Qwen3-30B-A3B · MoE · Q3_K_XL | 13.8 GB | **34.8** | 5.1 |
-| Qwen 3B · Q4_K | 2.0 GB | **35.7** | 5.3 |
-| Qwen3.8-27B · hybrid SSM · i-quant | 13.0 GB | **6.8** | 0.76 |
-
-A short prompt is the flattering case. Decode slows as the conversation grows, because
-every token re-reads the whole cache — and that, not the model, is what the second half of
-a long chat costs. The cache is stored as halves for exactly this reason; the figures below
-are with that in place:
-
-| Context | Decode |
-|---:|---:|
-| ~20 tokens | 108.0 tok/s |
-| 2,848 tokens | 83.8 tok/s |
-
-Decode is only half of what a prompt costs. **Reading** it — the prefill, everything before
-the first token — is the other half, and on a long prompt it is the larger one. Same machine,
-same 0.6B, time to first token end to end:
-
-| Prompt | Time to first token | Prompt tokens/s |
-|---:|---:|---:|
-| 49 tokens | 0.11 s | 441 |
-| 1,182 tokens | 1.65 s | 715 |
-| 3,092 tokens | 5.44 s | 569 |
-
-Two things make that number what it is, and neither is obvious. Above a few dozen rows the
-quantised matmul is the wrong kernel: unpacking the weights once and using the plain fp32
-matmul is 4.8× faster, because that kernel runs at 2117 GFLOPS against the quantised one's
-426 and the device is not what limits the first. And attention materialises a chunk of the
-score matrix at a time rather than none of it — a hand-written flash kernel runs at 94
-GFLOPS here, so spending the arithmetic where the machine is fast wins by 3.6× even at the
-cost of writing the scores down.
-
-On WebGPU, weight streaming runs at the hardware's read ceiling for every quantisation
-format, and what is left is decode arithmetic — close to uniform across formats.
-
-**WebGL is a fallback, not a peer.** Every kernel exists on it and every format is checked
-against the reference decoder there too, but expect 6–9×. The reason is structural rather
-than unfinished: WebGL2 has no compute stage, so each kernel is a fragment shader with one
-invocation per output value and no memory shared between invocations. A thread cannot stage
-the activations for its neighbours, so each one re-reads them — measured, that costs more
-than reading the weights does.
+**Bring your own IO.** The core does no IO itself. The callback you install decides where bytes
+come from: `use_default_io()` for your own files, `hf_read()` / `modelscope_read()` for a hub
+repo id, or your own `set_io_read` / `set_io_write` for any storage at all. Reads are cached,
+resumable, and persist across reloads.
 
 ## The chat app
 
-A complete local chat client lives in [`chat/`](chat/) — the SDK driving a real interface.
+A complete local chat client lives in [`chat/`](chat/): the SDK driving a real interface.
 It is deployed as it stands: **[open it](https://xnetsc.github.io/webpytorch/chat/)**, and
 everything below is a page you can use rather than a screenshot of one.
 
@@ -141,11 +134,11 @@ everything below is a page you can use rather than a screenshot of one.
 <tr>
 <td width="55%" valign="top">
 <img src="images/chat-models.png" alt="The model picker: 30B MoE, 27B hybrid, 32B dense, Gemma, Mistral, gpt-oss and the Qwen sizes, or a file from the device">
-<br><sub><b>Pick anything.</b> The presets span 0.4 GB to 13.8 GB — dense, MoE and hybrid-SSM — and the last three entries are “any other repo id”, “a GGUF from this device”, “a folder from this device”.</sub>
+<br><sub><b>Pick anything.</b> The presets span 0.4 GB to 13.8 GB (dense, MoE and hybrid-SSM), and the last three entries are “any other repo id”, “a GGUF from this device”, “a folder from this device”.</sub>
 </td>
 <td width="45%" valign="top">
 <img src="images/chat-mobile.png" alt="The same conversation on a phone-width screen">
-<br><sub><b>And on a phone.</b> The same client, the same rendering — code scrolls in its own track rather than stretching the page.</sub>
+<br><sub><b>And on a phone.</b> The same client, the same rendering; code scrolls in its own track rather than stretching the page.</sub>
 </td>
 </tr>
 </table>
@@ -162,12 +155,12 @@ everything below is a page you can use rather than a screenshot of one.
   tables. Sanitised before it reaches the DOM.
 - **The model can press it too.** Python and JavaScript are offered to the model as tools;
   it writes the call, the page runs it and hands back the result. Which tools exist is the
-  app's decision — the SDK parses and constrains them, it does not pick them.
-- **Press the code.** A Python block gets a ▶ and runs in its own Pyodide — separate from the
-  one holding the model — with output, tracebacks and matplotlib figures inline. numpy,
+  app's decision: the SDK parses and constrains them, it does not pick them.
+- **Press the code.** A Python block gets a ▶ and runs in its own Pyodide (separate from the
+  one holding the model), with output, tracebacks and matplotlib figures inline. numpy,
   pandas and matplotlib are loaded before you ask; add wheels from a URL or from disk.
 - **Edit anything, block by block.** A paragraph as text, a code block in the block, a table
-  cell by cell — a formula cell opens as LaTeX, an image cell as an image.
+  cell by cell: a formula cell opens as LaTeX, an image cell as an image.
 - **Works offline.** A service worker keeps every wheel, the wasm and the runtime
   permanently; the app's own files stay network-first, so an update still lands the moment
   there is a network.
@@ -176,9 +169,9 @@ everything below is a page you can use rather than a screenshot of one.
 ## Quickstart
 
 Needs the COOP/COEP headers that `SharedArrayBuffer` requires, and a GPU backend: WebGPU
-(Chrome/Edge 113+, Safari 18+) for the speeds above, or WebGL as a slower fallback. Without
-either, the weights fall back to the page's WASM heap — about 4 GB in total — and anything
-past roughly 2 GB runs out of memory while loading rather than running slowly.
+(Chrome/Edge 113+, Safari 18+) for the speeds above, or WebGL as a fallback. Without either,
+the weights fall back to the page's WASM heap (about 4 GB in total), and anything past roughly
+2 GB runs out of memory while loading rather than running slowly.
 
 ```bash
 # 1. build the WgPy backend wheels + fetch Pyodide (one-time) → docs/BUILD.md
@@ -197,6 +190,7 @@ webtorch/            the SDK
   _sdk.py              transformers-style facade + the task-pipeline registry
   llm.py               loading, prefill/decode, KV reuse, chat templates, tool calling
   lm_engine.py         generic decoder (dense + MoE) + samplers + capture/replay
+  decision.py          typed decisions over an encoder
   constrain.py         output constraints (callback, json, regex, choices, …)
   toolcall.py          reading/writing tool calls in whatever form a model uses
   quantize.py          streaming quantiser (IO-free core)
@@ -207,23 +201,25 @@ chat/                the chat app (index.html, app.js, cache-sw.js, pyworker.js)
 webtorch-sw.js       the SDK's service worker: cross-origin isolation for static hosts
 webapp/              example runner
 examples/            runnable examples
-docs/                API.md · SDK_README.md · ARCHITECTURE.md · BUILD.md · WGPY_BACKEND.md
-src/ webgl/ webgpu/ wgpy/ cupy/ cupyx/     vendored WgPy backend (modified — see NOTICE)
+docs/                API.md · SDK_README.md · ARCHITECTURE.md · BUILD.md · WGPY_BACKEND.md · articles/
+src/ webgl/ webgpu/ wgpy/ cupy/ cupyx/     vendored WgPy backend (modified, see NOTICE)
 ```
 
 Weights (`models/`), the Pyodide runtime (`lib/`) and build output are not in git.
 
 ## Docs
 
-- [SDK usage](docs/SDK_README.md) — torch, LLMs, quantisation, pipelines
+- [SDK usage](docs/SDK_README.md): torch, LLMs, quantisation, pipelines
 - [API reference](docs/API.md)
-- [Architecture](docs/ARCHITECTURE.md) — how webtorch sits on WgPy
-- [Build](docs/BUILD.md) — backend, models, running the demo
+- [Architecture](docs/ARCHITECTURE.md): how webtorch sits on WgPy
+- [Build](docs/BUILD.md): backend, models, running the demo
 - [WgPy backend](docs/WGPY_BACKEND.md)
+- How it was built, as a write-up: the design, what went wrong and why, in
+  [English](docs/articles/webtorch-share.en.md) and [中文](docs/articles/webtorch-share.zh.md)
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on **WgPy** (© The University of Tokyo, Edge Intelligence
+MIT, see [LICENSE](LICENSE). Built on **WgPy** (© The University of Tokyo, Edge Intelligence
 Systems, Inc.; MIT), whose WebGPU/WebGL backend is modified here: batched matmul, graph
 capture/replay, fused kernels, and the quantised matmul kernels. See [NOTICE](NOTICE).
 

@@ -312,6 +312,9 @@
     listen('log', opts.onLog);
     // A model arriving or going away: {state:'loaded'|'released', id, kind, surface}.
     listen('model', opts.onModel);
+    // The routes in use running slower than the set not in use did:
+    // {kind, in_use, unused, in_use_s, unused_s, routes_differ}. Switching is the host's call.
+    listen('routesSlower', opts.onRoutesSlower);
     // Errors do not go through `listeners` -- they go to the one sink, so that what the
     // service worker reports and what the runtime reports arrive at the same place.
     wt.onError(opts.onError);
@@ -476,6 +479,18 @@
       remeasure: function (o) {
         return call('remeasure', { budgetMs: o && o.budgetMs != null ? o.budgetMs : undefined });
       },
+      /**
+       * The sets of routes kept: `in_use` and `unused` (null until a remeasure has changed
+       * routes), each `{id, speeds}` with the last three of each kind in seconds per token
+       * or per request, and `differ` (the route keys that differ).
+       */
+      routeSets: function () { return call('routeSets'); },
+      /**
+       * Swap the set of routes in use with the one not in use; two calls are a round trip.
+       * Resolves with `{in_use, unused, changed, rebuilds}`. `onRoutesSlower` /
+       * `on('routesSlower')` says when the set in use has run slower than the other.
+       */
+      switchRoutes: function () { return call('switchRoutes'); },
       /** Fit decision probabilities on separate labelled held-out examples. */
       calibrate: function (examples, o) {
         o = o || {};

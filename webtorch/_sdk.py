@@ -318,6 +318,36 @@ def remeasure(budget_s=60.0):
     return _c.remeasure(float(budget_s))
 
 
+def route_sets():
+    """The sets of routes kept: the one in use and, once a remeasure has changed routes, the
+    one not in use, each with its id (the remeasure that made it, 0 for the load's) and how
+    it has run in use (the last three replies or requests of each kind, in seconds); and
+    which routes differ between them."""
+    from . import _core as _c
+    return _c.route_sets()
+
+
+def switch_routes():
+    """Swap the set of routes in use with the one not in use; two calls are a round trip.
+    A remeasure that changes routes puts what it made in use and keeps the set that was in
+    use as the one not in use, pushing out the set that was not. Recordings that used a route
+    that changes are rebuilt; returns the ids now in use and not in use and what changed."""
+    if not _LOADED and not _IMPL_CACHE:
+        raise RuntimeError("switch_routes needs a loaded model: it changes the routes that model uses")
+    from . import _core as _c
+    return _c.switch_routes()
+
+
+def on_routes_slower(fn):
+    """`fn(info)` is told when the routes in use have run slower than the set not in use
+    did: each of the last three replies (per token) or requests of a kind slower than each
+    of the other set's last three, counted only once the device has rested from the
+    remeasure. The SDK switches nothing by itself; `switch_routes` is how to. `None`
+    removes every callback."""
+    from . import _core as _c
+    return _c.on_routes_slower(fn)
+
+
 def release_all():
     """Release every cached model (frees their weights). Returns how many were released."""
     from . import _core as _c

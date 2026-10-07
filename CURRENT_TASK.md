@@ -1,6 +1,6 @@
 # Current task status
 
-> Last updated: 2026-10-06
+> Last updated: 2026-10-07
 
 ## Highest project principle
 
@@ -12,6 +12,14 @@ performance comparison and adopt whichever measured execution is fastest. Only b
 passing their recorded acceptance gates completes this task.
 
 ## One-line status
+
+**2026-10-07 remeasure within budget, two route sets, gates that hold, README as a pitch:**
+a race starts only when it fits; the decode search resumes where it stopped and changes nothing
+it did not prove; approximations are admitted per weight on hard inputs; the routes a remeasure
+replaced are kept (`switch_routes`, `on_routes_slower`, nothing switched by the SDK). The 27B
+slowdown after a remeasure was the fanless M5 clocking down (1.6x on a fixed kernel, back after
+a minute idle); the two route sets alternate at 7.92 tok/s each. README in English and Chinese
+with the MLX chart; article in docs/articles. Next: whatever the user asks.
 
 **2026-10-07 `remeasure` complete:** least recently raced first (kept with the profile), out of
 time → the rest continues when idle, every operator choice raced through `tune` (GPU clock,

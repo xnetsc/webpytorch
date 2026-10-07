@@ -344,6 +344,9 @@ except ImportError:
                              after: after || null, elapsed: elapsed || 0 });
       const kpk = remember ? await kpKey() : null;
       root.__kp = kpk ? await kpGet(kpk) : null;
+      // The routes in force running slower in use than the other set did: told to the page,
+      // which decides whether to switch back (`useRoutes`). Nothing is switched here.
+      root.__routesSlower = (s) => emit(0, 'routesSlower', JSON.parse(s));
       const task = tasks.begin();
       const out = await task.until(py(`
 import js, webtorch
@@ -355,6 +358,8 @@ webtorch.set_download_progress(lambda i: js.self.__dl(i["rate"]))
 webtorch.set_load_progress(
     lambda i: js.self.__stage(i["stage"], i.get("done"), i.get("total"),
                               i.get("after"), i.get("elapsed")))
+webtorch.on_routes_slower(None)
+webtorch.on_routes_slower(lambda i: js.self.__routesSlower(__import__("json").dumps(i)))
 # What this device worked out last time.
 _kp = js.self.__kp
 if _kp is not None:
@@ -654,6 +659,38 @@ json.dumps(webtorch.remeasure(${budget} / 1000.0))
         }
       }
       calibrateWhenIdle();         // the stale recordings, rebuilt between calls
+      return out;
+    },
+
+    /** The sets of routes kept, which is in force, and how each has run in use. */
+    async routeSets() {
+      if (!ready) throw new Error('no runtime');
+      return await pyJSON('import json, webtorch\njson.dumps(webtorch.route_sets())');
+    },
+
+    /**
+     * Swap the set of routes in use with the one not in use. Which is in use is kept for the
+     * next load, and the recordings the swap made stale are made again when idle.
+     */
+    async switchRoutes() {
+      if (!ready) throw new Error('no runtime');
+      const out = await pyJSON(`
+import json, webtorch
+if _MODEL["m"] is None:
+    raise RuntimeError("load a model first: switch_routes changes the routes that model uses")
+json.dumps(webtorch.switch_routes())
+`);
+      if (remember && out.changed) {
+        try {
+          const kpk = await kpKey();
+          if (kpk) await kpPut(kpk, JSON.parse(await py(
+            'import json, webtorch\njson.dumps(webtorch.kernel_profile())')));
+        } catch (e) {
+          out.kept = false;
+          report('tuning', 'could not keep which routes are in use: ' + ((e && e.message) || e));
+        }
+      }
+      calibrateWhenIdle();
       return out;
     },
 
