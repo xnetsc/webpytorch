@@ -4,7 +4,7 @@
 
 ### Large language models in a browser tab. No install, no drivers, any GPU.
 
-On a fanless **M5 MacBook Air**, in Chrome: **Qwen3-0.6B at 175+ tokens/s** · **a 30B MoE at 42 tokens/s** · **a 22-layer decision model in 15 ms**
+On a fanless **MacBook Air (M5, 24 GB)**, in Chrome: **Qwen3-0.6B at 175+ tokens/s** · **a 30B MoE at 42 tokens/s** · **a 22-layer decision model in 15 ms**
 
 ## ▶ [Try it now: it runs in your browser](https://xnetsc.github.io/webpytorch/chat/)
 
@@ -65,7 +65,7 @@ print(lm.generate("Why is this surprising?", max_new=64))
 
 ## Speed
 
-In the tab, not on a server: a fanless M5 MacBook Air, Chrome, WebGPU, greedy decoding.
+In the tab, not on a server: a fanless MacBook Air (M5, 24 GB), Chrome, WebGPU, greedy decoding.
 
 | Model | On disk | In the browser |
 |---|---:|---:|
@@ -76,7 +76,7 @@ In the tab, not on a server: a fanless M5 MacBook Air, Chrome, WebGPU, greedy de
 
 Against native MLX on the same machine, with the same requests:
 
-<img src="images/vs-mlx-en.svg" alt="Decision model latency, webtorch in Chrome against native MLX on the same M5 MacBook Air: one question two seconds apart 32 to 38 ms against 35.8 ms" width="860">
+<img src="images/vs-mlx-en.svg" alt="Decision model latency, webtorch in Chrome against native MLX on the same MacBook Air (M5, 24 GB): one question two seconds apart 32 to 38 ms against 35.8 ms" width="860">
 
 Asked the way people ask, one question every couple of seconds, the browser matches native MLX.
 

@@ -1,50 +1,51 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="420" viewBox="0 0 860 420" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
-<rect x="0.5" y="0.5" width="859" height="419" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="440" viewBox="0 0 860 440" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="859" height="439" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="28.0" y="40.0" font-size="19" fill="#1f2328" text-anchor="start" font-weight="700">Decision model: webtorch against native MLX</text>
-<text x="28.0" y="64.0" font-size="13" fill="#59636e" text-anchor="start" font-weight="normal">Same M5 MacBook Air, same requests · 22-layer encoder, F16 · milliseconds, lower is better</text>
-<line x1="70" y1="328.0" x2="830" y2="328.0" stroke="#e6e9ee"/>
-<text x="60.0" y="332.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">0</text>
-<line x1="70" y1="273.5" x2="830" y2="273.5" stroke="#e6e9ee"/>
-<text x="60.0" y="277.5" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">20</text>
-<line x1="70" y1="219.0" x2="830" y2="219.0" stroke="#e6e9ee"/>
-<text x="60.0" y="223.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">40</text>
-<line x1="70" y1="164.5" x2="830" y2="164.5" stroke="#e6e9ee"/>
-<text x="60.0" y="168.5" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">60</text>
-<line x1="70" y1="110.0" x2="830" y2="110.0" stroke="#e6e9ee"/>
-<text x="60.0" y="114.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">80</text>
-<text x="60.0" y="96.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">ms</text>
-<rect x="115.0" y="307.3" width="46" height="20.7" rx="4" fill="#a3aab3"/>
-<text x="138.0" y="299.3" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">7.6</text>
-<rect x="169.0" y="285.5" width="46" height="42.5" rx="4" fill="#2f6fec"/>
-<text x="192.0" y="277.5" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">15.6</text>
-<text x="165.0" y="352.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">1 question</text>
-<text x="165.0" y="371.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">back to back</text>
-<rect x="305.0" y="230.4" width="46" height="97.6" rx="4" fill="#a3aab3"/>
-<text x="328.0" y="222.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">35.8</text>
-<rect x="359.0" y="232.6" width="46" height="95.4" rx="4" fill="#2f6fec"/>
-<line x1="382.0" y1="240.8" x2="382.0" y2="224.4" stroke="#1f2328" stroke-width="2"/>
-<line x1="375.0" y1="240.8" x2="389.0" y2="240.8" stroke="#1f2328" stroke-width="2"/>
-<line x1="375.0" y1="224.4" x2="389.0" y2="224.4" stroke="#1f2328" stroke-width="2"/>
-<text x="382.0" y="216.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">32~38</text>
-<text x="355.0" y="352.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">1 question</text>
-<text x="355.0" y="371.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">2 s apart</text>
-<rect x="495.0" y="276.2" width="46" height="51.8" rx="4" fill="#a3aab3"/>
-<text x="518.0" y="268.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">19.0</text>
-<rect x="549.0" y="208.4" width="46" height="119.6" rx="4" fill="#2f6fec"/>
-<text x="572.0" y="200.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">43.9</text>
-<text x="545.0" y="352.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">3 questions</text>
-<text x="545.0" y="371.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">back to back</text>
-<rect x="685.0" y="196.7" width="46" height="131.3" rx="4" fill="#a3aab3"/>
-<text x="708.0" y="188.7" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">48.2</text>
-<rect x="739.0" y="145.4" width="46" height="182.6" rx="4" fill="#2f6fec"/>
-<line x1="762.0" y1="153.6" x2="762.0" y2="137.2" stroke="#1f2328" stroke-width="2"/>
-<line x1="755.0" y1="153.6" x2="769.0" y2="153.6" stroke="#1f2328" stroke-width="2"/>
-<line x1="755.0" y1="137.2" x2="769.0" y2="137.2" stroke="#1f2328" stroke-width="2"/>
-<text x="762.0" y="129.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">64~70</text>
-<text x="735.0" y="352.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">3 questions</text>
-<text x="735.0" y="371.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">2 s apart</text>
-<rect x="70" y="386" width="14" height="14" rx="3" fill="#a3aab3"/>
-<text x="92.0" y="398.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX (native)</text>
-<rect x="280" y="386" width="14" height="14" rx="3" fill="#2f6fec"/>
-<text x="302.0" y="398.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch (in the browser)</text>
+<text x="28.0" y="66.0" font-size="14" fill="#1f2328" text-anchor="start" font-weight="600">Test machine: MacBook Air (M5, 24 GB)</text>
+<text x="28.0" y="88.0" font-size="13" fill="#59636e" text-anchor="start" font-weight="normal">The same requests on both · 22-layer encoder, F16 · webtorch in Chrome · milliseconds, lower is better</text>
+<line x1="70" y1="348.0" x2="830" y2="348.0" stroke="#e6e9ee"/>
+<text x="60.0" y="352.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">0</text>
+<line x1="70" y1="293.5" x2="830" y2="293.5" stroke="#e6e9ee"/>
+<text x="60.0" y="297.5" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">20</text>
+<line x1="70" y1="239.0" x2="830" y2="239.0" stroke="#e6e9ee"/>
+<text x="60.0" y="243.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">40</text>
+<line x1="70" y1="184.5" x2="830" y2="184.5" stroke="#e6e9ee"/>
+<text x="60.0" y="188.5" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">60</text>
+<line x1="70" y1="130.0" x2="830" y2="130.0" stroke="#e6e9ee"/>
+<text x="60.0" y="134.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">80</text>
+<text x="60.0" y="116.0" font-size="12" fill="#59636e" text-anchor="end" font-weight="normal">ms</text>
+<rect x="115.0" y="327.3" width="46" height="20.7" rx="4" fill="#a3aab3"/>
+<text x="138.0" y="319.3" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">7.6</text>
+<rect x="169.0" y="305.5" width="46" height="42.5" rx="4" fill="#2f6fec"/>
+<text x="192.0" y="297.5" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">15.6</text>
+<text x="165.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">1 question</text>
+<text x="165.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">back to back</text>
+<rect x="305.0" y="250.4" width="46" height="97.6" rx="4" fill="#a3aab3"/>
+<text x="328.0" y="242.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">35.8</text>
+<rect x="359.0" y="252.6" width="46" height="95.4" rx="4" fill="#2f6fec"/>
+<line x1="382.0" y1="260.8" x2="382.0" y2="244.4" stroke="#1f2328" stroke-width="2"/>
+<line x1="375.0" y1="260.8" x2="389.0" y2="260.8" stroke="#1f2328" stroke-width="2"/>
+<line x1="375.0" y1="244.4" x2="389.0" y2="244.4" stroke="#1f2328" stroke-width="2"/>
+<text x="382.0" y="236.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">32~38</text>
+<text x="355.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">1 question</text>
+<text x="355.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">2 s apart</text>
+<rect x="495.0" y="296.2" width="46" height="51.8" rx="4" fill="#a3aab3"/>
+<text x="518.0" y="288.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">19.0</text>
+<rect x="549.0" y="228.4" width="46" height="119.6" rx="4" fill="#2f6fec"/>
+<text x="572.0" y="220.4" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">43.9</text>
+<text x="545.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">3 questions</text>
+<text x="545.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">back to back</text>
+<rect x="685.0" y="216.7" width="46" height="131.3" rx="4" fill="#a3aab3"/>
+<text x="708.0" y="208.7" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">48.2</text>
+<rect x="739.0" y="165.4" width="46" height="182.6" rx="4" fill="#2f6fec"/>
+<line x1="762.0" y1="173.6" x2="762.0" y2="157.2" stroke="#1f2328" stroke-width="2"/>
+<line x1="755.0" y1="173.6" x2="769.0" y2="173.6" stroke="#1f2328" stroke-width="2"/>
+<line x1="755.0" y1="157.2" x2="769.0" y2="157.2" stroke="#1f2328" stroke-width="2"/>
+<text x="762.0" y="149.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">64~70</text>
+<text x="735.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">3 questions</text>
+<text x="735.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">2 s apart</text>
+<rect x="70" y="406" width="14" height="14" rx="3" fill="#a3aab3"/>
+<text x="92.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX (native)</text>
+<rect x="280" y="406" width="14" height="14" rx="3" fill="#2f6fec"/>
+<text x="302.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch (in the browser)</text>
 </svg>

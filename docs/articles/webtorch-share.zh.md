@@ -11,7 +11,7 @@ webtorch 是一套跑在浏览器里的 PyTorch 风格 SDK，底层是 WebGPU。
 | Qwen3.8-27B（混合 SSM） | 9.8 GB | 每秒约 7 个 token |
 | 22 层的决策模型 | 0.7 GB | 一道题 15 毫秒左右 |
 
-机器是 M5 MacBook，浏览器是 Chrome，下同。
+机器是 MacBook Air（M5，24 GB），浏览器是 Chrome，下同。
 
 ---
 

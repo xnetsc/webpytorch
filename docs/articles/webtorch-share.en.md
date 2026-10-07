@@ -11,7 +11,7 @@ Results first (all of these run in the browser, nothing to install):
 | Qwen3.8-27B (hybrid SSM) | 9.8 GB | ~7 tokens/s |
 | 22-layer decision model | 0.7 GB | ~15 ms per question |
 
-Machine: M5 MacBook, Chrome. Same below.
+Machine: MacBook Air (M5, 24 GB), Chrome. Same below.
 
 ---
 

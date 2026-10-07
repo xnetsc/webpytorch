@@ -34,18 +34,20 @@ def text(x, y, s, size=14, fill=INK, anchor="start", weight="normal"):
             'font-weight="%s">%s</text>' % (x, y, size, fill, anchor, weight, esc(s)))
 
 
-def card(w, h, body, title, subtitle):
+def card(w, h, body, title, machine, subtitle):
+    """A chart on its own white card: title, the machine it was measured on, what is shown."""
     return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
             'font-family="%s">\n<rect x="0.5" y="0.5" width="%d" height="%d" rx="12" fill="%s" '
-            'stroke="%s"/>\n%s\n%s\n%s\n</svg>\n'
+            'stroke="%s"/>\n%s\n%s\n%s\n%s\n</svg>\n'
             % (w, h, w, h, FONT.replace("'", "&apos;"), w - 1, h - 1, CARD, EDGE,
-               text(28, 40, title, 19, INK, weight="700"), text(28, 64, subtitle, 13, MUTED),
-               "\n".join(body)))
+               text(28, 40, title, 19, INK, weight="700"),
+               text(28, 66, machine, 14, INK, weight="600"),
+               text(28, 88, subtitle, 13, MUTED), "\n".join(body)))
 
 
 def decide_chart(zh):
-    w, h = 860, 420
-    left, right, top, bottom = 70, 30, 110, 92
+    w, h = 860, 440
+    left, right, top, bottom = 70, 30, 130, 92
     plot_h = h - top - bottom
     span = w - left - right
     top_v = 80.0
@@ -92,9 +94,12 @@ def decide_chart(zh):
         lx += 210
     title = ("决策模型：webtorch 对比原生 MLX" if zh else
              "Decision model: webtorch against native MLX")
-    sub = ("同一台 M5 MacBook Air、同样的请求 · 22 层编码器，F16 · 毫秒，越低越好" if zh else
-           "Same M5 MacBook Air, same requests · 22-layer encoder, F16 · milliseconds, lower is better")
-    return card(w, h, body, title, sub)
+    machine = ("测试机器：MacBook Air（M5，24 GB）" if zh else
+               "Test machine: MacBook Air (M5, 24 GB)")
+    sub = ("两边同样的请求 · 22 层编码器，F16 · webtorch 跑在 Chrome 里 · 毫秒，越低越好" if zh else
+           "The same requests on both · 22-layer encoder, F16 · webtorch in Chrome · "
+           "milliseconds, lower is better")
+    return card(w, h, body, title, machine, sub)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 
 ### 浏览器标签页里跑大模型。不用安装，不用配驱动，什么显卡都能跑。
 
-无风扇的 **M5 MacBook Air**，Chrome 里：**Qwen3-0.6B 每秒 175 个 token 以上** · **30B MoE 每秒 42 个** · **22 层决策模型 15 毫秒一道题**
+无风扇的 **MacBook Air（M5，24 GB）**，Chrome 里：**Qwen3-0.6B 每秒 175 个 token 以上** · **30B MoE 每秒 42 个** · **22 层决策模型 15 毫秒一道题**
 
 ## ▶ [马上试：直接在浏览器里跑](https://xnetsc.github.io/webpytorch/chat/)
 
@@ -48,7 +48,7 @@ print(lm.generate("为什么这件事让人意外？", max_new=64))
 
 ## 速度
 
-在标签页里测的，不是服务器：无风扇的 M5 MacBook Air、Chrome、WebGPU，贪心解码。
+在标签页里测的，不是服务器：无风扇的 MacBook Air（M5，24 GB）、Chrome、WebGPU，贪心解码。
 
 | 模型 | 体积 | 浏览器里的速度 |
 |---|---:|---:|
@@ -59,7 +59,7 @@ print(lm.generate("为什么这件事让人意外？", max_new=64))
 
 同一台机器、同样的请求，和原生 MLX 比：
 
-<img src="images/vs-mlx-zh.svg" alt="决策模型延迟：Chrome 里的 webtorch 对比同一台 M5 MacBook Air 上的原生 MLX，间隔 2 秒问一道题 32~38 毫秒对 35.8 毫秒" width="860">
+<img src="images/vs-mlx-zh.svg" alt="决策模型延迟：Chrome 里的 webtorch 对比同一台 MacBook Air（M5，24 GB）上的原生 MLX，间隔 2 秒问一道题 32~38 毫秒对 35.8 毫秒" width="860">
 
 按日常用法，隔几秒问一道题，浏览器里和原生 MLX 打平。
 
