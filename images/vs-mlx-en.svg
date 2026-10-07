@@ -48,6 +48,6 @@
 <text x="92.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX (native)</text>
 <rect x="280" y="404" width="14" height="14" rx="3" fill="#2f6fec"/>
 <text x="302.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch (in the browser)</text>
-<text x="28.0" y="450.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX's lead comes from matrix hardware in Apple's GPU that WebGPU cannot use today.</text>
-<text x="28.0" y="469.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX runs only on Apple silicon; webtorch also runs on NVIDIA, AMD and Intel GPUs.</text>
+<text x="28.0" y="450.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX's lead comes from the matrix units in Apple's GPU. WebGPU cannot use hardware like this yet</text>
+<text x="28.0" y="469.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">(NVIDIA's Tensor Cores are another), so native keeps part of an edge for now; as WebGPU adds it, the two converge.</text>
 </svg>

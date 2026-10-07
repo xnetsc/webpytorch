@@ -79,9 +79,10 @@ Against native MLX on the same machine, with the same requests:
 <img src="images/vs-mlx-en.svg" alt="Decision model latency, webtorch in Chrome against native MLX on the same MacBook Air (M5, 24 GB): one question two seconds apart 32 to 38 ms against 35.8 ms" width="860">
 
 Asked the way people ask, one question every couple of seconds, the browser matches native MLX.
-MLX's lead in the other cases comes from the matrix hardware in Apple's GPU, which WebGPU cannot
-use today. MLX itself runs only on Apple silicon; the same webtorch page runs on NVIDIA, AMD and
-Intel GPUs too.
+Where MLX is ahead, it is using the matrix units in Apple's GPU. Some GPUs have hardware features
+like these (NVIDIA's Tensor Cores are another) that WebGPU does not expose yet, so native code keeps
+part of an edge for now; as WebGPU adds them, the two converge. MLX itself runs only on Apple
+silicon; the same webtorch page runs on NVIDIA, AMD and Intel GPUs too.
 
 ## What else it does
 

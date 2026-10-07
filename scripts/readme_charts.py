@@ -92,10 +92,10 @@ def decide_chart(zh):
                     % (lx, ly - 12, color))
         body.append(text(lx + 22, ly, name, 13, INK))
         lx += 210
-    notes = (("MLX 的优势来自苹果 GPU 里的矩阵硬件，WebGPU 目前用不了。",
-              "MLX 只能跑在苹果芯片上，webtorch 在英伟达、AMD、Intel 的显卡上也能跑。") if zh else
-             ("MLX's lead comes from matrix hardware in Apple's GPU that WebGPU cannot use today.",
-              "MLX runs only on Apple silicon; webtorch also runs on NVIDIA, AMD and Intel GPUs."))
+    notes = (("MLX 的优势来自苹果 GPU 的矩阵单元。这类硬件特性（英伟达的 Tensor Core 也是）WebGPU 目前还用不了，",
+              "所以原生暂时有部分性能优势；随着 WebGPU 补齐这些特性，两者会越来越接近。") if zh else
+             ("MLX's lead comes from the matrix units in Apple's GPU. WebGPU cannot use hardware like this yet",
+              "(NVIDIA's Tensor Cores are another), so native keeps part of an edge for now; as WebGPU adds it, the two converge."))
     for k, note in enumerate(notes):
         body.append(text(28, h - 38 + 19 * k, note, 12, MUTED))
     title = ("决策模型：webtorch 对比原生 MLX" if zh else

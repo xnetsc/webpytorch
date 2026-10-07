@@ -110,7 +110,7 @@ The 0.6B went from about 140 to over 175 tokens a second, with identical text.
 
 On the decision model, MLX measured 19 ms for three questions; WebGPU started at 100 ms. Merging the attention dispatches, folding the residual add into LayerNorm, and laying questions end to end instead of padding to the longest brought it to 44 ms.
 
-The rest is the platform. Matmuls reach about 4 TFLOPS on this chip, against a 6.2 TFLOPS half-precision peak. MLX reaches 12 through Apple's matrix units, which WebGPU cannot use. Chrome's experimental subgroup matrices (behind a developer flag) measured 3.9: still the ordinary ALUs.
+The rest is the platform. Matmuls reach about 4 TFLOPS on this chip, against a 6.2 TFLOPS half-precision peak. MLX reaches 12 through Apple's matrix units, which WebGPU cannot use. Chrome's experimental subgroup matrices (behind a developer flag) measured 3.9: still the ordinary ALUs. WebGPU does not expose hardware like this yet (NVIDIA's Tensor Cores are another); as it does, this gap closes.
 
 In everyday use it felt like MLX at twenty-something ms against 80 to 90 the first time and 50 to 60 after. The two numbers were measured differently: MLX back to back, webtorch with seconds between questions. Apple silicon clocks down when idle. After 200 ms of GPU idle the same work takes 2.6× longer; after 50 ms of CPU idle, 3 to 4×. A kernel that settles at 0.77 ms ran 3.6, 2.4, 2.0, 1.5, 1.2, 0.98 ms from idle; full clocks take fifteen to twenty milliseconds of continuous work. A question every few seconds always lands on a chip that just woke up.
 

@@ -61,7 +61,7 @@ print(lm.generate("为什么这件事让人意外？", max_new=64))
 
 <img src="images/vs-mlx-zh.svg" alt="决策模型延迟：Chrome 里的 webtorch 对比同一台 MacBook Air（M5，24 GB）上的原生 MLX，间隔 2 秒问一道题 32~38 毫秒对 35.8 毫秒" width="860">
 
-按日常用法，隔几秒问一道题，浏览器里和原生 MLX 打平。其余场景 MLX 更快，是因为它用上了苹果 GPU 里的矩阵硬件，WebGPU 目前用不了。MLX 只能跑在苹果芯片上，同一个 webtorch 页面在英伟达、AMD、Intel 的显卡上也能跑。
+按日常用法，隔几秒问一道题，浏览器里和原生 MLX 打平。MLX 更快的那几组，用的是苹果 GPU 的矩阵单元：部分显卡有这类硬件特性（英伟达的 Tensor Core 也是），WebGPU 目前还用不了，所以原生暂时有部分性能优势；随着 WebGPU 补齐这些特性，两者会越来越接近。MLX 只能跑在苹果芯片上，同一个 webtorch 页面在英伟达、AMD、Intel 的显卡上也能跑。
 
 ## 还能做什么
 
