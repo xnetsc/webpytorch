@@ -218,145 +218,108 @@
   }
 
   // ---- saying it to the model -------------------------------------------------------------
+  //
+  // xDecision answers from facts it is given; it does not reason, so it is used as a cheap
+  // if-else. Each option carries a few fact tags, the question names the tags wanted, and
+  // the model picks the option whose tags match. What it can and cannot do was measured with
+  // xDecision Q8_0 on 240 positions from real games (tetris/README.md has the table):
+  //
+  //   picks the option whose text says what the question asks for     99-100% right
+  //   "none of them" when nothing matches                              3% right
+  //   true/false about "option B" whose facts are in the state         "true" every time
+  //   sorting a fact sentence into categories that differ by a "no"    51% right
+  //   weighing several relative facts ("lands lowest, flattest…")      planner's pick 63%
+  //
+  // So: positive tags, no "none" option, no option letters to look up, and no two options
+  // with the same tags -- the rule then has exactly one best match.
 
-  /**
-   * One option's text, in words and relative to the other options.
-   *
-   * How it is worded decides whether the model can use it at all. Measured with xDecision
-   * Q8_0 on 240 decision points from real games, four options each, against the planner's
-   * own ranking (random picks its first choice 25% of the time, mean regret 29.8):
-   *
-   *   "columns 3-5: clears no lines, makes 1 new hole, stack 8 high, bumpiness 10"
-   *       -- the model picked the LAST option 218 times in 240; first choice 33%
-   *   "clears nothing, covers 1 empty cell (new holes, bad), lands 2 rows higher than the
-   *    lowest option, surface 3 bumpier than the flattest"
-   *       -- picked about evenly by position; first choice 60%, regret 10.6
-   *   ... plus ", 4 more ragged edges than the tidiest"
-   *       -- first choice 63-65%, regret 8.0-8.7
-   *   ... plus ", leaves a worse spot for the next piece"
-   *       -- worse: first choice 38%, regret 21.1; not used
-   *
-   * So the numbers are said as comparisons ("lowest", "2 rows higher than"), and a hole is
-   * said to be bad: the model weighs what it is told, it does not infer Tetris.
-   */
-  function describe(c, set) {
-    set = set || [c];
-    const f = c.features, parts = [];
-    const low = Math.min(...set.map(o => o.features.landingHeight));
-    const flat = Math.min(...set.map(o => o.features.bumpiness));
-    parts.push(f.rowsCleared === 0 ? 'clears nothing'
-      : 'clears ' + f.rowsCleared + (f.rowsCleared === 1 ? ' line' : ' lines'));
-    parts.push(f.newHoles > 0
-      ? 'covers ' + f.newHoles + ' empty ' + (f.newHoles === 1 ? 'cell' : 'cells') + ' (new holes, bad)'
-      : 'covers no empty cells');
-    const up = f.landingHeight - low;
-    const rows = +up.toFixed(1);
-    parts.push(up < 0.01 ? 'lands lowest'
-      : 'lands ' + rows + (rows === 1 ? ' row' : ' rows') + ' higher than the lowest option');
-    parts.push(f.bumpiness <= flat ? 'flattest surface'
-      : 'surface ' + (f.bumpiness - flat) + ' bumpier than the flattest');
-    const tidy = Math.min(...set.map(edges));
-    parts.push(edges(c) === tidy ? 'tidiest edges'
-      : (edges(c) - tidy) + ' more ragged edges than the tidiest');
-    return parts.join(', ');
-  }
+  const LINE = 'clears a line', CLEAN = 'hole-free', HOLE = 'makes a new hole';
 
-  // Filled/empty boundaries along rows and down columns: every overhang, gap and wall the
-  // placement leaves. The evaluation's two transition counts, said as one thing.
-  function edges(c) { return c.features.rowTransitions + c.features.columnTransitions; }
-
-  // Everything describe() says about an option: two options with the same signature read
-  // word for word the same to the model.
-  function signature(c) {
+  /** An option's text: its fact tags. "clears a line" appears only when it does. */
+  function facts(c) {
     const f = c.features;
-    return [f.rowsCleared, f.newHoles, f.landingHeight, f.bumpiness, edges(c)].join();
+    return (f.rowsCleared > 0 ? LINE + ', ' : '') + (f.newHoles > 0 ? HOLE : CLEAN);
   }
 
+  /** The rule, in the tags' own words. */
+  const INSTRUCTIONS = 'Choose the option that clears a line and is hole-free.';
+
+  // What the rule prefers, best first: a hole-free line clear, then hole-free, then a line
+  // clear that leaves a hole, then the rest.
+  const PREFERENCE = [LINE + ', ' + CLEAN, CLEAN, LINE + ', ' + HOLE, HOLE];
+
+  // The order options are listed in. There are four kinds of tags, so everything the model
+  // can be asked is 11 sets of kinds x 7 pieces = 77 inputs, and all of them were tried
+  // (tetris/eval/table.mjs). Listed left to right on the board it answered 364 of 420
+  // orderings right; in this order it answers all 77 right, with the right answer first,
+  // second or third depending on the set -- so it is the tags it reads, not a position.
+  const ORDER = [LINE + ', ' + HOLE, CLEAN, LINE + ', ' + CLEAN, HOLE];
+
   /**
-   * The options to put to the model: the best `k` of `ranked`, less any it cannot tell
-   * apart. Two placements described identically are one choice as far as the model can
-   * see, and offering both only splits its answer between them; the planner's preferred
-   * one stays.
+   * The options to put to the model: from the planner's best `k`, the best of each kind of
+   * fact tags, in the planner's order. Options with the same tags read the same to the
+   * model, so only the planner's preferred one of them is offered, and the model chooses
+   * between kinds.
    */
   function candidates(ranked, k) {
     const out = [], seen = new Set();
     for (const c of ranked.slice(0, k)) {
-      const sig = signature(c);
-      if (seen.has(sig)) continue;
-      seen.add(sig);
+      const tags = facts(c);
+      if (seen.has(tags)) continue;
+      seen.add(tags);
       out.push(c);
     }
     return out;
   }
 
+  /** The options as they are listed to the model (label A first). */
+  function arrange(options) {
+    return options.slice().sort((a, b) => ORDER.indexOf(facts(a)) - ORDER.indexOf(facts(b)));
+  }
+
   /**
-   * The board as the model reads it: a grid, filled rows only, bottom row last.
-   * `#` is a filled cell and `.` an empty one.
+   * The same rule evaluated in code: the answer the model should give. With the conditions
+   * evaluated here, this policy did not lose a game in 5 x 500 pieces (tetris/eval).
    */
-  function boardText(board) {
-    const rows = [];
-    let top = board.findIndex(r => r.some(v => v !== 0));
-    if (top < 0) top = board.length;
-    for (let y = top; y < board.length; y++) {
-      rows.push(board[y].map(v => (v ? '#' : '.')).join(''));
+  function expected(options) {
+    for (const tags of PREFERENCE) {
+      const c = options.find(o => facts(o) === tags);
+      if (c) return c;
     }
-    return rows;
+    return null;
   }
-
-  function stateFor(board, matrix, next, stats) {
-    const h = heights(board);
-    return {
-      game: 'Tetris',
-      board: boardText(board).join('\n') || '(empty)',
-      columns: board[0].length,
-      rows: board.length,
-      stack_height: Math.max(0, ...h),
-      holes: holes(board),
-      piece: pieceName(matrix),
-      next_piece: next ? pieceName(next) : null,
-      lines_cleared: stats ? stats.lines : undefined,
-    };
-  }
-
-  // The question type names are the checkpoint's own (`surface().takes.questions.types`);
-  // `choice` is the conventional name of the general, named-options shape.
-  const INSTRUCTIONS = 'Where should the current Tetris piece be dropped? Clear lines when '
-    + 'possible, never leave holes under the stack, and keep the stack low and flat.';
 
   /**
-   * One question whose options are the candidates, labelled A, B, C… `type` is the model's
-   * name for its named-options question type, read from its `surface()`.
+   * One question whose options are the candidates' fact tags, labelled A, B, C… `type` is
+   * the model's name for its named-options question type, read from its `surface()`.
    */
-  function question(candidates, o) {
+  function question(shown, o) {
     o = o || {};
     const criteria = {};
-    candidates.forEach((c, i) => {
-      criteria[String.fromCharCode(65 + i)] = describe(c, candidates);
-    });
+    shown.forEach((c, i) => { criteria[String.fromCharCode(65 + i)] = facts(c); });
     return { type: o.type || 'choice', instructions: o.instructions || INSTRUCTIONS, criteria };
-  }
-
-  // Options go to the model left to right on the board, not in the planner's order: it is
-  // asked to judge the placements, and handing them over best-first would let it answer by
-  // position.
-  function leftToRight(a, b) {
-    const ax = Math.min(...a.cells.map(c => c[0])), bx = Math.min(...b.cells.map(c => c[0]));
-    return ax - bx || a.rotations - b.rotations;
   }
 
   /**
    * Everything one turn puts to the model, from a bridge snapshot and the ranked placements:
-   * the options shown (`shown[i]` is label A+i), and the `state` and `questions` for
-   * decide(). The page and tetris/eval both ask through this, so what is measured is what
-   * the page asks.
+   * the options as listed (`shown[i]` is label A+i), the answer the rule gives (`expected`), and
+   * the `state` and `questions` for decide(). The page and tetris/eval both ask through
+   * this, so what is measured is what the page asks.
    */
   function ask(snap, ranked, k, type) {
-    const shown = candidates(ranked, k).sort(leftToRight);
+    const options = candidates(ranked, k);
+    const shown = arrange(options);
     return {
       shown,
-      state: stateFor(snap.board, snap.matrix, snap.next, snap),
+      expected: expected(options),
+      state: stateOf(pieceName(snap.matrix)),
       questions: { move: question(shown, { type }) },
     };
+  }
+
+  /** What the model is told besides the options: only which piece it is. */
+  function stateOf(piece) {
+    return { game: 'Tetris', piece };
   }
 
   /** The option a decide() answer picked, from what `ask` returned. */
@@ -368,7 +331,8 @@
   return {
     NAMES, WEIGHTS, INSTRUCTIONS,
     pieceName, clone, collides, rotateLikeGame, settle, heights, holes, measure,
-    placements, rank, find, candidates, describe, boardText, stateFor, question, leftToRight,
+    PREFERENCE, ORDER,
+    placements, rank, find, facts, candidates, arrange, expected, question, stateOf,
     ask, picked,
   };
 }));

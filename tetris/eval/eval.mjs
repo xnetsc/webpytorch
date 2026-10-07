@@ -1,8 +1,9 @@
 // Play whole games headless and report how far each one got, for one way of choosing:
 //
 //   --who model    xDecision answers the page's question (needs --model, runs decide.py)
+//   --who rules    the same rule evaluated in code ("代码" on the page)
 //   --who random   a uniform pick among the same options the model is shown
-//   --who rules    the planner's first choice ("只用规则" on the page)
+//   --who planner  the planner's own first choice, no rule
 //
 //   node tetris/eval/eval.mjs --who model --model path/to/xDecision-Q8_0.gguf
 //   node tetris/eval/eval.mjs --who random --games 5 --max-pieces 500 --k 4
@@ -48,27 +49,28 @@ for (let seed = first; seed < first + games; seed++) {
   const { api } = headlessGame(seed);
   const rotate = (m, dir) => api.rotateMatrix(m, dir);
   const pick = seeded(seed * 7 + 1);
-  let pieces = 0, top = 0, ms = 0, asked = 0;
+  let pieces = 0, top = 0, ms = 0, asked = 0;   // top: moves equal to the rule's answer
   while (!api.over() && pieces < cap) {
     const s = api.snapshot();
     const ranked = P.rank(s.board, s.matrix, s.pos, rotate, s.next, api.spawnOf);
     if (!ranked.length) break;
     const q = P.ask(s, ranked, k, 'choice');
-    let chosen = ranked[0];
-    if (o.who === 'random') chosen = q.shown[Math.floor(pick() * q.shown.length)];
+    let chosen = q.expected;
+    if (o.who === 'planner') chosen = ranked[0];
+    else if (o.who === 'random') chosen = q.shown[Math.floor(pick() * q.shown.length)];
     else if (o.who === 'model' && q.shown.length > 1) {
       const res = await decide(q.state, q.questions);
       if (res.error) throw new Error(res.error);
       chosen = P.picked(q, res.answers);
       ms += res.ms; asked++;
     }
-    if (chosen === ranked[0]) top++;
+    if (chosen === q.expected) top++;
     if (!api.perform(chosen)) throw new Error('the game did not take a planned move');
     pieces++;
   }
   const s = api.snapshot();
   const r = { seed, pieces, lines: s.lines, score: s.score, ended: s.gameOver,
-              rulesFirst: +(top / Math.max(1, pieces)).toFixed(3),
+              asRule: +(top / Math.max(1, pieces)).toFixed(3),
               msPerDecision: asked ? Math.round(ms / asked) : null };
   results.push(r);
   console.log(JSON.stringify(r));
@@ -78,4 +80,4 @@ const mean = (key, digits = 1) =>
   +(results.reduce((t, r) => t + r[key], 0) / results.length).toFixed(digits);
 console.log(JSON.stringify({ who: o.who, k, games, cap, lines: mean('lines'), pieces: mean('pieces'),
                              ended: results.filter(r => r.ended).length,
-                             rulesFirst: mean('rulesFirst', 3) }));
+                             asRule: mean('asRule', 3) }));

@@ -1,11 +1,13 @@
 /* xDecision plays vanilla-js-tetris.
  *
- * Each new piece is one turn:
+ * xDecision answers from the facts it is handed and does not reason, so it is used as a
+ * cheap if-else. Each new piece is one turn:
  *   1. read the game (bridge.js -> the game's own `board` and `player`),
- *   2. list every placement the game's controls can reach and what each leaves behind
- *      (planner.js),
- *   3. ask xDecision, through the webtorch SDK, one `choice` question whose options are the
- *      strongest of those placements -- the model's answer is the move,
+ *   2. list every placement the game's controls can reach, and keep the planner's best of
+ *      each kind of fact -- "clears a line", "hole-free" / "makes a new hole" (planner.js),
+ *   3. ask xDecision, through the webtorch SDK, one `choice` question: the rule ("Choose
+ *      the option that clears a line and is hole-free.") over those options' fact tags.
+ *      The option it picks is the move,
  *   4. play it with the game's own controls (playerRotate / playerMove / playerHardDrop).
  *
  * The model is the one the Pages chat app lists (chat/models.json), loaded and asked the
@@ -110,7 +112,7 @@
     const useModel = opt.mode() === 'model' && S.choiceType;
     const asked = P.ask(snap, ranked, Math.max(1, opt.k()), S.choiceType);
     const shown = asked.shown;
-    let chosen = ranked[0], answer = null;
+    let chosen = asked.expected, answer = null;
     if (opt.hold()) G.holdGravity(true);
     if (useModel && shown.length > 1) {
       const t0 = performance.now();
@@ -122,12 +124,12 @@
                  tokens: (res.usage || {}).input_tokens };
       S.stats.asked++;
       S.stats.ms += ms;
-      if (chosen === ranked[0]) S.stats.agree++;
+      if (chosen === asked.expected) S.stats.agree++;
     }
     // Switched off, or the piece was dropped by a person or by gravity while the model was
     // thinking: this answer is for a piece that is no longer in play.
     if (!S.on || G.token() !== S.token) { G.holdGravity(false); return; }
-    showTurn(snap, shown, chosen, ranked[0], answer, useModel);
+    showTurn(snap, shown, chosen, asked.expected, answer, useModel);
     const pace = opt.pace();
     if (pace !== 'fast') { overlay(shown, chosen); await sleep(pace === 'watch' ? 450 : 250); }
     if (!S.on || G.token() !== S.token) { overlay(null); G.holdGravity(false); return; }
@@ -206,31 +208,24 @@
   function syncButtons() {
     const modelReady = !!S.choiceType;
     $('#ai').disabled = opt.mode() === 'model' && !modelReady;
-    $('#ai').textContent = S.on ? '停止 AI' : (opt.mode() === 'model' ? '让 xDecision 来玩' : '让规则来玩（对照）');
+    $('#ai').textContent = S.on ? '停止 AI'
+      : (opt.mode() === 'model' ? '让 xDecision 来玩' : '让代码来玩（对照）');
   }
 
   // ---- what the page shows ----------------------------------------------------------------
 
   const pct = (p) => (p * 100).toFixed(1) + '%';
 
-  // The same facts as the option text the model reads (planner.describe), said for people.
-  function summary(c, set) {
+  // An option for people: where it goes, and the same facts its tags give the model.
+  function summary(c) {
     const f = c.features;
-    const low = Math.min(...set.map(o => o.features.landingHeight));
-    const flat = Math.min(...set.map(o => o.features.bumpiness));
-    const edge = (o) => o.features.rowTransitions + o.features.columnTransitions;
-    const tidy = Math.min(...set.map(edge));
     const xs = c.cells.map(cell => cell[0] + 1);
     const lo = Math.min(...xs), hi = Math.max(...xs);
     return (lo === hi ? '第 ' + lo + ' 列' : '第 ' + lo + '–' + hi + ' 列') + '：'
-      + [f.rowsCleared ? '消 ' + f.rowsCleared + ' 行' : '不消行',
-         f.newHoles > 0 ? '新增 ' + f.newHoles + ' 个洞' : '不留洞',
-         f.landingHeight - low < 0.01 ? '落点最低' : '比最低高 ' + +(f.landingHeight - low).toFixed(1) + ' 行',
-         f.bumpiness <= flat ? '表面最平' : '不平度 +' + (f.bumpiness - flat),
-         edge(c) <= tidy ? '边缘最整齐' : '参差 +' + (edge(c) - tidy)].join(' · ');
+      + (f.rowsCleared > 0 ? '消行 · ' : '') + (f.newHoles > 0 ? '留下新洞' : '不留洞');
   }
 
-  function showTurn(snap, shown, chosen, top, answer, useModel) {
+  function showTurn(snap, shown, chosen, rule, answer, useModel) {
     const box = $('#turn');
     box.textContent = '';
     const head = document.createElement('p');
@@ -239,8 +234,8 @@
       + (snap.next ? P.pieceName(snap.next) : '?') + ' · '
       + (useModel
         ? (answer ? 'xDecision ' + answer.ms.toFixed(0) + ' ms · 读了 ' + answer.tokens + ' 个 token'
-                  : '前几名在模型看来都一样，只剩一个，不用问')
-        : '规则直接取第一名（未调用模型）');
+                  : '候选的事实都一样，只剩一个，不用问')
+        : '同一条规则在代码里判断（未调用模型）');
     box.appendChild(head);
     const list = document.createElement('ol');
     list.className = 'cands';
@@ -254,9 +249,9 @@
       bar.style.width = p == null ? '0' : (p * 100).toFixed(1) + '%';
       const text = document.createElement('span');
       text.className = 'ctext';
-      text.textContent = label + '  ' + summary(c, shown) + (c === top ? '  ⚑规则首选' : '');
+      text.textContent = label + '  ' + summary(c) + (c === rule ? '  ✓按规则' : '');
       // What the model actually read for this option, word for word.
-      text.title = P.describe(c, shown);
+      text.title = P.facts(c);
       const prob = document.createElement('span');
       prob.className = 'prob';
       prob.textContent = p == null ? '' : pct(p);
@@ -276,7 +271,7 @@
       '最多消行 ' + st.bestLines,
       '最高分 ' + st.bestScore,
       st.asked ? 'xDecision 平均 ' + (st.ms / st.asked).toFixed(0) + ' ms/步' : null,
-      st.asked ? '与规则首选一致 ' + pct(st.agree / st.asked) : null,
+      st.asked ? 'xDecision 的判断与代码判断一致 ' + pct(st.agree / st.asked) : null,
     ].filter(Boolean).join(' · ');
   }
 
@@ -308,6 +303,8 @@
   }
 
   // ---- wiring ---------------------------------------------------------------------------
+
+  $('#rule').textContent = P.INSTRUCTIONS;
 
   if (ownURL) {
     const o = document.createElement('option');

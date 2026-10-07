@@ -37,40 +37,47 @@ const res  = await wt.decide(state, { move: question });   // res.answers.move.c
 
 ## 每一步怎么决定
 
+xDecision 根据给定的事实回答问题，不会推理。这里把它当一个便宜的 if-else：代码把事实写成标签，规则写成题目，
+模型挑出标签符合规则的那个选项。
+
 每来一个新方块，`ai.js` 做四件事：
 
 1. **读局面。** 通过 `bridge.js` 拿到游戏自己的 `board`（10×20）、当前方块 `player.matrix` / `player.pos`，
    以及预览里的下一个方块 `player.next`。
 2. **列出所有落点。** `planner.js` 按游戏的操作顺序（先旋转若干次，再左右移动，最后直接落下）找出每一个
-   能到达的落点，算出落下之后的结果：消几行、新增几个洞、落点高低、表面平不平、边缘参差多少。旋转用的就是游戏自己的
-   `rotate()`，碰撞检测和旋转时的踢墙逐行照抄 `tetris.js`，所以算出来的结果和游戏实际一致。然后按
-   Dellacherie 特征（权重用 El-Tetris 公开的数值）加上对下一个方块的一步预判，给落点排序，取前 K 个（默认 4 个）作为候选。
-   描述完全相同的候选在模型看来是同一个选项，只保留排在前面的那个。
-3. **问 xDecision。** 把棋盘和候选交给模型，问一道单选题，候选按在棋盘上从左到右的顺序排，标成 A、B、C、D：
+   能到达的落点。旋转用的就是游戏自己的 `rotate()`，碰撞检测和旋转时的踢墙逐行照抄 `tetris.js`，所以算出来的
+   结果和游戏实际一致。然后按 Dellacherie 特征（权重用 El-Tetris 公开的数值）加上对下一个方块的一步预判排序。
+3. **把事实写成标签，问 xDecision。** 每个落点只有两条事实：消不消行，留不留新洞。从前 K 名（默认 4 名）里，
+   每一类标签只留排在最前的那个，所以选项最多 4 个，而且标签各不相同。题目就是规则本身：
 
    ```json
    {
-     "state": {"game": "Tetris", "board": "....##....\n#.######.#", "piece": "T", "next_piece": "L", "...": "..."},
+     "state": {"game": "Tetris", "piece": "T"},
      "questions": {"move": {
        "type": "choice",
-       "instructions": "Where should the current Tetris piece be dropped? Clear lines when possible, never leave holes under the stack, and keep the stack low and flat.",
+       "instructions": "Choose the option that clears a line and is hole-free.",
        "criteria": {
-         "A": "clears nothing, covers no empty cells, lands lowest, surface 2 bumpier than the flattest, 2 more ragged edges than the tidiest",
-         "B": "clears 1 line, covers no empty cells, lands 1 row higher than the lowest option, flattest surface, tidiest edges",
-         "C": "clears nothing, covers 1 empty cell (new holes, bad), lands lowest, surface 4 bumpier than the flattest, 6 more ragged edges than the tidiest",
-         "D": "..."
+         "A": "hole-free",
+         "B": "clears a line, hole-free",
+         "C": "makes a new hole"
        }
      }}
    }
    ```
 
-   模型给每个选项一个概率，概率最高的那个就是这一步。题型名不是写死的，加载后从模型的 `surface()` 里找
-   “由调用方给选项”（shape 为 `named`）的那一种。
+   这道题相当于：有既消行又不留洞的就选它；没有，就选不留洞的；再没有，就选能消行的；都不行，就是剩下那个。
+   模型选概率最高的选项。题型名不是写死的，加载后从模型的 `surface()` 里找“由调用方给选项”（shape 为 `named`）
+   的那一种。
+
+   标签只有 4 种，所以模型可能被问到的输入一共只有 11 种标签组合 × 7 种方块 = 77 个。选项按固定的标签顺序排列，
+   这 77 个输入都实际问过模型，全部答对（`node tetris/eval/table.mjs <模型文件>` 可以重新检查）。按落点在棋盘上
+   从左到右排时，在所有排列下只答对 364 / 420 个，所以顺序是固定的。在这个顺序里，正确答案有时排第一、有时第二、
+   有时第三，说明模型读的是标签，不是位置。
 4. **执行。** 用游戏自己的 `playerRotate()`、`playerMove()`、`playerHardDrop()` 把方块放过去。执行前按
    落点再找一遍路径，模型思考期间方块如果往下掉了一格，也还是落到模型选的位置。
 
-页面上会列出每一步的候选、模型给每个候选的概率、模型选了哪个（★），以及规则估值的第一名（⚑），可以对照
-着看。“只用规则”模式不调用模型，直接取规则第一名，用来对比。
+页面上会列出每一步的选项、模型给每个选项的概率、模型选了哪个（★），以及同一条规则在代码里判断出的答案（✓），
+可以核对模型判断得对不对。“代码”模式不调用模型，直接用代码判断的答案，用来对比。
 
 ## 怎么调用游戏的内部接口
 
@@ -102,35 +109,42 @@ const res  = await wt.decide(state, { move: question });   // res.answers.move.c
 
 ## 实测效果
 
-用 `eval/eval.mjs` 测的：在 Node 里跑原版 `tetris.js`，种子 1–5 各一局，最多 500 块。每一步的候选完全相同
-（规则估值前 4 名，去掉描述相同的），只换“谁来选”：
+### 整局
 
-| 谁来选 | 平均消行 | 平均放下方块 | 500 块内结束的局数 |
-|---|---:|---:|---:|
-| **xDecision**（页面默认） | **106.4** | **300.2** | 5 / 5 |
-| 在同样的候选里随机选 | 8.2 | 55.2 | 5 / 5 |
-| 规则第一名（“只用规则”模式） | 198.4 | 500 | 0 / 5（封顶） |
+用 `eval/eval.mjs` 测：在 Node 里跑原版 `tetris.js`，种子 1–5 各一局，每局最多 500 块。每一步给出的选项完全相同，
+只换“谁来选”：
 
-- xDecision 比在同样候选里随机选多活约 5 倍、多消约 13 倍的行，它的选择确实来自对选项的理解，不是瞎猜。
-  58% 的时候它选的就是规则第一名。
-- 但它玩得不如每次都取规则第一名：规则第一名在 500 块（之前试过 1000 块）内一局都没输。模型选的不是第一名时，
-  多数时候会比第一名差一点，这些差距累积起来最终会输。想看最高分用“只用规则”，想看模型做决定用默认模式。
-- 选项怎么写，决定了模型能不能用。在 240 个真实对局局面上，4 个候选，统计模型选中规则第一名的比例和平均
-  估值损失（随机选是 25%、29.8）：
+| 谁来选 | 平均消行 | 平均放下方块 | 500 块内输掉 | 和规则答案一致 |
+|---|---:|---:|---:|---:|
+| **xDecision**（页面默认） | 198.6 | 500 | 0 / 5 | 100% |
+| 同一条规则，在代码里判断（“代码”模式） | 198.6 | 500 | 0 / 5 | 100% |
+| 规划器排第一的，不用规则 | 198.4 | 500 | 0 / 5 | 86.7% |
+| 在同样的选项里随机选 | 19.4 | 85 | 5 / 5 | 56.3% |
 
-  | 选项写法 | 选中第一名 | 平均损失 |
-  |---|---:|---:|
-  | 写数字：`columns 3-5: clears no lines, makes 1 new hole, stack 8 high, bumpiness 10` | 33% | 25.4 |
-  | 写成相互比较：`clears nothing, covers 1 empty cell (new holes, bad), lands 2 rows higher than the lowest option, …` | 60% | 10.6 |
-  | 再加上 `…, 4 more ragged edges than the tidiest`（现在用的） | 63% | 8.7 |
-  | 再加上 `…, leaves a worse spot for the next piece` | 38% | 21.1 |
+在没有显卡的机器上，用 SDK 的 CPU 路径（numpy）跑，每步约 100 毫秒。浏览器里走 WebGPU，权重相同，但数值
+路径不同，所以 77 个输入的检查是针对 CPU 路径做的。
 
-  写数字的时候，模型 240 次里有 218 次选了最后一个选项，跟内容无关；用这种写法试玩了两局，平均 30 块就输了。
-- 上面的数是在没有显卡的机器上用 SDK 的 CPU 路径（numpy）跑的，每步约 0.4 秒。浏览器里走 WebGPU，权重相同，但
-  数值路径不同，概率非常接近的时候个别选择可能不一样。
-- 浏览器里的完整流程在无界面 Chromium 里跑过：通过 SDK 加载 xDecision、模型连续决策并落子、候选在棋盘上标出、
-  “只用规则”模式、游戏结束后自动重开、停止后重力恢复、手机宽度没有横向滚动。那台机器没有显卡（软件模拟的
-  WebGPU），每步要 30～65 秒；在真正的显卡上会快得多，但我没有在显卡上实测过这个页面。
+### 这个模型能做什么、不能做什么
+
+在 240 个真实对局局面上实测（每个局面 4 个候选），结果决定了上面的设计：
+
+| 问法 | 结果 |
+|---|---|
+| 选项里写着题目要的事实，问“哪个选项是 X” | 99%～100% 答对 |
+| 没有选项符合时，答“都不是”（`none`） | 3% 答对：几乎从不选 `none` |
+| 事实放在 state 里，按字母问“选项 B 不留洞”（是/否题） | 所有问题都答“是” |
+| 把一句事实分到几个只差一个“不”字的类别里 | 51% 答对 |
+| 每个选项写一串相对比较（“落点最低、最平、边缘最整齐…”），让它挑最好的 | 63% 选中规划器第一名，整局平均 106 行、300 块就输 |
+| 选项写成数字（`stack 8 high, bumpiness 10`） | 240 次里 218 次选最后一个选项，跟内容无关 |
+
+所以：选项只写正面的事实标签；不设“都不是”；不让它按字母去 state 里查；标签不重复；规则用标签自己的原话写成
+题目。这样它就是一个便宜、可靠的 if-else。
+
+### 浏览器
+
+完整流程在无界面 Chromium 里跑过：通过 SDK 加载 xDecision、模型连续决策并落子、候选标在棋盘上、“代码”模式、
+游戏结束后自动重开、停止后重力恢复、手机宽度没有横向滚动。那台机器没有显卡，WebGPU 是 CPU 模拟的
+（`swiftshader`，`isFallbackAdapter: true`），每步约 8 秒（模型每步只读 46 个 token 左右）；在真正的显卡上会快得多，但没有在显卡上实测过这个页面。
 
 ## 文件
 
@@ -139,16 +153,18 @@ const res  = await wt.decide(state, { move: question });   // res.answers.move.c
 | `index.html` | 页面；保留了 `tetris.js` 要找的元素 id（`tetris`、`next`、`score`、`lines`、`level`、`start-button`） |
 | `vendor/tetris.js` | 上游游戏，原样 |
 | `bridge.js` | 游戏内部接口 → `window.TetrisGame` |
-| `planner.js` | 落点枚举、局面特征、给模型的题目（浏览器和 Node 都能用） |
+| `planner.js` | 落点枚举、局面特征、事实标签和规则题目（浏览器和 Node 都能用） |
 | `ai.js` | SDK 启动、模型加载、每一步的决策和执行、界面 |
 | `eval/headless.mjs` | 在 Node 的 vm 里跑原版 `tetris.js` + `bridge.js`（无画面、无重力、随机数可复现） |
 | `eval/eval.mjs`、`eval/decide.py` | 无界面地整局整局地玩，统计消行和存活块数；`--who model` 用 SDK 在本机 CPU 上跑 xDecision |
+| `eval/table.mjs` | 把模型可能被问到的 77 个输入全部问一遍，和代码里的规则核对 |
 | `../test/tetris_planner.test.mjs` | 检查每个计划落点经游戏函数执行后，棋盘和 planner 算的完全一样，以及重力暂停、题目格式等 |
 
 ```bash
 node --test test/tetris_planner.test.mjs
-node tetris/eval/eval.mjs --who rules            # 或 --who random
+node tetris/eval/eval.mjs --who rules            # 或 --who planner / --who random
 node tetris/eval/eval.mjs --who model --model path/to/xDecision-Q8_0.gguf
+node tetris/eval/table.mjs path/to/xDecision-Q8_0.gguf
 ```
 
 ## 许可

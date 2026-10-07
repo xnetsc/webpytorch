@@ -81,7 +81,7 @@ test('holding gravity stops the game loop from dropping the piece, and releasing
   assert.equal(api.snapshot().pos.y, y0 + 1);
 });
 
-test('a turn asks one question over options the model can tell apart, left to right', () => {
+test('a turn asks the rule over fact tags, one option per kind, in the verified order', () => {
   const { api } = game(3);
   const rotate = (m, d) => api.rotateMatrix(m, d);
   for (let n = 0; n < 25; n++) {
@@ -94,34 +94,33 @@ test('a turn asks one question over options the model can tell apart, left to ri
   const q = asked.questions.move;
   assert.deepEqual(Object.keys(asked.questions), ['move']);
   assert.equal(q.type, 'choice');
+  assert.equal(q.instructions, planner.INSTRUCTIONS);
   assert.ok(asked.shown.includes(ranked[0]), 'the planner\'s first choice is always offered');
   assert.deepEqual(Object.keys(q.criteria), asked.shown.map((_, i) => String.fromCharCode(65 + i)));
   const texts = Object.values(q.criteria);
   assert.equal(new Set(texts).size, texts.length, 'no two options read the same');
-  const lefts = asked.shown.map(c => Math.min(...c.cells.map(cell => cell[0])));
-  assert.deepEqual(lefts, lefts.slice().sort((a, b) => a - b));
-  assert.equal(asked.state.piece, planner.pieceName(s.matrix));
-  assert.equal(asked.state.board.split('\n').length, planner.boardText(s.board).length || 1);
+  for (const t of texts) assert.match(t, /^(clears a line, )?(hole-free|makes a new hole)$/);
+  const at = texts.map(t => planner.ORDER.indexOf(t));
+  assert.deepEqual(at, at.slice().sort((a, b) => a - b), 'listed in the verified order');
+  assert.deepEqual(asked.state, { game: 'Tetris', piece: planner.pieceName(s.matrix) });
+  assert.ok(asked.shown.includes(asked.expected));
   const label = Object.keys(q.criteria).at(-1);
   assert.equal(planner.picked(asked, { move: { choice: label } }), asked.shown.at(-1));
 });
 
-test('options are said relative to each other, and a hole is said to be bad', () => {
-  const { api } = game(4);
-  const rotate = (m, d) => api.rotateMatrix(m, d);
-  let holed = null, clean = null;
-  for (let n = 0; n < 40 && !(holed && clean); n++) {
-    const s = api.snapshot();
-    const all = planner.rank(s.board, s.matrix, s.pos, rotate);
-    holed = all.find(c => c.features.newHoles > 0);
-    clean = all.find(c => c.features.newHoles <= 0);
-    if (!(holed && clean)) api.perform(all[0]);
-  }
-  assert.ok(holed && clean);
-  const set = [clean, holed];
-  assert.match(planner.describe(holed, set), /covers \d+ empty cells? \(new holes, bad\)/);
-  assert.match(planner.describe(clean, set), /covers no empty cells/);
-  for (const c of set) assert.doesNotMatch(planner.describe(c, set), /\d+ high|bumpiness \d/);
+test('the rule in code: hole-free line clear, then hole-free, then a line clear, then the rest', () => {
+  const opt = (rowsCleared, newHoles) => ({ features: { rowsCleared, newHoles } });
+  const first = opt(0, 2), clean = opt(0, 0), cleanLine = opt(1, 0), holedLine = opt(2, 1);
+  assert.equal(planner.expected([first, clean, cleanLine, holedLine]), cleanLine);
+  assert.equal(planner.expected([first, holedLine, clean]), clean);
+  assert.equal(planner.expected([first, holedLine]), holedLine);
+  assert.equal(planner.expected([first]), first);
+  assert.deepEqual(planner.arrange([first, clean, cleanLine, holedLine]).map(planner.facts),
+                   planner.ORDER);
+  assert.equal(planner.facts(cleanLine), 'clears a line, hole-free');
+  assert.equal(planner.facts(holedLine), 'clears a line, makes a new hole');
+  assert.equal(planner.facts(clean), 'hole-free');
+  assert.equal(planner.facts(first), 'makes a new hole');
 });
 
 test('the page loads the xDecision GGUF the Pages chat app lists', () => {
