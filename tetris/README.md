@@ -102,7 +102,35 @@ const res  = await wt.decide(state, { move: question });   // res.answers.move.c
 
 ## 实测效果
 
-<!-- RESULTS -->
+用 `eval/eval.mjs` 测的：在 Node 里跑原版 `tetris.js`，种子 1–5 各一局，最多 500 块。每一步的候选完全相同
+（规则估值前 4 名，去掉描述相同的），只换“谁来选”：
+
+| 谁来选 | 平均消行 | 平均放下方块 | 500 块内结束的局数 |
+|---|---:|---:|---:|
+| **xDecision**（页面默认） | **106.4** | **300.2** | 5 / 5 |
+| 在同样的候选里随机选 | 8.2 | 55.2 | 5 / 5 |
+| 规则第一名（“只用规则”模式） | 198.4 | 500 | 0 / 5（封顶） |
+
+- xDecision 比在同样候选里随机选多活约 5 倍、多消约 13 倍的行，它的选择确实来自对选项的理解，不是瞎猜。
+  58% 的时候它选的就是规则第一名。
+- 但它玩得不如每次都取规则第一名：规则第一名在 500 块（之前试过 1000 块）内一局都没输。模型选的不是第一名时，
+  多数时候会比第一名差一点，这些差距累积起来最终会输。想看最高分用“只用规则”，想看模型做决定用默认模式。
+- 选项怎么写，决定了模型能不能用。在 240 个真实对局局面上，4 个候选，统计模型选中规则第一名的比例和平均
+  估值损失（随机选是 25%、29.8）：
+
+  | 选项写法 | 选中第一名 | 平均损失 |
+  |---|---:|---:|
+  | 写数字：`columns 3-5: clears no lines, makes 1 new hole, stack 8 high, bumpiness 10` | 33% | 25.4 |
+  | 写成相互比较：`clears nothing, covers 1 empty cell (new holes, bad), lands 2 rows higher than the lowest option, …` | 60% | 10.6 |
+  | 再加上 `…, 4 more ragged edges than the tidiest`（现在用的） | 63% | 8.7 |
+  | 再加上 `…, leaves a worse spot for the next piece` | 38% | 21.1 |
+
+  写数字的时候，模型 240 次里有 218 次选了最后一个选项，跟内容无关；用这种写法试玩了两局，平均 30 块就输了。
+- 上面的数是在没有显卡的机器上用 SDK 的 CPU 路径（numpy）跑的，每步约 0.4 秒。浏览器里走 WebGPU，权重相同，但
+  数值路径不同，概率非常接近的时候个别选择可能不一样。
+- 浏览器里的完整流程在无界面 Chromium 里跑过：通过 SDK 加载 xDecision、模型连续决策并落子、候选在棋盘上标出、
+  “只用规则”模式、游戏结束后自动重开、停止后重力恢复、手机宽度没有横向滚动。那台机器没有显卡（软件模拟的
+  WebGPU），每步要 30～65 秒；在真正的显卡上会快得多，但我没有在显卡上实测过这个页面。
 
 ## 文件
 
@@ -113,10 +141,14 @@ const res  = await wt.decide(state, { move: question });   // res.answers.move.c
 | `bridge.js` | 游戏内部接口 → `window.TetrisGame` |
 | `planner.js` | 落点枚举、局面特征、给模型的题目（浏览器和 Node 都能用） |
 | `ai.js` | SDK 启动、模型加载、每一步的决策和执行、界面 |
-| `../test/tetris_planner.test.mjs` | 在 Node 里跑原版 `tetris.js`，检查每个计划落点经游戏函数执行后，棋盘和 planner 算的完全一样 |
+| `eval/headless.mjs` | 在 Node 的 vm 里跑原版 `tetris.js` + `bridge.js`（无画面、无重力、随机数可复现） |
+| `eval/eval.mjs`、`eval/decide.py` | 无界面地整局整局地玩，统计消行和存活块数；`--who model` 用 SDK 在本机 CPU 上跑 xDecision |
+| `../test/tetris_planner.test.mjs` | 检查每个计划落点经游戏函数执行后，棋盘和 planner 算的完全一样，以及重力暂停、题目格式等 |
 
 ```bash
 node --test test/tetris_planner.test.mjs
+node tetris/eval/eval.mjs --who rules            # 或 --who random
+node tetris/eval/eval.mjs --who model --model path/to/xDecision-Q8_0.gguf
 ```
 
 ## 许可

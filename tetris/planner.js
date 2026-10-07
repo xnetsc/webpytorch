@@ -336,9 +336,39 @@
     return { type: o.type || 'choice', instructions: o.instructions || INSTRUCTIONS, criteria };
   }
 
+  // Options go to the model left to right on the board, not in the planner's order: it is
+  // asked to judge the placements, and handing them over best-first would let it answer by
+  // position.
+  function leftToRight(a, b) {
+    const ax = Math.min(...a.cells.map(c => c[0])), bx = Math.min(...b.cells.map(c => c[0]));
+    return ax - bx || a.rotations - b.rotations;
+  }
+
+  /**
+   * Everything one turn puts to the model, from a bridge snapshot and the ranked placements:
+   * the options shown (`shown[i]` is label A+i), and the `state` and `questions` for
+   * decide(). The page and tetris/eval both ask through this, so what is measured is what
+   * the page asks.
+   */
+  function ask(snap, ranked, k, type) {
+    const shown = candidates(ranked, k).sort(leftToRight);
+    return {
+      shown,
+      state: stateFor(snap.board, snap.matrix, snap.next, snap),
+      questions: { move: question(shown, { type }) },
+    };
+  }
+
+  /** The option a decide() answer picked, from what `ask` returned. */
+  function picked(asked, answers) {
+    const labels = Object.keys(asked.questions.move.criteria);
+    return asked.shown[labels.indexOf(answers.move.choice)];
+  }
+
   return {
     NAMES, WEIGHTS, INSTRUCTIONS,
     pieceName, clone, collides, rotateLikeGame, settle, heights, holes, measure,
-    placements, rank, find, candidates, describe, boardText, stateFor, question,
+    placements, rank, find, candidates, describe, boardText, stateFor, question, leftToRight,
+    ask, picked,
   };
 }));

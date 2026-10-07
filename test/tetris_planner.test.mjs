@@ -7,49 +7,18 @@ import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 import vm from 'node:vm';
+import { headlessGame, seeded } from '../tetris/eval/headless.mjs';
 
 const require = createRequire(import.meta.url);
 const planner = require('../tetris/planner.js');
-const tetrisSource = await readFile(new URL('../tetris/vendor/tetris.js', import.meta.url), 'utf8');
-const bridgeSource = await readFile(new URL('../tetris/bridge.js', import.meta.url), 'utf8');
 const aiSource = await readFile(new URL('../tetris/ai.js', import.meta.url), 'utf8');
 const models = JSON.parse(await readFile(new URL('../chat/models.json', import.meta.url), 'utf8'));
-
-function seeded(a) {
-  return function () {
-    a |= 0; a = a + 0x6D2B79F5 | 0;
-    let t = Math.imul(a ^ a >>> 15, 1 | a);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
 
 // Arrays made inside the vm have that realm's Array prototype, which strict deep equality
 // counts as a difference; compare their contents.
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
-// The game as the page runs it, minus the screen: tetris.js then bridge.js as two classic
-// scripts in one realm, so the bridge reaches the game's globals the way it does in a page.
-function game(seed) {
-  const noop = () => {};
-  const ctx2d = new Proxy({}, { get: () => noop, set: () => true });
-  const elements = {};
-  const document = {
-    getElementById: (id) => elements[id] || (elements[id] = {
-      getContext: () => ctx2d, width: 200, height: 400, textContent: '', addEventListener: noop,
-    }),
-    addEventListener: noop,
-  };
-  let onload = null;
-  const window = { addEventListener: (type, fn) => { if (type === 'load') onload = fn; } };
-  const context = vm.createContext({ document, window, requestAnimationFrame: noop,
-                                     console: { log: noop } });
-  vm.runInContext('Math.random = (' + seeded.toString() + ')(' + seed + ');', context);
-  vm.runInContext(tetrisSource, context);
-  vm.runInContext(bridgeSource, context);
-  onload();
-  return { api: window.TetrisGame, context };
-}
+const game = headlessGame;
 
 test('every planned placement lands exactly where the planner said, through the real game', () => {
   let dropped = 0;
@@ -112,19 +81,47 @@ test('holding gravity stops the game loop from dropping the piece, and releasing
   assert.equal(api.snapshot().pos.y, y0 + 1);
 });
 
-test('the question is one choice over the candidates, and the state carries the board', () => {
+test('a turn asks one question over options the model can tell apart, left to right', () => {
   const { api } = game(3);
   const rotate = (m, d) => api.rotateMatrix(m, d);
-  for (let n = 0; n < 25; n++) api.perform(planner.rank(api.snapshot().board, api.snapshot().matrix,
-                                                        api.snapshot().pos, rotate)[0]);
+  for (let n = 0; n < 25; n++) {
+    const s = api.snapshot();
+    api.perform(planner.rank(s.board, s.matrix, s.pos, rotate)[0]);
+  }
   const s = api.snapshot();
-  const cands = planner.rank(s.board, s.matrix, s.pos, rotate).slice(0, 4);
-  const q = planner.question(cands);
+  const ranked = planner.rank(s.board, s.matrix, s.pos, rotate, s.next, api.spawnOf);
+  const asked = planner.ask(s, ranked, 4, 'choice');
+  const q = asked.questions.move;
+  assert.deepEqual(Object.keys(asked.questions), ['move']);
   assert.equal(q.type, 'choice');
-  assert.deepEqual(Object.keys(q.criteria), ['A', 'B', 'C', 'D']);
-  const state = planner.stateFor(s.board, s.matrix, s.next, s);
-  assert.equal(state.piece, planner.pieceName(s.matrix));
-  assert.equal(state.board.split('\n').length, planner.boardText(s.board).length || 1);
+  assert.ok(asked.shown.includes(ranked[0]), 'the planner\'s first choice is always offered');
+  assert.deepEqual(Object.keys(q.criteria), asked.shown.map((_, i) => String.fromCharCode(65 + i)));
+  const texts = Object.values(q.criteria);
+  assert.equal(new Set(texts).size, texts.length, 'no two options read the same');
+  const lefts = asked.shown.map(c => Math.min(...c.cells.map(cell => cell[0])));
+  assert.deepEqual(lefts, lefts.slice().sort((a, b) => a - b));
+  assert.equal(asked.state.piece, planner.pieceName(s.matrix));
+  assert.equal(asked.state.board.split('\n').length, planner.boardText(s.board).length || 1);
+  const label = Object.keys(q.criteria).at(-1);
+  assert.equal(planner.picked(asked, { move: { choice: label } }), asked.shown.at(-1));
+});
+
+test('options are said relative to each other, and a hole is said to be bad', () => {
+  const { api } = game(4);
+  const rotate = (m, d) => api.rotateMatrix(m, d);
+  let holed = null, clean = null;
+  for (let n = 0; n < 40 && !(holed && clean); n++) {
+    const s = api.snapshot();
+    const all = planner.rank(s.board, s.matrix, s.pos, rotate);
+    holed = all.find(c => c.features.newHoles > 0);
+    clean = all.find(c => c.features.newHoles <= 0);
+    if (!(holed && clean)) api.perform(all[0]);
+  }
+  assert.ok(holed && clean);
+  const set = [clean, holed];
+  assert.match(planner.describe(holed, set), /covers \d+ empty cells? \(new holes, bad\)/);
+  assert.match(planner.describe(clean, set), /covers no empty cells/);
+  for (const c of set) assert.doesNotMatch(planner.describe(c, set), /\d+ high|bumpiness \d/);
 });
 
 test('the page loads the xDecision GGUF the Pages chat app lists', () => {

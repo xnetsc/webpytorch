@@ -103,32 +103,23 @@
 
   // ---- one turn ---------------------------------------------------------------------
 
-  // Options are shown to the model left to right on the board, not in the planner's order:
-  // the model is asked to judge the placements, and handing them over best-first would let
-  // it score by position.
-  function byColumn(a, b) {
-    const ax = Math.min(...a.cells.map(c => c[0])), bx = Math.min(...b.cells.map(c => c[0]));
-    return ax - bx || a.rotations - b.rotations;
-  }
-
   async function turn() {
     const snap = G.snapshot();
     const ranked = P.rank(snap.board, snap.matrix, snap.pos, rotate, snap.next, G.spawnOf);
     if (!ranked.length) return;
     const useModel = opt.mode() === 'model' && S.choiceType;
-    const shown = P.candidates(ranked, Math.max(1, opt.k())).sort(byColumn);
+    const asked = P.ask(snap, ranked, Math.max(1, opt.k()), S.choiceType);
+    const shown = asked.shown;
     let chosen = ranked[0], answer = null;
     if (opt.hold()) G.holdGravity(true);
     if (useModel && shown.length > 1) {
-      const question = P.question(shown, { type: S.choiceType });
-      const state = P.stateFor(snap.board, snap.matrix, snap.next, snap);
       const t0 = performance.now();
-      const res = await S.wt.decide(state, { move: question });
+      const res = await S.wt.decide(asked.state, asked.questions);
       const ms = performance.now() - t0;
-      const a = res.answers.move;
-      const labels = Object.keys(question.criteria);
-      chosen = shown[labels.indexOf(a.choice)];
-      answer = { labels, probabilities: a.probabilities, ms, tokens: (res.usage || {}).input_tokens };
+      chosen = P.picked(asked, res.answers);
+      answer = { labels: Object.keys(asked.questions.move.criteria),
+                 probabilities: res.answers.move.probabilities, ms,
+                 tokens: (res.usage || {}).input_tokens };
       S.stats.asked++;
       S.stats.ms += ms;
       if (chosen === ranked[0]) S.stats.agree++;
