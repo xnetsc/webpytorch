@@ -138,6 +138,7 @@ webtorch/            SDK
   onnxrt.py            通用 ONNX 运行时
   torchshim.py         `import torch` 兼容层
 chat/                聊天应用（index.html、app.js、cache-sw.js、pyworker.js）
+tetris/              xDecision 自动玩俄罗斯方块，直接调用游戏自己的函数（见 tetris/README.md）
 webtorch-sw.js       SDK 的 Service Worker：为静态托管提供跨源隔离
 webapp/              示例运行页
 examples/            可运行的示例

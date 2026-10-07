@@ -1,0 +1,127 @@
+/* The game panel keeps vanilla-js-tetris's look (its styles.css); the AI panel sits beside
+   it and wraps underneath on a narrow screen. */
+:root {
+  --bg: #222;
+  --panel: #333;
+  --card: #444;
+  --text: #fff;
+  --muted: #bbb;
+  --accent: #00f5ff;
+  --pick: #ffe138;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: Arial, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 16px;
+}
+
+.wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  justify-content: center;
+  align-items: flex-start;
+  max-width: 1040px;
+  margin: 0 auto;
+}
+
+.game, .ai {
+  background: var(--panel);
+  padding: 20px;
+  border-radius: 10px;
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+}
+
+.game { display: flex; gap: 20px; }
+
+.board { position: relative; width: 204px; height: 404px; flex: none; }
+.board canvas { position: absolute; left: 0; top: 0; }
+#tetris { background: #111; border: 2px solid #444; }
+#overlay { left: 2px; top: 2px; pointer-events: none; }
+
+.game-info { display: flex; flex-direction: column; gap: 15px; width: 130px; }
+.game-info h1 {
+  margin: 0;
+  color: var(--accent);
+  text-align: center;
+  letter-spacing: 3px;
+  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+.score-display, .next-piece { background: var(--card); padding: 10px; border-radius: 5px; }
+.score-display p, .next-piece p { margin: 5px 0; }
+#next { background: #111; border: 2px solid #444; width: 100%; height: auto; }
+.keys { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
+
+button {
+  font: inherit;
+  border: none;
+  border-radius: 5px;
+  padding: 9px 12px;
+  cursor: pointer;
+  background: var(--card);
+  color: var(--text);
+}
+button:disabled { opacity: 0.5; cursor: default; }
+#start-button, button.primary { background: var(--accent); color: #222; font-weight: bold; }
+#start-button:hover, button.primary:hover:not(:disabled) { background: #00cccc; }
+
+.ai { flex: 1 1 420px; max-width: 640px; min-width: 0; }
+.ai h2 { margin: 0 0 8px; color: var(--accent); }
+#status { color: var(--muted); min-height: 1.4em; margin: 0 0 12px; overflow-wrap: anywhere; }
+
+.row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+select, input[type=range] { font: inherit; }
+select { background: var(--card); color: var(--text); border: 1px solid #555; border-radius: 5px; padding: 8px; }
+
+.settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px 16px;
+  background: var(--card);
+  padding: 12px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+.settings label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.settings label.check { flex-direction: row; align-items: center; gap: 6px; }
+.settings select { width: 100%; }
+
+.rule { color: var(--muted); font-size: 14px; line-height: 1.6; margin: 0 0 12px; }
+.rule code { color: var(--text); }
+.turn { background: #2b2b2b; border-radius: 6px; padding: 10px 12px; }
+.turnhead { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
+.cands { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.cands li {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: #383838;
+  font-size: 13px;
+  overflow: hidden;
+}
+.cands li .bar { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(0, 245, 255, 0.22); }
+.cands li .ctext, .cands li .prob { position: relative; }
+.cands li .ctext { white-space: pre-wrap; overflow-wrap: anywhere; }
+.cands li .prob { flex: none; font-variant-numeric: tabular-nums; }
+.cands li.chosen { outline: 2px solid var(--pick); }
+.cands li.chosen .ctext::before { content: '★ '; color: var(--pick); }
+
+.stats { color: var(--muted); font-size: 14px; }
+.how { color: var(--muted); font-size: 14px; line-height: 1.6; }
+.how summary { cursor: pointer; color: var(--text); }
+code { background: #2b2b2b; padding: 1px 4px; border-radius: 3px; }
+
+@media (max-width: 520px) {
+  body { padding: 8px; }
+  .game { padding: 12px; gap: 12px; }
+  .game-info { width: 110px; gap: 10px; }
+  .ai { padding: 14px; }
+}

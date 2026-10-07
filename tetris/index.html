@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<!--
+  xDecision plays Tetris, in the browser.
+
+  The game is vanilla-js-tetris (https://github.com/trzaskos/vanilla-js-tetris), vendored
+  unmodified in vendor/. The AI plays it through the game's own functions (bridge.js), and
+  each move is the answer xDecision gives through the webtorch SDK (ai.js).
+
+      node serve-coi.mjs . 8119
+      open http://localhost:8119/tetris/
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xDecision 玩俄罗斯方块</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+  <!-- The ids tetris.js looks up: tetris, next, score, lines, level, start-button. -->
+  <section class="game">
+    <div class="board">
+      <!-- 10 columns x 20 px. Upstream's canvas is 240 px wide for a 10-column board, which
+           is the "pieces don't reach the right edge" bug its README lists. -->
+      <canvas id="tetris" width="200" height="400"></canvas>
+      <canvas id="overlay" width="200" height="400" aria-hidden="true"></canvas>
+    </div>
+    <div class="game-info">
+      <h1>TETRIS</h1>
+      <div class="score-display">
+        <p>Score: <span id="score">0</span></p>
+        <p>Lines: <span id="lines">0</span></p>
+        <p>Level: <span id="level">1</span></p>
+      </div>
+      <div class="next-piece">
+        <p>Next:</p>
+        <canvas id="next" width="100" height="100"></canvas>
+      </div>
+      <button id="start-button" type="button">Start/Pause</button>
+      <p class="keys">自己玩：← → 移动 · ↑ 旋转 · ↓ 下落 · 空格 直接落下 · P 暂停</p>
+    </div>
+  </section>
+
+  <section class="ai">
+    <h2>xDecision 来玩</h2>
+    <p id="status">正在启动运行时…</p>
+
+    <div id="loadRow" class="row">
+      <select id="source" aria-label="模型来源">
+        <option value="modelscope">ModelScope</option>
+        <option value="hf">Hugging Face</option>
+      </select>
+      <button id="load" type="button" disabled>加载 xDecision（Q8_0，402 MB）</button>
+    </div>
+
+    <div class="row">
+      <button id="ai" type="button" class="primary" disabled>让 xDecision 来玩</button>
+    </div>
+
+    <div class="settings">
+      <label>谁来决定
+        <select id="mode">
+          <option value="model">xDecision</option>
+          <option value="rules">代码（同一条规则，不调用模型，作对照）</option>
+        </select>
+      </label>
+      <label>候选数 <span id="kval">4</span>
+        <input id="k" type="range" min="2" max="6" value="4">
+      </label>
+      <label>节奏
+        <select id="pace">
+          <option value="normal">正常：先标出候选再落下</option>
+          <option value="watch">慢速：一步步按键</option>
+          <option value="fast">最快</option>
+        </select>
+      </label>
+      <label class="check"><input id="hold" type="checkbox" checked> 模型思考时方块不下落</label>
+      <label class="check"><input id="restart" type="checkbox" checked> 结束后自动重开</label>
+    </div>
+
+    <p class="rule">规则：<code id="rule"></code><br>
+      <span>意思是：有既消行又不留洞的就选它；没有就选不留洞的；再没有就选能消行的。</span></p>
+
+    <div id="turn" class="turn"><p class="turnhead">还没有走过一步。</p></div>
+    <p id="stats" class="stats"></p>
+
+    <details class="how">
+      <summary>它是怎么玩的</summary>
+      <p>xDecision 是根据给定事实回答问题的决策模型，不会推理，这里把它当一个便宜的 if-else 用。</p>
+      <p>每来一个新方块：先读出游戏自己的棋盘和当前方块，列出游戏操作能到达的每一个落点，
+        按规划器的估值排序。从前几名里，每一类事实（消行 / 不留洞 / 留下新洞）只留排在最前的一个作为候选，
+        在棋盘上标成 A、B、C、D。交给模型的 state 里逐个列出候选的编号和结果，比如
+        <code>{"id": "B", "result": "clears a line, hole-free"}</code>；选项是这些编号，题目就是上面那条规则。
+        模型选出的编号就是这一步，再用游戏自己的
+        <code>playerRotate</code> / <code>playerMove</code> / <code>playerHardDrop</code> 去执行。</p>
+      <p>✓ 标的是同一条规则在代码里判断出的答案，可以核对模型判断得对不对；“代码”模式不调用模型，直接用这个答案。</p>
+      <p>这里的概率是模型自己的打分，没有用俄罗斯方块的数据校准过，不代表“有这么大的把握是对的”。</p>
+    </details>
+  </section>
+</main>
+
+<script src="../dist/wgpy-main.js"></script>
+<script src="../webtorch/js/webtorch-main.js"></script>
+<script>
+// A static host (GitHub Pages) cannot send the COOP/COEP headers the GPU backend needs; the
+// SDK's service worker adds them. A first visit reloads once. The worker sits at the site
+// root, so the chat app's registration (with its own cache handler) covers this page too:
+// when the page is already isolated nothing is registered, and the chat's worker is kept
+// rather than replaced by a plain one.
+if (!self.crossOriginIsolated) webtorch.installServiceWorker({ baseURL: '../' });
+</script>
+<script src="vendor/tetris.js"></script>
+<script src="bridge.js"></script>
+<script src="planner.js"></script>
+<script src="ai.js"></script>
+</body>
+</html>

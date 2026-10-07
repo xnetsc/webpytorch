@@ -202,6 +202,7 @@ webtorch/            the SDK
   onnxrt.py            generic ONNX runtime
   torchshim.py         `import torch` compatibility
 chat/                the chat app (index.html, app.js, cache-sw.js, pyworker.js)
+tetris/              xDecision plays Tetris through the game's own functions (see tetris/README.md)
 webtorch-sw.js       the SDK's service worker: cross-origin isolation for static hosts
 webapp/              example runner
 examples/            runnable examples
