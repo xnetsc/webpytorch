@@ -1,11 +1,11 @@
-// Everything the page can ask the model, asked: options are one per kind of fact tags, and
-// there are four kinds, so a question is one of 11 sets of two or more kinds, for one of 7
-// pieces -- 77 inputs. Each is built the way planner.ask() builds it and answered by the
-// model; the answer is checked against the same rule evaluated in code.
+// Every input the page can send the model, asked. Candidates are one per kind of facts, under
+// the ids A-D, so a question is one of 11 sets of two or more kinds for one of 7 pieces: 77
+// inputs in all. Each is built the way planner.ask() builds it and checked against the same
+// rule evaluated in code.
 //
 //   node tetris/eval/table.mjs path/to/xDecision-Q8_0.gguf
 //
-// Prints one line per input it got wrong and a total. The page relies on the total being 77.
+// Prints one line per input it got wrong and a total. The page relies on all 77 being right.
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
@@ -25,7 +25,7 @@ const decide = (state, questions) => new Promise((resolve) => {
   server.stdin.write(JSON.stringify({ state, questions }) + '\n');
 });
 
-// One stand-in option per kind: only the facts the tags are made from.
+// One stand-in candidate per kind: the facts the tags are made from.
 const KINDS = [[1, 0], [0, 0], [1, 1], [0, 1]].map(([rowsCleared, newHoles]) =>
   ({ features: { rowsCleared, newHoles } }));
 
@@ -35,15 +35,16 @@ for (const piece of P.NAMES) {
     const options = KINDS.filter((_, i) => mask & (1 << i));
     if (options.length < 2) continue;
     const shown = P.arrange(options);
-    const asking = { shown, questions: { move: P.question(shown, { type: 'choice' }) } };
-    const res = await decide(P.stateOf(piece), asking.questions);
+    const labels = P.ids(shown);
+    const state = P.stateOf(piece, shown, labels);
+    const res = await decide(state, { move: P.question(labels, { type: 'choice' }) });
     if (res.error) throw new Error(res.error);
-    const got = P.picked(asking, res.answers), want = P.expected(options);
+    const got = P.picked({ shown, labels }, res.answers), want = P.expected(options);
     asked++;
     if (got === want) right++;
     else {
-      console.log('wrong: piece ' + piece + ', options [' + shown.map(P.facts).join(' | ') + ']'
-                  + ' -> "' + P.facts(got) + '", rule says "' + P.facts(want) + '"');
+      console.log('wrong: ' + JSON.stringify(state) + ' -> ' + res.answers.move.choice
+                  + ', rule says ' + labels[shown.indexOf(want)]);
     }
   }
 }

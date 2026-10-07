@@ -1,13 +1,14 @@
 /* xDecision plays vanilla-js-tetris.
  *
- * xDecision answers from the facts it is handed and does not reason, so it is used as a
+ * xDecision answers from the facts in its state and does not reason, so it is used as a
  * cheap if-else. Each new piece is one turn:
  *   1. read the game (bridge.js -> the game's own `board` and `player`),
  *   2. list every placement the game's controls can reach, and keep the planner's best of
  *      each kind of fact -- "clears a line", "hole-free" / "makes a new hole" (planner.js),
- *   3. ask xDecision, through the webtorch SDK, one `choice` question: the rule ("Choose
- *      the option that clears a line and is hole-free.") over those options' fact tags.
- *      The option it picks is the move,
+ *   3. ask xDecision, through the webtorch SDK: the state lists those candidates as
+ *      {id: "A", result: "clears a line, hole-free"}, the options are the ids, and the
+ *      question is the rule ("Choose the option that clears a line and is hole-free.").
+ *      The id it picks is the move,
  *   4. play it with the game's own controls (playerRotate / playerMove / playerHardDrop).
  *
  * The model is the one the Pages chat app lists (chat/models.json), loaded and asked the
@@ -129,7 +130,7 @@
     // Switched off, or the piece was dropped by a person or by gravity while the model was
     // thinking: this answer is for a piece that is no longer in play.
     if (!S.on || G.token() !== S.token) { G.holdGravity(false); return; }
-    showTurn(snap, shown, chosen, asked.expected, answer, useModel);
+    showTurn(snap, asked, chosen, answer, useModel);
     const pace = opt.pace();
     if (pace !== 'fast') { overlay(shown, chosen); await sleep(pace === 'watch' ? 450 : 250); }
     if (!S.on || G.token() !== S.token) { overlay(null); G.holdGravity(false); return; }
@@ -216,7 +217,7 @@
 
   const pct = (p) => (p * 100).toFixed(1) + '%';
 
-  // An option for people: where it goes, and the same facts its tags give the model.
+  // A candidate for people: where it goes, and the same facts the model reads about it.
   function summary(c) {
     const f = c.features;
     const xs = c.cells.map(cell => cell[0] + 1);
@@ -225,7 +226,8 @@
       + (f.rowsCleared > 0 ? '消行 · ' : '') + (f.newHoles > 0 ? '留下新洞' : '不留洞');
   }
 
-  function showTurn(snap, shown, chosen, rule, answer, useModel) {
+  function showTurn(snap, asked, chosen, answer, useModel) {
+    const shown = asked.shown, rule = asked.expected;
     const box = $('#turn');
     box.textContent = '';
     const head = document.createElement('p');
@@ -242,16 +244,16 @@
     shown.forEach((c, i) => {
       const li = document.createElement('li');
       if (c === chosen) li.className = 'chosen';
-      const label = answer ? answer.labels[i] : String.fromCharCode(65 + i);
-      const p = answer ? answer.probabilities[label] : null;
+      const label = String.fromCharCode(65 + i);
+      const p = answer ? answer.probabilities[answer.labels[i]] : null;
       const bar = document.createElement('span');
       bar.className = 'bar';
       bar.style.width = p == null ? '0' : (p * 100).toFixed(1) + '%';
       const text = document.createElement('span');
       text.className = 'ctext';
       text.textContent = label + '  ' + summary(c) + (c === rule ? '  ✓按规则' : '');
-      // What the model actually read for this option, word for word.
-      text.title = P.facts(c);
+      // What the model read about this placement, word for word.
+      text.title = JSON.stringify(asked.state.placements[i]);
       const prob = document.createElement('span');
       prob.className = 'prob';
       prob.textContent = p == null ? '' : pct(p);

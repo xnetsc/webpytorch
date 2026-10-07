@@ -89,9 +89,10 @@
       <summary>它是怎么玩的</summary>
       <p>xDecision 是根据给定事实回答问题的决策模型，不会推理，这里把它当一个便宜的 if-else 用。</p>
       <p>每来一个新方块：先读出游戏自己的棋盘和当前方块，列出游戏操作能到达的每一个落点，
-        按规划器的估值排序。从前几名里，每一类事实（消行 / 不留洞 / 留下新洞）只留排在最前的一个，
-        作为选项。每个选项只写事实标签，比如 <code>clears a line, hole-free</code>；
-        题目就是上面那条规则。模型选出标签符合规则的那个选项，再用游戏自己的
+        按规划器的估值排序。从前几名里，每一类事实（消行 / 不留洞 / 留下新洞）只留排在最前的一个作为候选，
+        在棋盘上标成 A、B、C、D。交给模型的 state 里逐个列出候选的编号和结果，比如
+        <code>{"id": "B", "result": "clears a line, hole-free"}</code>；选项是这些编号，题目就是上面那条规则。
+        模型选出的编号就是这一步，再用游戏自己的
         <code>playerRotate</code> / <code>playerMove</code> / <code>playerHardDrop</code> 去执行。</p>
       <p>✓ 标的是同一条规则在代码里判断出的答案，可以核对模型判断得对不对；“代码”模式不调用模型，直接用这个答案。</p>
       <p>这里的概率是模型自己的打分，没有用俄罗斯方块的数据校准过，不代表“有这么大的把握是对的”。</p>
@@ -103,8 +104,11 @@
 <script src="../webtorch/js/webtorch-main.js"></script>
 <script>
 // A static host (GitHub Pages) cannot send the COOP/COEP headers the GPU backend needs; the
-// SDK's service worker adds them. A first visit reloads once.
-webtorch.installServiceWorker({ baseURL: '../' });
+// SDK's service worker adds them. A first visit reloads once. The worker sits at the site
+// root, so the chat app's registration (with its own cache handler) covers this page too:
+// when the page is already isolated nothing is registered, and the chat's worker is kept
+// rather than replaced by a plain one.
+if (!self.crossOriginIsolated) webtorch.installServiceWorker({ baseURL: '../' });
 </script>
 <script src="vendor/tetris.js"></script>
 <script src="bridge.js"></script>

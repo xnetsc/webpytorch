@@ -219,19 +219,23 @@
 
   // ---- saying it to the model -------------------------------------------------------------
   //
-  // xDecision answers from facts it is given; it does not reason, so it is used as a cheap
-  // if-else. Each option carries a few fact tags, the question names the tags wanted, and
-  // the model picks the option whose tags match. What it can and cannot do was measured with
-  // xDecision Q8_0 on 240 positions from real games (tetris/README.md has the table):
+  // xDecision answers from the facts in its state; it does not reason, so it is used as a
+  // cheap if-else. The state lists every candidate placement with its facts, the options are
+  // those candidates' ids, and the question is the rule. Which forms it can and cannot use
+  // was measured with xDecision Q8_0 (tetris/README.md has the tables):
   //
-  //   picks the option whose text says what the question asks for     99-100% right
-  //   "none of them" when nothing matches                              3% right
-  //   true/false about "option B" whose facts are in the state         "true" every time
-  //   sorting a fact sentence into categories that differ by a "no"    51% right
-  //   weighing several relative facts ("lands lowest, flattest…")      planner's pick 63%
+  //   state lists [{id, result}], options = the ids                       77/77 (every input)
+  //   state lists [{at: "columns 2-3, rows 1-3", result}], options = places 1848/1848 on a test
+  //       set, but 99.5% in real games: places named with the same digits ("columns 2-3,
+  //       rows 1-3" / "columns 1-3, rows 2-3") get each other's facts
+  //   state maps {place: facts}                                             1826/1848
+  //   "none of them" when nothing matches                                   3% right
+  //   true/false about "option B" whose facts are in the state              "true" every time
+  //   weighing several relative facts ("lands lowest, flattest…")           planner's pick 63%
   //
-  // So: positive tags, no "none" option, no option letters to look up, and no two options
-  // with the same tags -- the rule then has exactly one best match.
+  // So: a state that holds everything the rule needs, one record per candidate under a plain
+  // id; positive fact tags; no "none" option; no two candidates of the same kind. Where a
+  // placement goes is the page's business, not the model's: the rule does not need it.
 
   const LINE = 'clears a line', CLEAN = 'hole-free', HOLE = 'makes a new hole';
 
@@ -248,11 +252,11 @@
   // clear that leaves a hole, then the rest.
   const PREFERENCE = [LINE + ', ' + CLEAN, CLEAN, LINE + ', ' + HOLE, HOLE];
 
-  // The order options are listed in. There are four kinds of tags, so everything the model
-  // can be asked is 11 sets of kinds x 7 pieces = 77 inputs, and all of them were tried
-  // (tetris/eval/table.mjs). Listed left to right on the board it answered 364 of 420
-  // orderings right; in this order it answers all 77 right, with the right answer first,
-  // second or third depending on the set -- so it is the tags it reads, not a position.
+  // The order candidates are listed in. With four kinds of facts and plain ids, everything
+  // the model can be asked is one of 11 sets of kinds for one of 7 pieces: 77 inputs, and in
+  // this order it answers all of them the way the rule does (tetris/eval/table.mjs). The
+  // right answer comes first, second or third depending on the set, so it is the facts it
+  // reads, not a position.
   const ORDER = [LINE + ', ' + HOLE, CLEAN, LINE + ', ' + CLEAN, HOLE];
 
   /**
@@ -289,50 +293,60 @@
     return null;
   }
 
+  /** The candidates' ids, in listing order: A, B, C, D -- the letters drawn on the board. */
+  function ids(shown) {
+    return shown.map((_, i) => String.fromCharCode(65 + i));
+  }
+
   /**
-   * One question whose options are the candidates' fact tags, labelled A, B, C… `type` is
-   * the model's name for its named-options question type, read from its `surface()`.
+   * What the model decides from: the piece, and a record per candidate -- its id and what
+   * it does. Everything the rule needs.
    */
-  function question(shown, o) {
+  function stateOf(piece, shown, labels) {
+    return { game: 'Tetris', piece,
+             placements: shown.map((c, i) => ({ id: labels[i], result: facts(c) })) };
+  }
+
+  /**
+   * The question: the rule, with the candidates' ids as the options. `type` is the model's
+   * name for its named-options question type, read from its `surface()`.
+   */
+  function question(labels, o) {
     o = o || {};
     const criteria = {};
-    shown.forEach((c, i) => { criteria[String.fromCharCode(65 + i)] = facts(c); });
+    for (const name of labels) criteria[name] = null;
     return { type: o.type || 'choice', instructions: o.instructions || INSTRUCTIONS, criteria };
   }
 
   /**
    * Everything one turn puts to the model, from a bridge snapshot and the ranked placements:
-   * the options as listed (`shown[i]` is label A+i), the answer the rule gives (`expected`), and
-   * the `state` and `questions` for decide(). The page and tetris/eval both ask through
-   * this, so what is measured is what the page asks.
+   * the candidates as listed (`shown[i]` has id `labels[i]`), the answer the rule gives
+   * (`expected`), and the `state` and `questions` for decide(). The page and tetris/eval both
+   * ask through this, so what is measured is what the page asks.
    */
   function ask(snap, ranked, k, type) {
     const options = candidates(ranked, k);
     const shown = arrange(options);
+    const labels = ids(shown);
     return {
       shown,
+      labels,
       expected: expected(options),
-      state: stateOf(pieceName(snap.matrix)),
-      questions: { move: question(shown, { type }) },
+      state: stateOf(pieceName(snap.matrix), shown, labels),
+      questions: { move: question(labels, { type }) },
     };
   }
 
-  /** What the model is told besides the options: only which piece it is. */
-  function stateOf(piece) {
-    return { game: 'Tetris', piece };
-  }
-
-  /** The option a decide() answer picked, from what `ask` returned. */
+  /** The placement a decide() answer picked, from what `ask` returned. */
   function picked(asked, answers) {
-    const labels = Object.keys(asked.questions.move.criteria);
-    return asked.shown[labels.indexOf(answers.move.choice)];
+    return asked.shown[asked.labels.indexOf(answers.move.choice)];
   }
 
   return {
     NAMES, WEIGHTS, INSTRUCTIONS,
     pieceName, clone, collides, rotateLikeGame, settle, heights, holes, measure,
     PREFERENCE, ORDER,
-    placements, rank, find, facts, candidates, arrange, expected, question, stateOf,
-    ask, picked,
+    placements, rank, find, facts, candidates, arrange, expected, ids, stateOf,
+    question, ask, picked,
   };
 }));

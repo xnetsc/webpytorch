@@ -81,7 +81,7 @@ test('holding gravity stops the game loop from dropping the piece, and releasing
   assert.equal(api.snapshot().pos.y, y0 + 1);
 });
 
-test('a turn asks the rule over fact tags, one option per kind, in the verified order', () => {
+test('a turn puts the deciding facts in the state and the placements as options', () => {
   const { api } = game(3);
   const rotate = (m, d) => api.rotateMatrix(m, d);
   for (let n = 0; n < 25; n++) {
@@ -96,16 +96,22 @@ test('a turn asks the rule over fact tags, one option per kind, in the verified 
   assert.equal(q.type, 'choice');
   assert.equal(q.instructions, planner.INSTRUCTIONS);
   assert.ok(asked.shown.includes(ranked[0]), 'the planner\'s first choice is always offered');
-  assert.deepEqual(Object.keys(q.criteria), asked.shown.map((_, i) => String.fromCharCode(65 + i)));
-  const texts = Object.values(q.criteria);
-  assert.equal(new Set(texts).size, texts.length, 'no two options read the same');
-  for (const t of texts) assert.match(t, /^(clears a line, )?(hole-free|makes a new hole)$/);
-  const at = texts.map(t => planner.ORDER.indexOf(t));
-  assert.deepEqual(at, at.slice().sort((a, b) => a - b), 'listed in the verified order');
-  assert.deepEqual(asked.state, { game: 'Tetris', piece: planner.pieceName(s.matrix) });
   assert.ok(asked.shown.includes(asked.expected));
-  const label = Object.keys(q.criteria).at(-1);
-  assert.equal(planner.picked(asked, { move: { choice: label } }), asked.shown.at(-1));
+  // Options are the candidates' ids, A B C D, and nothing else.
+  assert.deepEqual(asked.labels, asked.shown.map((_, i) => String.fromCharCode(65 + i)));
+  assert.deepEqual(Object.keys(q.criteria), asked.labels);
+  assert.ok(Object.values(q.criteria).every(v => v === null));
+  // The state holds every candidate and what it does: everything the rule needs.
+  assert.deepEqual(Object.keys(asked.state), ['game', 'piece', 'placements']);
+  assert.equal(asked.state.piece, planner.pieceName(s.matrix));
+  assert.deepEqual(asked.state.placements,
+                   asked.shown.map((c, i) => ({ id: asked.labels[i], result: planner.facts(c) })));
+  const results = asked.state.placements.map(p => p.result);
+  assert.equal(new Set(results).size, results.length, 'one placement per kind of facts');
+  const at = results.map(t => planner.ORDER.indexOf(t));
+  assert.deepEqual(at, at.slice().sort((a, b) => a - b), 'listed in the verified order');
+  const last = asked.labels.at(-1);
+  assert.equal(planner.picked(asked, { move: { choice: last } }), asked.shown.at(-1));
 });
 
 test('the rule in code: hole-free line clear, then hole-free, then a line clear, then the rest', () => {
