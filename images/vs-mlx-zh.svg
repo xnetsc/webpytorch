@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="440" viewBox="0 0 860 440" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
-<rect x="0.5" y="0.5" width="859" height="439" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="488" viewBox="0 0 860 488" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="859" height="487" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="28.0" y="40.0" font-size="19" fill="#1f2328" text-anchor="start" font-weight="700">决策模型：webtorch 对比原生 MLX</text>
 <text x="28.0" y="66.0" font-size="14" fill="#1f2328" text-anchor="start" font-weight="600">测试机器：MacBook Air（M5，24 GB）</text>
 <text x="28.0" y="88.0" font-size="13" fill="#59636e" text-anchor="start" font-weight="normal">两边同样的请求 · 22 层编码器，F16 · webtorch 跑在 Chrome 里 · 毫秒，越低越好</text>
@@ -44,8 +44,10 @@
 <text x="762.0" y="149.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">64~70</text>
 <text x="735.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">三道题</text>
 <text x="735.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">间隔 2 秒</text>
-<rect x="70" y="406" width="14" height="14" rx="3" fill="#a3aab3"/>
-<text x="92.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX（原生）</text>
-<rect x="280" y="406" width="14" height="14" rx="3" fill="#2f6fec"/>
-<text x="302.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch（浏览器）</text>
+<rect x="70" y="404" width="14" height="14" rx="3" fill="#a3aab3"/>
+<text x="92.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX（原生）</text>
+<rect x="280" y="404" width="14" height="14" rx="3" fill="#2f6fec"/>
+<text x="302.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch（浏览器）</text>
+<text x="28.0" y="450.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX 的优势来自苹果 GPU 里的矩阵硬件，WebGPU 目前用不了。</text>
+<text x="28.0" y="469.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX 只能跑在苹果芯片上，webtorch 在英伟达、AMD、Intel 的显卡上也能跑。</text>
 </svg>

@@ -46,8 +46,8 @@ def card(w, h, body, title, machine, subtitle):
 
 
 def decide_chart(zh):
-    w, h = 860, 440
-    left, right, top, bottom = 70, 30, 130, 92
+    w, h = 860, 488
+    left, right, top, bottom = 70, 30, 130, 140
     plot_h = h - top - bottom
     span = w - left - right
     top_v = 80.0
@@ -85,13 +85,19 @@ def decide_chart(zh):
         a, b = cn if zh else en
         body.append(text(cx, top + plot_h + 24, a, 14, INK, "middle", "600"))
         body.append(text(cx, top + plot_h + 43, b, 13, MUTED, "middle"))
-    lx, ly = left, h - 22
+    lx, ly = left, h - 72
     for name, color in (("MLX（原生）" if zh else "MLX (native)", MLX),
                         ("webtorch（浏览器）" if zh else "webtorch (in the browser)", OURS)):
         body.append('<rect x="%d" y="%d" width="14" height="14" rx="3" fill="%s"/>'
                     % (lx, ly - 12, color))
         body.append(text(lx + 22, ly, name, 13, INK))
         lx += 210
+    notes = (("MLX 的优势来自苹果 GPU 里的矩阵硬件，WebGPU 目前用不了。",
+              "MLX 只能跑在苹果芯片上，webtorch 在英伟达、AMD、Intel 的显卡上也能跑。") if zh else
+             ("MLX's lead comes from matrix hardware in Apple's GPU that WebGPU cannot use today.",
+              "MLX runs only on Apple silicon; webtorch also runs on NVIDIA, AMD and Intel GPUs."))
+    for k, note in enumerate(notes):
+        body.append(text(28, h - 38 + 19 * k, note, 12, MUTED))
     title = ("决策模型：webtorch 对比原生 MLX" if zh else
              "Decision model: webtorch against native MLX")
     machine = ("测试机器：MacBook Air（M5，24 GB）" if zh else

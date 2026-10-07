@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="440" viewBox="0 0 860 440" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
-<rect x="0.5" y="0.5" width="859" height="439" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="488" viewBox="0 0 860 488" font-family="-apple-system, BlinkMacSystemFont, &apos;Segoe UI&apos;, &apos;PingFang SC&apos;, &apos;Hiragino Sans GB&apos;, &apos;Microsoft YaHei&apos;, &apos;Noto Sans CJK SC&apos;, Helvetica, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="859" height="487" rx="12" fill="#ffffff" stroke="#d0d7de"/>
 <text x="28.0" y="40.0" font-size="19" fill="#1f2328" text-anchor="start" font-weight="700">Decision model: webtorch against native MLX</text>
 <text x="28.0" y="66.0" font-size="14" fill="#1f2328" text-anchor="start" font-weight="600">Test machine: MacBook Air (M5, 24 GB)</text>
 <text x="28.0" y="88.0" font-size="13" fill="#59636e" text-anchor="start" font-weight="normal">The same requests on both · 22-layer encoder, F16 · webtorch in Chrome · milliseconds, lower is better</text>
@@ -44,8 +44,10 @@
 <text x="762.0" y="149.2" font-size="13" fill="#1f2328" text-anchor="middle" font-weight="700">64~70</text>
 <text x="735.0" y="372.0" font-size="14" fill="#1f2328" text-anchor="middle" font-weight="600">3 questions</text>
 <text x="735.0" y="391.0" font-size="13" fill="#59636e" text-anchor="middle" font-weight="normal">2 s apart</text>
-<rect x="70" y="406" width="14" height="14" rx="3" fill="#a3aab3"/>
-<text x="92.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX (native)</text>
-<rect x="280" y="406" width="14" height="14" rx="3" fill="#2f6fec"/>
-<text x="302.0" y="418.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch (in the browser)</text>
+<rect x="70" y="404" width="14" height="14" rx="3" fill="#a3aab3"/>
+<text x="92.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">MLX (native)</text>
+<rect x="280" y="404" width="14" height="14" rx="3" fill="#2f6fec"/>
+<text x="302.0" y="416.0" font-size="13" fill="#1f2328" text-anchor="start" font-weight="normal">webtorch (in the browser)</text>
+<text x="28.0" y="450.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX's lead comes from matrix hardware in Apple's GPU that WebGPU cannot use today.</text>
+<text x="28.0" y="469.0" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">MLX runs only on Apple silicon; webtorch also runs on NVIDIA, AMD and Intel GPUs.</text>
 </svg>
