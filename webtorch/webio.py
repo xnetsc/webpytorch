@@ -737,16 +737,21 @@ async def _remote_size(url, headers):
     except ImportError:
         pyfetch = None
     if pyfetch is not None:
+        # Only a successful answer says how long the FILE is. An error page has a length
+        # too -- its own: modelscope.cn answers a HEAD for a repo it does not carry with 404
+        # and Content-Length 145, and taking that as the size made the reader reject the
+        # .ai copy as "a different file" and fail the load on the .cn 404. (urllib below
+        # raises on an error status, so the host path never had this.)
         try:
             r = await _pyfetch(url, method="HEAD", headers=dict(headers or {}))
             cl = r.headers.get("content-length") or r.headers.get("Content-Length")
-            if cl and str(cl).isdigit(): return int(cl)
+            if r.ok and cl and str(cl).isdigit(): return int(cl)
         except Exception: pass
         try:
             h = dict(headers or {}); h["Range"] = "bytes=0-0"
             r = await _pyfetch(url, headers=h)
             cr = r.headers.get("content-range") or r.headers.get("Content-Range")
-            if cr and "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
+            if r.status == 206 and cr and "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
                 return int(cr.rsplit("/", 1)[-1])
         except Exception: pass
         return None
