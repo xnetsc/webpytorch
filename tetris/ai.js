@@ -37,6 +37,7 @@
   const S = {
     wt: null,              // the SDK runtime, once started
     choiceType: null,      // the model's own name for its named-options question type
+    cached: false,         // the cache held a complete copy when the runtime started
     on: false,             // AI playing
     busy: false,           // a turn in progress
     token: null,           // the piece the last turn was for (bridge `token()`)
@@ -73,6 +74,7 @@
       const listing = await wt.cache.list().catch(() => ({}));
       const hit = !ownURL && (listing.items || []).some(item => item.complete
         && item.key.endsWith('/' + MODEL.repo + '/resolve/main/' + MODEL.file));
+      S.cached = hit;
       $('#load').textContent = hit ? '从缓存加载 xDecision' : '加载 xDecision（402 MB）';
       say('运行时就绪（' + wt.backend + (wt.reason ? '：' + wt.reason : '') + '）。'
           + (hit ? 'xDecision 已在浏览器缓存里，加载不用下载。'
@@ -84,6 +86,81 @@
   }
   startRuntime();
 
+  // ---- what a load is doing --------------------------------------------------------------
+  //
+  // The SDK reports two things while a model loads, and both are shown: how many bytes have
+  // been read (and how fast they are arriving over the network, while they are), and which
+  // step of the load is running. Reading stops well before the load does -- the steps after
+  // it check the weights, run the model once and time it on this GPU -- so without the
+  // second line a finished byte count reads as a hang.
+  const STEPS = {
+    weights: ['权重', '读取权重并放到显卡上'],
+    warm: ['预热', '先完整跑一遍，确认能算'],
+    tuning: ['测速', '比较几种计算方式在这块显卡上的速度，记下最快的'],
+    recording: ['录制', '为每种输入长度录下计算过程，之后每一步直接回放'],
+    checking: ['核对', '核对权重和文件是否一致'],
+    proving: ['试算', '跑一次前向，确认能用'],
+  };
+  const mb = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB';
+
+  const progress = (function () {
+    let t0 = 0, total = 0, read = 0, step = null, stepAt = 0, took = [];
+    const fill = () => $('#loadFill');
+    const bar = (f) => { fill().classList.remove('busy'); fill().style.width = (Math.min(1, f) * 100) + '%'; };
+    const busy = () => fill().classList.add('busy');
+    const name = (k) => (STEPS[k] || [k])[0];
+    function finishStep(now) {
+      if (step && now - stepAt >= 1000) took.push(name(step) + ' ' + ((now - stepAt) / 1000).toFixed(1) + ' 秒');
+    }
+    return {
+      start() {
+        t0 = performance.now(); total = 0; read = 0; step = null; took = [];
+        $('#progress').hidden = false;
+        bar(0);
+        $('#progressBytes').textContent = S.cached ? '从浏览器缓存读取…' : '准备下载…';
+        $('#progressStage').textContent = '';
+      },
+      // {bytes, total, rate, dlRate}: bytes read so far, of the file's total when the reader
+      // knows it; dlRate only while bytes are coming over the network.
+      bytes(p) {
+        if (p.total) total = p.total;
+        read = total ? Math.min(p.bytes, total) : p.bytes;
+        if (step && step !== 'weights') { this.readDone(); return; }
+        const parts = ['已读取 ' + mb(read) + (total ? ' / ' + mb(total) : '')];
+        if (p.dlRate) parts.push('下载 ' + mb(p.dlRate) + '/s');
+        else if (S.cached) parts.push('来自浏览器缓存');
+        if (p.rate && !p.dlRate) parts.push(mb(p.rate) + '/s');
+        $('#progressBytes').textContent = parts.join(' · ');
+        bar(read / (total || MODEL.size));
+      },
+      // Reading is over once the load moves past the weights: say so, without a speed that
+      // would otherwise stay on screen as the last one measured.
+      readDone() {
+        $('#progressBytes').textContent = '已读取 ' + mb(total || read)
+          + (S.cached ? '，来自浏览器缓存' : '，下载完成');
+      },
+      // {stage, done, total, after, elapsed}: the step now running; `weights` repeats per
+      // tensor with a count, the later steps cannot say how far they are.
+      stage(s) {
+        const now = performance.now();
+        if (s.stage !== step) { finishStep(now); step = s.stage; stepAt = now; }
+        const n = s.total && s.done <= s.total ? '（' + s.done + '/' + s.total + '）' : '';
+        $('#progressStage').textContent = '正在' + ((STEPS[s.stage] || [0, s.stage])[1]) + n + '…'
+          + (took.length ? '　已完成：' + took.join('，') : '');
+        if (s.stage !== 'weights') { busy(); this.readDone(); }
+      },
+      done() {
+        const now = performance.now();
+        finishStep(now);
+        bar(1);
+        $('#progressBytes').textContent = '已加载 ' + mb(total || read || MODEL.size)
+          + (S.cached ? '（来自浏览器缓存）' : '') + ' · 共用时 ' + ((now - t0) / 1000).toFixed(1) + ' 秒';
+        $('#progressStage').textContent = took.length ? '各步用时：' + took.join('，') : '';
+      },
+      fail() { $('#progress').hidden = true; },
+    };
+  }());
+
   async function loadModel() {
     $('#load').disabled = true;
     // A cache the browser may evict is not much of a cache for 400 MB. Asked on the click,
@@ -92,12 +169,14 @@
     catch (e) { /* not offered here */ }
     try {
       const wt = await ready;
+      progress.start();
       const target = ownURL ? new URL(ownURL, location.href).href : MODEL.repo + '/' + MODEL.file;
+      say('正在加载 xDecision…');
       const info = await wt.load(target, {
-        onProgress: (p) => say('读取 xDecision：' + (p.bytes / 1e6).toFixed(0) + ' / '
-                               + ((p.total || MODEL.size) / 1e6).toFixed(0) + ' MB'
-                               + (p.dlRate ? ' · ' + (p.dlRate / 1e6).toFixed(1) + ' MB/s' : '')),
-        onStage: (s) => say('加载中：' + s.stage + '…'),
+        onProgress: (p) => progress.bytes(p),
+        onStage: (st) => progress.stage(st),
+        // The SDK's own "loading <file> …" line; the progress lines below say more.
+        onStatus: () => {},
       });
       if (info.kind !== 'decision') throw new Error('加载到的不是决策模型（kind=' + info.kind + '）');
       // The question types are the checkpoint's; the one we need is the one whose options
@@ -106,6 +185,7 @@
       const named = Object.entries(types.types || {}).find(([, t]) => t.shape === 'named');
       if (!named) throw new Error('这个模型没有“从给定选项里选一个”的题型');
       S.choiceType = named[0];
+      progress.done();
       say('xDecision 已加载（' + S.wt.backend + '）。');
       $('#loadRow').hidden = true;
       $('#mode').value = 'model';
@@ -115,6 +195,7 @@
       // replaces the whole runtime before another attempt, and so does this. What was
       // already downloaded stays in the cache and is not fetched again.
       const message = (e && e.message) || String(e);
+      progress.fail();
       try { if (S.wt) S.wt.close(); } catch (err) { /* already gone */ }
       S.wt = null;
       await startRuntime().catch(() => {});

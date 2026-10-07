@@ -78,6 +78,19 @@ button:disabled { opacity: 0.5; cursor: default; }
 select, input[type=range] { font: inherit; }
 select { background: var(--card); color: var(--text); border: 1px solid #555; border-radius: 5px; padding: 8px; }
 
+.progress { margin: -4px 0 12px; }
+.progress .track { height: 8px; background: #2b2b2b; border-radius: 4px; overflow: hidden; }
+.progress .fill { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+/* A step that cannot say how far it has got: the bar moves instead of pretending to measure. */
+.progress .fill.busy {
+  width: 100% !important;
+  background: repeating-linear-gradient(-45deg, var(--accent) 0 12px, #00a8b0 12px 24px);
+  background-size: 34px 34px;
+  animation: progress-busy 0.8s linear infinite;
+}
+@keyframes progress-busy { to { background-position: 34px 0; } }
+.progress .ptext { margin: 6px 0 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+
 .settings {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));

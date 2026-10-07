@@ -34,6 +34,10 @@ const info = await wt.load('mccoysc/xDecision/models/gguf/xDecision-Q8_0.gguf');
 const res  = await wt.decide(state, { move: question });   // res.answers.move.choice
 ```
 
+加载时页面显示 SDK 报告的两种进度：读了多少字节（已读取 / 总大小，下载时还有下载速度，从缓存读时注明来自缓存），
+以及当前在做哪一步（读取权重并放到显卡上，带张量计数；预热；在这块显卡上测速；为每种输入长度录制计算过程），
+加载完成后列出各步用时。读取完成以后后面几步还要一段时间，所以第二行是为了让人知道它没有卡住。
+
 手里已经有这个文件的话，也可以从自己的服务器加载：`/tetris/?model=/models/gguf/xDecision-Q8_0.gguf`
 （同源，或者对方允许跨域）。
 
