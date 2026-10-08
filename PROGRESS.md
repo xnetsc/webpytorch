@@ -1,5 +1,58 @@
 # Progress
 
+## 2026-10-08 ▸ An adapter on a decode row in one dispatch; q/k/v and gate/up stay shared with adapters
+
+**Trigger:** user: with a LoRA attached the 0.6B decodes 3x slower; every adapted projection
+adds two tiny matmuls the generic kernel runs slowly at these shapes; fuse them into one kernel.
+
+**Why it was slow:** `x @ A^T` has r outputs, which no tiled matmul shape takes (N % 64), so the
+generic kernel gave each of r threads a whole K-long dot product; then `t @ B^T`, then the add:
+three dispatches per adapted projection. Adapted projections also left the shared q/k/v and
+gate/up dispatch. Rank 16 on all seven projections of the 0.6B: 562 → 1150 dispatches a step
+(`matmul` x196, `matmul_n64k4` x196, `elementwise_2_add_0` +196).
+
+**Changes:**
+- `_lora_fused` / `_LORA_WGSL`: one workgroup of 256 computes t = A x (lane l, rank group q sums
+  `A^T[k, 4q..4q+3] * x[k]` over k = l mod LANES, reads of a row of A^T coalesced), sums the
+  lanes in workgroup memory in two stages (three barriers whatever the rank), then adds
+  `t . B^T[:, n]` to the outputs it owns. Every workgroup computes t itself; how many outputs
+  it owns is the route: `fused:256`, `fused:1024`, `fused:4096`. Each variant is checked against
+  numpy when it is added (a WGSL compile error writes nothing and raises nothing).
+- `LoRA.add`: `composed` (the old path) and the fused widths raced per adapter shape on a decode
+  row by `_weight_execution`, composed first so an unproven race keeps it; prefill keeps the
+  composed GEMMs (a fused workgroup repeats r*K per row) and races nothing on a prompt. The rank
+  is padded to a multiple of four with zeros (exact). The routes are kept in a saved profile.
+- `CausalLM._warm_adapters`: each adapter shape raced at load and on `attach_adapter`, on random
+  inputs (zeros pass any route), before the decode step is warmed and recorded.
+- `parallel_linear` / `parallel_swiglu`: the shared route runs on the stored weights alone
+  (`_project`, `_bare`) and each adapter is added to its own output afterwards, so its race and
+  key are those of a model without adapters. WebGL's in-place gate/up texture keeps the
+  separate route.
+- `examples/lora_decode_benchmark.py` (in `webapp/`): rank-16 zero and random adapters made in
+  memory on the 0.6B, each route forced and then raced: tok/s, text, dispatches by kernel.
+
+**Data (headless Chromium, SwiftShader WebGPU, no GPU; Qwen3-0.6B Q4_K_M, rank 16 on q/k/v/o/
+gate/up/down of all 28 layers = 196 adapted projections, 12 greedy tokens):**
+
+| | dispatches a step | text |
+|---|---|---|
+| no adapter, before / after | 562 / 562 | "The capital of France is Paris." |
+| zero adapter, composed (before and after) | 1150 | same as no adapter |
+| zero adapter, `fused:1024` | 758 (+196 `lora_fused_q4_o4`) | same as no adapter |
+| random adapter, composed / `fused:1024` / `fused:256` | 1150 / 758 / 758 | identical in all three, and to the old code |
+
+Every fused width matches numpy within 1.2e-6 of the output scale for ranks 1–1024, odd K and
+N, 1–3 rows. Python 341 passed (4 new), JS 127; the new GPU tests pass in the page.
+
+**Not measured:** speed on a GPU. SwiftShader runs a workgroup's barriers as coroutines (one
+256-thread workgroup with three barriers ~1.2 ms), so there every fused width times slower than
+composed and its race keeps composed, and decode speed (0.24 tok/s either way) says nothing.
+On the M5 the race decides; `lora_decode_benchmark.py` measures it.
+
+**Seen in passing:** the SDK's streaming reader (`webio._read_streaming`) held ~10x the bytes it
+read in this Chromium (a 0.6B load grew the renderer to ~12 GB and crashed it); a plain
+`r.bytes()` reader stayed at ~255 MB. The runs above used the plain reader. Not fixed here.
+
 ## 2026-10-08 ▸ LoRA adapters for any language model; a slot-head decision model recognised by what its folder holds
 
 **Trigger:** user: can the decision-model recognition load JEV-9B (a Qwen3.5-9B backbone, an

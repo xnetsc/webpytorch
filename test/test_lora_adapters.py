@@ -225,7 +225,7 @@ def test_a_rank_padded_to_four_adds_exactly_nothing():
         assert not lo.At.numpy()[:, r:].any() and not lo.Bt.numpy()[r:].any()
         x = rng.standard_normal((3, 7)).astype(np.float32)
         y = rng.standard_normal((3, 9)).astype(np.float32)
-        got = np.asarray(lo.add(wt.xp.asarray(x), wt.xp.asarray(y)), np.float32)
+        got = wt.Tensor(lo.add(wt.xp.asarray(x), wt.xp.asarray(y))).numpy()
         np.testing.assert_allclose(got, y + 0.25 * (x @ A.T) @ B.T, rtol=1e-5, atol=1e-5)
 
 

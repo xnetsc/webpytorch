@@ -23,6 +23,15 @@ read. Open: (1) JEV-9B end-to-end: Q8_0 backbone downloading into `models/jev-9b
 ~0.991 true; choice ~0.33/0.14/0.53/0.001) with and without the adapter (`adapter=False`);
 (2) adapter decode costs 3x on the 0.6B: one fused kernel per adapted projection.
 
+**2026-10-08 adapter in one dispatch:** a decode row's adapter is one `lora_fused` dispatch
+(t = A x reduced in workgroup memory, then `t . B^T` added), raced per shape against the
+composed matmuls at load; q/k/v and gate/up keep their shared dispatch with adapters attached.
+0.6B, rank 16 on all 196 projections: 1150 → 758 dispatches a step, text identical to the
+composed route (SwiftShader). Open: (1) the M5's tok/s with each route
+(`examples/lora_decode_benchmark.py` in `webapp/`) and which one its race picks; (2) the
+streaming reader's memory (`webio._read_streaming` held ~10x what it read in headless
+Chromium); (3) then JEV-9B as above.
+
 **2026-10-07 remeasure within budget, two route sets, gates that hold, README as a pitch:**
 a race starts only when it fits; the decode search resumes where it stopped and changes nothing
 it did not prove; approximations are admitted per weight on hard inputs; the routes a remeasure
