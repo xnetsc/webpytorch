@@ -268,6 +268,20 @@ ids matching the tensor. Committing only on the happy path is what produced a ca
 claimed a prefix it did not contain — and the symptom was not a crash but fluent, degenerate
 output.
 
+## Adapters on stored weights
+
+A PEFT LoRA adapter is read from PEFT's own files and placed by the Hugging Face module path it
+was trained on (`adapters.py`, `CausalLM.attach_adapter`). It stays beside each weight as two
+float32 matrices and adds `scale*(x A^T) B^T` to that projection's output; it is never merged,
+because merging would decode a quantized weight and store it at a width the file does not have.
+A projection without one (`lora` None) runs exactly as before, and the paths that read several
+stored weights in one dispatch hand an adapted projection to its own call. Linear-attention
+value heads are stored tiled in a GGUF, so an adapter's value rows (and out_proj's columns) are
+moved to that order when attached. An adapter is attached during the load, before warm-up, so
+route races and recorded decode steps include it; attaching later drops the model's own
+recordings. A slot-head decision model is the same language model with its adapter plus a
+linear head over the last hidden state (`decision.SlotDecisionModel`).
+
 ## Where a decision belongs
 
 The SDK is an abstraction over a *class* of needs, not a set of features for the chat app.

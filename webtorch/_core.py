@@ -12459,6 +12459,10 @@ def parallel_linear(linears, x, execution="auto"):
     if execution not in ("auto", "separate", "fused") + fused_modes:
         raise ValueError("execution must be auto, separate, fused, or a fused:<shape> route")
     separate = lambda: tuple(layer(x) for layer in linears)
+    if _lora_live(linears):
+        # The shared dispatch reads the stored weights directly; an adapter is added by each
+        # projection's own call.
+        return separate()
     xd = x.data
     rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
     capable = (2 <= len(linears) <= 3 and rows == 1 and _adam_backend_ready()
@@ -12573,6 +12577,8 @@ def parallel_swiglu(linears, x, execution="auto"):
         out = swiglu(gate, up)
         return out if out is not None else (gate / (1.0 + (-gate).exp())) * up
 
+    if _lora_live(linears):
+        return separate()
     xd = x.data
     rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
     capable = (rows == 1 and all(isinstance(l, GGMLLinear) for l in linears)
@@ -15719,12 +15725,49 @@ def stored_linear(weight, bias=None, execution="auto"):
     return fn(bias=bias, execution=execution) if callable(fn) else None
 
 
+# ---- low-rank adapters on a stored weight, at inference -----------------------------------
+#
+# A LoRA adapter trained on a model's original weights adds `scale * (x @ A^T) @ B^T` to a
+# projection's output. It is kept beside the weight, not merged into it: merging would decode a
+# quantised weight to floats and write a new one at a width the file does not store. A
+# projection without one (`lora` None) runs exactly as it did before adapters existed.
+class LoRA(object):
+    """One projection's adapter: `scale * (x @ A^T) @ B^T`, with A (r, in) and B (out, r) as
+    an adapter file stores them, kept in float32 on the device with the scale folded into B."""
+
+    def __init__(self, A, B, scale):
+        A = np.asarray(A, np.float32)
+        B = np.asarray(B, np.float32)
+        if A.ndim != 2 or B.ndim != 2 or A.shape[0] != B.shape[1]:
+            raise ValueError("LoRA A %s and B %s do not share a rank" % (A.shape, B.shape))
+        self.rank, self.k = int(A.shape[0]), int(A.shape[1])
+        self.n = int(B.shape[0])
+        self.At = Tensor(np.ascontiguousarray(A.T))
+        self.Bt = Tensor(np.ascontiguousarray(B.T * np.float32(scale)))
+
+    def delta(self, x2):
+        return x2.matmul(self.At).matmul(self.Bt)
+
+
+def _lora_live(linears):
+    return any(getattr(l, "lora", None) is not None for l in linears)
+
+
+def _lora_add(linear, xf, y, lead, n):
+    """`y` plus `linear`'s adapter, if it has one, on its input rows `xf`."""
+    lora = getattr(linear, "lora", None)
+    if lora is None:
+        return y
+    return y + lora.delta(Tensor(xf)).reshape(*lead, n)
+
+
 class GGMLLinear(Module):
     """Inference-only Linear whose weight stays in the encoding the GGUF shipped it in.
 
     Nothing is dequantized or requantized at load: the file's bytes go to the GPU as they
     are and `ggml_matmul` unpacks each block while it multiplies. That removes the whole
     conversion pass -- the bulk of a load -- and the second rounding it imposed."""
+    lora = None   # a `LoRA` adapter added to the output, once one is attached
 
     def __init__(self, raw, type_name, K, N, bias=None, execution="auto"):
         if execution not in ("stored", "tiled", "tiled_half", "dp4a", "materialized", "auto"):
@@ -15759,11 +15802,12 @@ class GGMLLinear(Module):
         rows = int(xd.reshape(-1, self.Kt).shape[0])
         execution = (self.decode_execution
                      if rows == 1 and self.decode_execution is not None else self.execution)
-        of = ggml_matmul(_contig(xd.reshape(-1, self.Kt)), self.packed,
+        xf = _contig(xd.reshape(-1, self.Kt))
+        of = ggml_matmul(xf, self.packed,
                          self.type_name, self.Kt, self.Nt, bias=self.bias,
                          execution=execution,
                          shape_execution=(self.decode_shape if rows == 1 else "auto"))
-        return Tensor(of.reshape(*lead, self.Nt))                 # inference-only
+        return _lora_add(self, xf, Tensor(of.reshape(*lead, self.Nt)), lead, self.Nt)
 
 
 
@@ -16077,6 +16121,8 @@ class GGMLMoELinear(Module):
 
 class QuantizedLinear(Module):
     """Inference-only GPTQ-format weight-quantized Linear (group-wise int4/int8)."""
+    lora = None   # a `LoRA` adapter added to the output, once one is attached
+
     def __init__(self, qweight, qzeros, scales, bias, Kt, Nt, Kp, Np, gs, bits,
                  zero_offset=0.0, execution="auto"):
         if execution not in ("stored", "materialized", "auto"):
@@ -16167,7 +16213,10 @@ class QuantizedLinear(Module):
         of = run(execution)
         if self.Np != self.Nt:
             of = _contig(of[:, :self.Nt])
-        return Tensor((of + self.bias).reshape(*lead, self.Nt))   # inference-only
+        y = Tensor((of + self.bias).reshape(*lead, self.Nt))   # inference-only
+        if self.lora is None:
+            return y
+        return _lora_add(self, _contig(xd.reshape(-1, self.Kt)), y, lead, self.Nt)
 
     def nbytes(self):
         return int(self.qweight.size * 4 + self.qzeros.size * 4 + self.scales.size * 4 + self.bias.size * 4)
@@ -16178,6 +16227,8 @@ class UnquantizedLinear(Module):
     model and are computed in fp32 (the WebGPU/WebGL backend is fp32). Exposes the same
     `__call__(x) -> Tensor` interface as `QuantizedLinear`, so the LLM engine treats int4 /
     int8 / fp16 layers identically (capture-replay decode works the same)."""
+    lora = None   # a `LoRA` adapter added to the output, once one is attached
+
     def __init__(self, weight, bias=None):
         W = np.asarray(weight)                                   # (Nt=out, Kt=in)
         self.Nt, self.Kt = int(W.shape[0]), int(W.shape[1])
@@ -16189,7 +16240,8 @@ class UnquantizedLinear(Module):
         xd = x.data; lead = xd.shape[:-1]
         xf = _contig(xd.reshape(-1, self.Kt))
         of = xf @ self.Wt
-        return Tensor((of + self.bias).reshape(*lead, self.Nt))
+        return _lora_add(self, xf, Tensor((of + self.bias).reshape(*lead, self.Nt)),
+                         lead, self.Nt)
 
     def nbytes(self):
         return int(self.Wt.size * 4 + self.bias.size * 4)

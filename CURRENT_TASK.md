@@ -1,6 +1,6 @@
 # Current task status
 
-> Last updated: 2026-10-07
+> Last updated: 2026-10-08
 
 ## Highest project principle
 
@@ -12,6 +12,16 @@ performance comparison and adopt whichever measured execution is fastest. Only b
 passing their recorded acceptance gates completes this task.
 
 ## One-line status
+
+**2026-10-08 LoRA for any language model; slot-head decision models by content:** PEFT
+adapters load with a model (`adapter=`, or beside it in its folder), kept unmerged on every
+projection, applied in prefill and recorded decode (0.6B: zero adapter gives the same text,
+every decoded token agrees with a fresh prefill). A decision folder with slots, a head, a
+language model and optional temperatures/adapter loads as `SlotDecisionModel`, with no names
+read. Open: (1) JEV-9B end-to-end: Q8_0 backbone downloading into `models/jev-9b`
+(`segdl.py`, parts resume); then load the folder, compare with the model card (noul refund
+~0.991 true; choice ~0.33/0.14/0.53/0.001) with and without the adapter (`adapter=False`);
+(2) adapter decode costs 3x on the 0.6B: one fused kernel per adapted projection.
 
 **2026-10-07 remeasure within budget, two route sets, gates that hold, README as a pitch:**
 a race starts only when it fits; the decode search resumes where it stopped and changes nothing

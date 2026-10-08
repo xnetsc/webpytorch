@@ -1238,16 +1238,17 @@ class CausalLM:
         return blocks
 
     @classmethod
-    async def from_gptq(cls, base, lmax=None):
-        """Stream + build from a served AutoGPTQ int4 dir (e.g. '/models/qwen7b-gptq')."""
+    async def from_gptq(cls, base, lmax=None, adapter=None):
+        """Stream + build from a served AutoGPTQ int4 dir (e.g. '/models/qwen7b-gptq').
+        `adapter`: LoRA modules to attach before warm-up, as `adapters.read_lora` gives them."""
         self = cls(base)
         try:
-            return await self._from_gptq(lmax)
+            return await self._from_gptq(lmax, adapter)
         except BaseException:
             self._abort_build()      # a dead load must not strand half a model in GPU memory
             raise
 
-    async def _from_gptq(self, lmax=None):
+    async def _from_gptq(self, lmax=None, adapter=None):
         from . import webio
         self.lmax = lmax
         self._shard_hdr = {}
@@ -1284,6 +1285,8 @@ class CausalLM:
         # that the fused forms do in two, on the backend where a dispatch costs the most.
         self._gpu = wt._adam_backend_ready()        # webgpu -> capture path available
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
+        if adapter:
+            self.attach_adapter(adapter)
         self._init_state()
         self._audit()               # weights must agree with the file
         self._smoke()               # and the first forward must be usable
@@ -1588,7 +1591,7 @@ class CausalLM:
 
     @classmethod
     async def from_gguf(cls, url, lmax=None, bits=None, quantize=True, weights="native",
-                        expert_weights_norm=None):
+                        expert_weights_norm=None, adapter=None):
         """Load a llama.cpp GGUF. `url` is the served .gguf file.
 
         `weights="native"` (the default) uploads each tensor in its own encoding and
@@ -1613,17 +1616,19 @@ class CausalLM:
         QK-norm (`attn_q_norm`/`attn_k_norm`, e.g. Qwen3) and sparse-MoE (`ffn_gate_inp` +
         `ffn_*_exps`). So any Llama-style decoder GGUF (llama / qwen2 / qwen3 / mistral / …)
         loads without a per-model branch. A GGUF whose weights use a quantization type this
-        SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error."""
+        SDK cannot dequantize (e.g. the IQ i-quants) is rejected with a clear error.
+
+        `adapter`: LoRA modules to attach before warm-up, as `adapters.read_lora` gives them."""
         self = cls(None)
         try:
             return await self._from_gguf(url, lmax, bits, quantize, weights,
-                                         expert_weights_norm)
+                                         expert_weights_norm, adapter)
         except BaseException:
             self._abort_build()      # a dead load must not strand half a model in GPU memory
             raise
 
     async def _from_gguf(self, url, lmax=None, bits=None, quantize=True, weights="native",
-                         expert_weights_norm=None):
+                         expert_weights_norm=None, adapter=None):
         from . import ggufload as G
         self._expert_norm_default = expert_weights_norm
         self.lmax = lmax; self._gguf = url
@@ -1925,6 +1930,8 @@ class CausalLM:
         # more physical memory for the first whole-model GPU step. The following small
         # input/readback buffers may allocate a fresh bounded window as needed.
         wt._release_transfer_memory()
+        if adapter:
+            self.attach_adapter(adapter)
         _load_stage("warming")
         self._init_state()          # kernel shapes measured for this model
         _load_stage("checking")
@@ -2025,19 +2032,20 @@ class CausalLM:
         return self._mklin(await self._np(prefix + ".weight"), b)
 
     @classmethod
-    async def from_fp16(cls, base, lmax=None, quantize=None):
+    async def from_fp16(cls, base, lmax=None, quantize=None, adapter=None):
         """Load a plain fp16/bf16 HF safetensors dir (no `quantization_config`). Runs the
         model UNquantized by default (fp16 weights, fp32 compute); pass `quantize=4` or `8`
         to instead quantize every linear to int on load (same served fp16 model → int
-        inference). Same engine (KV cache, capture/replay, generate) as the int loaders."""
+        inference). Same engine (KV cache, capture/replay, generate) as the int loaders.
+        `adapter`: LoRA modules to attach before warm-up, as `adapters.read_lora` gives them."""
         self = cls(base)
         try:
-            return await self._from_fp16(lmax, quantize)
+            return await self._from_fp16(lmax, quantize, adapter)
         except BaseException:
             self._abort_build()      # a dead load must not strand half a model in GPU memory
             raise
 
-    async def _from_fp16(self, lmax=None, quantize=None):
+    async def _from_fp16(self, lmax=None, quantize=None, adapter=None):
         from . import webio
         self.lmax = lmax; self._shard_hdr = {}
         self._qbits = int(quantize) if quantize else 0
@@ -2069,6 +2077,8 @@ class CausalLM:
         self.load_s = round(time.perf_counter() - t0, 1)
         self._gpu = wt._adam_backend_ready()
         self._fused = wt._adam_backend_ready() or wt._webgl_ready()
+        if adapter:
+            self.attach_adapter(adapter)
         self._init_state()
         self._audit()               # weights must agree with the file
         self._smoke()               # and the first forward must be usable
@@ -3245,6 +3255,10 @@ class CausalLM:
                               for m in linears),
             "q4_shapes": sorted((int(k), int(n)) for k, n in qshapes),
         }
+        adapted = sorted((int(m.Kt), int(m.Nt), int(m.lora.rank)) for m in linears
+                         if getattr(m, "lora", None) is not None)
+        if adapted:             # absent otherwise, so a model without adapters keeps its key
+            topology["adapters"] = adapted
         if backend == "webgpu":
             topology["sampler_route"] = CausalLM._decode_sampler_route(
                 self, pick_mode or CausalLM._decode_pick_mode(self))
@@ -5062,6 +5076,144 @@ class CausalLM:
             if st is not None:
                 st.reset()
 
+    # ---- low-rank adapters, by the module names they were trained on ------------------
+    # Where a decoder layer's projections live here, keyed by the name the module has inside
+    # a Hugging Face layer: an adapter names what it changes the way it was trained.
+    _ADAPTER_SLOTS = {"self_attn.q_proj": "q", "self_attn.k_proj": "k",
+                      "self_attn.v_proj": "v", "self_attn.o_proj": "o",
+                      "mlp.gate_proj": "gate", "mlp.up_proj": "up", "mlp.down_proj": "down"}
+    _ADAPTER_LINEAR = {"linear_attn.in_proj_qkv": "qkv", "linear_attn.in_proj_z": "g",
+                       "linear_attn.in_proj_b": "beta", "linear_attn.in_proj_a": "alpha",
+                       "linear_attn.out_proj": "o"}
+
+    def attach_adapter(self, modules):
+        """Attach low-rank adapters, `{module path: (A, B, scale)}` as `adapters.read_lora`
+        gives them, to the projections they were trained on. From then on every call this
+        model runs includes them; a projection no adapter names runs as it did.
+
+        A linear-attention layer runs its value heads in ggml's tiled order (value head v
+        reads key head v % n_k_heads, the order llama.cpp's converter writes a Hugging Face
+        weight's grouped heads in), so an adapter trained on the grouped weights is put in
+        that order too: the value rows of in_proj_qkv, the rows of in_proj_z/b/a, and the
+        input columns of out_proj. A module with no projection here raises, as does a shape
+        that does not match: an adapter applied to part of what it was trained on gives
+        answers that look fine and are not."""
+        import re
+        placed = []
+        for path, (A, B, scale) in modules.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.(.+)$", str(path))
+            if m is None:
+                raise NotImplementedError("adapter module %s is not inside a decoder layer" % path)
+            i, rest = int(m.group(1)), m.group(2)
+            if i >= len(self.layers) or not isinstance(self.layers[i], dict):
+                raise ValueError("adapter module %s: this model has %d layers"
+                                 % (path, len(self.layers)))
+            lay = self.layers[i]
+            A = np.asarray(A, np.float32)
+            B = np.asarray(B, np.float32)
+            lin = None
+            if rest in self._ADAPTER_SLOTS:
+                lin = lay.get(self._ADAPTER_SLOTS[rest])
+            elif rest in self._ADAPTER_LINEAR and lay.get("linear") is not None:
+                la = lay["linear"]
+                key = self._ADAPTER_LINEAR[rest]
+                lin = la.w.get(key)
+                if lin is not None:
+                    A, B = CausalLM._adapter_tiled(la, key, A, B)
+            if lin is None or not hasattr(lin, "Kt"):
+                raise NotImplementedError("adapter module %s has no projection here to attach to"
+                                          % path)
+            if A.shape[1] != int(lin.Kt) or B.shape[0] != int(lin.Nt):
+                raise ValueError("adapter module %s: A %s and B %s against a %dx%d projection"
+                                 % (path, A.shape, B.shape, int(lin.Kt), int(lin.Nt)))
+            lin.lora = wt.LoRA(A, B, scale)
+            placed.append(str(path))
+        CausalLM._adapters_changed(self)
+        return placed
+
+    def _adapters_changed(self):
+        """What attaching or removing an adapter leaves stale: the cached rows and every
+        recorded step were computed without it. During a load neither exists yet, and the
+        warm-up that follows runs with the adapter in place."""
+        CausalLM._kv_drop(self)
+        self._reset_linear_state()
+        if "kv_cap" not in self.__dict__:
+            return
+        # As when the cache grows: this model's recordings go, and the next reply records
+        # its steps again. Other models' recordings are not this one's to drop.
+        self.capture_ready = False
+        self._greedy_chunk_capture_ready = False
+        self._decode_graph_signature = None
+        self._decode_graph_logits = None
+        self._decode_graph_token = None
+        if getattr(self, "_gpu", False) and self._capturable():
+            # The adapter's matmul shapes register here, not inside the next recording.
+            self._warm_decode_step()
+
+    @staticmethod
+    def _adapter_tiled(la, key, A, B):
+        """An adapter's value-head rows (or out_proj's columns), from the grouped order of a
+        Hugging Face weight to the tiled order this linear-attention layer runs in."""
+        hk, hv, dk, dv = int(la.hk), int(la.hv), int(la.dk), int(la.dv)
+        if hv == hk:
+            return A, B
+        if hv % hk:
+            raise NotImplementedError("%d value heads over %d key heads" % (hv, hk))
+        r = hv // hk
+
+        def perm(hd):
+            n = hk * r * hd
+            return np.arange(n).reshape(hk, r, hd).transpose(1, 0, 2).reshape(n)
+        if key == "qkv":
+            qk = 2 * hk * dk
+            B = np.concatenate([B[:qk], B[qk:][perm(dv)]], axis=0)
+        elif key == "g":
+            B = B[perm(dv)]
+        elif key in ("beta", "alpha"):
+            B = B[perm(1)]
+        elif key == "o":
+            A = A[:, perm(dv)]
+        return A, B
+
+    def detach_adapters(self):
+        """Take every attached adapter off again."""
+        for lay in getattr(self, "layers", None) or ():
+            if not isinstance(lay, dict):
+                continue
+            mods = [lay.get(k) for k in set(self._ADAPTER_SLOTS.values())]
+            if lay.get("linear") is not None:
+                mods += list(lay["linear"].w.values())
+            for lin in mods:
+                if lin is not None and getattr(lin, "lora", None) is not None:
+                    lin.lora = None
+        CausalLM._adapters_changed(self)
+
+    def prefill_hidden(self, ids):
+        """The final-norm hidden state at the last of `ids`, prefilled from an empty cache,
+        as float32 on the host. Leaves no conversation behind: the rows it wrote are
+        dropped and the recurrent state is cleared, so the next reply starts clean."""
+        ids = [int(t) for t in ids]
+        if not ids:
+            raise ValueError("prefill_hidden needs at least one token")
+        if len(ids) > int(self.lmax):
+            raise ValueError("%d tokens is past this model's context of %d"
+                             % (len(ids), int(self.lmax)))
+        self._reset_linear_state()
+        CausalLM._kv_drop(self)
+        try:
+            if self._capturable():
+                self._kv_reserve(len(ids))
+                self._prefill(ids, start=0, head=False)
+                hidden = self._last_prefill_hidden
+            else:
+                cache = wt.KVCache(self.L, self.NKV, self.HD, self.lmax)
+                self._kv_forward(ids, 0, cache)
+                hidden = self._last_hidden
+            return np.asarray(hidden.numpy(), np.float32).reshape(-1).copy()
+        finally:
+            CausalLM._kv_drop(self)
+            self._reset_linear_state()
+
     def _is_linear_layer(self, i):
         """True when layer `i` is a linear-attention (recurrent state) layer rather than softmax
         attention. Driven by the config's `layer_types` / `full_attention_interval`."""
@@ -5597,9 +5749,11 @@ class CausalLM:
             gc.collect()
             wt._gpu_release_idle_pool()
 
-    def _prefill(self, ids, embeds=None, start=0):
+    def _prefill(self, ids, embeds=None, start=0, head=True):
         """Run `ids` through the model, writing their keys and values into the cache at
-        `start`, and return the argmax of the last position's logits.
+        `start`, and return the argmax of the last position's logits. `head=False`: stop at
+        the last position's final-norm hidden state (`_last_prefill_hidden`) and return None,
+        for a caller that reads that state with a head of its own.
 
         `start` > 0 means the cache already holds the `start` tokens before these -- see
         `_kv_prefix`. The new tokens then carry rotary positions `start..start+T-1` and
@@ -5701,6 +5855,10 @@ class CausalLM:
         # The LAST REAL row, which is not the last row when the prompt was padded above.
         self._last_prefill_hidden = wt.Tensor(wt._contig(
             fin.data[T_real - 1:T_real]))
+        if not head:
+            self._moe_prefill_seen.update(self._moe_prefill_pending)
+            CausalLM._moe_prefill_api_completed(self, T_real)
+            return None
         picked = self._head_argmax(self._last_prefill_hidden)
         self._moe_prefill_seen.update(self._moe_prefill_pending)
         CausalLM._moe_prefill_api_completed(self, T_real)

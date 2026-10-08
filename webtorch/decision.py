@@ -378,6 +378,29 @@ def answer_confidence(p):
     return float(np.clip(p.max(), 0.0, 1.0))
 
 
+# What each SHAPE asks a caller for and answers with, in the words someone deciding what to
+# ask would use (see `DecisionModel.surface`).
+_DESCRIBED = {
+    "named":   {"label": "Pick one", "min": 2, "needs": "options", "options": "named",
+                "help": "Name the things it may choose between. It answers with one "
+                        "of them and says how likely each was.",
+                "asks_for": "the options to choose between",
+                "answer": "one of the options, with a probability for each"},
+    "ordered": {"label": "Rate on a scale", "min": 2, "needs": "levels",
+                "options": "ordered",
+                "help": "Describe the levels in order, lowest first. It answers with "
+                        "where on that scale this lands.",
+                "asks_for": "the levels of the scale, in order",
+                "answer": "where it lands on the scale"},
+    "fixed":   {"label": "How likely is this true?", "min": 2, "needs": None,
+                "options": "fixed",
+                "help": "Write a statement. It answers with how likely that statement "
+                        "is to hold, from 0 to 100%.",
+                "asks_for": "nothing -- just the statement",
+                "answer": "how likely the statement is to hold, in [0, 1]"},
+}
+
+
 class DecisionModel(wt.Module):
     """An encoder, a small transformer head, and a scorer that reads one position per option.
 
@@ -1216,29 +1239,10 @@ class DecisionModel(wt.Module):
         # what the type asks for and what it answers with, and that is the shape. Keyed that
         # way, a model with types nobody has seen describes itself correctly with no entry
         # here, which a table keyed by name could never do.
-        described = {
-            "named":   {"label": "Pick one", "min": 2, "needs": "options", "options": "named",
-                        "help": "Name the things it may choose between. It answers with one "
-                                "of them and says how likely each was.",
-                        "asks_for": "the options to choose between",
-                        "answer": "one of the options, with a probability for each"},
-            "ordered": {"label": "Rate on a scale", "min": 2, "needs": "levels",
-                        "options": "ordered",
-                        "help": "Describe the levels in order, lowest first. It answers with "
-                                "where on that scale this lands.",
-                        "asks_for": "the levels of the scale, in order",
-                        "answer": "where it lands on the scale"},
-            "fixed":   {"label": "How likely is this true?", "min": 2, "needs": None,
-                        "options": "fixed",
-                        "help": "Write a statement. It answers with how likely that statement "
-                                "is to hold, from 0 to 100%.",
-                        "asks_for": "nothing -- just the statement",
-                        "answer": "how likely the statement is to hold, in [0, 1]"},
-        }
         types = {}
         for t in self.cfg.qtypes:
             shape = self.cfg.shape_of(t)
-            types[t] = dict(described.get(shape) or described[GENERAL_SHAPE], shape=shape)
+            types[t] = dict(_DESCRIBED.get(shape) or _DESCRIBED[GENERAL_SHAPE], shape=shape)
         return {
             "kind": "decision",
             "takes": {"state": {"kinds": ["text", "json"]},
@@ -1252,6 +1256,242 @@ class DecisionModel(wt.Module):
             "limits": {"sequence_tokens": self.cfg.max_len,
                        "question_tokens": self.cfg.head_max_len,
                        "option_tokens": self.cfg.option_tokens},
+        }
+
+
+# ---- a decision head over a language model ---------------------------------------------
+#
+# The other way a decision model is built: a decoder reads one prompt per question, written
+# in the template the model was trained with, and a linear head over the last position's
+# final-norm hidden state scores a fixed row of answer slots. Each question type owns a run
+# of those slots, and a question uses the first of its type's slots, one per answer. The
+# decoder is an ordinary language model run by the ordinary engine; a LoRA adapter trained
+# with the head is attached to it the way any adapter is (`adapters`).
+
+
+def _bare_v1(kind, shape, state, question, labels, texts):
+    """The `bare-v1` prompt. A named question's options are lettered by their slots'
+    verbalizers ("A) ..."); every other shape lists the verbalizers themselves."""
+    lines = (["%s) %s" % (l, t) for l, t in zip(labels, texts)] if shape == "named"
+             else list(labels))
+    return ("[kind] %s\n[state] %s\n[question] %s\n[options]\n%s\n[decision]:"
+            % (kind, state, question, "\n".join(lines)))
+
+
+# Prompt templates, by the name a checkpoint gives its template. The template is part of what
+# the head was trained on, so one this engine does not know is refused, never approximated.
+_SLOT_TEMPLATES = {"bare-v1": _bare_v1}
+
+
+def slot_layout(cfg):
+    """The answer slots a config declares, or None for a config that declares none:
+    `{"num_slots", "ranges": {type: (start, end)}, "verbalizers", "template"}`."""
+    slots = cfg.get("slots") if isinstance(cfg, dict) else None
+    ranges = slots.get("ranges") if isinstance(slots, dict) else None
+    if not isinstance(ranges, dict) or not ranges:
+        return None
+    try:
+        out = {str(k): (int(r[0]), int(r[1])) for k, r in ranges.items()}
+        n = int(slots.get("num_slots") or max(e for _, e in out.values()))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    for k, (a, z) in out.items():
+        if not 0 <= a < z <= n:
+            raise ValueError("answer slots of type %r run %d..%d of %d" % (k, a, z, n))
+    verbal = slots.get("verbalizers")
+    if not (isinstance(verbal, list) and len(verbal) == n):
+        raise ValueError("a slot head needs one verbalizer per slot to write its prompt "
+                         "(%d slots, verbalizers %r)" % (n, verbal))
+    return {"num_slots": n, "ranges": out, "verbalizers": [str(v) for v in verbal],
+            "template": slots.get("template_version") or cfg.get("template_version")}
+
+
+def _per_kind(cfg, kinds):
+    """The temperatures a calibration file holds per question type, or None if it is not
+    one for these types."""
+    per = cfg.get("per_kind") if isinstance(cfg, dict) else None
+    if not isinstance(per, dict) or not per or not set(per) <= set(kinds):
+        return None
+    try:
+        return {str(k): float(v) for k, v in per.items()}
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_answer(qtype, shape, labels, p, criteria):
+    """One question's answer, in the same terms `DecisionModel.decide` reports."""
+    legacy_confidence = answer_confidence(p) if shape == "fixed" else confidence(p)
+    ans = {"type": qtype, "shape": shape,
+           "probabilities": {l: round(float(v), 4) for l, v in zip(labels, p)},
+           "confidence": round(legacy_confidence, 4),
+           "answer_confidence": round(answer_confidence(p), 4)}
+    if shape == "ordered":
+        ans["score"] = round(float((np.arange(len(p)) * p).sum()), 4)
+        ans["legend"] = {}
+    elif shape == "fixed":
+        ans["noul"] = round(float(p[1]), 4)
+    else:
+        ans["choice"] = labels[int(p.argmax())]
+    return ans
+
+
+class SlotDecisionModel(object):
+    """A language model, a prompt template and a linear head over answer slots.
+
+    Same request and answer as `DecisionModel`: a state and `{id: {"type", "instructions",
+    "criteria"}}` in, a distribution per question out. A `named` type takes the caller's
+    options, up to as many as it has slots; the other shapes answer over their slots' own
+    verbalizers, so their options are the model's and a caller supplies none.
+    """
+
+    def __init__(self, lm, weight, bias, layout, temperatures=None, adapter=None):
+        W = np.asarray(weight, np.float32)
+        if W.ndim != 2 or W.shape[0] != layout["num_slots"]:
+            raise ValueError("a %s head for %d answer slots" % (W.shape, layout["num_slots"]))
+        if W.shape[1] != int(lm.H):
+            raise ValueError("the head reads a %d-wide hidden state and the language model "
+                             "has %d" % (W.shape[1], int(lm.H)))
+        template = _SLOT_TEMPLATES.get(layout["template"])
+        if template is None:
+            raise NotImplementedError("prompt template %r is not one this engine writes (%s)"
+                                      % (layout["template"], ", ".join(sorted(_SLOT_TEMPLATES))))
+        self.lm = lm
+        self.W = W
+        self.b = (np.zeros(W.shape[0], np.float32) if bias is None
+                  else np.asarray(bias, np.float32).reshape(-1))
+        self.layout = layout
+        self.template = template
+        self.adapter = adapter
+        kinds = sorted(layout["ranges"], key=lambda k: layout["ranges"][k][0])
+        types = []
+        for k in kinds:
+            shape = dict(_CONVENTIONAL).get(k, GENERAL_SHAPE)
+            a, z = layout["ranges"][k]
+            if shape == "fixed" and z - a != 2:
+                raise ValueError("type %r answers yes or no and has %d slots" % (k, z - a))
+            types.append({"name": k, "shape": shape})
+        dec = {"question_types": types, "question_layout": "per_question",
+               "max_len": int(lm.lmax)}
+        if temperatures:
+            dec["temperature"] = [temperatures.get(k, 1.0) for k in kinds]
+        self.cfg = DecisionConfig(dec)
+        # Each question is its own prompt: the template has room for one.
+        self.cfg.question_layout_source = "checkpoint_structure"
+
+    def release(self):
+        lm = self.__dict__.get("lm")
+        self.__dict__["lm"] = None
+        if lm is not None:
+            lm.release()
+        self.__dict__["_released"] = True
+
+    def _slot_labels(self, qtype):
+        a, z = self.layout["ranges"][qtype]
+        return self.layout["verbalizers"][a:z]
+
+    def _prepare_questions(self, state, questions):
+        state_text = str(serialize_state(state))
+        built, total = [], 0
+        for qid, q in (questions or {}).items():
+            qtype = q["type"]
+            if qtype not in self.cfg.qtypes:
+                raise ValueError("%r is not a question type this model answers (%s)"
+                                 % (qtype, ", ".join(self.cfg.qtypes)))
+            shape = self.cfg.shape_of(qtype)
+            slots = self._slot_labels(qtype)
+            ins = q.get("instructions")
+            ins = ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False)
+            crit = q.get("criteria")
+            if shape == "named":
+                labels, texts = render_options(shape, crit)
+                if not 2 <= len(labels) <= len(slots):
+                    raise ValueError("question %r: %d options, and this type takes 2 to %d"
+                                     % (qid, len(labels), len(slots)))
+                letters = slots[:len(labels)]
+            else:
+                # The answers are the model's own; it never sees anything a caller adds.
+                given = list(crit) if isinstance(crit, (dict, list, tuple)) else []
+                described = isinstance(crit, dict) and any(crit.values())
+                if (given and [str(g) for g in given] != slots) or described:
+                    raise ValueError("question %r: type %r answers over %s, its own levels; "
+                                     "say what they mean in the question instead"
+                                     % (qid, qtype, "/".join(slots)))
+                labels, texts, letters = list(slots), None, list(slots)
+            text = self.template(qtype, shape, state_text, ins, letters, texts)
+            ids = self.lm.tok.encode_special(text)
+            total += len(ids)
+            built.append((qid, q, qtype, ids, list(range(len(labels))), labels))
+        return built, total
+
+    def _raw_questions(self, built, execution=None):
+        """Each question's raw slot logits, in `DecisionModel._raw_questions`' terms."""
+        prefill_ms = head_ms = 0.0
+        for qid, q, qtype, ids, markers, labels in built:
+            t0 = time.perf_counter()
+            h = self.lm.prefill_hidden(ids)
+            t1 = time.perf_counter()
+            a = self.layout["ranges"][qtype][0]
+            n = len(labels)
+            logits = (self.W[a:a + n] @ h + self.b[a:a + n]).astype(np.float64)
+            prefill_ms += (t1 - t0) * 1000
+            head_ms += (time.perf_counter() - t1) * 1000
+            yield qid, q, qtype, markers, labels, logits, None
+        if execution is not None:
+            execution.update({"prefill_ms": round(prefill_ms, 3), "head_ms": round(head_ms, 3)})
+
+    def decide(self, state, questions, *, profile=False):
+        """Answer every question about this state; see `DecisionModel.decide`."""
+        out = {}
+        request_start = time.perf_counter()
+        built, total = self._prepare_questions(state, questions)
+        prepare_ms = (time.perf_counter() - request_start) * 1000
+        execution = {}
+        for qid, q, qtype, markers, labels, logits, _ in self._raw_questions(built, execution):
+            z = logits / self.cfg.temp_for(qtype, len(labels))
+            p = np.exp(z - z.max()); p = p / p.sum()
+            out[qid] = _slot_answer(qtype, self.cfg.shape_of(qtype), labels, p,
+                                    q.get("criteria"))
+        usage = {"input_tokens": total, "output_tokens": 0, "questions": len(built),
+                 "sequence_tokens": {str(b[0]): len(b[3]) for b in built}}
+        if profile:
+            usage.update(execution, prepare_ms=round(prepare_ms, 3))
+        else:
+            wt.note_speed("decide:%d" % (1 << (max(1, int(total)) - 1).bit_length()),
+                          time.perf_counter() - request_start)
+        return {"answers": out, "usage": usage}
+
+    __call__ = decide
+    # Fitting temperatures is the same job on the same raw logits.
+    calibrate = DecisionModel.calibrate
+    _target_index = staticmethod(DecisionModel._target_index)
+
+    def surface(self):
+        """What this model takes and returns; see `DecisionModel.surface`."""
+        types = {}
+        for t in self.cfg.qtypes:
+            shape = self.cfg.shape_of(t)
+            slots = self._slot_labels(t)
+            spec = dict(_DESCRIBED.get(shape) or _DESCRIBED[GENERAL_SHAPE], shape=shape)
+            if shape == "named":
+                spec["max"] = len(slots)
+            else:
+                spec.update(needs=None, levels=list(slots), min=len(slots), max=len(slots))
+                if shape == "ordered":
+                    spec.update(help="Ask it in plain words. It answers with a level from %s "
+                                     "to %s; say in the question what the levels mean."
+                                     % (slots[0], slots[-1]),
+                                asks_for="nothing; the levels are the model's own")
+            types[t] = spec
+        return {
+            "kind": "decision",
+            "takes": {"state": {"kinds": ["text", "json"]},
+                      "questions": {"types": types, "max": None}},
+            "returns": {"per_question": ["probabilities", "answer_confidence", "confidence"]},
+            "question_layout": self.cfg.question_layout,
+            "question_layout_source": self.cfg.question_layout_source,
+            "calibration": self.cfg.calibration(),
+            "limits": {"sequence_tokens": self.cfg.max_len},
+            "adapter": self.adapter,
         }
 
 
@@ -1622,9 +1862,10 @@ async def load_decision(src, container=None, **kw):
     something is published in a different wrapper.
 
     What a model IS is still never read off a name. The container is (a format is a naming
-    convention), but the answer to "decision model?" comes from the tensors the checkpoint
-    carries -- see `looks_like_decision` -- so one nobody has heard of is recognised on the
-    first try and one with a familiar name is not.
+    convention), but the answer to "decision model?" comes from what the checkpoint carries:
+    an encoder and a scorer (`looks_like_decision`), or a slot head over a language model
+    (`_slot_model`). So one nobody has heard of is recognised on the first try and one with a
+    familiar name is not.
 
     `container` is `webio.container_of(src)` when the caller already computed it, so a load
     that has to know the format anyway does not work it out twice.
@@ -1637,12 +1878,16 @@ async def load_decision(src, container=None, **kw):
     src = str(src).rstrip("/")
     kind = webio.container_of(src) if container is None else container
     if kind == "gguf":
-        return await _from_gguf(src, **kw)
-    if kind:
+        model = await _from_gguf(src, **kw)
+    elif kind:
         # A lone weights file in some other container: the config and tokenizer a decision
         # model needs are not in it and there is nowhere to look for them.
         return None
-    return await _from_directory(src, **kw)
+    else:
+        model = await _from_directory(src, **kw)
+    if model is None:
+        model = await _slot_model(src, kind, **kw)
+    return model
 
 
 async def _from_directory(src, **kw):
@@ -1742,3 +1987,134 @@ async def _from_directory(src, **kw):
     # nothing on the GPU, because nothing was.
     _warm_decision(model, dec_cfg, webio)
     return model
+
+
+# A slot head's config and calibration are small JSON files; a tokenizer or vocabulary at the
+# top of the same folder runs to megabytes and is not worth reading to find out it is not one.
+_SLOT_CONFIG_BYTES = 1 << 20
+
+
+def _adapter_dirs(names):
+    """The folders (relative, "" for the top) that hold a PEFT adapter's two files."""
+    from .adapters import ADAPTER_CONFIG, ADAPTER_WEIGHTS
+    out = []
+    for n in names:
+        d = n[:-len(ADAPTER_CONFIG)].rstrip("/")
+        if (n == ADAPTER_CONFIG or n.endswith("/" + ADAPTER_CONFIG)) \
+                and (d + "/" if d else "") + ADAPTER_WEIGHTS in names:
+            out.append(d)
+    return sorted(out)
+
+
+async def _slot_model(src, container=None, **kw):
+    """Open `src` as a decision head over a language model, or return None for another task.
+
+    Recognised by what the folder holds, never by a name: a JSON file that declares answer
+    slots (`slot_layout`), a safetensors file holding one [slots, hidden] matrix and at most
+    its bias, a language model to run under it (the GGUF `src` names, or the one model in
+    the folder), and optionally temperatures per question type and a LoRA adapter. The
+    adapter is the one the config names by its folder, else the folder's only one; `adapter=`
+    overrides that (False: none). A folder that cannot be listed (a served one: HTTP has no
+    directory listing) is not recognised this way.
+    """
+    from . import webio
+    from .hfcompat import _decode
+
+    src = str(src).rstrip("/")
+    folder = (src.rsplit("/", 1)[0] if "/" in src else None) if container else src
+    names = webio.files_under(folder) if folder else None
+    if not names:
+        return None
+    top = [n for n in names if "/" not in n]
+    layout = cfg = None
+    jsons = []
+    for n in top:
+        if not n.endswith(".json"):
+            continue
+        size = await webio.local_size(folder + "/" + n)
+        if size is None or size > _SLOT_CONFIG_BYTES:
+            continue
+        try:
+            c = await webio.read_json(folder + "/" + n)
+        except Exception:
+            continue
+        jsons.append(c)
+        if layout is None:
+            got = slot_layout(c)
+            if got is not None:
+                layout, cfg = got, c
+    if layout is None:
+        return None
+    if cfg.get("softcap"):
+        raise NotImplementedError("a slot head with softcap=%r: where it applies is not "
+                                  "declared, and guessing changes every answer"
+                                  % cfg.get("softcap"))
+    temps = next((t for t in (_per_kind(c, layout["ranges"]) for c in jsons) if t), None)
+
+    S = layout["num_slots"]
+    head = None
+    for n in top:
+        if not n.endswith(".safetensors"):
+            continue
+        h, base = await _safetensors_header(folder + "/" + n)
+        mats = [k for k, v in h.items() if len(v["shape"]) == 2 and v["shape"][0] == S]
+        vecs = [k for k, v in h.items() if v["shape"] == [S]]
+        if len(mats) == 1 and len(h) == 1 + len(vecs) and len(vecs) <= 1:
+            if head is not None:
+                raise ValueError("%s holds two slot heads: %s and %s" % (folder, head[0], n))
+            head = (n, h, base, mats[0], vecs[0] if vecs else None)
+    if head is None:
+        raise ValueError("%s declares %d answer slots and holds no [%d, hidden] head for them"
+                         % (folder, S, S))
+
+    if container == "gguf":
+        backbone = src
+    else:
+        ggufs = [n for n in top if webio.container_of(n) == "gguf"]
+        if "config.json" in top:
+            backbone = folder
+        elif len(ggufs) == 1:
+            backbone = folder + "/" + ggufs[0]
+        else:
+            raise ValueError("%s holds a slot head and %s language model to run it on"
+                             % (folder, "no" if not ggufs else "more than one"))
+
+    adapter = kw.pop("adapter", None)
+    if adapter is None:
+        dirs = _adapter_dirs(names)
+        named = [d for d in dirs if d and any(isinstance(v, str) and v.strip("/") == d
+                                              for v in cfg.values())]
+        pick = named if len(named) == 1 else dirs
+        if len(pick) > 1:
+            raise ValueError("%s holds %d adapters (%s) and its config names none of them; "
+                             "pass adapter= to choose" % (folder, len(pick), ", ".join(pick)))
+        adapter = (folder + ("/" + pick[0] if pick[0] else "")) if pick else False
+
+    path = folder + "/" + head[0]
+    tensors = {}
+    for name in (head[3], head[4]):
+        if name is None:
+            continue
+        info = head[1][name]
+        a, z = info["data_offsets"]
+        raw = await _rng(path, head[2] + a, head[2] + z - 1)
+        tensors[name] = np.asarray(_decode(bytes(raw), info["dtype"], info["shape"]),
+                                   np.float32)
+
+    from ._sdk import AutoModelForCausalLM, _LLM_OPTS
+    opts = {k: kw[k] for k in _LLM_OPTS if k in kw and k not in ("dtype", "adapter")}
+    lm = await AutoModelForCausalLM.from_pretrained(backbone, adapter=adapter, **opts)
+    try:
+        ids = cfg.get("verbalizer_ids")
+        if isinstance(ids, list) and len(ids) == S:
+            got = [lm.tok.encode(v) for v in layout["verbalizers"]]
+            bad = [(v, g, i) for v, g, i in zip(layout["verbalizers"], got, ids) if g != [int(i)]]
+            if bad:
+                raise ValueError("this language model's tokenizer does not give the token ids "
+                                 "the head was trained with: %s"
+                                 % ", ".join("%r -> %s, not [%s]" % b for b in bad[:4]))
+        return SlotDecisionModel(lm, tensors[head[3]], tensors.get(head[4]), layout,
+                                 temperatures=temps, adapter=adapter or None)
+    except BaseException:
+        lm.release()
+        raise

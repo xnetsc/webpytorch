@@ -26,6 +26,7 @@
     "webenv.py",
     "webio.py",
     "encoder.py",
-    "decision.py"
+    "decision.py",
+    "adapters.py"
   ]
 }

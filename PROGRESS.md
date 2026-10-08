@@ -1,5 +1,56 @@
 # Progress
 
+## 2026-10-08 ▸ LoRA adapters for any language model; a slot-head decision model recognised by what its folder holds
+
+**Trigger:** user: can the decision-model recognition load JEV-9B (a Qwen3.5-9B backbone, an
+unmerged PEFT LoRA, a 24-slot head over the last hidden state, per-type temperatures) without a
+model name anywhere; and LoRA is not only for decision models, so a plain model with an adapter
+must work the same way, without changing anything for models that have none.
+
+**Changes:**
+- `adapters.py`: reads PEFT's own files (`adapter_config.json`, `adapter_model.safetensors`),
+  pairs A and B by module path, computes alpha/r (rsLoRA, rank and alpha patterns). Options that
+  change the forward pass and are not applied (DoRA, aLoRA, `modules_to_save`, a bias, any
+  unknown option that is set) refuse the load. `adapter_for`: an adapter whose two files sit at
+  the top of the model's folder is attached; one in a subfolder only when named.
+- `wt.LoRA` on a projection (`lora` attribute, None by default) adds `scale*(x A^T) B^T` to every
+  call of GGML, GPTQ and fp16 linears; the shared-dispatch paths take the separate route for an
+  adapted projection. Kept beside the weight, never merged, so quantized weights keep their width.
+- `CausalLM.attach_adapter`: placed by the Hugging Face module path; linear-attention value heads
+  moved from the grouped order of an HF weight to the tiled order the GGUF stores them in; any
+  module without a projection or with the wrong shape raises. Attached during a load before
+  warm-up; attached later, the model's own recordings are dropped and the decode step warmed
+  again. The decode-plan key includes the adapters; the load cache key includes the adapter.
+- `load(..., adapter=)`, `from_pretrained(..., adapter=)`, JS `wt.load(src, {adapter})`.
+- `decision.SlotDecisionModel` + `_slot_model`: a JSON declaring `slots.ranges`/`verbalizers`/
+  `template_version`, a safetensors with one `[slots, hidden]` matrix (and bias), the language
+  model (the loaded GGUF or the folder's only model), optional `per_kind` temperatures and
+  adapter, all found by content. Template `bare-v1` registered; unknown templates refused.
+  Verbalizer token ids checked against the backbone tokenizer. Same request/answer/calibrate/
+  surface as the encoder decision model. `CausalLM.prefill_hidden` gives the final-norm hidden
+  state of the last token without the vocabulary head.
+- `webio.files_under`, `webio.local_size`; `adapters.py` added to `modules.json`.
+
+**Data (M5 Air, headless Chrome, Qwen3-0.6B Q4_K_M, 40 greedy tokens, each generated token
+re-checked by a fresh prefill of everything before it):**
+
+| | adapted projections | text | tok/s | prefill disagrees |
+|---|---|---|---|---|
+| no adapter | 0 | normal | 153 / 175 | 0 / 40 |
+| zero adapter (B = 0) | 84 | identical to no adapter | 53 / 55 | 0 / 40 |
+| random adapter | 84 | changed (the test adapter is strong) | 52 / 55 | 0 / 40 |
+
+Python 337 passed (20 of them new), JS 127 passed.
+
+**Limits:** an adapter costs 3x decode on the 0.6B (two tiny matmuls per adapted projection on
+the generic kernel; 84 projections add ~12 ms a token). JEV-9B itself is not yet run: the
+Q8_0 backbone (9.5 GB) is still downloading at ~0.5 MB/s, so its answers have not been compared
+with the model card's references, with and without the adapter. A served folder cannot be
+listed, so a slot head is recognised only in a picked folder or a local directory.
+
+**Unchanged:** models without an adapter run the same code (a None check while recording), and
+their decode-plan and cache keys are the same as before.
+
 ## 2026-10-07 ▸ Remeasure within its budget; two sets of routes; an accuracy gate that does not pass by luck; README rebuilt
 
 **Trigger:** user: a 27B remeasure ran 60.26 s of a 60 s budget, its decode search never got

@@ -230,7 +230,7 @@ have called the wrong tool sometimes call none at all (measured 2 of 8 → 4 of 
 and which failure is better depends on what you do next.
 
 ## Causal LM (dense + MoE series)
-- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native")`
+- `await webtorch.AutoModelForCausalLM.from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native", adapter=None)`
   - Runs inference at **int4, int8, or fp16** — `dtype` selects it:
     - `"auto"` (default): AutoGPTQ dir → int at its declared bits; `*.gguf` → **its own
       encoding**, kept packed (see `weights` below); plain fp16/bf16 HF dir → **fp16**
@@ -253,6 +253,21 @@ and which failure is better depends on what you do next.
   - returns a model with `.generate(prompt, max_new=…) -> GenResult` and
     `.stream(prompt, max_new=…) -> iterator[token]`. `GenResult` carries `.text`,
     `.tokens`, `.ttft_s` and `.decode_tok_s`; printing it shows the timings above the text.
+  - `adapter=`: a PEFT LoRA folder (`adapter_config.json` + `adapter_model.safetensors`)
+    to run the model with. Left unset, a PEFT adapter whose two files sit at the top of the
+    model's own folder (a picked folder, or a local directory) is attached; one in a
+    subfolder is attached only when named. `False` loads without one. The adapter is kept
+    beside each weight, not merged, so a quantized weight keeps its width; it applies to
+    prefill and to every recorded decode step. Adapters are placed by the Hugging Face
+    module path they were trained on (`model.layers.N.self_attn.q_proj`, `mlp.down_proj`,
+    the linear-attention `in_proj_qkv`/`in_proj_z`/`in_proj_b`/`in_proj_a`/`out_proj`,
+    with value heads moved to the tiled order a GGUF stores them in). An option that changes
+    the forward pass and is not applied (DoRA, aLoRA, `modules_to_save`, a bias, any
+    unknown option that is set) refuses the load instead of running part of the adapter.
+    The same weights with and without an adapter are two models for the load cache. From
+    JavaScript: `wt.load(source, { adapter })`. `model.attach_adapter(adapters.read_lora
+    (folder))` and `model.detach_adapters()` change it after a load; the model's recorded
+    steps are dropped and recorded again.
 
 ### Watching a stream — `model.stream_n`
 
@@ -458,6 +473,24 @@ shows each length; `encoder_tokens`, `encoder_passes`, and `batched` describe th
 actually ran. Exact duplicate sequences inside one call reuse their encoder result. Short
 compatible sequences may share one padded encoder pass; the intermediate hidden rows remain
 on the GPU until their decision heads have consumed them.
+
+### A slot head over a language model
+
+The other kind of decision model is a language model, a prompt template and a linear head
+over answer slots. Its folder holds a JSON file declaring the slots (`slots.ranges` per
+question type, `slots.verbalizers`, `slots.template_version`), a safetensors file with one
+`[slots, hidden]` matrix and at most its bias, the language model (the GGUF that was loaded,
+or the single model in the folder), optionally a JSON with `per_kind` temperatures, and
+optionally a PEFT LoRA adapter trained with the head (the one the config names by its
+folder, else the folder's only one; `adapter=False` runs without it). None of these is found
+by its file name, so the folder can be called anything; it must be listable (a picked folder
+or a local directory). Each question is one prompt in the declared template (`bare-v1`; an
+unknown template is refused), prefilled once; the last position's final-norm hidden state
+goes through the head, the question's first slots are taken, divided by the type's
+temperature and normalised. Requests and answers are the same as above. A `named` type
+takes 2 up to its slot count of options; `ordered` and `fixed` types answer over their own
+verbalizers (for example `0`..`5`, `false`/`true`), so options other than those are refused
+rather than silently ignored. `calibrate()` fits on the same raw logits.
 
 ### Probability calibration
 

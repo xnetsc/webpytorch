@@ -428,13 +428,14 @@
        * Load a model. `source` is whatever the installed reader takes; `file` names one
        * inside a repo. Returns {id, kind, surface} -- `surface` is the model's own account
        * of what it takes and returns, so a caller builds itself from that rather than from
-       * a table of its own.
+       * a table of its own. `adapter` is a PEFT LoRA folder to run it with (false: none;
+       * unset, one at the top of the model's own folder).
        */
       load: function (source, o) {
         const [rest, on] = split(o, { onProgress: 'progress', onStage: 'stage',
                                       onStatus: 'status' });
         return call('load', { source: source, file: rest.file,
-                              maxContext: rest.maxContext }, on);
+                              maxContext: rest.maxContext, adapter: rest.adapter }, on);
       },
       release: function () { return call('release'); },
       /** End this runtime and release its WASM heap and browser GPU context/device. */

@@ -71,16 +71,24 @@ class AutoModelForCausalLM:
     """
     @staticmethod
     async def from_pretrained(path, dtype="auto", bits=None, lmax=None, weights="native",
-                              container=None, **kw):
+                              container=None, adapter=None, **kw):
         """`kw` takes the same generation options as `load()`/`pipeline()` — temperature,
         top_p, top_k, min_p, do_sample, seed, repetition_penalty, presence_penalty,
         frequency_penalty, max_new_tokens, min_new_tokens, max_length, stop, constraint,
-        enable_thinking — and installs them as this model's defaults."""
+        enable_thinking — and installs them as this model's defaults.
+
+        `adapter` is a PEFT LoRA folder to run the model with (False: none). Unset, the
+        adapter whose files sit at the top of the model's own folder is used, if there is
+        one; see `adapters.adapter_for`."""
         import asyncio
+        from . import adapters as _adapters, webio
         from .webio import cancel as _cancel_stop
         _cancel_stop(False)      # a stop meant for an earlier load must not hit this one
         p = str(path).rstrip("/")
-        key = _impl_cache_key(p, dtype, bits, lmax, weights)
+        if container is None:
+            container = webio.container_of(p)
+        adapter = _adapters.adapter_for(p, adapter, container)
+        key = _impl_cache_key(p, dtype, bits, lmax, weights, adapter)
         e = _IMPL_CACHE.get(key)
         if e is not None and not e["impl"].__dict__.get("_released"):
             e["refs"] += 1
@@ -96,7 +104,7 @@ class AutoModelForCausalLM:
         try:
             impl = await AutoModelForCausalLM._load_raw(
                 p, dtype, bits, lmax, weights, kw.get("expert_weights_norm"),
-                container=container)
+                container=container, adapter=adapter)
         except BaseException as exc:
             _IMPL_LOADING.pop(key, None)
             if not fut.done(): fut.set_exception(exc)
@@ -108,8 +116,11 @@ class AutoModelForCausalLM:
 
     @staticmethod
     async def _load_raw(p, dtype, bits, lmax, weights, expert_weights_norm=None,
-                        container=None):
-        from . import llm as _llm, webio
+                        container=None, adapter=None):
+        from . import adapters as _adapters, llm as _llm, webio
+        # Read before the weights: an adapter this engine cannot apply fails in a second,
+        # not after a multi-GB load.
+        adapter = await _adapters.read_lora(adapter) if adapter else None
         if (webio.container_of(p) if container is None else container) == "gguf":
             # "auto" means the same here as for an AutoGPTQ dir: keep the stored
             # precision (bits=None lets the loader read it off the file).
@@ -118,17 +129,18 @@ class AutoModelForCausalLM:
             # GPU-only). "auto"/int4/int8 requantize to the int engine as before.
             return await _llm.CausalLM.from_gguf(
                 p, lmax=lmax, bits=gb, quantize=(dtype != "fp16"), weights=weights,
-                expert_weights_norm=expert_weights_norm)
+                expert_weights_norm=expert_weights_norm, adapter=adapter)
         cfg = await webio.read_json(p + "/config.json")
         if "quantization_config" in cfg:                     # already-quantized AutoGPTQ (int4/int8)
-            return await _llm.CausalLM.from_gptq(p, lmax=lmax)
+            return await _llm.CausalLM.from_gptq(p, lmax=lmax, adapter=adapter)
         q = {"int4": 4, "int8": 8}.get(dtype)                # plain fp16/bf16 HF dir
-        return await _llm.CausalLM.from_fp16(p, lmax=lmax, quantize=q)   # q=None → run fp16
+        return await _llm.CausalLM.from_fp16(p, lmax=lmax, quantize=q,  # q=None → run fp16
+                                             adapter=adapter)
 
 
 # Options every LLM entry point forwards to AutoModelForCausalLM. Kept in one place so a
 # new loader option reaches load(), pipeline() and the multimodal path without three edits.
-_LLM_OPTS = ("dtype", "bits", "lmax", "weights")
+_LLM_OPTS = ("dtype", "bits", "lmax", "weights", "adapter")
 # Generation options are not load options -- they do not change how weights are built -- but
 # every mainstream API lets you set them once at load/pipeline time and have them hold for
 # every later call. Collected here and installed as the model's defaults, below whatever a
@@ -161,8 +173,8 @@ _IMPL_CACHE = {}     # key -> {"impl": model, "refs": int}
 _IMPL_LOADING = {}   # key -> asyncio.Future, so concurrent loads of one model run once
 
 
-def _impl_cache_key(path, dtype, bits, lmax, weights):
-    return (str(path).rstrip("/"), dtype, bits, lmax, weights)
+def _impl_cache_key(path, dtype, bits, lmax, weights, adapter=None):
+    return (str(path).rstrip("/"), dtype, bits, lmax, weights, adapter)
 
 
 # ---- ONE unified entry point for every model type ---------------------------
@@ -385,7 +397,8 @@ async def load(source=None, task=None, dtype="auto", encoder=None, reuse=True, *
 
     LLM options forwarded to the loader (same names as `AutoModelForCausalLM.from_pretrained`
     and `pipeline`): `lmax=` context length (None = a size that stays responsive, capped by
-    KV memory), `bits=`, `weights=`.
+    KV memory), `bits=`, `weights=`, `adapter=` a PEFT LoRA folder (False: none; unset, one
+    at the top of the model's own folder).
 
     Generation options may also be set here and become that model's defaults for every later
     call: `temperature`, `top_p`, `top_k`, `min_p`, `do_sample`, `seed`, `repetition_penalty`,

@@ -1550,6 +1550,43 @@ def local_files():
     return list(_local_files)
 
 
+def files_under(folder):
+    """The files under `folder`, as sorted paths relative to it, or None when it cannot be
+    listed: HTTP has no directory listing, so a served folder answers None rather than an
+    empty list that would read as "nothing there"."""
+    base = str(folder).rstrip("/")
+    pre = base + "/"
+    names = [n[len(pre):] for n in _local_files if n.startswith(pre)]
+    if names:
+        return sorted(names)
+    if _local_miss(pre + "?"):                 # inside a picked folder, and nothing under it
+        return []
+    if _is_url(base) or _in_browser():
+        return None
+    import os
+    if not os.path.isdir(base):
+        return None
+    return sorted(os.path.relpath(os.path.join(d, f), base).replace(os.sep, "/")
+                  for d, _, fs in os.walk(base) for f in fs)
+
+
+async def local_size(name):
+    """The size in bytes of a file `files_under` can list, or None for one it cannot."""
+    n = str(name)
+    h = _local_files.get(n)
+    if h is not None:
+        get_file = getattr(h, "getFile", None)
+        f = await get_file() if callable(get_file) else h
+        return int(f.size)
+    if _is_url(n) or _in_browser():
+        return None
+    import os
+    try:
+        return os.path.getsize(n)
+    except OSError:
+        return None
+
+
 def forget_model_file(name):
     """Stop reading `name` from a local file."""
     if _local_files.pop(name, None) is None:

@@ -323,6 +323,8 @@ except ImportError:
       emit(current, 'status', 'loading ' + src + ' …');
       pyodide.globals.set('_src', src);
       pyodide.globals.set('_lmax', a.maxContext || 0);
+      pyodide.globals.set('_adapter', a.adapter === false ? false
+                                      : (a.adapter ? String(a.adapter) : null));
       // Two different things from two different owners: how far the LOAD has got comes
       // from the SDK, and the download rate comes from the transport the host installed --
       // the SDK has no transport and cannot know one.
@@ -368,7 +370,10 @@ if _kp is not None:
 try:
     if _MODEL["m"] is not None:
         webtorch.release(_MODEL["m"]); _MODEL["m"] = None
-    m = await webtorch.load(src, **({"lmax": lmax} if lmax else {}))
+    _opts = {"lmax": lmax} if lmax else {}
+    if _adapter is not None:
+        _opts["adapter"] = _adapter
+    m = await webtorch.load(src, **_opts)
     _MODEL["m"] = m; _MODEL["id"] = src
 except (webtorch.Cancelled, KeyboardInterrupt) as _e:
     # Both are the same event seen from two places: the cooperative flag reached a
@@ -388,7 +393,7 @@ finally:
     # worker boundary.  Drop both its Python and JS views even on a failed load.
     import webtorch._core as _wt_core
     _wt_core._release_transfer_memory()
-    for _wt_tmp in ("m", "src", "lmax", "_kp", "_n", "_e"):
+    for _wt_tmp in ("m", "src", "lmax", "_kp", "_n", "_e", "_opts", "_adapter"):
         globals().pop(_wt_tmp, None)
     globals().pop("_wt_tmp", None)
 import json as _json
