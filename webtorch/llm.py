@@ -3272,8 +3272,14 @@ class CausalLM:
         }
         adapted = sorted((int(m.Kt), int(m.Nt), int(m.lora.rank)) for m in linears
                          if getattr(m, "lora", None) is not None)
+        # `linears` lists GGML leaves for the stored-weight tuner. Adapters on GPTQ or
+        # unquantized projections are dependencies of this upper plan just as much.
+        get_adapted = getattr(self, "_adapted", None)
+        if callable(get_adapted):
+            adapted = sorted((int(a.k), int(a.n), int(a.rank)) for a in get_adapted())
         if adapted:             # absent otherwise, so a model without adapters keeps its key
             topology["adapters"] = adapted
+            topology["adapters_build"] = wt._lora_build()
         if backend == "webgpu":
             topology["sampler_route"] = CausalLM._decode_sampler_route(
                 self, pick_mode or CausalLM._decode_pick_mode(self))
@@ -4876,7 +4882,15 @@ class CausalLM:
             _t0 = time.perf_counter()
             self._set_inputs(tok, 0)
             _t1 = time.perf_counter()
-            first_logits = self._decode_fwd()
+            plat = wt._adam_kernel['platform']
+            # A complete cold step must not be fragmented at arbitrary producer-message
+            # boundaries. Each fragment otherwise has a different weight residency set.
+            # Explicit upload/readback barriers still flush inside this finite scope.
+            plat.beginSubmission()
+            try:
+                first_logits = self._decode_fwd()
+            finally:
+                plat.endSubmission()
             _t2 = time.perf_counter()
             first_logits.numpy()
             _t3 = time.perf_counter()
@@ -4884,7 +4898,11 @@ class CausalLM:
             b = self._dispatch_names()
             self._set_inputs(tok, 0)
             _t4 = time.perf_counter()
-            second_logits = self._decode_fwd()
+            plat.beginSubmission()
+            try:
+                second_logits = self._decode_fwd()
+            finally:
+                plat.endSubmission()
             _t5 = time.perf_counter()
             second_logits.numpy()
             _t6 = time.perf_counter()
@@ -4918,8 +4936,8 @@ class CausalLM:
                               "  ".join("%s x%d" % (k, v) for k, v in
                                         sorted(again.items(), key=lambda kv: -kv[1])
                                         if v)))
-        except Exception:
-            pass                      # best effort: a model that cannot do this still loads
+        except Exception as exc:
+            raise RuntimeError("decoder warmup failed") from exc
         finally:
             wt._count_dispatch_names(False)
             self._reset_linear_state()

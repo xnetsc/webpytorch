@@ -66,6 +66,7 @@ export class NNWebGPUContext {
   // pure overhead -- and creating a bind group is one of the more expensive WebGPU calls.
   private bindGroupCache: Map<string, GPUBindGroup> = new Map();
   private pendingCount = 0;
+  private submissionDepth = 0;
   // Submissions the GPU has not finished. While it is working, dispatches accumulate into one
   // submit; once it has nothing, what is pending goes at once (`kick`) instead of waiting for
   // the threshold or the next readback. Without this a prefill whose Python issued its 452
@@ -397,7 +398,7 @@ export class NNWebGPUContext {
       this.passEncoder.end();
       this.passEncoder = null;
     }
-    if (this.pendingCount >= this.flushThreshold) {
+    if (!this.submissionDepth && this.pendingCount >= this.flushThreshold) {
       this.flush();
     }
   }
@@ -405,9 +406,21 @@ export class NNWebGPUContext {
   /** Submit what is pending if the GPU has nothing to do; called after each batch of
    * commands the producer sends. A diagnostic pass being timed is left whole. */
   kick(): void {
-    if (this.inflight === 0 && this.pendingCount > 0 && !this.diagnosticQuery && !this.span) {
+    if (!this.submissionDepth && this.inflight === 0 && this.pendingCount > 0 && !this.diagnosticQuery && !this.span) {
       this.flush();
     }
+  }
+
+  /** Keep a finite producer operation together, without suppressing explicit upload or
+   * readback barriers. Those barriers still preserve data dependencies inside the scope. */
+  beginSubmission(): void {
+    this.assertAlive();
+    this.submissionDepth++;
+  }
+
+  endSubmission(): void {
+    if (!this.submissionDepth) throw new Error('unbalanced WebGPU submission scope');
+    if (--this.submissionDepth === 0) this.flush();
   }
 
   /** Whether `spanBegin` can time anything here: the device has timestamp queries. */
@@ -613,7 +626,7 @@ export class NNWebGPUContext {
     if (!this.commandEncoder) this.commandEncoder = this.device.createCommandEncoder();
     this.commandEncoder.clearBuffer(buffer);
     this.pendingCount++;
-    if (this.pendingCount >= this.flushThreshold) this.flush();
+    if (!this.submissionDepth && this.pendingCount >= this.flushThreshold) this.flush();
   }
 
   // Defer a buffer destroy until the next flush: a dispatch already encoded in

@@ -376,6 +376,12 @@ class WebGPUPlatform:
         """Time the GPU work issued from here to `timingEnd` with the device's timestamps."""
         return gpu.timingBegin()
 
+    def beginSubmission(self):
+        return gpu.beginSubmission()
+
+    def endSubmission(self):
+        return gpu.endSubmission()
+
     timestamp_step_ns = 0.0
 
     def timingEnd(self):

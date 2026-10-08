@@ -5214,8 +5214,20 @@ def _kernel_build():
     actually generates the kernels: the source of the generator, and every format's decode
     fragment. Computed once.
     """
-    if "v" in _KBUILD:
-        return _KBUILD["v"]
+    return _kernel_digest(False)
+
+
+def _kernel_digest(include_extensions):
+    """The shared kernels' stamp, or the previous all-shader stamp for migration.
+
+    An optional adapter cannot invalidate measurements of unchanged base-model kernels.
+    Its own races and dependent decoder plans carry `_lora_build()` in their keys instead.
+    The old stamp is accepted only when it describes these exact current shared kernels
+    AND extension templates; this is not permission to import an arbitrary older build.
+    """
+    cache_key = "legacy" if include_extensions else "v"
+    if cache_key in _KBUILD:
+        return _KBUILD[cache_key]
     import hashlib
     import inspect
     h = hashlib.sha1()
@@ -5241,12 +5253,14 @@ def _kernel_build():
     # verdict from the broken build after the template was fixed.
     g = globals()
     for name in sorted(g):
+        if name == "_LORA_WGSL" and not include_extensions:
+            continue
         v = g[name]
         if isinstance(v, str) and ("@compute" in v or "@group(" in v or "\nfn " in v):
             h.update(name.encode())
             h.update(v.encode())
-    _KBUILD["v"] = h.hexdigest()[:16]
-    return _KBUILD["v"]
+    _KBUILD[cache_key] = h.hexdigest()[:16]
+    return _KBUILD[cache_key]
 
 
 def _count_dispatch_names(on):
@@ -5433,13 +5447,14 @@ def _accept_tuned(entries, into):
 def use_kernel_profile(profile):
     """Take back what `kernel_profile` returned. Returns how many entries were accepted.
 
-    A profile from another build is ignored entirely rather than partially: a kernel changes
-    with the code that generates it, and half-trusting one is how a stale verdict outlives
-    the shader it was about.
+    Shared-kernel changes reject the profile. An exact previous all-shader stamp is also
+    accepted for migration; optional adapter races and their dependent upper plans now
+    carry their own source stamp in their keys, so unrelated base-model routes survive.
     """
     if not isinstance(profile, dict):
         return 0
-    if str(profile.get("build")) != _kernel_build():
+    build = str(profile.get("build"))
+    if build != _kernel_build() and build != _kernel_digest(True):
         return 0
     n = _accept_tuned(profile.get("tuned"), _TUNED)
     # The set of routes not in use, kept beside the one in use (`switch_routes`).
@@ -15805,7 +15820,8 @@ class LoRA(object):
             return bool(np.all(np.isfinite(got))
                         and float(np.abs(got - reference[0]).max()) / scale < 1e-5)
 
-        which = _weight_execution("lora", "r%d" % self.r4, self.k, self.n, m, run,
+        which = _weight_execution("lora", "r%d:%s" % (self.r4, _lora_build()),
+                                  self.k, self.n, m, run,
                                   candidates=_LORA_ROUTES, check=correct)
         return self._run(which, xf, y)
 
@@ -15921,6 +15937,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   }
 }
 """
+
+
+def _lora_build():
+    """Adapter arithmetic, layout, generation and correctness gates, independently stamped.
+
+    Both a leaf race and any upper plan that uses an adapter must include this stamp.
+    Unadapted models do not depend on it. Old unscoped adapter keys are never selected.
+    """
+    if "lora" not in _KBUILD:
+        import hashlib
+        import inspect
+        h = hashlib.sha1(_LORA_WGSL.encode())
+        h.update(repr((_LORA_WG, _LORA_ROUTES)).encode())
+        for fn in (LoRA, _lora_src, _lora_kernel, _lora_fused):
+            h.update(inspect.getsource(fn).encode())
+        _KBUILD["lora"] = h.hexdigest()[:16]
+    return _KBUILD["lora"]
 
 
 def _lora_src(qp, opt):

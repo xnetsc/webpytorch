@@ -3525,3 +3525,68 @@ HTML carries SDK version `cb903a1458`, and the served `_core.py` SHA-1
 No second model was loaded for a remote inference check while Chrome's local
 test tab still held xDecision; deployment byte identity is confirmed, but
 remote end-to-end inference remains a separate browser check.
+
+## 2026-10-08 ▸ JEV-only regression audit; optional shaders no longer invalidate unrelated measurements
+
+**Trigger:** compare today's JEV-9B changes, not the Tetris request, against the original
+recorded 0.6B / 27B / 30B / Laya / xDecision performance; fix proven regressions.
+
+**Evidence:** serial local-file Chrome/Metal/WebGPU tests of `ad87cfc` and `bf5add7`, plus
+the historical `bd00721` 30B checkpoint. No model downloads, no two loaded models. Same-profile
+adjacent old/fixed 0.6B both ~170.5 tok/s; JEV-before/after 30B settles near 40, with identical
+six replies; historical 43-tok/s source itself ran at 32.5–39 today. Laya/F16 three questions
+~44 ms, Q8 ~50 ms before and after. A slow 27B round (3.7–4.2) recovered to 7.1–7.7 using
+exactly the same code and route entries. Do not turn that into an unsupported claim of a
+specific thermal-versus-paging split: the full conditions and slower runs are retained.
+
+**Root cause fixed:** `_kernel_build` hashed the newly added LoRA WGSL into the global stamp,
+discarding all pre-JEV measurements even for models without adapters. The shared stamp now
+excludes this independent extension; adapter leaf races and dependent upper decoder plans
+carry their own source/layout/gate stamp. Non-GGUF adapters also participate in that upper
+dependency key. Exact legacy all-shader stamps migrate; edits to shared kernels still reject
+old profiles. No shader arithmetic, model-name routing, weight width or fallback changes.
+
+**Measured fix:** 27B accepts 344 pre-JEV records and avoids the repeated 59.84 s deferred
+calibration (0.26 s); decode 6.84–7.38 tok/s, unchanged text. 0.6B imports today's old full
+stamp (60 entries), load 1.50 s; three decision formats also import and preserve their exact
+answer JSON. 30B reuses its exact old routes and skips ~9 s deferred calibration, but its
+cold warm-step still spends ~37 s in first GPU synchronization. That separate waiting problem
+is NOT marked fixed, nor are constant sustained throughput or all backend/model gates claimed.
+
+**Tests:** one regression reproduced red on pristine `bf5add7`, green here. Host suite
+`pytest -q test/test_*.py`: 352 passed, 17 skipped; JS: 127 passed. Chrome WebGPU/WebGL/CPU
+profile/adapter checks pass, including WebGPU fused/shared-projection numerical regressions.
+The bare repository-wide pytest command is not a passing suite: it includes browser runners
+and packaging scripts, producing 14 collection errors on the host. SDK URL stamp verified.
+
+Details: `docs/2026-10-08-jev-performance-audit.md`; raw reports, inputs, outputs, counters
+and runners: ignored local `scratch/perf-2026-10-08.tgz`. No commit or push by this audit.
+
+## 2026-10-08 ▸ Cold-load diagnosis and requested main snapshot
+
+**Evidence:** draining the queue before the cold decoder took 2.24 ms. Intrusive per-stage
+readbacks put 42.78 of 44.87 s in MoE MLP, but also changed residency and cannot be used as
+an ordinary latency benchmark. A whole-step timestamp span measured 17.51 s wall time versus
+31.15 ms GPU execution; its next step took 60.14 ms wall / 21.26 ms GPU. A process memory
+snapshot showed 12.8 GiB of graphics allocations, 10.8 GiB swapped out. This establishes
+substantial paging and separates arithmetic from waiting; it does not establish a sole cause
+or a stable latency bound.
+
+**Retained:** a finite WebGPU submission scope around each cold decode, preserving explicit
+upload/readback barriers, and always ending the scope on failure. Ordinary inference retains
+submit-when-idle. Warmup errors now propagate instead of silently claiming a successful load.
+The ordinary scoped run measured 27.22 s warm-step / 48.60 s full load; second synchronization
+was 35.83 ms, first token 1.26 s and six replies matched the previous same-profile output.
+No shader arithmetic, weight representation, steady decode route or model-name branch changed.
+
+**Not retained:** local-read copy, smaller expert windows, preallocated expert storage,
+whole-stack transpose and disabling the page's separate code runtime were diagnostic-only.
+Their unpaired cold waits did not establish a reliable best route. Disabling the extra runtime
+still gave 43.68 s warm-step / 64.34 s full load. The later observed training process started
+at 17:47:16, after that test ended at 17:46:18, so it CANNOT explain that run's slowdown.
+
+**Checks already completed:** host suite 352 passed / 17 skipped; two additional warmup
+failure tests passed separately. JS suite 130 passed, including three submission-scope tests.
+The user then explicitly requested no more testing, accepted 31 s waiting, and requested the
+current snapshot be committed and pushed directly to main. No claim of a stable <=31 s bound
+is made from these samples. Non-test Chrome was closed with explicit user authorization.

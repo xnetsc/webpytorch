@@ -513,6 +513,12 @@ function initGPUInterface(gpuAvailable: boolean, gpuDeviceInfo: any) {
     timingBegin: () => {
       commands.enqueue({ method: 'gpu.timingBegin' });
     },
+    beginSubmission: () => {
+      commands.enqueue({ method: 'gpu.beginSubmission' });
+    },
+    endSubmission: () => {
+      commands.enqueue({ method: 'gpu.endSubmission' });
+    },
     /** [milliseconds of GPU time since `timingBegin`, its passes summed; the timestamps'
      * step in ns]. Waits for that work. -1 ms where it could not be timed (no timestamps, or
      * more passes than a span holds). */

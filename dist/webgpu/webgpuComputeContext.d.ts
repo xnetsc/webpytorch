@@ -93,6 +93,9 @@ export interface ComputeContextGPUMessageEndCapture {
 export interface ComputeContextGPUMessageTimingBegin {
     method: 'gpu.timingBegin';
 }
+export interface ComputeContextGPUMessageSubmission {
+    method: 'gpu.beginSubmission' | 'gpu.endSubmission';
+}
 export interface ComputeContextGPUMessageTimingEnd {
     method: 'gpu.timingEnd';
     data?: SharedArrayBuffer;
@@ -135,7 +138,7 @@ export interface ComputeContextGPUMessageStageRead {
     slot: number;
     seq: number;
 }
-export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageTimingBegin | ComputeContextGPUMessageTimingEnd | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer | ComputeContextGPUMessageSharedUploadMany;
+export type ComputeContextGPUMessage = ComputeContextGPUMessageAddKernel | ComputeContextGPUMessageCreateBuffer | ComputeContextGPUMessageCreateMetaBuffer | ComputeContextGPUMessageDisposeBuffer | ComputeContextGPUMessageGetData | ComputeContextGPUMessageSampleLogitsDevice | ComputeContextGPUMessageRunKernel | ComputeContextGPUMessageSetData | ComputeContextGPUMessageUploadMemory | ComputeContextGPUMessageSharedUpload | ComputeContextGPUMessageSharedMetaBuffer | ComputeContextGPUMessageReleaseUploadMemory | ComputeContextGPUMessageBeginCapture | ComputeContextGPUMessageEndCapture | ComputeContextGPUMessageReplay | ComputeContextGPUMessageTimingBegin | ComputeContextGPUMessageSubmission | ComputeContextGPUMessageTimingEnd | ComputeContextGPUMessageResetCaptures | ComputeContextGPUMessageReleaseCapture | ComputeContextGPUMessageStageArena | ComputeContextGPUMessageStageRead | ComputeContextGPUMessageClearBuffer | ComputeContextGPUMessageSharedUploadMany;
 export declare class ComputeContextGPU {
     tensorBuffers: Map<number, WebGPUTensorBuffer>;
     private vocabSampler;

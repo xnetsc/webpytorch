@@ -110,6 +110,10 @@ export interface ComputeContextGPUMessageTimingBegin {
   method: 'gpu.timingBegin';
 }
 
+export interface ComputeContextGPUMessageSubmission {
+  method: 'gpu.beginSubmission' | 'gpu.endSubmission';
+}
+
 export interface ComputeContextGPUMessageTimingEnd {
   method: 'gpu.timingEnd';
   data?: SharedArrayBuffer;
@@ -178,6 +182,7 @@ export type ComputeContextGPUMessage =
   | ComputeContextGPUMessageEndCapture
   | ComputeContextGPUMessageReplay
   | ComputeContextGPUMessageTimingBegin
+  | ComputeContextGPUMessageSubmission
   | ComputeContextGPUMessageTimingEnd
   | ComputeContextGPUMessageResetCaptures
   | ComputeContextGPUMessageReleaseCapture
@@ -511,6 +516,12 @@ export class ComputeContextGPU {
             this.mnotify![0] = -1;
             Atomics.notify(this.mnotify!, 0);
           });
+        break;
+      case 'gpu.beginSubmission':
+        getNNWebGPUContext().beginSubmission();
+        break;
+      case 'gpu.endSubmission':
+        getNNWebGPUContext().endSubmission();
         break;
       case 'gpu.timingBegin':
         getNNWebGPUContext().spanBegin();

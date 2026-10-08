@@ -13,6 +13,29 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-08 snapshot approved for main:** freeze the current measured implementation;
+the user explicitly stopped further testing and accepted 31 s of cold warmup waiting.
+Retain scoped tuning-profile invalidation, finite WebGPU warm-step submission, and explicit
+warmup failure propagation. Keep upload-window, whole-stack transpose, preallocation and
+extra-runtime-disable experiments out of production. One ordinary scoped-submission load
+measured 27.22 s warm-step / 48.60 s total load, with all six replies unchanged; another
+run measured 43.68 s warm-step. The accepted snapshot is not a guarantee under arbitrary
+system memory pressure. No additional model benchmark is authorized by this snapshot request.
+
+**2026-10-08 JEV regression audit and cache-invalidation fix (uncommitted):** the new LoRA
+shader invalidated every unchanged base-model kernel profile. Shared and adapter stamps now
+have separate dependency scopes, including adapted upper plans for GGUF/non-GGUF and both
+GPU backends; exact old profiles migrate, genuinely changed shared kernels remain rejected.
+27B imported its pre-JEV profile (344 entries): deferred calibration 59.84 s → 0.26 s,
+6.84–7.38 tok/s. Same-profile adjacent 0.6B old/fixed both ~170.5 tok/s; 30B ~39–40;
+Laya/F16 ~44–46 ms and Q8 ~50–52 ms for three questions. The historical 43-tok/s 30B
+commit also ran at 32.5–39 today. The 27B's earlier 4-tok/s round returned to 7.1–7.7
+with identical code/routes; do not attribute those fluctuations to JEV or pretend their
+hardware/OS contributions are fully separated. Large-model cold GPU waits remain open.
+Tests: host 352 passed/17 skipped, JS 127 passed; WebGPU/WebGL/CPU browser adapter/profile
+checks passed. No model downloads or overlapping loads; no commit/push. Full evidence and
+limits: `docs/2026-10-08-jev-performance-audit.md`, `scratch/perf-2026-10-08.tgz`.
+
 **2026-10-08 adapters measured, JEV-9B verified, tokenizer fixed:** on the M5 the load's race
 picks fused:256 (0.6B, rank 16 everywhere: 122-128 tok/s against 157 without an adapter and 14 on
 the composed route; text identical on every route). JEV-9B through the chat page's folder input

@@ -33,6 +33,7 @@ export declare class NNWebGPUContext {
     private passEncoder;
     private bindGroupCache;
     private pendingCount;
+    private submissionDepth;
     private inflight;
     private pendingDisposes;
     private readbackPool;
@@ -59,6 +60,10 @@ export declare class NNWebGPUContext {
     /** Submit what is pending if the GPU has nothing to do; called after each batch of
      * commands the producer sends. A diagnostic pass being timed is left whole. */
     kick(): void;
+    /** Keep a finite producer operation together, without suppressing explicit upload or
+     * readback barriers. Those barriers still preserve data dependencies inside the scope. */
+    beginSubmission(): void;
+    endSubmission(): void;
     /** Whether `spanBegin` can time anything here: the device has timestamp queries. */
     hasTimestamps(): boolean;
     /** Start timing the GPU work issued from now to `spanEnd`. False where the device cannot
