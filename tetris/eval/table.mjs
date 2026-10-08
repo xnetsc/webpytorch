@@ -1,7 +1,7 @@
 // Every input the page can send the model, asked. Candidates are one per kind of facts, under
-// the ids A-D, so a question is one of 11 sets of two or more kinds for one of 7 pieces: 77
-// inputs in all. Each is built the way planner.ask() builds it and checked against the same
-// rule evaluated in code.
+// the letters A-D, so a question is one of 11 sets of two or more kinds for one of 7 pieces:
+// 77 inputs in all. Each is built the way planner.ask() builds it and checked against the
+// answer worked out in code from the same principles (planner.expected).
 //
 //   node tetris/eval/table.mjs path/to/xDecision-Q8_0.gguf
 //

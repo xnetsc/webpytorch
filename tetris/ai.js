@@ -1,14 +1,15 @@
 /* xDecision plays vanilla-js-tetris.
  *
- * xDecision answers from the facts in its state and does not reason, so it is used as a
- * cheap if-else. Each new piece is one turn:
+ * xDecision answers from the facts in its state and does not reason, so everything the
+ * decision needs is written into the state. Each new piece is one turn:
  *   1. read the game (bridge.js -> the game's own `board` and `player`),
  *   2. list every placement the game's controls can reach, and keep the planner's best of
- *      each kind of fact -- "clears a line", "hole-free" / "makes a new hole" (planner.js),
- *   3. ask xDecision, through the webtorch SDK: the state lists those candidates as
- *      {id: "A", result: "clears a line, hole-free"}, the options are the ids, and the
- *      question is the rule ("Choose the option that clears a line and is hole-free.").
- *      The id it picks is the move,
+ *      each kind of result -- "clears a line", "hole-free" / "makes a new hole" (planner.js),
+ *   3. ask xDecision, through the webtorch SDK: the state says how the game is played, lost
+ *      and what to avoid, then lists the candidates as {id: "A", result: "clears a line,
+ *      hole-free", effect: "clears a line with no hole: helps you win"}; the question is
+ *      "Which placement gives the best chance to win?" and the options are the letters.
+ *      The letter it picks is the move,
  *   4. play it with the game's own controls (playerRotate / playerMove / playerHardDrop).
  *
  * The model is the one the Pages chat app lists (chat/models.json), loaded and asked the
@@ -336,7 +337,7 @@
       + (useModel
         ? (answer ? 'xDecision ' + answer.ms.toFixed(0) + ' ms · 读了 ' + answer.tokens + ' 个 token'
                   : '候选的事实都一样，只剩一个，不用问')
-        : '同一条规则在代码里判断（未调用模型）');
+        : '按同样的原则在代码里判断（未调用模型）');
     box.appendChild(head);
     const list = document.createElement('ol');
     list.className = 'cands';
@@ -350,7 +351,7 @@
       bar.style.width = p == null ? '0' : (p * 100).toFixed(1) + '%';
       const text = document.createElement('span');
       text.className = 'ctext';
-      text.textContent = label + '  ' + summary(c) + (c === rule ? '  ✓按规则' : '');
+      text.textContent = label + '  ' + summary(c) + (c === rule ? '  ✓代码判断' : '');
       // What the model read about this placement, word for word.
       text.title = JSON.stringify(asked.state.placements[i]);
       const prob = document.createElement('span');
@@ -405,7 +406,7 @@
 
   // ---- wiring ---------------------------------------------------------------------------
 
-  $('#rule').textContent = P.INSTRUCTIONS;
+  $('#rule').textContent = P.QUESTION;
 
   $('#load').onclick = loadModel;
   $('#ai').onclick = () => setRunning(!S.on);

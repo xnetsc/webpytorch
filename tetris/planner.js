@@ -219,23 +219,23 @@
 
   // ---- saying it to the model -------------------------------------------------------------
   //
-  // xDecision answers from the facts in its state; it does not reason, so it is used as a
-  // cheap if-else. The state lists every candidate placement with its facts, the options are
-  // those candidates' ids, and the question is the rule. Which forms it can and cannot use
-  // was measured with xDecision Q8_0 (tetris/README.md has the tables):
+  // A decision, not a lookup: the state says how the game is played, won and lost and what to
+  // avoid, then what each candidate placement would do and what that means for winning; the
+  // question asks which placement gives the best chance to win; the options are the
+  // placements themselves, as letters. xDecision answers from the facts in its state and does
+  // not reason, so those facts have to be stated, not left to infer. Measured with xDecision
+  // Q8_0 (tetris/README.md has the tables; 77 is every input, 120 are real positions):
   //
-  //   state lists [{id, result}], options = the ids                       77/77 (every input)
-  //   state lists [{at: "columns 2-3, rows 1-3", result}], options = places 1848/1848 on a test
-  //       set, but 99.5% in real games: places named with the same digits ("columns 2-3,
-  //       rows 1-3" / "columns 1-3, rows 2-3") get each other's facts
-  //   state maps {place: facts}                                             1826/1848
-  //   "none of them" when nothing matches                                   3% right
-  //   true/false about "option B" whose facts are in the state              "true" every time
-  //   weighing several relative facts ("lands lowest, flattest…")           planner's pick 63%
+  //   principles + each placement's result and its effect on winning     77/77, 120/120
+  //   the same without the effect line (principles alone)                42/77
+  //   the same, question "which should be played next?"                  50/77
+  //   + board summary / next piece / each placement's columns and rows   111 / 85 / 89 of 120
+  //   + more than one placement of a kind (best 4 / best 8)               104 / 74 of 120
+  //   the facts written as prose paragraphs instead of records            ~65%, mostly "A"
   //
-  // So: a state that holds everything the rule needs, one record per candidate under a plain
-  // id; positive fact tags; no "none" option; no two candidates of the same kind. Where a
-  // placement goes is the page's business, not the model's: the rule does not need it.
+  // So the state holds what the decision needs and nothing it does not: more description of
+  // the board made the choice worse, not better. Where a placement goes is the page's
+  // business; the model is told what it does.
 
   const LINE = 'clears a line', CLEAN = 'hole-free', HOLE = 'makes a new hole';
 
@@ -245,19 +245,37 @@
     return (f.rowsCleared > 0 ? LINE + ', ' : '') + (f.newHoles > 0 ? HOLE : CLEAN);
   }
 
-  /** The rule, in the tags' own words. */
-  const INSTRUCTIONS = 'Choose the option that clears a line and is hole-free.';
+  /** How the game is played, won and lost, and what to avoid: the first part of the state. */
+  const PRINCIPLES = {
+    how_to_play: 'Pieces fall one at a time; you choose where each lands. A completely filled '
+      + 'row disappears: clearing lines is how you win.',
+    how_you_lose: 'You lose when the stack reaches the top.',
+    what_to_avoid: 'A hole (an empty cell covered by a block) cannot be cleared and pushes the '
+      + 'stack up. Avoid holes.',
+  };
+
+  /** What a placement's facts mean for winning, by the principles above. */
+  function effect(c) {
+    const f = c.features;
+    if (f.rowsCleared > 0 && f.newHoles <= 0) return 'clears a line with no hole: helps you win';
+    if (f.newHoles <= 0) return 'no hole: keeps you safe';
+    if (f.rowsCleared > 0) return 'clears a line but makes a hole';
+    return 'makes a hole: helps you lose';
+  }
+
+  /** The question. The rule is not in it: it is in the state, as principles. */
+  const QUESTION = 'Which placement gives the best chance to win?';
 
   // What the rule prefers, best first: a hole-free line clear, then hole-free, then a line
   // clear that leaves a hole, then the rest.
   const PREFERENCE = [LINE + ', ' + CLEAN, CLEAN, LINE + ', ' + HOLE, HOLE];
 
-  // The order candidates are listed in. With four kinds of facts and plain ids, everything
+  // The order candidates are listed in. With four kinds of facts and plain letters, everything
   // the model can be asked is one of 11 sets of kinds for one of 7 pieces: 77 inputs, and in
-  // this order it answers all of them the way the rule does (tetris/eval/table.mjs). The
-  // right answer comes first, second or third depending on the set, so it is the facts it
-  // reads, not a position.
-  const ORDER = [LINE + ', ' + HOLE, CLEAN, LINE + ', ' + CLEAN, HOLE];
+  // this order it answers all of them the way the rule does (tetris/eval/table.mjs); 3 of the
+  // 24 orders do. The right answer comes first, second or third depending on the set, so it
+  // is the facts it reads, not a position.
+  const ORDER = [CLEAN, LINE + ', ' + HOLE, LINE + ', ' + CLEAN, HOLE];
 
   /**
    * The options to put to the model: from the planner's best `k`, the best of each kind of
@@ -299,23 +317,26 @@
   }
 
   /**
-   * What the model decides from: the piece, and a record per candidate -- its id and what
-   * it does. Everything the rule needs.
+   * What the model decides from: the principles, the piece, and a record per candidate --
+   * its letter, what it does, and what that means for winning.
    */
   function stateOf(piece, shown, labels) {
-    return { game: 'Tetris', piece,
-             placements: shown.map((c, i) => ({ id: labels[i], result: facts(c) })) };
+    return Object.assign({ game: 'Tetris' }, PRINCIPLES, {
+      piece,
+      placements: shown.map((c, i) => ({ id: labels[i], result: facts(c), effect: effect(c) })),
+    });
   }
 
   /**
-   * The question: the rule, with the candidates' ids as the options. `type` is the model's
-   * name for its named-options question type, read from its `surface()`.
+   * The question, with the candidates' letters as the options -- as short as options get,
+   * since question and options share the model's 256-token head. `type` is the model's name
+   * for its named-options question type, read from its `surface()`.
    */
   function question(labels, o) {
     o = o || {};
     const criteria = {};
     for (const name of labels) criteria[name] = null;
-    return { type: o.type || 'choice', instructions: o.instructions || INSTRUCTIONS, criteria };
+    return { type: o.type || 'choice', instructions: o.instructions || QUESTION, criteria };
   }
 
   /**
@@ -343,10 +364,10 @@
   }
 
   return {
-    NAMES, WEIGHTS, INSTRUCTIONS,
+    NAMES, WEIGHTS, PRINCIPLES, QUESTION,
     pieceName, clone, collides, rotateLikeGame, settle, heights, holes, measure,
     PREFERENCE, ORDER,
-    placements, rank, find, facts, candidates, arrange, expected, ids, stateOf,
+    placements, rank, find, facts, effect, candidates, arrange, expected, ids, stateOf,
     question, ask, picked,
   };
 }));

@@ -81,7 +81,7 @@ test('holding gravity stops the game loop from dropping the piece, and releasing
   assert.equal(api.snapshot().pos.y, y0 + 1);
 });
 
-test('a turn puts the deciding facts in the state and the placements as options', () => {
+test('a turn: principles and candidates in the state, a win question, letters as options', () => {
   const { api } = game(3);
   const rotate = (m, d) => api.rotateMatrix(m, d);
   for (let n = 0; n < 25; n++) {
@@ -94,18 +94,20 @@ test('a turn puts the deciding facts in the state and the placements as options'
   const q = asked.questions.move;
   assert.deepEqual(Object.keys(asked.questions), ['move']);
   assert.equal(q.type, 'choice');
-  assert.equal(q.instructions, planner.INSTRUCTIONS);
+  assert.equal(q.instructions, planner.QUESTION);
+  assert.doesNotMatch(q.instructions, /hole|line/, 'the rule is in the state, not the question');
   assert.ok(asked.shown.includes(ranked[0]), 'the planner\'s first choice is always offered');
   assert.ok(asked.shown.includes(asked.expected));
   // Options are the candidates' ids, A B C D, and nothing else.
   assert.deepEqual(asked.labels, asked.shown.map((_, i) => String.fromCharCode(65 + i)));
   assert.deepEqual(Object.keys(q.criteria), asked.labels);
   assert.ok(Object.values(q.criteria).every(v => v === null));
-  // The state holds every candidate and what it does: everything the rule needs.
-  assert.deepEqual(Object.keys(asked.state), ['game', 'piece', 'placements']);
+  // The state holds the principles and every candidate with what it does and what that means.
+  assert.deepEqual(Object.keys(asked.state),
+                   ['game', 'how_to_play', 'how_you_lose', 'what_to_avoid', 'piece', 'placements']);
   assert.equal(asked.state.piece, planner.pieceName(s.matrix));
-  assert.deepEqual(asked.state.placements,
-                   asked.shown.map((c, i) => ({ id: asked.labels[i], result: planner.facts(c) })));
+  assert.deepEqual(asked.state.placements, asked.shown.map((c, i) =>
+    ({ id: asked.labels[i], result: planner.facts(c), effect: planner.effect(c) })));
   const results = asked.state.placements.map(p => p.result);
   assert.equal(new Set(results).size, results.length, 'one placement per kind of facts');
   const at = results.map(t => planner.ORDER.indexOf(t));
@@ -127,6 +129,8 @@ test('the rule in code: hole-free line clear, then hole-free, then a line clear,
   assert.equal(planner.facts(holedLine), 'clears a line, makes a new hole');
   assert.equal(planner.facts(clean), 'hole-free');
   assert.equal(planner.facts(first), 'makes a new hole');
+  assert.match(planner.effect(cleanLine), /helps you win/);
+  assert.match(planner.effect(first), /helps you lose/);
 });
 
 test('the page loads the xDecision GGUF the Pages chat app lists', () => {

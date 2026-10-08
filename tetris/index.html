@@ -63,7 +63,7 @@
       <label>谁来决定
         <select id="mode">
           <option value="model">xDecision</option>
-          <option value="rules">代码（同一条规则，不调用模型，作对照）</option>
+          <option value="rules">代码（同样的原则，不调用模型，作对照）</option>
         </select>
       </label>
       <label>候选数 <span id="kval">4</span>
@@ -80,22 +80,22 @@
       <label class="check"><input id="restart" type="checkbox" checked> 结束后自动重开</label>
     </div>
 
-    <p class="rule">规则：<code id="rule"></code><br>
-      <span>意思是：有既消行又不留洞的就选它；没有就选不留洞的；再没有就选能消行的。</span></p>
+    <p class="rule">问模型：<code id="rule"></code><br>
+      <span>交给它的局面里写着：怎么玩、怎么算赢和输、要避免什么（洞），以及每个候选落点的结果和它对输赢的影响。</span></p>
 
     <div id="turn" class="turn"><p class="turnhead">还没有走过一步。</p></div>
     <p id="stats" class="stats"></p>
 
     <details class="how">
       <summary>它是怎么玩的</summary>
-      <p>xDecision 是根据给定事实回答问题的决策模型，不会推理，这里把它当一个便宜的 if-else 用。</p>
+      <p>xDecision 是根据给定事实回答问题的决策模型，不会推理，所以判断要用的事实都写在交给它的局面里。</p>
       <p>每来一个新方块：先读出游戏自己的棋盘和当前方块，列出游戏操作能到达的每一个落点，
-        按规划器的估值排序。从前几名里，每一类事实（消行 / 不留洞 / 留下新洞）只留排在最前的一个作为候选，
-        在棋盘上标成 A、B、C、D。交给模型的 state 里逐个列出候选的编号和结果，比如
-        <code>{"id": "B", "result": "clears a line, hole-free"}</code>；选项是这些编号，题目就是上面那条规则。
-        模型选出的编号就是这一步，再用游戏自己的
+        按规划器的估值排序。从前几名里，每一类结果（消行 / 不留洞 / 留下新洞）只留排在最前的一个作为候选，
+        在棋盘上标成 A、B、C、D。交给模型的局面写着怎么玩、怎么算输、要避免什么，以及每个候选的结果和它对输赢的影响，比如
+        <code>{"id": "B", "result": "clears a line, hole-free", "effect": "clears a line with no hole: helps you win"}</code>；
+        问题是“哪个落点最有机会赢”，选项就是这几个字母。模型选出的字母就是这一步，再用游戏自己的
         <code>playerRotate</code> / <code>playerMove</code> / <code>playerHardDrop</code> 去执行。</p>
-      <p>✓ 标的是同一条规则在代码里判断出的答案，可以核对模型判断得对不对；“代码”模式不调用模型，直接用这个答案。</p>
+      <p>✓ 标的是按同样的原则在代码里判断出的答案，可以核对模型判断得对不对；“代码”模式不调用模型，直接用这个答案。</p>
       <p>这里的概率是模型自己的打分，没有用俄罗斯方块的数据校准过，不代表“有这么大的把握是对的”。</p>
     </details>
   </section>
