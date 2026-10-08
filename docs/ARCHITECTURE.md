@@ -274,8 +274,13 @@ A PEFT LoRA adapter is read from PEFT's own files and placed by the Hugging Face
 was trained on (`adapters.py`, `CausalLM.attach_adapter`). It stays beside each weight as two
 float32 matrices and adds `scale*(x A^T) B^T` to that projection's output; it is never merged,
 because merging would decode a quantized weight and store it at a width the file does not have.
-A projection without one (`lora` None) runs exactly as before, and the paths that read several
-stored weights in one dispatch hand an adapted projection to its own call. Linear-attention
+A projection without one (`lora` None) runs exactly as before. The paths that read several
+stored weights in one dispatch (q/k/v, gate/up) keep their route and add each adapter to its
+own output afterwards. On a decode row the adapter can be one dispatch (`_lora_fused`): a
+workgroup reduces t = A x in workgroup memory and adds `t . B^T` to the outputs it owns,
+instead of two matmuls and an add, the first of which no tiled shape fits (r outputs, each a
+K-long dot product walked by one thread). Which of the composed and fused routes runs is raced
+per adapter shape while the model warms; prefill keeps the composed GEMMs. Linear-attention
 value heads are stored tiled in a GGUF, so an adapter's value rows (and out_proj's columns) are
 moved to that order when attached. An adapter is attached during the load, before warm-up, so
 route races and recorded decode steps include it; attaching later drops the model's own

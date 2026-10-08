@@ -4862,7 +4862,7 @@ def _route_names():
     return ({"stored", "tiled", "tiled_half", "dp4a", "materialized", "full", "packed",
              "selected_full", "selected_q", "base", "alternate", "f32", "f16",
              "slots", "grouped", "grouped_half"}
-            | set(_ATTN_TILES) | set(_CATTN_TARGETS))
+            | set(_ATTN_TILES) | set(_CATTN_TARGETS) | set(_LORA_ROUTES))
 
 # What one race sample should cost (see `_weight_execution`): enough work that the readback's
 # own noise is small against the difference being measured. By the GPU's own timestamps there
@@ -12458,11 +12458,19 @@ def parallel_linear(linears, x, execution="auto"):
     fused_modes = ("fused:default", "fused:balanced", "fused:compact", "fused:narrow")
     if execution not in ("auto", "separate", "fused") + fused_modes:
         raise ValueError("execution must be auto, separate, fused, or a fused:<shape> route")
-    separate = lambda: tuple(layer(x) for layer in linears)
-    if _lora_live(linears):
-        # The shared dispatch reads the stored weights directly; an adapter is added by each
-        # projection's own call.
-        return separate()
+    outs = _parallel_bare(linears, x, execution)
+    if not _lora_live(linears):
+        return outs
+    # The shared dispatch reads the stored weights alone, and so does every route raced
+    # against it: an adapter adds the same work whichever of them runs, so it is added
+    # after, each to its own output, and the route stays the one chosen without adapters.
+    xf = _contig(x.data.reshape(-1, int(x.data.shape[-1])))
+    return tuple(_lora_add(l, xf, o) for l, o in zip(linears, outs))
+
+
+def _parallel_bare(linears, x, execution):
+    """`parallel_linear` without any adapter."""
+    separate = lambda: tuple(_bare(layer, x) for layer in linears)
     xd = x.data
     rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
     capable = (2 <= len(linears) <= 3 and rows == 1 and _adam_backend_ready()
@@ -12577,7 +12585,9 @@ def parallel_swiglu(linears, x, execution="auto"):
         out = swiglu(gate, up)
         return out if out is not None else (gate / (1.0 + (-gate).exp())) * up
 
-    if _lora_live(linears):
+    if _lora_live(linears) and not _adam_backend_ready():
+        # WebGL's fused form renders gate and up into one texture that `swiglu` reads in
+        # place; there is no output of either projection for its adapter to be added to.
         return separate()
     xd = x.data
     rows = int(np.prod(xd.shape[:-1])) if xd.ndim > 1 else 1
@@ -15733,7 +15743,11 @@ def stored_linear(weight, bias=None, execution="auto"):
 # projection without one (`lora` None) runs exactly as it did before adapters existed.
 class LoRA(object):
     """One projection's adapter: `scale * (x @ A^T) @ B^T`, with A (r, in) and B (out, r) as
-    an adapter file stores them, kept in float32 on the device with the scale folded into B."""
+    an adapter file stores them, kept in float32 on the device with the scale folded into B.
+
+    Stored as A^T (in, r4) and B^T (r4, out), the rank padded with zeros to a multiple of
+    four (`r4`) so the fused kernel reads A^T a vec4 at a time; a zero column of A^T and the
+    zero row of B^T it meets add exactly nothing, on either route."""
 
     def __init__(self, A, B, scale):
         A = np.asarray(A, np.float32)
@@ -15742,23 +15756,238 @@ class LoRA(object):
             raise ValueError("LoRA A %s and B %s do not share a rank" % (A.shape, B.shape))
         self.rank, self.k = int(A.shape[0]), int(A.shape[1])
         self.n = int(B.shape[0])
-        self.At = Tensor(np.ascontiguousarray(A.T))
-        self.Bt = Tensor(np.ascontiguousarray(B.T * np.float32(scale)))
+        r4 = -(-self.rank // 4) * 4
+        At = np.zeros((self.k, r4), np.float32)
+        At[:, :self.rank] = A.T
+        Bt = np.zeros((r4, self.n), np.float32)
+        Bt[:self.rank] = B.T * np.float32(scale)
+        self.r4 = r4
+        self.At = Tensor(At)
+        self.Bt = Tensor(Bt)
 
     def delta(self, x2):
         return x2.matmul(self.At).matmul(self.Bt)
+
+    def add(self, xf, y, execution="auto"):
+        """`y` (M, out) plus this adapter on the input rows `xf` (M, in), as an array.
+
+        "composed" is the two matmuls and the add, each its own dispatch; "fused:<n>" is one
+        dispatch (`_lora_fused`) whose workgroups write n outputs each. ``auto`` races them
+        per shape on this device, the composed route first so an unproven race keeps it."""
+        if execution not in ("auto",) + _LORA_ROUTES:
+            raise ValueError("execution must be 'auto' or one of %s" % (_LORA_ROUTES,))
+        m = int(xf.shape[0])
+        # A row is a workgroup row of the grid, which WebGPU guarantees 65535 of.
+        fusable = _adam_backend_ready() and self.r4 // 4 <= _LORA_WG and m <= 65535
+        if execution != "auto":
+            if execution != "composed" and not fusable:
+                raise RuntimeError("no fused adapter route for this shape here")
+            return self._run(execution, xf, y)
+        # Offered for one row: a decode step, raced while the model warms. Every workgroup
+        # repeats the r*K of t for its own row, so a prompt's rows would repeat it once per
+        # row per workgroup, where the composed GEMMs share each read of A^T between rows;
+        # prefill keeps them, and races nothing at the reader's first prompt.
+        if not fusable or m != 1:
+            return self._run("composed", xf, y)
+        reference = [None]
+
+        def run(which):
+            return self._run(which, xf, y)
+
+        def correct(which):
+            if which == "composed":
+                return True
+            if reference[0] is None:
+                reference[0] = np.asarray(run("composed").get(), np.float32)
+            got = np.asarray(run(which).get(), np.float32)
+            scale = max(1e-6, float(np.abs(reference[0]).max()))
+            # The same values summed in another order: fp32 rounding, nothing more.
+            return bool(np.all(np.isfinite(got))
+                        and float(np.abs(got - reference[0]).max()) / scale < 1e-5)
+
+        which = _weight_execution("lora", "r%d" % self.r4, self.k, self.n, m, run,
+                                  candidates=_LORA_ROUTES, check=correct)
+        return self._run(which, xf, y)
+
+    def _run(self, which, xf, y):
+        if which == "composed":
+            return y + self.delta(Tensor(xf)).data
+        return _lora_fused(self, xf, y, int(which.split(":")[1]) // _LORA_WG)
 
 
 def _lora_live(linears):
     return any(getattr(l, "lora", None) is not None for l in linears)
 
 
-def _lora_add(linear, xf, y, lead, n):
-    """`y` plus `linear`'s adapter, if it has one, on its input rows `xf`."""
+def _lora_add(linear, xf, y):
+    """`y`, the Tensor `linear` computed from its input rows `xf`, plus its adapter if it has
+    one."""
     lora = getattr(linear, "lora", None)
     if lora is None:
         return y
-    return y + lora.delta(Tensor(xf)).reshape(*lead, n)
+    shape = tuple(y.data.shape)
+    out = lora.add(xf, _contig(y.data.reshape(-1, shape[-1])))
+    return Tensor(out.reshape(*shape))
+
+
+def _bare(layer, x):
+    """`layer(x)` without its adapter: what a shared dispatch over several weights computes,
+    before each adapter is added to its own output."""
+    project = getattr(layer, "_project", None)
+    return layer(x) if project is None else project(x)[0]
+
+
+# ---- an adapter in one dispatch --------------------------------------------------------------
+#
+# The composed adapter is three dispatches per projection per token, and the first of them is
+# the expensive one: `x @ A^T` has r outputs, which no tiled matmul shape fits, so the generic
+# kernel gives each of its r threads the whole K-long dot product to walk alone. On a 0.6B
+# with 84 adapted projections that was ~12 ms a token on top of a ~5.7 ms step.
+#
+# Here one workgroup of `_LORA_WG` threads first computes all of t = A x together: thread
+# (lane l, rank group q) sums A^T[k, 4q..4q+3] * x[k] over every k = l mod LANES, so the
+# threads of a rank group split K between them and the reads of a row of A^T are coalesced;
+# the lanes are then summed in workgroup memory, in two stages so that three barriers do it
+# whatever the rank. With t in workgroup memory each thread adds `t . B^T[:, n]` to its
+# outputs. Every workgroup computes t for itself -- r*K multiply-adds, the size of the
+# adapter -- because nothing in WebGPU lets one workgroup wait for another. How many outputs
+# a workgroup writes (`OPT` per thread) trades how many workgroups repeat that against how
+# many columns of B^T each one walks; which is better is raced per shape (`LoRA.add`).
+_LORA_WG = 256
+_LORA_ROUTES = ("composed", "fused:256", "fused:1024", "fused:4096")
+_LORA_ADDED = {}
+
+_LORA_WGSL = """@group(0) @binding(0)
+var<storage,read> x: array<f32>;
+@group(0) @binding(1)
+var<storage,read> at: array<vec4<f32>>;
+@group(0) @binding(2)
+var<storage,read> bt: array<f32>;
+@group(0) @binding(3)
+var<storage,read> y: array<f32>;
+@group(0) @binding(4)
+var<storage,read_write> outp: array<f32>;
+struct LM { K: u32, N: u32, Q: u32, pad: u32, }
+@group(0) @binding(5)
+var<storage,read> lm: LM;
+const QP: u32 = QPu;
+const LANES: u32 = LANESu;
+const S1: u32 = S1u;
+const OPT: u32 = OPTu;
+var<workgroup> part: array<vec4<f32>, WGu>;
+var<workgroup> t: array<vec4<f32>, QPu>;
+@compute @workgroup_size(WG)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let i = lid.x;
+  let row = wid.y;
+  let q = i % QP;
+  let l = i / QP;
+  var acc = vec4<f32>(0.0);
+  if (q < lm.Q) {
+    let xo = row * lm.K;
+    for (var k: u32 = l; k < lm.K; k = k + LANES) {
+      acc = acc + at[k * lm.Q + q] * x[xo + k];
+    }
+  }
+  part[i] = acc;
+  workgroupBarrier();
+  // Lanes l and l + S1, l + 2*S1, ... into lane l < S1; then those S1 into t.
+  if (l < S1) {
+    var p = part[i];
+    for (var j: u32 = l + S1; j < LANES; j = j + S1) { p = p + part[j * QP + q]; }
+    part[i] = p;
+  }
+  workgroupBarrier();
+  if (i < QP) {
+    var p = part[i];
+    for (var j: u32 = 1u; j < S1; j = j + 1u) { p = p + part[j * QP + i]; }
+    t[i] = p;
+  }
+  workgroupBarrier();
+  let N = lm.N;
+  let first = wid.x * (WGu * OPT) + i;
+  for (var j: u32 = 0u; j < OPT; j = j + 1u) {
+    let n = first + j * WGu;
+    if (n < N) {
+      var d = 0.0;
+      for (var g: u32 = 0u; g < lm.Q; g = g + 1u) {
+        let tv = t[g];
+        let o = g * 4u * N + n;
+        d = d + tv.x * bt[o] + tv.y * bt[o + N] + tv.z * bt[o + 2u * N] + tv.w * bt[o + 3u * N];
+      }
+      outp[row * N + n] = y[row * N + n] + d;
+    }
+  }
+}
+"""
+
+
+def _lora_src(qp, opt):
+    """The fused adapter kernel's source for `qp` rank groups (a power of two, at most the
+    workgroup) and `opt` outputs a thread."""
+    lanes = _LORA_WG // qp
+    return (_LORA_WGSL.replace("QPu", "%du" % qp)
+            .replace("LANESu", "%du" % lanes)
+            .replace("S1u", "%du" % min(lanes, 16))
+            .replace("OPTu", "%du" % opt)
+            .replace("WGu", "%du" % _LORA_WG)
+            .replace("WG)", "%d)" % _LORA_WG))
+
+
+def _lora_kernel(qp, opt):
+    """The fused adapter kernel for `qp` rank groups and `opt` outputs a thread, added and
+    checked against numpy the first time it is asked for."""
+    name = "lora_fused_q%d_o%d" % (qp, opt)
+    if name in _LORA_ADDED:
+        if not _LORA_ADDED[name]:
+            raise RuntimeError("%s failed its self-check on this device" % name)
+        return name
+    ro = "read-only-storage"
+    _adam_kernel["platform"].addKernel(
+        name, {"source": _lora_src(qp, opt), "bindingTypes": [ro, ro, ro, ro, "storage", ro]})
+    _LORA_ADDED[name] = None          # set before the check: the check runs this kernel
+    # A WGSL compile error does not raise; the dispatch writes nothing. Two rows, a K that is
+    # no multiple of anything, more outputs than one workgroup writes, and two ranks: one
+    # using every rank group of this kernel, one the fewest it is chosen for, padded.
+    rng = np.random.default_rng(7)
+    ok = True
+    for r in (4 * qp, 4 * (qp // 2) + 1):
+        A = rng.standard_normal((r, 37)).astype(np.float32)
+        B = rng.standard_normal((_LORA_WG * opt + 5, r)).astype(np.float32)
+        lo = LoRA(A, B, 0.5)
+        xs = rng.standard_normal((2, 37)).astype(np.float32)
+        ys = rng.standard_normal((2, B.shape[0])).astype(np.float32)
+        got = np.asarray(_lora_fused(lo, xp.asarray(xs), xp.asarray(ys), opt,
+                                     name=name).get(), np.float32)
+        want = ys + 0.5 * (xs @ A.T) @ B.T
+        ok = ok and bool(np.all(np.isfinite(got))
+                         and np.abs(got - want).max() <= 1e-4 * max(1.0, np.abs(want).max()))
+    _LORA_ADDED[name] = ok
+    if not ok:
+        raise RuntimeError("%s failed its self-check on this device" % name)
+    return name
+
+
+def _lora_fused(lora, xf, y, opt, name=None):
+    """`y + scale * (xf @ A^T) @ B^T` in one dispatch: `xf` (M, in), `y` (M, out)."""
+    m = int(xf.shape[0])
+    q = lora.r4 // 4
+    qp = 1 << (q - 1).bit_length()
+    if name is None:
+        name = _lora_kernel(qp, opt)
+    xf = _contig(xf)
+    y = _contig(y)
+    out = _empty((m, lora.n))
+    meta = _adam_kernel["make_meta"]((lora.k, lora.n, q, 0), "u4,u4,u4,u4")
+    per = _LORA_WG * opt
+    _adam_kernel["platform"].runKernel({
+        "name": name,
+        "tensors": [xf.buffer.buffer_id, lora.At.data.buffer.buffer_id,
+                    lora.Bt.data.buffer.buffer_id, y.buffer.buffer_id,
+                    out.buffer.buffer_id, meta.buffer_id],
+        "workGroups": {"x": (lora.n + per - 1) // per, "y": m, "z": 1}})
+    return out
 
 
 class GGMLLinear(Module):
@@ -15797,6 +16026,11 @@ class GGMLLinear(Module):
         self.bias = None if bias is None else xp.asarray(np.asarray(bias, np.float32))
 
     def forward(self, x):
+        y, xf = self._project(x)
+        return _lora_add(self, xf, y)
+
+    def _project(self, x):
+        """The stored weight's own product, without the adapter, and the input rows it read."""
         xd = x.data
         lead = xd.shape[:-1]
         rows = int(xd.reshape(-1, self.Kt).shape[0])
@@ -15807,7 +16041,7 @@ class GGMLLinear(Module):
                          self.type_name, self.Kt, self.Nt, bias=self.bias,
                          execution=execution,
                          shape_execution=(self.decode_shape if rows == 1 else "auto"))
-        return _lora_add(self, xf, Tensor(of.reshape(*lead, self.Nt)), lead, self.Nt)
+        return Tensor(of.reshape(*lead, self.Nt)), xf                 # inference-only
 
 
 
@@ -16164,9 +16398,14 @@ class QuantizedLinear(Module):
         return QuantizedLinear(qw, qz, sc, b, K, N, Kp, Np, group_size, bits)
 
     def forward(self, x):
+        y, xf = self._project(x)
+        return _lora_add(self, xf, y)
+
+    def _project(self, x):
+        """The quantized weight's own product, without the adapter, and the input rows."""
         xd = x.data
         lead = xd.shape[:-1]
-        xf = _contig(xd.reshape(-1, self.Kt))
+        xf = x0 = _contig(xd.reshape(-1, self.Kt))
         if self.Kp != self.Kt:                      # pad activation to padded K
             xp_ = _zeros((int(xf.shape[0]), self.Kp)); xp_[:, :self.Kt] = xf; xf = xp_
         def run(which):
@@ -16213,10 +16452,7 @@ class QuantizedLinear(Module):
         of = run(execution)
         if self.Np != self.Nt:
             of = _contig(of[:, :self.Nt])
-        y = Tensor((of + self.bias).reshape(*lead, self.Nt))   # inference-only
-        if self.lora is None:
-            return y
-        return _lora_add(self, _contig(xd.reshape(-1, self.Kt)), y, lead, self.Nt)
+        return Tensor((of + self.bias).reshape(*lead, self.Nt)), x0   # inference-only
 
     def nbytes(self):
         return int(self.qweight.size * 4 + self.qzeros.size * 4 + self.scales.size * 4 + self.bias.size * 4)
@@ -16237,11 +16473,15 @@ class UnquantizedLinear(Module):
                                else np.asarray(bias, np.float32))
 
     def forward(self, x):
+        y, xf = self._project(x)
+        return _lora_add(self, xf, y)
+
+    def _project(self, x):
+        """The weight's own product, without the adapter, and the input rows it read."""
         xd = x.data; lead = xd.shape[:-1]
         xf = _contig(xd.reshape(-1, self.Kt))
         of = xf @ self.Wt
-        return _lora_add(self, xf, Tensor((of + self.bias).reshape(*lead, self.Nt)),
-                         lead, self.Nt)
+        return Tensor((of + self.bias).reshape(*lead, self.Nt)), xf
 
     def nbytes(self):
         return int(self.Wt.size * 4 + self.bias.size * 4)

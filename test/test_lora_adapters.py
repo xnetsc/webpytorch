@@ -130,6 +130,7 @@ def test_adapters_land_on_the_projection_their_module_path_names():
     A = np.ones((2, H), np.float32); B = np.ones((8, 2), np.float32)
     placed = m.attach_adapter({"model.layers.0.self_attn.q_proj": (A, B, 1.0)})
     assert placed == ["model.layers.0.self_attn.q_proj"] and q.lora is not None
+    assert CausalLM._adapted(m) == [q.lora]          # what the load's warm-up races
     with pytest.raises(NotImplementedError):
         m.attach_adapter({"model.layers.0.self_attn.rotary": (A, B, 1.0)})
     with pytest.raises(ValueError):
@@ -137,7 +138,7 @@ def test_adapters_land_on_the_projection_their_module_path_names():
     with pytest.raises(ValueError):
         m.attach_adapter({"model.layers.3.self_attn.q_proj": (A, B, 1.0)})
     m.detach_adapters()
-    assert q.lora is None
+    assert q.lora is None and CausalLM._adapted(m) == []
 
 
 def test_value_heads_move_to_the_tiled_order_the_layer_runs_in():
@@ -210,3 +211,131 @@ def test_the_same_weights_with_another_adapter_are_another_model():
     b = _sdk._impl_cache_key("m.gguf", "auto", None, None, "native", "lora")
     assert a != b
     assert "adapter" in _sdk._LLM_OPTS
+
+
+# ---- the adapter in one dispatch ---------------------------------------------------------------
+
+def test_a_rank_padded_to_four_adds_exactly_nothing():
+    rng = np.random.default_rng(1)
+    for r in (1, 3, 4, 5):
+        A = rng.standard_normal((r, 7)).astype(np.float32)
+        B = rng.standard_normal((9, r)).astype(np.float32)
+        lo = wt.LoRA(A, B, 0.25)
+        assert lo.rank == r and lo.r4 == -(-r // 4) * 4
+        assert not lo.At.numpy()[:, r:].any() and not lo.Bt.numpy()[r:].any()
+        x = rng.standard_normal((3, 7)).astype(np.float32)
+        y = rng.standard_normal((3, 9)).astype(np.float32)
+        got = np.asarray(lo.add(wt.xp.asarray(x), wt.xp.asarray(y)), np.float32)
+        np.testing.assert_allclose(got, y + 0.25 * (x @ A.T) @ B.T, rtol=1e-5, atol=1e-5)
+
+
+def test_without_webgpu_the_adapter_is_composed_and_a_fused_request_says_so():
+    if wt._adam_backend_ready():
+        pytest.skip("host behaviour")
+    lo = wt.LoRA(np.ones((2, 4), np.float32), np.ones((3, 2), np.float32), 1.0)
+    x, y = wt.xp.asarray(np.ones((1, 4), np.float32)), wt.xp.asarray(np.zeros((1, 3), np.float32))
+    np.testing.assert_allclose(np.asarray(lo.add(x, y)), 8.0)
+    np.testing.assert_allclose(np.asarray(lo.add(x, y, execution="composed")), 8.0)
+    with pytest.raises(RuntimeError):
+        lo.add(x, y, execution="fused:256")
+    with pytest.raises(ValueError):
+        lo.add(x, y, execution="fused")
+
+
+def test_fused_kernel_source_fills_every_constant_and_fits_workgroup_memory():
+    for qp in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        for opt in (1, 4, 16):
+            src = wt._lora_src(qp, opt)
+            for token in ("QPu", "LANESu", "S1u", "OPTu", "WGu", "(WG)"):
+                assert token not in src, (qp, opt, token)
+            # Two vec4 arrays: the lane partials (one per thread) and t (one per rank group).
+            assert "array<vec4<f32>, %du>" % wt._LORA_WG in src
+            assert "array<vec4<f32>, %du>" % qp in src
+            assert 16 * (wt._LORA_WG + qp) <= 16384
+            lanes = wt._LORA_WG // qp
+            assert "const LANES: u32 = %du;" % lanes in src
+            assert "const S1: u32 = %du;" % min(lanes, 16) in src
+    assert set(wt._LORA_ROUTES) == {"composed", "fused:256", "fused:1024", "fused:4096"}
+    assert wt._LORA_ROUTES[0] == "composed"          # an unproven race keeps it
+
+
+def test_shared_projections_add_each_adapter_to_its_own_output():
+    rng = np.random.default_rng(2)
+    H, F = 6, 5
+    Wg, Wu = (rng.standard_normal((F, H)).astype(np.float32) for _ in range(2))
+    gate, up = wt.UnquantizedLinear(Wg), wt.UnquantizedLinear(Wu)
+    A = rng.standard_normal((3, H)).astype(np.float32)
+    B = rng.standard_normal((F, 3)).astype(np.float32)
+    up.lora = wt.LoRA(A, B, 2.0)
+    x = rng.standard_normal((1, H)).astype(np.float32)
+    g = x @ Wg.T
+    u = x @ Wu.T + 2.0 * (x @ A.T) @ B.T
+    a, b = wt.parallel_linear((gate, up), wt.Tensor(x))
+    np.testing.assert_allclose(a.numpy(), g, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(b.numpy(), u, rtol=1e-5, atol=1e-5)
+    # The projection without its adapter is what a shared dispatch computes.
+    np.testing.assert_allclose(wt._bare(up, wt.Tensor(x)).numpy(), x @ Wu.T, rtol=1e-5, atol=1e-5)
+    act = wt.parallel_swiglu((gate, up), wt.Tensor(x)).numpy()
+    np.testing.assert_allclose(act, g / (1.0 + np.exp(-g)) * u, rtol=1e-4, atol=1e-5)
+
+
+def _q8_0(W):
+    """`W` (out, in) as GGUF Q8_0 bytes, and the values those bytes hold."""
+    N, K = W.shape
+    blocks = W.reshape(N, K // 32, 32).astype(np.float32)
+    d = (np.abs(blocks).max(-1) / 127.0).astype(np.float16)
+    q = np.round(blocks / np.maximum(d.astype(np.float32), 1e-8)[..., None])
+    q = q.clip(-127, 127).astype(np.int8)
+    rec = np.zeros((N, K // 32), dtype=[("d", "<f2"), ("q", "i1", (32,))])
+    rec["d"], rec["q"] = d, q
+    return rec.tobytes(), (d.astype(np.float32)[..., None] * q).reshape(N, K)
+
+
+def test_the_fused_adapter_matches_numpy_in_the_browser():
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    rng = np.random.default_rng(3)
+    for (M, K, N, r) in ((1, 1024, 2048, 16), (1, 3072, 1024, 64), (2, 37, 300, 3),
+                         (3, 513, 777, 1), (1, 96, 48, 128), (1, 2048, 1024, 13),
+                         (1, 64, 5000, 1024)):
+        A = (rng.standard_normal((r, K)) / np.sqrt(K)).astype(np.float32)
+        B = rng.standard_normal((N, r)).astype(np.float32)
+        lo = wt.LoRA(A, B, 0.75)
+        x = rng.standard_normal((M, K)).astype(np.float32)
+        y = rng.standard_normal((M, N)).astype(np.float32)
+        want = y + 0.75 * (x @ A.T) @ B.T
+        for route in wt._LORA_ROUTES:
+            got = np.asarray(lo.add(wt.xp.asarray(x), wt.xp.asarray(y), execution=route).get())
+            assert np.abs(got - want).max() <= 1e-5 * max(1.0, np.abs(want).max()), (M, K, N, r,
+                                                                                        route)
+
+
+def test_adapted_projections_keep_their_shared_dispatch_in_the_browser():
+    if not wt._adam_backend_ready():
+        pytest.skip("requires the WebGPU browser backend")
+    rng = np.random.default_rng(4)
+    K, Ns = 256, (512, 256, 256)
+    lins, refs = [], []
+    for N in Ns:
+        raw, W = _q8_0(rng.standard_normal((N, K)).astype(np.float32) * 0.1)
+        lins.append(wt.GGMLLinear(raw, "Q8_0", K, N, execution="stored"))
+        refs.append(W)
+    loras = [(rng.standard_normal((8, K)).astype(np.float32) * 0.1,
+              rng.standard_normal((N, 8)).astype(np.float32)) for N in Ns]
+    lins[0].lora = wt.LoRA(*loras[0], 2.0)
+    lins[2].lora = wt.LoRA(*loras[2], 2.0)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    want = [x @ W.T for W in refs]
+    want[0] = want[0] + 2.0 * (x @ loras[0][0].T) @ loras[0][1].T
+    want[2] = want[2] + 2.0 * (x @ loras[2][0].T) @ loras[2][1].T
+    for execution in ("separate", "fused"):
+        wt._count_dispatch_names(True)
+        from wgpy_backends.webgpu.platform import WebGPUPlatform
+        before = dict(WebGPUPlatform.by_name)
+        got = wt.parallel_linear(lins, wt.Tensor(x), execution=execution)
+        names = {k for k, v in WebGPUPlatform.by_name.items() if v != before.get(k, 0)}
+        wt._count_dispatch_names(False)
+        for g, w in zip(got, want):
+            np.testing.assert_allclose(g.numpy(), w, rtol=2e-4, atol=2e-4 * np.abs(w).max())
+        shared = any(n.startswith("ggml_parallel3") for n in names)
+        assert shared == (execution == "fused"), names

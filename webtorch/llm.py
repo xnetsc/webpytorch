@@ -5147,8 +5147,39 @@ class CausalLM:
         self._decode_graph_logits = None
         self._decode_graph_token = None
         if getattr(self, "_gpu", False) and self._capturable():
-            # The adapter's matmul shapes register here, not inside the next recording.
+            # The adapter's matmul shapes register here, not inside the next recording, and
+            # its routes race before the step that counts what a step dispatches.
+            CausalLM._warm_adapters(self)
             self._warm_decode_step()
+
+    def _adapted(self):
+        """Every attached adapter, where `attach_adapter` puts them."""
+        out = []
+        for lay in getattr(self, "layers", None) or ():
+            if not isinstance(lay, dict):
+                continue
+            mods = [lay.get(k) for k in set(self._ADAPTER_SLOTS.values())]
+            if lay.get("linear") is not None:
+                mods += list(lay["linear"].w.values())
+            out += [lin.lora for lin in mods
+                    if lin is not None and getattr(lin, "lora", None) is not None]
+        return out
+
+    def _warm_adapters(self):
+        """Each adapter shape once on a decode row, so its routes race now (`LoRA.add`) and
+        not inside a decode step. The inputs are not zero: zeros give every route the same
+        answer, whatever it computes, and the race checks each route against the composed
+        one before timing it."""
+        shapes = {}
+        for lora in CausalLM._adapted(self):
+            shapes.setdefault((lora.k, lora.n, lora.r4), lora)
+        rng = np.random.default_rng(1)
+        out = None
+        for (k, n, _r), lora in sorted(shapes.items(), key=lambda kv: kv[0]):
+            out = lora.add(xp.asarray(rng.standard_normal((1, k)).astype(np.float32)),
+                           xp.asarray(rng.standard_normal((1, n)).astype(np.float32)))
+        if out is not None:
+            wt.Tensor(out).numpy()
 
     @staticmethod
     def _adapter_tiled(la, key, A, B):
@@ -5377,6 +5408,7 @@ class CausalLM:
                 # their stored-kernel registration on every large-model load.
                 held.append(v(x, eidx) if key[3] else v(x))
                 # No per-shape readback: queue order and the final read settle them all.
+            CausalLM._warm_adapters(self)
             if held:
                 held[-1].numpy()
             held.clear()
