@@ -316,7 +316,12 @@
     if (typeof loadPyodide === 'undefined') importScripts(idx + 'pyodide.js');
     const pyodide = await loadPyodide({ indexURL: idx, stdout: opts.stdout, stderr: opts.stderr });
     root.pyodide = pyodide;
-    await pyodide.loadPackage(['micropip', 'numpy']);
+    // `regex` beside numpy: a BPE tokenizer cuts text with \p{L}/\p{N} classes, which the
+    // standard library's `re` does not have, and the same model then sees other tokens than
+    // the ones it was trained on (`[kind]` became `[`,`kind` instead of `[k`,`ind`). Small, and
+    // fetched in parallel; if it cannot be had, the tokenizer's `re` rendering is used.
+    await Promise.all([pyodide.loadPackage(['micropip', 'numpy']),
+                       pyodide.loadPackage(['regex']).catch(() => null)]);
     // Chat templates are Jinja. Fetched now, in the background and not awaited, so the first
     // model that has a template does not wait on a package fetch inside its load: resolved
     // there by micropip it was 3.4-20 s of a 0.6B's 5-22 s load, the spread being the

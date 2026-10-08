@@ -43,6 +43,7 @@ async function start(config) {
   pyodide = await loadPyodide({ indexURL: PYODIDE_URL, stdout, stderr: stdout });
   await pyodide.loadPackage('micropip');
   await pyodide.loadPackage('numpy');
+  await pyodide.loadPackage('regex').catch(() => null);   // exact BPE pre-tokenizing
   if (initWorkerResult) {
     await pyodide.loadPackage(`../dist/wgpy_${initWorkerResult.backend}-1.0.0-py3-none-any.whl`);
     log(`backend: ${initWorkerResult.backend}`);

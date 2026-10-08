@@ -168,6 +168,14 @@ class BPETokenizer:
                    r"|\s+(?!\S)|\s+")
     PRETOK_GPT4 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
                    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+    # The same two for the standard library's `re`, which has no \p{...}: a letter is a word
+    # character that is not a digit or "_", a number is a decimal digit. The previous
+    # stand-in only knew ASCII letters, so it cut "[kind]" as "[","kind" where the model was
+    # trained on "[k","ind", ran CJK text and its punctuation together, and kept a run of
+    # spaces off the word after it.
+    RE_GPT2 = r"'s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?(?:[^\s\w]|_)+|\s+(?!\S)|\s+"
+    RE_GPT4 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|(?:[^\r\n\w]|_)?[^\W\d_]+|\d"
+               r"| ?(?:[^\s\w]|_)+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 
     def __init__(self, vocab, merges, eos_ids=None, chat_format=None,
                  chat_template=None, control=None, pattern=None, style=None):
@@ -205,12 +213,10 @@ class BPETokenizer:
             import regex as _re
             pat = pattern or self.PRETOK_GPT4
         except Exception:
-            # `re` has no \p{...}; this is the ASCII reading of whichever pattern was asked
-            # for, and it differs from it outside ASCII.
+            # `re` has no \p{...}: the `re` rendering of whichever pattern was asked for.
             import re as _re
-            pat = (r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+"
-                   if (pattern or self.PRETOK_GPT4) == self.PRETOK_GPT2 else
-                   r"'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]+|\s+")
+            pat = (self.RE_GPT2 if (pattern or self.PRETOK_GPT4) == self.PRETOK_GPT2
+                   else self.RE_GPT4)
         self.re = _re; self.pat = _re.compile(pat)
         # `style` is the Metaspace description from `pretok_style`, or None for byte-level.
         # It is read from the model's own file, never assumed: the two families produce
@@ -235,11 +241,20 @@ class BPETokenizer:
             return got
         word = list(tok)
         while len(word) > 1:
-            pairs = {(word[i], word[i + 1]): i for i in range(len(word) - 1)}
-            best = min(pairs, key=lambda p: self.ranks.get(p, 1 << 30))
+            best = min(zip(word, word[1:]), key=lambda p: self.ranks.get(p, 1 << 30))
             if best not in self.ranks:
                 break
-            i = pairs[best]; word = word[:i] + [best[0] + best[1]] + word[i + 2:]
+            # Every occurrence of the pair, left to right, as the reference BPE does. Merging
+            # one of them -- the last, which is what a dict of positions kept -- cut three
+            # spaces as " ","  " where the model was trained on "   ".
+            first, second = best
+            merged, i = [], 0
+            while i < len(word):
+                if i + 1 < len(word) and word[i] == first and word[i + 1] == second:
+                    merged.append(first + second); i += 2
+                else:
+                    merged.append(word[i]); i += 1
+            word = merged
         if len(cache) >= self._BPE_CACHE_MAX:
             cache.clear()
         cache[tok] = word

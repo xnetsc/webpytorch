@@ -13,6 +13,14 @@ passing their recorded acceptance gates completes this task.
 
 ## One-line status
 
+**2026-10-08 adapters measured, JEV-9B verified, tokenizer fixed:** on the M5 the load's race
+picks fused:256 (0.6B, rank 16 everywhere: 122-128 tok/s against 157 without an adapter and 14 on
+the composed route; text identical on every route). JEV-9B through the chat page's folder input
+matches its model card to the second decimal (choice 0.330/0.140/0.529/0.001, noul 0.991) once
+the tokenizer cuts like llama.cpp: the worker now loads `regex`, the `re` fallback knows Unicode
+letters, and BPE merges every occurrence of a pair. Open: the streaming reader's memory
+(`webio._read_streaming`, from the entry below).
+
 **2026-10-08 LoRA for any language model; slot-head decision models by content:** PEFT
 adapters load with a model (`adapter=`, or beside it in its folder), kept unmerged on every
 projection, applied in prefill and recorded decode (0.6B: zero adapter gives the same text,

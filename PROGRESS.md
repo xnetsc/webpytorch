@@ -1,5 +1,55 @@
 # Progress
 
+## 2026-10-08 ▸ Adapter routes measured on the M5; JEV-9B matches its model card; two tokenizer faults fixed
+
+**Trigger:** user: the fused adapter route was only checked on SwiftShader; measure each route on
+the M5 with `examples/lora_decode_benchmark.py` in `webapp/`, and run JEV-9B end to end now that
+its backbone is here.
+
+**Adapter routes, M5 Air (headless Chrome, Metal), 0.6B Q4_K_M, rank 16 on all 196 projections,
+median of three 64-token greedy replies:**
+
+| route | zero adapter tok/s | random adapter tok/s | dispatches a step | text |
+|---|---|---|---|---|
+| no adapter | 157.4 | | 562 | |
+| composed | 14.2 | 14.8 | 1150 | same |
+| fused:256 | 121.9 | 127.8 | 758 | same |
+| fused:1024 | 111.2 | 117.5 | 758 | same |
+| fused:4096 | 101.3 | 108.1 | 758 | same |
+| auto (the load's race) | 122.1, picks fused:256 | 127.8, picks fused:256 | 758 | same |
+
+Run in this order; `auto` ran last and matched fused:256, which ran first, so the order is not
+what ranks them. The composed route is 8.6x slower than the fused one.
+
+**JEV-9B (Q8_0 backbone, sha256 checked; loaded through the chat page's folder input in 25 s,
+found as a slot-head decision model with its adapter):** the first run gave choice
+0.277/0.157/0.565/0.001 against the card's 0.33/0.14/0.53/0.001. The prompt was 68 tokens;
+llama.cpp cuts it into 65. Two faults, both in the tokenizer every BPE model uses:
+
+- The worker never loaded `regex`, so the pre-tokenizer ran its ASCII stand-in for `re`:
+  `[kind]` became `[`,`kind` (trained: `[k`,`ind`), CJK text ran together with its punctuation,
+  and a run of spaces kept no space for the word after it. The worker (and `webapp/`) now load
+  `regex` beside numpy, and the `re` rendering of the GPT-2/GPT-4 patterns uses Unicode letters
+  (`[^\W\d_]`) and the lookahead, so it matches llama.cpp on prose, code, URLs, CJK, accents;
+  it still differs on numbers that are not decimal digits (①, ½), which only `regex` knows.
+- `_bpe` merged the LAST occurrence of a repeated pair (a dict of positions), so three spaces
+  became " ","  " instead of "   ". Now every occurrence, left to right, as the reference BPE.
+
+After both: 65 tokens, and
+
+| | choice issue_warning / renegotiate / dual_source / maintain | noul true |
+|---|---|---|
+| model card | ≈ 0.33 / 0.14 / 0.53 / 0.001 | 0.991 |
+| with adapter | 0.330 / 0.140 / 0.529 / 0.001 | 0.991 |
+| without adapter | 0.057 / 0.214 / 0.670 / 0.059 | 0.984 |
+| adapter without the value-head reorder (deliberately wrong, earlier tokenizer) | 0.242 / 0.170 / 0.588 / 0.0006 | 0.992 |
+
+About 0.6-0.7 s a question on the M5. The 0.6B's chat text is unchanged by the tokenizer fixes
+(152/163 tok/s, every decoded token agrees with a fresh prefill), and the rank-4 test adapter now
+decodes at 127/148 tok/s (52/55 before the fused route). Python 343 passed, JS 127 passed.
+
+**Limits:** prompts with ①-style numbers still tokenize differently where `regex` cannot load.
+
 ## 2026-10-08 ▸ An adapter on a decode row in one dispatch; q/k/v and gate/up stay shared with adapters
 
 **Trigger:** user: with a LoRA attached the 0.6B decodes 3x slower; every adapted projection
